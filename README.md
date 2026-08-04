@@ -85,6 +85,20 @@ node ~/.workbuddy/skills/token-usage-tracker/token-tracker.js
 # 上一轮 ⏱️ 耗时 2m 27s | 输入 332.1万 / 输出 1.5万 tokens（该轮累计 333.5万，缓存命中 328.9万）
 ```
 
+## 只保留 Token 通知（关闭 WorkBuddy 自带通知）
+
+如果只想看到本技能的 Token 推送、不想被 WorkBuddy 应用自带的「任务已完成」等通知打扰：
+
+```
+Windows 设置 → 系统 → 通知 → 应用通知
+→ 找到「WorkBuddy」→ 关闭它的通知开关
+```
+
+本技能的 toast 使用**独立应用名「WorkBuddy Token Tracker」** 直接调用 Windows 系统通知 API 弹出，**不经过 WorkBuddy 客户端设置**——所以关闭 WorkBuddy 自带通知**不影响 Token 通知**，两者互不干扰。
+
+- 若在通知列表里找不到「WorkBuddy」条目：说明该版本把通知设为系统级强发（应用内开关也管不住），只能忽略或按应用提示处理。
+- 若想连 Token 通知也一起关：在通知列表单独关闭「WorkBuddy Token Tracker」即可（本技能的 toast 会随之停止）。
+
 ## 文件结构
 
 ```
