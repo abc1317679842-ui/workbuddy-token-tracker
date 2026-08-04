@@ -22,6 +22,14 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 | 🔤 **可读性** | 大数自动用「万/亿」单位（287.9万 / 1.5亿），读起来快 |
 | 🔒 **纯本地** | 不修改 WorkBuddy 应用包/签名/账号/对话数据，只读 traces + 维护自身快照 |
 
+## 预览
+
+实际运行时 Windows 系统通知效果（回答结束后立即弹出）：
+
+![Toast 系统通知预览](assets/preview-toast.png)
+
+*两行展示：上一行耗时 / 输入 / 输出，下行缓存命中 / 费用估算（本图示例为该技能自身一次日常使用）*
+
 ## 工作原理
 
 每个 `trace_*.json` = 一轮完整 LLM 调用，**整轮结束后才落盘**：
@@ -103,10 +111,12 @@ Windows 设置 → 系统 → 通知 → 应用通知
 
 ```
 token-usage-tracker/
-├── token-tracker.js      # 核心脚本：读 trace、聚合 spans、算费用、弹 toast
-├── refresh-prices.js     # 每日价格自动刷新（OpenRouter 免费 API，当天只拉一次）
-├── pricing.json          # 20+ 模型官方人民币价格 + OpenRouter or_id 映射 + 高峰倍率
-└── SKILL.md              # 技能说明与使用指令（含时序限制说明）
+├── token-tracker.js          # 核心脚本：读 trace、聚合 spans、算费用、弹 toast
+├── refresh-prices.js         # 每日价格自动刷新（OpenRouter 免费 API，当天只拉一次）
+├── pricing.json              # 20+ 模型官方人民币价格 + OpenRouter or_id 映射 + 高峰倍率
+├── SKILL.md                  # 技能说明与使用指令（含时序限制说明）
+└── assets/
+    └── preview-toast.png     # README 中引用的 Windows 系统通知效果图
 ```
 
 ## 系统要求
