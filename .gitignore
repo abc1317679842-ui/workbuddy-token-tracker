@@ -1,0 +1,4 @@
+# 运行时状态（本地生成，不入库）
+.snapshot.json
+.stop-probe.json
+*.log

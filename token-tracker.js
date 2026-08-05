@@ -180,9 +180,10 @@ function saveSnapshot(snap) {
   }
 }
 
-function lineFor(stat, sameRound) {
+function lineFor(stat, sameRound, modelShort) {
   const prefix = sameRound ? '上一轮 ' : '';
-  return `${prefix}⏱️ 耗时 ${fmtDur(stat.durMs)} | 输入 ${fmt(stat.in)} / 输出 ${fmt(stat.out)} tokens（该轮累计 ${fmt(stat.total)}，缓存命中 ${fmt(stat.cached)}）`;
+  const head = modelShort ? `${modelShort} ｜ ` : '';
+  return `${prefix}${head}耗时 ${fmtDur(stat.durMs)} ｜ 输入 ${fmt(stat.in)} / 输出 ${fmt(stat.out)} tokens（该轮累计 ${fmt(stat.total)}，缓存命中 ${fmt(stat.cached)}）`;
 }
 
 // Stop hook 探针：记录触发时间、payload、读到的 trace 文件与统计，用于验证 Stop 事件
@@ -325,14 +326,157 @@ function showToast(line1, line2) {
   }
 }
 
-// toast 两行数据：行1=耗时/输入/输出，行2=缓存命中 + 费用（含高峰标注）
-function toastLine1(stat) {
-  return `⏱️ ${fmtDur(stat.durMs)} ｜ 输入 ${fmt(stat.in)} ／ 输出 ${fmt(stat.out)}`;
+// 模型显示名：优先取 pricing 里收录的 name（去掉括号说明），未收录用 trace 原始名。
+// 完整显示不截断（用户要求：toast 两行空间足够放全名），仅去掉括号里的补充说明便于紧凑。
+function shortModelName(stat, pricing) {
+  let name = '';
+  const hit = findModel(pricing, stat && stat.model);
+  if (hit && hit.m && hit.m.name) name = String(hit.m.name);
+  else name = String((stat && stat.model) || '');
+  return name.replace(/\(.*?\)/g, '').trim();
+}
+
+// 显示宽度近似：全角字符≈2、半角≈1（用于 toast 超宽保护，避免触发换行变 3 行）
+function dispWidth(s) {
+  let w = 0;
+  for (const ch of String(s || '')) {
+    w += /[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]/.test(ch) ? 2 : 1;
+  }
+  return w;
+}
+
+// 当前时段价格策略标注（放行1 模型名后，用户要求：第一行有空间，时段信息写第一行）：
+//   - 模型声明 peak_multiplier>1 且当前在高峰时段 → `高峰×N`（如 DeepSeek 原厂系=2：工作日 9-12/14-18 翻倍）
+//   - 预留：未来模型若声明 night_discount（夜间折扣），夜间显示 `夜间N折`
+//   - 无时段策略 → 空串不显示（避免噪音）
+function periodNote(stat, pricing) {
+  if (!pricing || !stat) return '';
+  const hit = findModel(pricing, stat.model);
+  if (!hit) return '';
+  const m = hit.m;
+  const mult = typeof m.peak_multiplier === 'number' ? m.peak_multiplier : 1;
+  if (isPeakHour() && mult > 1) return `高峰×${mult}`;
+  // 夜间折扣预留：if (m.night_discount && isNightHour()) return `夜间${m.night_discount}折`;
+  return '';
+}
+
+// toast 两行数据（紧凑版，Windows 通知默认只显示两行；ToastText02 模板正文超长会换行变 3 行）。
+// 布局原则（2026-08-05 v2.7，用户要求：行1 只放模型名+时段+耗时，行2 输入/输出写完整）：
+//   行1 = [模型名｜][时段标注｜]耗时   —— 标题大字：模型名 + 时段策略（高峰×2 等）+ 耗时
+//   行2 = 输入 X / 输出 Y｜缓存NN.NN%｜¥W  —— 正文小字：核心数字，价格不带「约」（价格本就是估算展示）
+// 说明：Windows toast 第二行默认即「正文小字号」（ToastText02 模板标题大字+正文小字）；
+//       更小字号（Caption）需 AdaptiveGroup+HintStyle 自定义 XML（Win10 周年更新+），兼容性有风险，未采用。
+// 分隔符「｜」两侧不加空格以省宽度。两行均有超宽保护，保证绝不触发换行变 3 行。
+const TOAST_LINE_MAX_W = 52; // 一行最大显示宽度单位（实测用户原行1 约 51u 即"占满"，52 为安全值）
+function toastLine1(stat, modelShort, period) {
+  const head = modelShort ? `${modelShort}｜` : '';
+  const mid = period ? `${period}｜` : '';
+  return `${head}${mid}${fmtDur(stat.durMs)}`;
 }
 function toastLine2(stat, pricing) {
   const cost = fmtCost(calcCost(stat, pricing));
-  const peak = isPeakHour() ? '（高峰价）' : '';
-  return `缓存 ${fmt(stat.cached)} ｜ 费用约 ${cost || '未收录'}${peak}`;
+  const input = (stat && stat.in) || 0;
+  const cached = (stat && stat.cached) || 0;
+  // 缓存占比精确到两位小数（如 99.12%）；无输入数据则不显示缓存段
+  const ratioPct = input > 0 ? ((cached / input) * 100).toFixed(2) : null;
+  const ratioTxt = ratioPct === null ? '' : `缓存${ratioPct}%｜`;
+  let line = `输入 ${fmt(stat.in)} / 输出 ${fmt(stat.out)}｜${ratioTxt}${cost || '未收录'}`;
+  // 宽度保护：超宽丢缓存占比，保住价格与核心数字（高峰标注已移至行1，行2 不再有溢出风险）
+  if (dispWidth(line) > TOAST_LINE_MAX_W) {
+    line = line.replace(ratioTxt, '');
+  }
+  return line;
+}
+
+// ===== 新模型价格自动补录（检测到未收录模型 → 立即联网查 OpenRouter） =====
+
+// 同步跑一个子进程 fetch OpenRouter（父脚本主流程是同步的，用 execFileSync 等待结果）。
+// 返回：找到 → {id, usdIn, usdOut}（USD/百万 tokens）；未找到 → null；网络/解析失败 → undefined。
+function lookupOrPrice(modelName, timeoutMs) {
+  const script = [
+    '(async () => {',
+    "  try {",
+    "    const res = await fetch('https://openrouter.ai/api/v1/models', { headers: { 'User-Agent': 'token-usage-tracker/1.0' } });",
+    "    if (!res.ok) { console.error('HTTP ' + res.status); process.exit(2); }",
+    "    const j = await res.json();",
+    `    const needle = ${JSON.stringify(String(modelName).toLowerCase())};`,
+    "    let hit = null;",
+    "    for (const m of (j.data || [])) { if (String(m.id).toLowerCase() === needle) { hit = m; break; } }",
+    "    if (!hit) for (const m of (j.data || [])) { const id = String(m.id).toLowerCase(); if (id && (id.includes(needle) || needle.includes(id))) { hit = m; break; } }",
+    "    if (!hit) { console.error('NOT_FOUND'); process.exit(3); }",
+    "    const pr = (hit.pricing || {});",
+    "    const pIn = Number(pr.prompt), pOut = Number(pr.completion);",
+    "    if (!(pIn >= 0 && pOut >= 0)) { console.error('NO_PRICE'); process.exit(4); }",
+    "    console.log(JSON.stringify({ id: hit.id, usdIn: pIn * 1e6, usdOut: pOut * 1e6 }));",
+    "  } catch (e) { console.error(String(e && e.message)); process.exit(1); }",
+    '})();',
+  ].join('\n');
+  try {
+    const out = require('child_process').execFileSync(process.execPath, ['-e', script], {
+      timeout: timeoutMs || 10000, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf-8',
+    });
+    const lines = out.trim().split('\n');
+    return JSON.parse(lines[lines.length - 1]);
+  } catch (e) {
+    const stderr = String((e && e.stderr) || '').trim();
+    if (stderr.includes('NOT_FOUND') || stderr.includes('NO_PRICE')) return null;
+    process.stderr.write(`[token-tracker] OpenRouter 查价失败: ${stderr.slice(0, 150)}\n`);
+    return undefined;
+  }
+}
+
+// 把新模型按 OpenRouter USD 价 × 汇率补入 pricing.json（标注 auto_converted，待人工核验官方价）
+function addModelPrice(pricing, modelName, ref) {
+  const name = String(modelName).toLowerCase();
+  const rate = Number(pricing.usd_cny_rate) > 0 ? pricing.usd_cny_rate : 7.2;
+  pricing.models[name] = {
+    name: String(modelName),
+    input_price: Number((ref.usdIn * rate).toFixed(2)),
+    cached_price: Number((ref.usdIn * rate * 0.1).toFixed(2)),
+    output_price: Number((ref.usdOut * rate).toFixed(2)),
+    peak_multiplier: 1,
+    or_id: ref.id,
+    usd_input_price: Number(ref.usdIn.toFixed(6)),
+    usd_output_price: Number(ref.usdOut.toFixed(6)),
+    auto_converted: true,
+    note: '新模型自动补录（OpenRouter USD×汇率估算，待人工核验官方价；时段策略默认无峰谷，如厂商有高峰/夜间折扣需搜索核验后补 peak_multiplier/night_discount 字段）',
+  };
+  try {
+    fs.mkdirSync(path.dirname(PRICING), { recursive: true });
+    fs.writeFileSync(PRICING, JSON.stringify(pricing, null, 2) + '\n');
+    return true;
+  } catch (e) {
+    process.stderr.write(`[token-tracker] 新模型价格写入失败: ${e.message}\n`);
+    return false;
+  }
+}
+
+// 检测未收录模型 → 立即联网补录。返回 { status, note }：
+//   none（已收录/无模型名）| added（自动补录成功）| not-found（OpenRouter 无此模型，记入已查列表）
+//   | error（联网失败，不记已查，下次重试）| skipped（已查过未收录，不再重复联网）
+function ensureNewModelPricing(pricing, stat) {
+  if (!pricing || !pricing.models || !stat || !stat.model) return { status: 'none', note: '' };
+  const hit = findModel(pricing, stat.model);
+  if (hit && typeof hit.m.input_price === 'number') return { status: 'none', note: '' };
+  const name = String(stat.model).toLowerCase();
+  const looked = (pricing._lookedup_models || []).indexOf(name) >= 0;
+  if (looked) {
+    return { status: 'skipped', note: `⚠️ 新模型 ${stat.model} 价格已查过未收录，可搜官方定价页人工补录` };
+  }
+  const ref = lookupOrPrice(stat.model);
+  if (ref === null) {
+    // OpenRouter 确认没有 → 记入已查列表，避免每次运行都联网
+    pricing._lookedup_models = pricing._lookedup_models || [];
+    if (pricing._lookedup_models.indexOf(name) < 0) pricing._lookedup_models.push(name);
+    try { fs.writeFileSync(PRICING, JSON.stringify(pricing, null, 2) + '\n'); }
+    catch (e) { process.stderr.write(`[token-tracker] 已查列表写入失败: ${e.message}\n`); }
+    return { status: 'not-found', note: `⚠️ 新模型 ${stat.model} OpenRouter 未收录，请用 unified-search 搜官方定价页补录` };
+  }
+  if (ref === undefined) {
+    return { status: 'error', note: `⚠️ 新模型 ${stat.model} 联网查价失败（网络异常），稍后自动重试` };
+  }
+  const ok = addModelPrice(pricing, stat.model, ref);
+  return { status: ok ? 'added' : 'error', note: ok ? `ℹ️ 新模型 ${stat.model} 已自动补录估算价（OpenRouter，待核验）；时段折扣策略（高峰/夜间）请用搜索技能核验补录` : `⚠️ 新模型 ${stat.model} 价格写入失败` };
 }
 
 function main() {
@@ -346,14 +490,14 @@ function main() {
   const plain = (msg) => (asHook ? { hookSpecificOutput: { additionalContext: msg } } : msg);
 
   const f = latestTraceFile(true);
-  if (!f) { out(plain('⏱️ 暂无 trace 数据（可能尚未发生模型调用）')); return; }
+  if (!f) { out(plain('暂无 trace 数据（可能尚未发生模型调用）')); return; }
 
   let t;
   try { t = readTrace(f); } catch (e) {
     if (asStop) {
       writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: false, reason: 'trace-not-ready', payload: summarizePayload(readStdin()) });
     }
-    out(plain('⏱️ trace 文件尚未完成写入（稍后重试）'));
+    out(plain('trace 文件尚未完成写入（稍后重试）'));
     return;
   }
 
@@ -385,12 +529,14 @@ function main() {
       }
     }
     if (!tSame) saveSnapshot({ file: tf, stat: ts });
-    const line = lineFor(ts, tSame);
+    const modelShort = shortModelName(ts, pricing);
+    const line = lineFor(ts, tSame, modelShort);
+    const nmNote = ensureNewModelPricing(pricing, ts).note;
     writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sameRound: tSame, traceFile: tf, stat: ts, line, waited: !sameRound ? 0 : (tSame ? 'timeout' : 'ok'), payload: summarizePayload(readStdin()) });
-    // 本条精确数据 → 弹 Windows 系统通知（两行：耗时/输入/输出 + 缓存/费用；execFileSync 保证弹出；UI 内 systemMessage 通道实测不显示，故用 toast）
-    if (!tSame) showToast(toastLine1(ts), toastLine2(ts, pricing));
-    // systemMessage 保留：若未来平台支持即生效，不显示则无副作用
-    out({ hookSpecificOutput: { systemMessage: line } });
+    // 本条精确数据 → 弹 Windows 系统通知（两行：模型/耗时/输入输出 + 缓存/费用；execFileSync 保证弹出；UI 内 systemMessage 通道实测不显示，故用 toast）
+    if (!tSame) showToast(toastLine1(ts, modelShort, periodNote(ts, pricing)), toastLine2(ts, pricing));
+    // systemMessage 保留：若未来平台支持即生效，不显示则无副作用；含新模型补录提示
+    out({ hookSpecificOutput: { systemMessage: nmNote ? `${line}\n${nmNote}` : line } });
     return;
   }
 
@@ -399,9 +545,14 @@ function main() {
     saveSnapshot({ file: f, stat });
   }
 
+  const shown = sameRound ? snap.stat : stat;
+  const modelShort = shortModelName(shown, pricing);
+  const nmNote = ensureNewModelPricing(pricing, shown).note;
+  const line = lineFor(shown, sameRound, modelShort);
+
   out(asHook
-    ? { hookSpecificOutput: { additionalContext: lineFor(sameRound ? snap.stat : stat, sameRound) } }
-    : lineFor(sameRound ? snap.stat : stat, sameRound));
+    ? { hookSpecificOutput: { additionalContext: nmNote ? `${line}\n${nmNote}` : line } }
+    : (nmNote ? `${line}\n${nmNote}` : line));
 }
 
 main();
