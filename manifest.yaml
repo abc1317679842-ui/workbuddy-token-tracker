@@ -1,0 +1,11 @@
+name: token-usage-tracker
+display_name: Token 用量追踪
+version: 2.18.0
+description: 每次回答后显示真实 Token 消耗、耗时与费用。内置大模型也能按官方 API 实际价格精确计算当次消耗；对 DeepSeek 深度优化——使用自定义 API 时可实时显示账户余额。Windows 系统通知即时推送，零依赖单文件。
+category: productivity
+author: abc1317679842-ui
+license: MIT
+platforms:
+  - windows
+requires:
+  - workbuddy-desktop

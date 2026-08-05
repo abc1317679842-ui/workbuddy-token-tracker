@@ -6,6 +6,33 @@ type: skill
 
 # Token Usage Tracker（每轮 token 消耗追踪）
 
+## 环境要求（新用户先看）
+- **WorkBuddy / CodeBuddy 桌面端**：本技能的数据源是客户端落盘的 `~/.workbuddy/traces/<pid>/trace_*.json`（每轮模型调用结束自动生成）——没有这个机制的环境无法使用。
+- **Windows 10/11**：系统通知（toast）仅 Windows 支持；macOS/Linux 可正常手动使用（方式 A），但不弹通知。
+- **Node.js ≥ 20**：脚本零依赖单文件，无需 npm install。
+
+## 安装与启用（新用户必读：装完必须配 hooks 才自动弹通知）
+从技能市场安装 = 文件拷入 skills 目录，**不会自动挂 hook**。请让 WorkBuddy 助手帮你把下面配置合并进 `settings.json`（或手动添加）：
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "matcher": ".*", "hooks": [ { "type": "command", "command": "node <技能目录>/token-tracker.js --hook" } ] }
+    ],
+    "Stop": [
+      { "matcher": ".*", "hooks": [ { "type": "command", "command": "node <技能目录>/token-tracker.js --stop" } ] }
+    ]
+  }
+}
+```
+
+`<技能目录>` 替换为实际安装路径（如 `C:/Users/你的用户名/.workbuddy/skills/token-usage-tracker`）。效果：
+- 挂好 `Stop` hook → **每轮回答结束自动弹「本条消耗」Windows 通知**（核心体验）
+- 挂好 `UserPromptSubmit` hook → 下轮提问时自动注入上一轮用量
+- **不挂 hooks 也能用**：手动运行 `node <技能目录>/token-tracker.js --stop` 查看最近一轮消耗（方式 A）
+- 不需要通知：只删 `Stop` 段即可，其余功能不受影响
+
 ## 为什么需要
 WorkBuddy 客户端 UI 不显示每轮对话的 token 用量：内置模型只显示「积分」，自有 API 模式也不展示 token。但平台在每次模型调用**整轮结束后**都会把真实用量写进一个新的 `traces/<pid>/trace_*.json`（含 `totalTokens` / `totalInputTokens` / `totalOutputTokens` / `totalCachedTokens` / `duration` / `startedAt` / `endedAt`）。本技能把这些数据读出来，让你每轮都能看到真实消耗。
 
