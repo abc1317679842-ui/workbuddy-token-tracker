@@ -30,6 +30,15 @@ const TRACE_DIR = path.join(WB, 'traces');
 const SNAP = path.join(WB, 'skills', 'token-usage-tracker', '.snapshot.json');
 const PROBE = path.join(WB, 'skills', 'token-usage-tracker', '.stop-probe.json');
 const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
+const MODELS_CFG = path.join(WB, 'models.json'); // 自定义 API 配置（含 apiKey），仅 DeepSeek 官方模型启用余额显示
+const BALANCE_CACHE = path.join(WB, 'skills', 'token-usage-tracker', '.balance.json');
+const BALANCE_TTL_MS = 15 * 1000; // 余额缓存 15 秒（v2.18 从 60s 压短：用户要求实时，接口实测 300ms 级；正常轮询间隔 >15s 即每轮拿实时数，15s 内连发才复用）
+// 积分/自定义 API 模式识别（v2.10）：官方文档证实内置模型列表就有 deepseek-v4-flash（与自定义 id 同名），
+// trace/hook payload/transcript 无模式标记，进程级探测（tasklist/wmic/netstat）被本机安全策略禁用——
+// "密钥是否在用"信号抓不到。用户认可方案 = **默认不显示，检测到余额变化才显示**：
+// 余额会变 = DeepSeek 账户在真实消耗 = 自定义 API 模式（或其他处使用同一 key），这正是"有密钥才有消耗"的等价信号；
+// 积分模式余额恒定 → 永不显示。
+const BALANCE_HISTORY_MAX = 20;        // 缓存里保留的余额观测条数（用于与上次对比判定"是否变化"）
 
 function fmt(n) {
   n = Number(n || 0);
@@ -355,7 +364,7 @@ function periodNote(stat, pricing) {
   if (!hit) return '';
   const m = hit.m;
   const mult = typeof m.peak_multiplier === 'number' ? m.peak_multiplier : 1;
-  if (isPeakHour() && mult > 1) return `高峰×${mult}`;
+  if (isPeakHour() && mult > 1) return `高峰`; // v2.14: 只显示「高峰」两字（用户拍板：不带 ×N、保持 1m 40s 耗时格式，省 2u 给余额腾位）
   // 夜间折扣预留：if (m.night_discount && isNightHour()) return `夜间${m.night_discount}折`;
   return '';
 }
@@ -367,11 +376,23 @@ function periodNote(stat, pricing) {
 // 说明：Windows toast 第二行默认即「正文小字号」（ToastText02 模板标题大字+正文小字）；
 //       更小字号（Caption）需 AdaptiveGroup+HintStyle 自定义 XML（Win10 周年更新+），兼容性有风险，未采用。
 // 分隔符「｜」两侧不加空格以省宽度。两行均有超宽保护，保证绝不触发换行变 3 行。
-const TOAST_LINE_MAX_W = 52; // 一行最大显示宽度单位（实测用户原行1 约 51u 即"占满"，52 为安全值）
-function toastLine1(stat, modelShort, period) {
-  const head = modelShort ? `${modelShort}｜` : '';
-  const mid = period ? `${period}｜` : '';
-  return `${head}${mid}${fmtDur(stat.durMs)}`;
+const TOAST_LINE_MAX_W = 52; // 一行最大显示宽度单位（正文小字上限；实测用户原行1 约 51u 即"占满"，52 为安全值）
+// v2.17 实测修正：用户弹 5 个通知逐步加空格定位真实极限——测试四（模型名后 4 空格=47u）第一行不换行、测试五（5 空格=48u）换行
+// → 行1 标题大字真实上限 47u（此前 42u 是保守估算值，低估了 5u；放宽后空间充裕可给分隔符两侧加空格）
+const TOAST_ROW1_MAX_W = 47;
+// toast 行1（v2.11：余额紧跟耗时 1 空格——v2.10 的"剩余空间居中"在带高峰标注时标题大字超宽变 3 行，
+// 用户实测反馈后要求"不留空直接紧挨时间"；行1 宽度保护用实测安全值 42u，超宽丢余额）
+// 布局：行1 = 模型名 | 时段标注 | 耗时 余额X（v2.17：实测上限 47u 后空间充裕，分隔符「 | 」两侧各 1 空格——
+// 用户反馈"模型名和分隔符挨太近像一体"；高峰与模型名不再紧贴，可读性优先）
+function toastLine1(stat, modelShort, period, balTxt) {
+  const head = modelShort || '';
+  // 分隔符「 | 」两侧各 1 空格：有时段 → 模型名 | 时段 | 耗时；无时段 → 模型名 | 耗时；无模型 → 不补
+  const mid = period ? ` | ${period} | ` : (modelShort ? ' | ' : '');
+  const base = `${head}${mid}${fmtDur(stat.durMs)}`;
+  if (!balTxt) return base;
+  const line = `${base} ${balTxt}`; // 耗时↔余额 1 空格分隔
+  // 行1 标题大字超宽（>47u 实测换行）→ 退回无余额 base
+  return dispWidth(line) <= TOAST_ROW1_MAX_W ? line : base;
 }
 function toastLine2(stat, pricing) {
   const cost = fmtCost(calcCost(stat, pricing));
@@ -386,6 +407,102 @@ function toastLine2(stat, pricing) {
     line = line.replace(ratioTxt, '');
   }
   return line;
+}
+
+// ===== DeepSeek 账户余额查询（NIX 客户端同款原理，仅自定义 API 模式） =====
+// 原理：DeepSeek 官方接口 GET https://api.deepseek.com/user/balance + Bearer 认证即可查余额，
+// 无需网页登录——这就是 NIX 等 DeepSeek 客户端"只给 API key 就能显示余额"的原因。
+// 仅当 models.json 里配置了 DeepSeek 官方模型（url 指向 api.deepseek.com）时启用；内置积分模式无 key → 返回空。
+
+// 从 models.json 提取 DeepSeek 官方 API key（脱敏使用：仅本机请求 api.deepseek.com，不外传）
+function deepSeekApiKey() {
+  try {
+    const list = JSON.parse(fs.readFileSync(MODELS_CFG, 'utf-8'));
+    if (!Array.isArray(list)) return '';
+    for (const m of list) {
+      const url = String((m && m.url) || '');
+      const key = String((m && m.apiKey) || '');
+      if (url.includes('api.deepseek.com') && key.startsWith('sk-')) return key;
+    }
+  } catch (e) { /* models.json 缺失/损坏 → 内置积分模式，无余额可查 */ }
+  return '';
+}
+
+// 同步子进程 fetch 余额（主流程是同步的，沿用 lookupOrPrice 的子进程模式）。
+// 返回 { total, currency } 或 null（失败/无余额）。
+function queryBalance(key, timeoutMs) {
+  const script = [
+    '(async () => {',
+    '  try {',
+    `    const res = await fetch('https://api.deepseek.com/user/balance', { headers: { 'Accept': 'application/json', 'Authorization': 'Bearer ' + ${JSON.stringify(key)} } });`,
+    '    if (!res.ok) { console.error(\'HTTP \' + res.status); process.exit(2); }',
+    '    const j = await res.json();',
+    '    const arr = (j && Array.isArray(j.balance_infos)) ? j.balance_infos : [];',
+    '    const cny = arr.find(b => b && b.currency === \'CNY\') || arr[0];',
+    '    if (!cny || cny.total_balance == null) { console.error(\'NO_BALANCE\'); process.exit(3); }',
+    '    console.log(JSON.stringify({ total: Number(cny.total_balance), currency: cny.currency || \'CNY\' }));',
+    '  } catch (e) { console.error(String(e && e.message)); process.exit(1); }',
+    '})();',
+  ].join('\n');
+  try {
+    const out = require('child_process').execFileSync(process.execPath, ['-e', script], {
+      timeout: timeoutMs || 5000, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf-8',
+    });
+    const lines = out.trim().split('\n');
+    return JSON.parse(lines[lines.length - 1]);
+  } catch (e) {
+    const stderr = String((e && e.stderr) || '').trim();
+    if (stderr.includes('NO_BALANCE')) return null;
+    process.stderr.write(`[token-tracker] 余额查询失败: ${stderr.slice(0, 150)}\n`);
+    return null;
+  }
+}
+
+// 读取余额缓存（含历史），损坏/缺失 → 返回默认空结构（不抛错）
+function readBalanceCache() {
+  try {
+    const j = JSON.parse(fs.readFileSync(BALANCE_CACHE, 'utf-8'));
+    if (j && typeof j === 'object') {
+      j.history = Array.isArray(j.history) ? j.history : [];
+      return j;
+    }
+  } catch (e) { /* 无缓存/损坏 → 默认结构 */ }
+  return { time: 0, total: null, currency: 'CNY', history: [] };
+}
+
+// 追加一次余额观测到历史（保留最近 BALANCE_HISTORY_MAX 条，旧格式缓存自动补 history 字段）
+function pushBalanceHistory(cache, now, total) {
+  cache.history.push({ time: now, total });
+  if (cache.history.length > BALANCE_HISTORY_MAX) cache.history = cache.history.slice(-BALANCE_HISTORY_MAX);
+}
+
+// 余额显示文本：`余额¥2.77`（v2.18 恢复 ¥ 符号——实测行1 上限 47u 空间充裕；v2.15 曾去符号省宽度）；无 key / 非 DeepSeek / 余额未变化 / 查询失败且无缓存 → 空串（不显示，不报错）
+// v2.10 变化检测：默认不显示（用户："宁愿先几轮不显示"）；每次查询与上次观测对比，
+// 余额变了（账户在真实消耗=自定义 API 模式或别处用同一 key）才显示，积分模式余额恒定 → 永不显示。
+// 缓存 15 秒（BALANCE_TTL_MS，v2.18 从 60s 压短——用户要求实时：余额接口实测 300ms 级，15s 内连发 toast 才复用缓存，正常轮询基本每轮都拿实时数）。
+function balanceText() {
+  const key = deepSeekApiKey();
+  if (!key) return '';
+  const now = Date.now();
+  const cache = readBalanceCache();
+// 取当前余额：15 秒缓存命中直接复用，否则网络查询；查询失败降级用旧缓存
+  let total = null;
+  if (typeof cache.total === 'number' && (now - (cache.time || 0)) < BALANCE_TTL_MS) {
+    total = cache.total;
+  } else {
+    const r = queryBalance(key);
+    if (r && typeof r.total === 'number') total = r.total;
+    else if (typeof cache.total === 'number') total = cache.total; // 失败降级，不因网络抖动闪没
+  }
+  if (total === null) return '';
+  const last = cache.history.length ? cache.history[cache.history.length - 1].total : null;
+  pushBalanceHistory(cache, now, total);
+  try { fs.writeFileSync(BALANCE_CACHE, JSON.stringify({ time: now, total, currency: cache.currency || 'CNY', history: cache.history })); } catch (e) { /* 缓存写失败不致命 */ }
+  // 首次观测：只记录 baseline，不显示（给变化检测建立对比基准）
+  if (last === null) return '';
+  // 余额与上次不同（toFixed(2) 字符串比较，避免浮点相等判断）→ 账户在消耗 → 显示
+  // v2.18: 恢复「¥」符号（实测行1 上限 47u，峰值场景 45u+1u=46u 仍有富余）
+  return total.toFixed(2) !== last.toFixed(2) ? `余额¥${total.toFixed(2)}` : '';
 }
 
 // ===== 新模型价格自动补录（检测到未收录模型 → 立即联网查 OpenRouter） =====
@@ -533,8 +650,11 @@ function main() {
     const line = lineFor(ts, tSame, modelShort);
     const nmNote = ensureNewModelPricing(pricing, ts).note;
     writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sameRound: tSame, traceFile: tf, stat: ts, line, waited: !sameRound ? 0 : (tSame ? 'timeout' : 'ok'), payload: summarizePayload(readStdin()) });
-    // 本条精确数据 → 弹 Windows 系统通知（两行：模型/耗时/输入输出 + 缓存/费用；execFileSync 保证弹出；UI 内 systemMessage 通道实测不显示，故用 toast）
-    if (!tSame) showToast(toastLine1(ts, modelShort, periodNote(ts, pricing)), toastLine2(ts, pricing));
+    // 本条精确数据 → 弹 Windows 系统通知（两行：模型/耗时/余额 + 输入输出/缓存/费用；execFileSync 保证弹出；UI 内 systemMessage 通道实测不显示，故用 toast）
+    if (!tSame) {
+      const bal = balanceText(); // 自定义 API 的 DeepSeek 模型显示余额（60 秒缓存，每轮 toast 基本都拿实时数）
+      showToast(toastLine1(ts, modelShort, periodNote(ts, pricing), bal), toastLine2(ts, pricing));
+    }
     // systemMessage 保留：若未来平台支持即生效，不显示则无副作用；含新模型补录提示
     out({ hookSpecificOutput: { systemMessage: nmNote ? `${line}\n${nmNote}` : line } });
     return;
