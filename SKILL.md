@@ -1,13 +1,13 @@
 ---
 name: token-usage-tracker
-description: 在每次回答后显示真实 token 消耗与耗时。WorkBuddy 客户端不显示 token（内置模式只显示积分、自有 API 模式也不显示），但每轮 LLM 调用结束都会把真实 token/耗时落盘成一个新 trace 文件（~/.workbuddy/traces/<pid>/trace_*.json）。本技能读取该数据，在每次最终回复的最后单独一行附上「耗时 + 输入/输出 token」。当用户说「显示 token」「看消耗」「这次用了多少 token」「统计用量」或任何希望看到每次回答成本时触发。
+description: 在每次回答后显示真实 token 消耗与耗时。【仅适配 WorkBuddy 桌面客户端（Windows），不适用于其他 AI 工具/平台——数据源是 WorkBuddy 每轮调用后落盘的 trace 文件，依赖其 hooks 机制】WorkBuddy 客户端不显示 token（内置模式只显示积分、自有 API 模式也不显示），但每轮 LLM 调用结束都会把真实 token/耗时落盘成一个新 trace 文件（~/.workbuddy/traces/<pid>/trace_*.json）。本技能读取该数据，在每次最终回复的最后单独一行附上「耗时 + 输入/输出 token」。当用户说「显示 token」「看消耗」「这次用了多少 token」「统计用量」或任何希望看到每次回答成本时触发。
 type: skill
 ---
 
 # Token Usage Tracker（每轮 token 消耗追踪）
 
 ## 环境要求（新用户先看）
-- **WorkBuddy / CodeBuddy 桌面端**：本技能的数据源是客户端落盘的 `~/.workbuddy/traces/<pid>/trace_*.json`（每轮模型调用结束自动生成）——没有这个机制的环境无法使用。
+- **仅适配 WorkBuddy / CodeBuddy 桌面端（Windows 10/11）**：本技能的数据源是客户端落盘的 `~/.workbuddy/traces/<pid>/trace_*.json`（每轮模型调用结束自动生成）+ 客户端 hooks 挂载点——**其他 AI 工具/平台（Claude Code、Cursor、ChatGPT 桌面版、其他 OpenClaw 客户端等）没有这套机制，装上也不会工作**，请勿在其他环境安装。
 - **Windows 10/11**：系统通知（toast）仅 Windows 支持；macOS/Linux 可正常手动使用（方式 A），但不弹通知。
 - **Node.js ≥ 20**：脚本零依赖单文件，无需 npm install。
 

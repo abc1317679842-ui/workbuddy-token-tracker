@@ -6,6 +6,16 @@
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
+## ⚠️ 适用性声明（安装前必读）
+
+| | |
+|---|---|
+| ✅ **唯一适配** | **WorkBuddy 桌面客户端**（Windows 10/11，Node.js ≥ 20）——数据源是 WorkBuddy 每轮调用后落盘的 `~/.workbuddy/traces/<pid>/trace_*.json`，并依赖其 hooks 机制自动触发 |
+| ❌ **不适用** | 其他任何 AI 工具 / 平台（Claude Code、Cursor、ChatGPT 桌面版、其他 OpenClaw 客户端等）——它们没有 WorkBuddy 的 traces 落盘机制与 hooks 挂载点，装上也不会工作 |
+| ⚠️ **功能差异** | 每轮系统通知（toast）仅 Windows 支持；macOS/Linux 即使装了本技能也不弹通知（可手动查看统计） |
+
+**简单说：不在 WorkBuddy 桌面端使用，本技能没有意义。** 请确认你的环境再安装。
+
 ## 为什么做这个
 
 WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
