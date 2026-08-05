@@ -258,7 +258,5 @@
       "usd_input_price": 0.14,
       "usd_output_price": 0.57
     }
-  },
-  "last_source": "openrouter",
-  "last_refresh_note": "2026-08-05T00:00:40.756Z 自动刷新：更新 18 个模型 USD 参考价（汇率 7.2）"
+  }
 }
