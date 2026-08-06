@@ -27,7 +27,17 @@ const os = require('os');
 
 const WB = process.env.WB_ROOT || path.join(os.homedir(), '.workbuddy');
 const TRACE_DIR = path.join(WB, 'traces');
-const SNAP = path.join(WB, 'skills', 'token-usage-tracker', '.snapshot.json');
+const SNAP_DIR = path.join(WB, 'skills', 'token-usage-tracker');
+const SNAP = path.join(SNAP_DIR, '.snapshot.json');
+// v2.21（2026-08-06）：快照按 session_id 拆分。多会话并发时全局单快照会被互相覆盖
+// （B 会话提交会把 lastUserMsgAt 盖成自己的时间 → A 会话 Stop 聚合起点错乱）。
+// 有 sid → .snapshot-<sid>.json（各会话隔离）；无 sid（手动运行）→ 全局 .snapshot.json（行为不变）。
+function snapPath(sid) {
+  if (!sid) return SNAP;
+  // 防御：session_id 来自外部 payload，只留安全字符防路径注入（C6）
+  const safe = String(sid).replace(/[^a-zA-Z0-9_-]/g, '');
+  return safe ? path.join(SNAP_DIR, `.snapshot-${safe}.json`) : SNAP;
+}
 const PROBE = path.join(WB, 'skills', 'token-usage-tracker', '.stop-probe.json');
 const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
 const MODELS_CFG = path.join(WB, 'models.json'); // 自定义 API 配置（含 apiKey），仅 DeepSeek 官方模型启用余额显示
@@ -147,6 +157,72 @@ function extract(t) {
   return res;
 }
 
+// v2.20：聚合"一轮内所有模型调用"的完整消耗。
+// 一个用户轮次会落盘多个 trace（如会话起标题的 terminalTitleGenerator 小调用 + 主任务 trace，
+// 实测 744 + 122.3 万），旧实现只取最新一个 trace，丢掉了其余部分——用户明确要求完整数据。
+// 聚合规则（与锚点 trace 同 pid 目录，即同一进程/会话空间）：
+//   1. startedAt >= 本轮起点（UserPromptSubmit hook 记录的 lastUserMsgAt，精确到用户提交时刻）；
+//   2. trace 有 sessionId → 只有与 Stop payload 一致才计入（明确异会话排除）；
+//   3. trace 无 sessionId（内部调用如起标题）→ 归属到「时间距离最近的主任务 trace」（v2.22）。
+// v2.22（2026-08-06）：多会话并发时，仅"起点之后"不足以隔离内部调用——B 会话在 A 任务中途
+// 提交时，A 的内部调用时间戳可能落在 B 起点之后而被 B 误收。用户洞察："各会话的任务结束
+// 时间不可能在同一秒"——因此对无 sessionId 的内部调用，改为归属到「时间上最近的、有 sessionId
+// 的主任务 trace」：落在某主任务窗口内（距离=0）或距某主任务端点最近者即为归属会话，只有
+// 归属本会话的才累加。比"±N 秒容差窗口"精确，能利用任务时间线天然分隔并发会话。
+// 累加 in/out/cached/total；耗时 = 窗口内最早 startedAt → 最新 endedAt；模型名取最后一次出现的。
+function aggregateRound(roundStartMs, sessionId, anchorFile) {
+  const dir = path.dirname(anchorFile);
+  let files;
+  try { files = fs.readdirSync(dir).filter((f) => /^trace_.+\.json$/.test(f)); }
+  catch (e) { return null; }
+  // 第一遍：收集全部候选，并提取"主任务时间线"（有 sessionId 的有效 trace，作为内部调用的归属锚点）
+  const cands = [];
+  const mains = [];
+  for (const f of files) {
+    const fp = path.join(dir, f);
+    let t;
+    try { t = JSON.parse(fs.readFileSync(fp, 'utf-8')); } catch (e) { continue; } // 半写/损坏：跳过
+    const tr = (t && t.trace) || {};
+    const st = Date.parse(tr.startedAt || '');
+    const et = Date.parse(tr.endedAt || '') || st;
+    const sid = tr.sessionId ? String(tr.sessionId) : '';
+    const s = extract(t);
+    cands.push({ st, et, sid, s });
+    if (sid && (s.in || s.out)) mains.push({ st, et, sid });
+  }
+  // 归属：无 sid 内部调用 → 距它时间最近的主任务 trace 的会话（在窗口内距离=0；否则取端点最近者）
+  const ownerOf = (c) => {
+    if (c.sid) return c.sid;
+    if (!mains.length) return sessionId; // 无任何主任务锚点（罕见）→ 退化为按本会话处理（v2.20 行为）
+    let best = null, bestD = Infinity;
+    for (const m of mains) {
+      const d = (c.st > m.et) ? (c.st - m.et) : ((c.et < m.st) ? (m.st - c.et) : 0);
+      if (d < bestD) { bestD = d; best = m; }
+    }
+    return best ? best.sid : sessionId;
+  };
+  let inSum = 0, outSum = 0, cachedSum = 0, totalSum = 0;
+  let firstStart = null, lastEnd = null, model = '';
+  for (const c of cands) {
+    if (!(c.st >= roundStartMs)) continue;                       // 必须在本轮用户提交之后
+    const owner = ownerOf(c);
+    if (owner && sessionId && owner !== sessionId) continue;     // 归属非本会话 → 排除（含异会话主任务与错位的内部调用）
+    const s = c.s;
+    if (!(s.in || s.out)) continue;                              // 无真实 token 的空壳：跳过
+    inSum += s.in; outSum += s.out; cachedSum += s.cached;
+    totalSum += s.total || (s.in + s.out);
+    if (firstStart === null || c.st < firstStart) firstStart = c.st;
+    if (lastEnd === null || c.et > lastEnd) lastEnd = c.et;
+    if (s.model) model = s.model;
+  }
+  if (!inSum && !outSum) return null;
+  return {
+    in: inSum, out: outSum, cached: cachedSum, total: totalSum || (inSum + outSum),
+    durMs: (firstStart !== null && lastEnd !== null) ? Math.max(0, lastEnd - firstStart) : 0,
+    model,
+  };
+}
+
 // 同步休眠（Node 主线程可用 Atomics.wait，避免忙等烧 CPU；异常时退化为忙等兜底）
 function sleep(ms) {
   try {
@@ -171,18 +247,19 @@ function readTrace(f) {
   throw lastErr;
 }
 
-function loadSnapshot() {
+function loadSnapshot(sid) {
   try {
-    return JSON.parse(fs.readFileSync(SNAP, 'utf-8'));
+    return JSON.parse(fs.readFileSync(snapPath(sid), 'utf-8'));
   } catch (e) {
     return null; // 不存在或损坏：按首轮处理
   }
 }
 
-function saveSnapshot(snap) {
+function saveSnapshot(snap, sid) {
   try {
-    fs.mkdirSync(path.dirname(SNAP), { recursive: true });
-    fs.writeFileSync(SNAP, JSON.stringify(snap));
+    const p = snapPath(sid);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify(snap));
   } catch (e) {
     // 快照写失败不阻断主输出，但按 C2 要求必须在 stderr 暴露，不静默
     process.stderr.write(`[token-tracker] 快照写入失败: ${e.message}\n`);
@@ -599,6 +676,11 @@ function ensureNewModelPricing(pricing, stat) {
 function main() {
   const asHook = process.argv.includes('--hook');
   const asStop = process.argv.includes('--stop');
+  // v2.21：hook 与 stop 都从 payload 读 session_id（快照按会话拆分，多会话并发不互相覆盖）；
+  // 手动运行无 payload → sid='' → 全局快照（行为不变）。stdin 只读一次，后面全部复用 payloadRaw。
+  const payloadRaw = (asHook || asStop) ? readStdin() : '';
+  let sid = '';
+  try { sid = String((JSON.parse(payloadRaw).session_id) || ''); } catch (e) { /* payload 非 JSON 或无 session 字段 */ }
 
   // 输出统一走 stdout；hook 场景输出 Claude-Code 风格 JSON
   const out = (hookOut) => {
@@ -612,14 +694,14 @@ function main() {
   let t;
   try { t = readTrace(f); } catch (e) {
     if (asStop) {
-      writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: false, reason: 'trace-not-ready', payload: summarizePayload(readStdin()) });
+      writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: false, reason: 'trace-not-ready', payload: summarizePayload(payloadRaw) });
     }
     out(plain('trace 文件尚未完成写入（稍后重试）'));
     return;
   }
 
   const stat = extract(t);
-  const snap = loadSnapshot();
+  const snap = loadSnapshot(sid);
   const sameRound = !!(snap && snap.file === f);
   const pricing = autoRefreshPricing(loadPricing());
   // 刷新失败/文件缺失时的提醒（不静默）
@@ -628,28 +710,43 @@ function main() {
   }
 
   if (asStop) {
-    // 实测发现 Stop 触发比本轮 trace 落盘早几百毫秒（读到旧文件 → sameRound=true）。
-    // 轮询等待"比快照更新的有效 trace"出现（最多 3 秒），拿到即本条精确数据；超时则退化为"上一轮"。
+    const stopPayload = payloadRaw; // stdin 已在 main 开头读取一次：聚合取 session_id、探针记录 payload 共用
+    // v2.19 修复（2026-08-06）：Stop 触发可能比本轮 trace 落盘早（实测早 15ms）。
+    // 旧逻辑只在 sameRound || !snap 时等待；若入口文件恰是"另一个旧文件"（如会话起标题的
+    // terminalTitleGenerator 小 trace）且 != 快照文件，会被误判为"本条"直接弹 toast
+    // （曾把 744 tokens 当成本轮展示，真实为 122.3 万）。
+    // 新逻辑：入口文件非"刚落盘"（≤1s）时一律轮询等待"比入口更新的有效 trace"（最多 3 秒），
+    // 拿到即本条精确数据；超时且入口明显是旧文件（落盘 >3s 前）→ 标"上一轮"，不冒充本条。
     let tf = f, ts = stat, tSame = sameRound;
-    // 等待"比入口文件更新"的有效 trace 出现（最多 3 秒）＝本条落盘。两种情况必须等：
-    //   sameRound=true（入口文件=上一轮，等本条）；snap 缺失（首轮，入口文件可能也是上一轮，不能直接当"本条"）。
-    // 若入口文件本就是本条（落盘早于 Stop），3 秒内不会有新文件，超时后仍按"本条"处理（tSame 保持 false）。
-    if (sameRound || !snap) {
+    const entryMtime = fs.statSync(f).mtimeMs;
+    const freshEnough = (Date.now() - entryMtime) <= 1000; // 1 秒内落盘 → 入口本身就是本条
+    if (!freshEnough) {
       const deadline = Date.now() + 3000;
       while (Date.now() < deadline) {
         sleep(200);
         const nf = latestTraceFile(true);
-        if (nf && nf !== f) {
+        if (nf && nf !== f && fs.statSync(nf).mtimeMs > entryMtime) {
           try { ts = extract(readTrace(nf)); tf = nf; tSame = false; break; }
           catch (e) { /* 新文件半写中，继续等 */ }
         }
       }
+      if (tf === f && (Date.now() - entryMtime) > 3000) tSame = true; // 没等到且入口很旧 → 按"上一轮"展示
     }
-    if (!tSame) saveSnapshot({ file: tf, stat: ts });
+    // v2.20：聚合本轮起点（UserPromptSubmit hook 记录的 lastUserMsgAt）之后、同会话的全部有效
+    // trace，得到一轮的完整消耗（起标题内部调用 + 主任务等全部算入）；无起点记录（如手动运行
+    // --stop）→ 退化为单 trace（v2.19 行为）。
+    // v2.21：快照按 sid 隔离读取——多会话并发时只聚合本会话的起点，不被其他会话覆盖。
+    const prevSnap = loadSnapshot(sid) || {};
+    const roundStart = prevSnap.lastUserMsgAt || 0;
+    if (roundStart > 0) {
+      const agg = aggregateRound(roundStart, sid, tf);
+      if (agg) { ts = agg; tSame = false; }
+    }
+    if (!tSame) saveSnapshot({ file: tf, stat: ts, lastUserMsgAt: prevSnap.lastUserMsgAt || 0 }, sid);
     const modelShort = shortModelName(ts, pricing);
     const line = lineFor(ts, tSame, modelShort);
     const nmNote = ensureNewModelPricing(pricing, ts).note;
-    writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sameRound: tSame, traceFile: tf, stat: ts, line, waited: !sameRound ? 0 : (tSame ? 'timeout' : 'ok'), payload: summarizePayload(readStdin()) });
+    writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sid, sameRound: tSame, traceFile: tf, stat: ts, line, waited: !sameRound ? 0 : (tSame ? 'timeout' : 'ok'), payload: summarizePayload(stopPayload) });
     // 本条精确数据 → 弹 Windows 系统通知（两行：模型/耗时/余额 + 输入输出/缓存/费用；execFileSync 保证弹出；UI 内 systemMessage 通道实测不显示，故用 toast）
     if (!tSame) {
       const bal = balanceText(); // 自定义 API 的 DeepSeek 模型显示余额（60 秒缓存，每轮 toast 基本都拿实时数）
@@ -660,9 +757,14 @@ function main() {
     return;
   }
 
-  if (!sameRound) {
-    // 新轮次：展示该轮统计并记录快照（供后续轮次去重）
-    saveSnapshot({ file: f, stat });
+  if (asHook) {
+    // v2.20：--hook 在用户提交消息时运行——记录本轮起点时间戳（供 Stop 端聚合"一轮内所有 trace"），
+    // 同时更新"上一轮"文件/统计。无论是否 sameRound 都要刷新起点。
+    // v2.21：按 sid 拆分快照（多会话并发各自记录起点，互不覆盖）。
+    saveSnapshot({ file: f, stat, lastUserMsgAt: Date.now() }, sid);
+  } else if (!sameRound) {
+    // 手动模式：新轮次展示该轮统计并记录快照（供后续轮次去重）
+    saveSnapshot({ file: f, stat }, sid);
   }
 
   const shown = sameRound ? snap.stat : stat;

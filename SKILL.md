@@ -60,7 +60,15 @@ node ~/.workbuddy/skills/token-usage-tracker/token-tracker.js
 `settings.json` 的 `hooks.UserPromptSubmit` 已挂接本技能的 `--hook` 模式，会在你提交下一轮时自动把「上一轮」的 token 注入上下文，无需手动跑脚本。
 
 ### 方式 C：Stop 事件 + Windows 系统通知（目标：本条回答显示本条消耗与费用）
-WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触发）。`settings.json` 的 `hooks.Stop` 已挂接本技能 `--stop` 模式：回答结束时本轮 trace 已落盘（实测 Stop 比落盘早几百毫秒，脚本会轮询等待最多 3 秒），读到最新文件即为**本条回答**的精确统计，然后：
+WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触发）。`settings.json` 的 `hooks.Stop` 已挂接本技能 `--stop` 模式：回答结束时本轮 trace 已落盘（实测 Stop 比落盘早 ~15ms，脚本会轮询等待最多 3 秒），读到最新文件即为**本条回答**的精确统计，然后：
+
+> **v2.19（2026-08-06 修复）**：旧逻辑只在 `sameRound || !snap` 时等待；若入口文件恰是"另一个旧文件"（如会话起标题的 terminalTitleGenerator 小 trace）且 ≠ 快照文件，会被误判为"本条"直接弹 toast（曾把 744 tokens 当成本轮展示，真实 122.3 万）。现改为：入口文件非"刚落盘"（≤1s）时一律轮询等待"比入口更新的有效 trace"（≤3s）；超时且入口明显是旧文件（落盘 >3s 前）→ 标"上一轮"不冒充本条。备份：`token-tracker.js.bak-20260806`。
+
+> **v2.20（2026-08-06，完整消耗聚合）**：一个用户轮次会落盘多个 trace（起标题内部调用 + 主任务，实测 744 + 122.3 万），v2.19 仍只取最新一个——用户明确要求完整数据。现增加整轮聚合：`--hook`（用户提交时）把本轮起点时间戳 `lastUserMsgAt` 写入快照；`--stop` 聚合「起点之后、同 pid 目录、（无 sessionId 的内部调用 或 sessionId 与 Stop payload 一致）」的全部有效 trace，累加 in/out/cached/total，耗时 = 窗口内最早 startedAt → 最新 endedAt；无起点记录（手动运行）退化为单 trace（v2.19 行为）。快照保存时保留 lastUserMsgAt。备份：`token-tracker.js.v2.19-20260806`。
+
+> **v2.21（2026-08-06，多会话并发快照隔离）**：v2.20 的 `.snapshot.json` 是**全局单文件、不带 sessionId**，hook matcher 为 `.*` 全局触发——同时开多个会话时，后提交的会话会把 `lastUserMsgAt` 覆盖成自己的时间 → 先结束的会话 Stop 聚合起点错乱（用户问"多任务并发时 token 计算是不是没用了"）。现改为快照按 `session_id` 拆分：hook/stop 都从 payload 读 `session_id`（WorkBuddy 所有 hook payload 均带此字段，实测/官方文档确认），有 sid → `.snapshot-<sid>.json`（各会话隔离）；无 sid（手动运行）→ 全局 `.snapshot.json`（行为不变）。sid 来自外部 payload，只留 `[a-zA-Z0-9_-]` 防路径注入。备份：`token-tracker.js.v2.20-20260806`。验证：隔离测试 7/7 通过（A/B 双会话互不覆盖、起点先后正确、手动全局快照兼容、单会话聚合回归）。已知限制（P1 沿用）：无 sessionId 的内部调用（起标题等）在**同一 pid 目录同时活跃多会话**时无法归属会话，理论上会串入窗口内的其他会话——仅限"同进程多会话真并发"，日常单会话/顺序多会话不受影响。
+
+> **v2.22（2026-08-06，内部调用按最近主任务归属）**：v2.21 遗留 P1——无 sessionId 的内部调用（起标题等）只看"起点之后"，B 会话在 A 任务中途提交时，A 的内部调用时间戳落在 B 起点之后会被 B 误收。用户洞察："各会话任务结束时间不可能在同一秒"。现改为**最近主任务归属**：对无 sessionId 的内部调用，找到时间距离最近的主任务 trace（有 sessionId 的，窗口内距离=0，否则取端点最近者），归属该会话；只有归属本会话的才累加。这样利用任务时间线天然分隔并发会话，比"±N 秒容差窗口"精确。备份：`token-tracker.js.v2.21-20260806`。验证：隔离测试 10/10 通过（含核心 S4：真并发交错时 A 的内部调用归 A、B 不误收；S5 反向验证）。剩余极限：两个会话的内部调用与各自主任务时间线完全重合（同秒级真并发）时仍无法区分——数据源无 sessionId 标记，属平台限制。
 
 - **Windows 系统通知（toast，两行，Windows 通知默认只显示两行）**：调用 PowerShell WinRT Toast API 弹出
   ```
