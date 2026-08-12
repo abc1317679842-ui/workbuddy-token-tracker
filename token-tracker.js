@@ -27,6 +27,18 @@ const os = require('os');
 
 const WB = process.env.WB_ROOT || path.join(os.homedir(), '.workbuddy');
 const TRACE_DIR = path.join(WB, 'traces');
+
+// ===== 联网功能开关（v2.30）=====
+// 说明：本脚本默认「零密钥联网」——唯一的密钥型请求（DeepSeek 余额查询）默认关闭。
+// 公开价表（OpenRouter）每日自动刷新/新模型补录默认开启，均无需密钥，失败自动降级为本地价。
+// 三个分开关各自独立；ENABLE_NETWORK=false 时所有联网请求一律跳过（一键零联网）。
+const ENABLE_NETWORK = true;        // 总开关：false = 全部联网功能关闭（含分开关）
+const ENABLE_BALANCE_QUERY = false; // 分开关1：余额查询（携带 DeepSeek API key 请求官方接口，最敏感）
+const ENABLE_PRICE_REFRESH = true;  // 分开关2：每日价格自动刷新（OpenRouter 公开价表，无需密钥）
+const ENABLE_MODEL_LOOKUP = true;   // 分开关3：新模型价格自动补录（OpenRouter 公开价表，无需密钥）
+// 余额查询安全性：开启后仅向官方 https://api.deepseek.com/user/balance 发送请求，密钥只通过
+// Authorization: Bearer 头传给该官方域名，不会发给第三方；请求内容不含任何本地数据。
+// 注意：余额查询默认关闭，需要时把 ENABLE_BALANCE_QUERY 改为 true（且 models.json 需配置 DeepSeek key）。
 const SNAP_DIR = path.join(WB, 'skills', 'token-usage-tracker');
 const SNAP = path.join(SNAP_DIR, '.snapshot.json');
 // v2.21（2026-08-06）：快照按 session_id 拆分。多会话并发时全局单快照会被互相覆盖
@@ -39,6 +51,57 @@ function snapPath(sid) {
   return safe ? path.join(SNAP_DIR, `.snapshot-${safe}.json`) : SNAP;
 }
 const PROBE = path.join(WB, 'skills', 'token-usage-tracker', '.stop-probe.json');
+// v2.23（2026-08-12）：专家团/多子回合防重。同一用户轮次内多个子代理（如专家团 7 个专家）
+// 各自完成都会触发一次 Stop，旧逻辑每次都弹 toast → 弹 N 次。
+// v2.24（2026-08-12）：修正 v2.23 缺陷——v2.23 把弹窗延后到"用户下次提交（--hook）"，违背
+// 技能"任务完成后及时弹出（可延迟几秒）"的要求。v2.24 改为 Stop 端 debounce：Stop 检测到多
+// 子回合时写合并文件（含 at 时间戳）+ spawn 一个 detached 后台 watcher（--flush-delayed），
+// watcher 延迟 DELAY_TOAST_MS 后复查：若期间又有新 trace 落盘（下一子回合在跑）→ 退出不弹，
+// 下一次 Stop 会重写合并文件并起新 watcher；若期间无新 trace → 整轮汇总只弹一次并清除文件。
+// 单 trace 普通轮次行为不变（Stop 立即弹本条）。--hook 端保留兜底：watcher 意外未弹（如应用
+// 关闭）时用户下次提交补弹一次。
+const DELAY_TOAST_MS = 6 * 1000; // debounce 窗口：最后一个子回合结束后延迟几秒弹汇总（技能要求"可延迟几秒"）
+function coalescePath(sid) {
+  if (!sid) return path.join(SNAP_DIR, '.coalesce.json');
+  const safe = String(sid).replace(/[^a-zA-Z0-9_-]/g, '');
+  return safe ? path.join(SNAP_DIR, `.coalesce-${safe}.json`) : path.join(SNAP_DIR, '.coalesce.json');
+}
+function readCoalesce(sid) {
+  try {
+    const d = JSON.parse(fs.readFileSync(coalescePath(sid), 'utf-8'));
+    return (d && d.agg) ? d.agg : null;
+  } catch (e) { return null; }
+}
+function readCoalesceInfo(sid) {
+  try { return JSON.parse(fs.readFileSync(coalescePath(sid), 'utf-8')); }
+  catch (e) { return null; }
+}
+function writeCoalesce(sid, agg, meta) {
+  const payload = { at: Date.now(), agg };
+  if (typeof meta === 'string') payload.traceFile = meta; // 兼容旧调用（传 traceFile 字符串）
+  else if (meta && typeof meta === 'object') {
+    if (meta.traceFile) payload.traceFile = meta.traceFile;
+    if (meta.tsPath) payload.tsPath = meta.tsPath;         // v2.25：transcript 数据源（watcher 复查用）
+    if (meta.roundStart) payload.roundStart = meta.roundStart;
+  }
+  try { fs.writeFileSync(coalescePath(sid), JSON.stringify(payload)); }
+  catch (e) { process.stderr.write(`[token-tracker] 合并文件写入失败: ${e.message}\n`); }
+}
+function clearCoalesce(sid) {
+  try { fs.unlinkSync(coalescePath(sid)); } catch (e) { /* 不存在则忽略 */ }
+}
+// 多子回合时起一个 detached 后台 watcher：延迟 DELAY_TOAST_MS 后复查，无新 trace 则弹汇总。
+// 父进程是 Stop hook（同步短生命周期），必须 unref 让 watcher 独立存活；Windows 下 detached
+// + stdio:'ignore' + windowsHide 避免闪黑窗。
+function spawnFlushWatcher(sid) {
+  try {
+    const cp = require('child_process');
+    const child = cp.spawn(process.execPath, [__filename, '--flush-delayed', sid || ''], {
+      detached: true, stdio: 'ignore', windowsHide: true, env: process.env,
+    });
+    child.unref();
+  } catch (e) { process.stderr.write(`[token-tracker] 延迟弹窗 watcher 启动失败: ${e.message}\n`); }
+}
 const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
 const MODELS_CFG = path.join(WB, 'models.json'); // 自定义 API 配置（含 apiKey），仅 DeepSeek 官方模型启用余额显示
 const BALANCE_CACHE = path.join(WB, 'skills', 'token-usage-tracker', '.balance.json');
@@ -223,6 +286,179 @@ function aggregateRound(roundStartMs, sessionId, anchorFile) {
   };
 }
 
+// v2.25（2026-08-12）：transcript 数据源——专家团/Agent 子代理的调用不落盘 traces，但
+// transcript(jsonl) 的 providerData.usage 完整记录每次模型调用（主会话 + subagents/*.jsonl）。
+// usage 字段为 camelCase：{requests, inputTokens, outputTokens, totalTokens, inputTokensDetails:[{cached_tokens}]}
+function extractUsage(u) {
+  if (!u || typeof u !== 'object') return null;
+  const inT = u.inputTokens || u.input_tokens || u.prompt_tokens || 0;
+  const outT = u.outputTokens || u.output_tokens || u.completion_tokens || 0;
+  if (!inT && !outT) return null;
+  let cached = 0;
+  const det = u.inputTokensDetails || u.prompt_tokens_details || null;
+  if (Array.isArray(det)) { for (const d of det) { if (d && d.cached_tokens) cached += d.cached_tokens; } }
+  else if (det && typeof det === 'object') cached = det.cached_tokens || 0;
+  return { in: inT, out: outT, cached };
+}
+
+// 从 Stop payload 拿主 transcript 路径（payload.transcript_path；兼容 .json / 实际落盘 .jsonl）
+function transcriptPathFromPayload(payloadRaw) {
+  try {
+    const p = JSON.parse(payloadRaw);
+    let tp = p && p.transcript_path ? String(p.transcript_path) : '';
+    if (!tp) return null;
+    if (/\.jsonl?$/.test(tp)) { /* 已是 json/jsonl */ }
+    else if (tp.endsWith('.json')) tp = tp + 'l';
+    if (!fs.existsSync(tp) && tp.endsWith('l')) tp = tp.slice(0, -1); // .jsonl 不存在回退 .json
+    return fs.existsSync(tp) ? tp : null;
+  } catch (e) { return null; }
+}
+
+// 读 jsonl 全部行（容错跳过损坏/半写行）
+function readTranscLines(tsPath) {
+  const rows = [];
+  let raw;
+  try { raw = fs.readFileSync(tsPath, 'utf-8'); } catch (e) { return rows; }
+  for (const line of raw.split('\n')) {
+    const s = line.trim();
+    if (!s) continue;
+    try { rows.push(JSON.parse(s)); } catch (e) { /* 半写行跳过 */ }
+  }
+  return rows;
+}
+
+// 聚合 transcript 中 timestamp > fromTs 的全部调用（按 messageId/conversationRequestId 去重）
+function aggregateTranscLines(rows, fromTs) {
+  const seen = new Set();
+  let inSum = 0, outSum = 0, cachedSum = 0;
+  let firstTs = null, lastTs = 0, model = '', count = 0;
+  for (const r of rows) {
+    const ts = r.timestamp;
+    if (!(typeof ts === 'number') || ts <= fromTs) continue;
+    const pd = r.providerData || {};
+    const u = extractUsage(pd.usage);
+    if (!u) continue;
+    const key = pd.messageId || pd.conversationRequestId || r.id || (r.type + ':' + ts);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    inSum += u.in; outSum += u.out; cachedSum += u.cached;
+    if (firstTs === null || ts < firstTs) firstTs = ts;
+    if (ts > lastTs) lastTs = ts;
+    if (!model) model = pd.model || pd.requestModelId || '';
+    count++;
+  }
+  if (!count) return null;
+  return { in: inSum, out: outSum, cached: cachedSum, total: inSum + outSum, durMs: Math.max(0, lastTs - (firstTs || lastTs)), model, firstTs, lastTs, count };
+}
+
+// 子代理 transcript 目录：主 transcript 同级 <session名>/subagents/（session 名 = 主文件去扩展名）
+function subagentsDirFromTranscript(tsPath) {
+  const base = path.basename(tsPath).replace(/\.jsonl?$/, '');
+  return path.join(path.dirname(tsPath), base, 'subagents');
+}
+
+// v2.28：检测主 transcript 本轮（roundStart 之后）是否有专家团活动（Agent/Team 工具调用）。
+// 专家团是异步 spawn——子代理文件可能比主理人的 Agent 调用晚 10~20s 才落盘，中途 Stop 聚合时
+// subCount=0 会被误判成"普通轮"立即弹 toast（实测 48 秒专家团弹 3 次 = 中途 2 次误判 + 最终 1 次）。
+// 判定专家团不能只看 subCount，还要看主 transcript 本轮是否出现 TeamCreate/Agent/SendMessage(teammate)。
+function hasTeamActivity(tsPath, roundStartMs) {
+  try {
+    for (const r of readTranscLines(tsPath)) {
+      if (r.type !== 'function_call') continue;
+      const ts = r.timestamp;
+      if (!(typeof ts === 'number') || ts <= roundStartMs) continue;
+      const name = String(r.name || '');
+      if (name === 'Agent' || name === 'TeamCreate' || name === 'TeamDelete') return true;
+      if (name === 'DeferExecuteTool' || name === 'SendMessage') {
+        const s = JSON.stringify(r.arguments || r.input || '');
+        if (/Team(Create|Delete)|team_name|subagent_type|teammate|recipient/.test(s)) return true;
+      }
+    }
+  } catch (e) { /* 读取失败：当作无团队活动 */ }
+  return false;
+}
+
+// 聚合本轮（roundStartMs 之后）主 transcript + 子代理的全部调用。
+// 子代理文件按 mtime > roundStartMs 归属本轮（一次专家团一批新文件，不跨轮复用）。
+function aggregateTranscript(tsPath, roundStartMs) {
+  const main = aggregateTranscLines(readTranscLines(tsPath), roundStartMs);
+  const subDir = subagentsDirFromTranscript(tsPath);
+  let subRows = [];
+  if (fs.existsSync(subDir)) {
+    try {
+      for (const f of fs.readdirSync(subDir)) {
+        if (!/^agent-.*\.jsonl$/.test(f)) continue;
+        const fp = path.join(subDir, f);
+        let mt = 0;
+        try { mt = fs.statSync(fp).mtimeMs; } catch (e) { continue; }
+        if (mt <= roundStartMs) continue; // 本轮之前创建的子代理（上一轮专家团）→ 排除
+        subRows = subRows.concat(readTranscLines(fp));
+      }
+    } catch (e) { /* subagents 读取失败：忽略子代理部分 */ }
+  }
+  const sub = aggregateTranscLines(subRows, 0); // 子代理文件本身只属于本次专家团
+  if (!main && !sub) return null;
+  const res = {
+    in: (main ? main.in : 0) + (sub ? sub.in : 0),
+    out: (main ? main.out : 0) + (sub ? sub.out : 0),
+    cached: (main ? main.cached : 0) + (sub ? sub.cached : 0),
+    model: (sub && sub.model) || (main && main.model) || '',
+    count: (main ? main.count : 0) + (sub ? sub.count : 0),
+    subCount: sub ? sub.count : 0,
+    // v2.28：本轮主 transcript 是否有专家团活动（子代理文件未落盘也能识别）
+    teamActive: hasTeamActivity(tsPath, roundStartMs),
+  };
+  res.total = res.in + res.out;
+  const firstTs = Math.min(...[main && main.firstTs, sub && sub.firstTs].filter(Boolean));
+  const lastTs = Math.max(main ? main.lastTs : 0, sub ? sub.lastTs : 0);
+  res.durMs = Math.max(0, lastTs - (firstTs || lastTs));
+  return res;
+}
+
+// watcher 用：roundStart 后是否有 timestamp > sinceMs 的新调用（主 transcript）或子代理文件 mtime > sinceMs
+function hasNewTranscSince(tsPath, roundStartMs, sinceMs) {
+  if (roundStartMs <= 0 || !tsPath) return false;
+  for (const r of readTranscLines(tsPath)) {
+    const ts = r.timestamp;
+    if (typeof ts === 'number' && ts > roundStartMs && ts > sinceMs && extractUsage((r.providerData || {}).usage)) return true;
+  }
+  const subDir = subagentsDirFromTranscript(tsPath);
+  if (fs.existsSync(subDir)) {
+    try {
+      for (const f of fs.readdirSync(subDir)) {
+        if (!/^agent-.*\.jsonl$/.test(f)) continue;
+        try { if (fs.statSync(path.join(subDir, f)).mtimeMs > sinceMs) return true; } catch (e) { /* 忽略 */ }
+      }
+    } catch (e) { /* 忽略 */ }
+  }
+  return false;
+}
+
+// v2.23：统计本轮（roundStart 之后、同会话归属）内「有真实 token」的 trace 数量。
+// >1 即视为多子回合（专家团/并行子代理），用于决定是否走合并防重。与 aggregateRound
+// 口径一致：空壳 trace（无 in/out）不计；无 sid 的内部调用归属最近主任务（简单近似，
+// 用于计数判断，无需极端精确）。
+function countRoundValidTraces(roundStartMs, sessionId, anchorFile) {
+  if (!(roundStartMs > 0)) return 1;
+  const dir = path.dirname(anchorFile);
+  let files;
+  try { files = fs.readdirSync(dir).filter((f) => /^trace_.+\.json$/.test(f)); }
+  catch (e) { return 1; }
+  let cnt = 0;
+  for (const f of files) {
+    try {
+      const t = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf-8'));
+      const tr = (t && t.trace) || {};
+      const st = Date.parse(tr.startedAt || '');
+      if (!st || st < roundStartMs) continue;
+      const s = extract(t);
+      if (!(s.in || s.out)) continue;
+      cnt++;
+    } catch (e) { /* 半写/损坏：跳过 */ }
+  }
+  return cnt;
+}
+
 // 同步休眠（Node 主线程可用 Atomics.wait，避免忙等烧 CPU；异常时退化为忙等兜底）
 function sleep(ms) {
   try {
@@ -324,6 +560,8 @@ function todayStr() { return new Date().toISOString().slice(0, 10); }
 // 联网拉 OpenRouter 更新（execFileSync 保证刷新完成才继续；失败保留本地价并 stderr 暴露，不静默）。
 function autoRefreshPricing(pricing) {
   if (!pricing) return null;
+  // v2.30：联网开关——总开关或分开关关闭时跳过自动刷新（沿用本地价，不联网）
+  if (!(ENABLE_NETWORK && ENABLE_PRICE_REFRESH)) return pricing;
   if (pricing.date === todayStr()) return pricing;
   const script = path.join(path.dirname(PRICING), 'refresh-prices.js');
   if (!fs.existsSync(script)) {
@@ -332,7 +570,7 @@ function autoRefreshPricing(pricing) {
   }
   try {
     require('child_process').execFileSync(process.execPath, [script], {
-      timeout: 15000, stdio: 'pipe', env: Object.assign({}, process.env, { WB_ROOT: WB }),
+      timeout: 15000, stdio: 'pipe', windowsHide: true, env: Object.assign({}, process.env, { WB_ROOT: WB }),
     });
     return loadPricing(); // 刷新成功 → 重新读取（含新 date）
   } catch (e) {
@@ -360,6 +598,22 @@ function findModel(pricing, modelName) {
   return best;
 }
 
+// 本地/自定义模型识别：custom-local: 前缀或 localhost/127.0.0.1 端点 → 本地免费，不计费
+function isLocalModel(name) {
+  const n = String(name || '').toLowerCase();
+  return n.includes('custom-local') || n.includes('localhost') || n.includes('127.0.0.1');
+}
+
+// 模型显示名清理：去掉 provider 前缀与组织前缀（custom-local:qwen/qwen3.6-35b-a3b → qwen3.6-35b-a3b）
+function cleanModelName(name) {
+  let n = String(name || '').trim();
+  const ci = n.indexOf(':');
+  if (ci > 0 && ci < n.length - 1 && !n.includes('://')) n = n.slice(ci + 1); // 去掉 provider:（不含协议头）
+  const si = n.lastIndexOf('/');
+  if (si >= 0 && si < n.length - 1) n = n.slice(si + 1); // 去掉 org/ 组织前缀
+  return n;
+}
+
 // 高峰时段（北京时间，本地时区即北京）：9:00-12:00、14:00-18:00，价格翻倍
 function isPeakHour() {
   const h = new Date().getHours();
@@ -369,6 +623,7 @@ function isPeakHour() {
 // cost = 未命中输入×输入价 + 命中输入×缓存价 + 输出×输出价（元），按当前时段取倍率
 function calcCost(stat, pricing) {
   if (!pricing || !stat) return null;
+  if (isLocalModel(stat.model)) return null; // 本地模型不计费（即使 pricing 误收录也不按云端价算）
   const hit = findModel(pricing, stat.model || 'deepseek-v4-flash');
   if (!hit) return null;
   const m = hit.m;
@@ -406,7 +661,7 @@ function showToast(line1, line2) {
   ].join('; ');
   try {
     const enc = Buffer.from(ps, 'utf16le').toString('base64');
-    require('child_process').execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', enc], { timeout: 10000, stdio: 'ignore' });
+    require('child_process').execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', enc], { timeout: 10000, stdio: 'ignore', windowsHide: true });
   } catch (e) {
     process.stderr.write(`[token-tracker] toast 失败: ${e.message}\n`);
   }
@@ -416,9 +671,14 @@ function showToast(line1, line2) {
 // 完整显示不截断（用户要求：toast 两行空间足够放全名），仅去掉括号里的补充说明便于紧凑。
 function shortModelName(stat, pricing) {
   let name = '';
-  const hit = findModel(pricing, stat && stat.model);
-  if (hit && hit.m && hit.m.name) name = String(hit.m.name);
-  else name = String((stat && stat.model) || '');
+  const raw = String((stat && stat.model) || '');
+  if (isLocalModel(raw)) {
+    name = cleanModelName(raw); // 本地模型：去 provider/组织前缀显示干净名
+  } else {
+    const hit = findModel(pricing, raw);
+    if (hit && hit.m && hit.m.name) name = String(hit.m.name);
+    else name = raw;
+  }
   return name.replace(/\(.*?\)/g, '').trim();
 }
 
@@ -472,13 +732,14 @@ function toastLine1(stat, modelShort, period, balTxt) {
   return dispWidth(line) <= TOAST_ROW1_MAX_W ? line : base;
 }
 function toastLine2(stat, pricing) {
-  const cost = fmtCost(calcCost(stat, pricing));
+  const isLocal = isLocalModel(stat && stat.model);
+  const cost = isLocal ? '本地·免费' : (fmtCost(calcCost(stat, pricing)) || '未收录');
   const input = (stat && stat.in) || 0;
   const cached = (stat && stat.cached) || 0;
   // 缓存占比精确到两位小数（如 99.12%）；无输入数据则不显示缓存段
   const ratioPct = input > 0 ? ((cached / input) * 100).toFixed(2) : null;
   const ratioTxt = ratioPct === null ? '' : `缓存${ratioPct}%｜`;
-  let line = `输入 ${fmt(stat.in)} / 输出 ${fmt(stat.out)}｜${ratioTxt}${cost || '未收录'}`;
+  let line = `输入 ${fmt(stat.in)} / 输出 ${fmt(stat.out)}｜${ratioTxt}${cost}`;
   // 宽度保护：超宽丢缓存占比，保住价格与核心数字（高峰标注已移至行1，行2 不再有溢出风险）
   if (dispWidth(line) > TOAST_LINE_MAX_W) {
     line = line.replace(ratioTxt, '');
@@ -523,7 +784,7 @@ function queryBalance(key, timeoutMs) {
   ].join('\n');
   try {
     const out = require('child_process').execFileSync(process.execPath, ['-e', script], {
-      timeout: timeoutMs || 5000, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf-8',
+      timeout: timeoutMs || 5000, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf-8', windowsHide: true,
     });
     const lines = out.trim().split('\n');
     return JSON.parse(lines[lines.length - 1]);
@@ -558,6 +819,8 @@ function pushBalanceHistory(cache, now, total) {
 // 余额变了（账户在真实消耗=自定义 API 模式或别处用同一 key）才显示，积分模式余额恒定 → 永不显示。
 // 缓存 15 秒（BALANCE_TTL_MS，v2.18 从 60s 压短——用户要求实时：余额接口实测 300ms 级，15s 内连发 toast 才复用缓存，正常轮询基本每轮都拿实时数）。
 function balanceText() {
+  // v2.30：联网开关——总开关或余额分开关关闭时永不查询余额（默认关闭=零密钥联网）
+  if (!(ENABLE_NETWORK && ENABLE_BALANCE_QUERY)) return '';
   const key = deepSeekApiKey();
   if (!key) return '';
   const now = Date.now();
@@ -607,7 +870,7 @@ function lookupOrPrice(modelName, timeoutMs) {
   ].join('\n');
   try {
     const out = require('child_process').execFileSync(process.execPath, ['-e', script], {
-      timeout: timeoutMs || 10000, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf-8',
+      timeout: timeoutMs || 10000, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf-8', windowsHide: true,
     });
     const lines = out.trim().split('\n');
     return JSON.parse(lines[lines.length - 1]);
@@ -650,6 +913,11 @@ function addModelPrice(pricing, modelName, ref) {
 //   | error（联网失败，不记已查，下次重试）| skipped（已查过未收录，不再重复联网）
 function ensureNewModelPricing(pricing, stat) {
   if (!pricing || !pricing.models || !stat || !stat.model) return { status: 'none', note: '' };
+  // v2.30：联网开关——总开关或补录分开关关闭时不联网，提示手动补录（不静默，避免用户误以为已收录）
+  if (!(ENABLE_NETWORK && ENABLE_MODEL_LOOKUP)) {
+    return { status: 'skipped', note: `ℹ️ 新模型 ${stat.model} 价格自动补录已关闭（ENABLE_MODEL_LOOKUP=false），请手动补录` };
+  }
+  if (isLocalModel(stat.model)) return { status: 'none', note: '' }; // 本地模型不计费，禁止自动补录云端价
   const hit = findModel(pricing, stat.model);
   if (hit && typeof hit.m.input_price === 'number') return { status: 'none', note: '' };
   const name = String(stat.model).toLowerCase();
@@ -676,6 +944,32 @@ function ensureNewModelPricing(pricing, stat) {
 function main() {
   const asHook = process.argv.includes('--hook');
   const asStop = process.argv.includes('--stop');
+  // v2.24：--flush-delayed <sid> —— Stop 端 spawn 的 detached 后台 watcher 入口。
+  // 延迟 DELAY_TOAST_MS 后复查本轮是否还有新调用：无新 → 弹整轮汇总一次并清除合并文件；
+  // 有新（下一子回合在跑）→ 退出不弹（新 Stop 会重写合并文件并再起 watcher）。
+  // v2.25：合并文件若记录 tsPath（transcript 数据源）→ 复查 transcript/subagents 是否有新调用；
+  // 否则按 v2.24 复查最新 trace 文件 mtime。
+  if (process.argv.includes('--flush-delayed')) {
+    const fSid = process.argv[process.argv.indexOf('--flush-delayed') + 1] || '';
+    sleep(DELAY_TOAST_MS);
+    const info = readCoalesceInfo(fSid);
+    if (!info || !info.agg) return; // 已被清理/已弹 → 直接退出
+    if (info.tsPath) {
+      if (hasNewTranscSince(info.tsPath, info.roundStart || 0, info.at || 0)) return; // 期间又有调用 → 重新计时
+    } else {
+      const nf = latestTraceFile(true);
+      if (nf && (fs.statSync(nf).mtimeMs > (info.at || 0))) return; // 期间又有子回合落盘 → 让新 Stop 重新计时
+    }
+    const pricing = loadPricing();
+    const agg = info.agg;
+    const bal = balanceText();
+    showToast(toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), bal), toastLine2(agg, pricing));
+    clearCoalesce(fSid);
+    // v2.27：watcher 弹窗完成 = 专家团本轮真正结束 → 推进 lastStopAt（供 hook 端起点刷新守卫）
+    const ws = loadSnapshot(fSid) || {};
+    saveSnapshot({ file: ws.file || '', stat: ws.stat || null, lastUserMsgAt: ws.lastUserMsgAt || 0, lastStopAt: Date.now() }, fSid);
+    return;
+  }
   // v2.21：hook 与 stop 都从 payload 读 session_id（快照按会话拆分，多会话并发不互相覆盖）；
   // 手动运行无 payload → sid='' → 全局快照（行为不变）。stdin 只读一次，后面全部复用 payloadRaw。
   const payloadRaw = (asHook || asStop) ? readStdin() : '';
@@ -688,8 +982,67 @@ function main() {
   };
   const plain = (msg) => (asHook ? { hookSpecificOutput: { additionalContext: msg } } : msg);
 
+  // v2.25：pricing 提前加载（transcript 数据源分支同样需要）
+  const pricing = autoRefreshPricing(loadPricing());
+  // 刷新失败/文件缺失时的提醒（不静默）
+  if (pricing && pricing.date !== todayStr()) {
+    process.stderr.write(`[token-tracker] 定价数据过期（${pricing.date}），自动刷新未成功，请手动运行 refresh-prices.js\n`);
+  }
+
+  // v2.25（2026-08-12）：Stop 优先 transcript 数据源——WorkBuddy 5.3.11 专家团（Agent 工具
+  // spawn 子代理）的模型调用**不落盘 traces**（实测 KET 专家团真实 675.8万 tokens，traces 只
+  // 落了 4.6万空壳 trace，差 147 倍），但 transcript(providerData.usage) 完整记录主会话 +
+  // subagents/*.jsonl。普通会话 transcript 按时间窗统计与 traces 完全一致（同源），故改用它。
+  // 本轮边界 = 用户提交（hook 记 lastUserMsgAt）之后主 transcript + 子代理文件（mtime>本轮起点）
+  // 的全部调用。无 payload（手动 --stop）或本轮无 transcript 数据 → 退回下方 traces 兜底逻辑。
+  if (asStop) {
+    const tsPath = transcriptPathFromPayload(payloadRaw);
+    const prevSnap0 = loadSnapshot(sid) || {};
+    const roundStart0 = prevSnap0.lastUserMsgAt || 0;
+    if (tsPath && roundStart0 > 0) {
+      let agg = aggregateTranscript(tsPath, roundStart0);
+      if (!agg) { sleep(500); agg = aggregateTranscript(tsPath, roundStart0); } // transcript 尾部可能未 flush
+      if (!agg) { sleep(1500); agg = aggregateTranscript(tsPath, roundStart0); }
+      if (agg) {
+        const modelShort = shortModelName(agg, pricing);
+        const nmNote = ensureNewModelPricing(pricing, agg).note;
+        const line = lineFor(agg, false, modelShort);
+        writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sid, sameRound: false, transcriptPath: tsPath, stat: agg, line, source: 'transcript', payload: summarizePayload(payloadRaw) });
+        // 只有专家团（本轮有子代理 subagents 或有团队活动）才走合并延迟弹一次汇总——避免普通
+        // 多工具轮也延迟；普通轮（无 subagents 且无团队活动）无论几次调用都立即弹整轮聚合（v2.20）
+        // v2.27：普通轮立即弹并推进 lastStopAt 标记本轮结束；专家团不推进（中途多次 Stop 会写
+        // coalesce+watcher，若推进会让插话 hook 误判轮次结束而刷新起点）——专家团的轮次边界由
+        // watcher 弹窗完成时推进（见 --flush-delayed）。
+        // v2.28：判定专家团 = subCount>0 或 teamActive（子代理异步落盘，中途 Stop 时 subCount 可能
+        // 为 0，但主 transcript 本轮已有 Agent/TeamCreate 调用 → 仍按专家团合并，避免误弹多次）。
+        if (agg.subCount > 0 || agg.teamActive) {
+          writeCoalesce(sid, agg, { tsPath, roundStart: roundStart0 });
+          spawnFlushWatcher(sid);
+        } else {
+          saveSnapshot({ file: tsPath, stat: agg, lastUserMsgAt: roundStart0, lastStopAt: Date.now() }, sid);
+          const bal = balanceText();
+          showToast(toastLine1(agg, modelShort, periodNote(agg, pricing), bal), toastLine2(agg, pricing));
+        }
+        out({ hookSpecificOutput: { systemMessage: nmNote ? `${line}\n${nmNote}` : line } });
+        return;
+      }
+    }
+  }
+
   const f = latestTraceFile(true);
-  if (!f) { out(plain('暂无 trace 数据（可能尚未发生模型调用）')); return; }
+  if (!f) {
+    // v2.25：hook 无 trace 时也要记录本轮起点（否则全新会话第一轮 Stop 时 roundStart=0 无法聚合）
+    // v2.27：同样应用起点刷新守卫——专家团进行中（无完成的 Stop）插话不刷新起点
+    if (asHook) {
+      const psnap3 = loadSnapshot(sid) || {};
+      const prevStart3 = psnap3.lastUserMsgAt || 0;
+      const prevStop3 = psnap3.lastStopAt || 0;
+      const inProgress3 = prevStart3 > 0 && prevStop3 < prevStart3;
+      saveSnapshot({ file: '', stat: null, lastUserMsgAt: inProgress3 ? prevStart3 : Date.now(), lastStopAt: psnap3.lastStopAt || 0 }, sid);
+    }
+    out(plain('暂无 trace 数据（可能尚未发生模型调用）'));
+    return;
+  }
 
   let t;
   try { t = readTrace(f); } catch (e) {
@@ -703,11 +1056,6 @@ function main() {
   const stat = extract(t);
   const snap = loadSnapshot(sid);
   const sameRound = !!(snap && snap.file === f);
-  const pricing = autoRefreshPricing(loadPricing());
-  // 刷新失败/文件缺失时的提醒（不静默）
-  if (pricing && pricing.date !== todayStr()) {
-    process.stderr.write(`[token-tracker] 定价数据过期（${pricing.date}），自动刷新未成功，请手动运行 refresh-prices.js\n`);
-  }
 
   if (asStop) {
     const stopPayload = payloadRaw; // stdin 已在 main 开头读取一次：聚合取 session_id、探针记录 payload 共用
@@ -742,15 +1090,28 @@ function main() {
       const agg = aggregateRound(roundStart, sid, tf);
       if (agg) { ts = agg; tSame = false; }
     }
-    if (!tSame) saveSnapshot({ file: tf, stat: ts, lastUserMsgAt: prevSnap.lastUserMsgAt || 0 }, sid);
     const modelShort = shortModelName(ts, pricing);
     const line = lineFor(ts, tSame, modelShort);
     const nmNote = ensureNewModelPricing(pricing, ts).note;
     writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sid, sameRound: tSame, traceFile: tf, stat: ts, line, waited: !sameRound ? 0 : (tSame ? 'timeout' : 'ok'), payload: summarizePayload(stopPayload) });
     // 本条精确数据 → 弹 Windows 系统通知（两行：模型/耗时/余额 + 输入输出/缓存/费用；execFileSync 保证弹出；UI 内 systemMessage 通道实测不显示，故用 toast）
+    // v2.23（2026-08-12）：多子回合防重——专家团等场景同一用户轮次内每个子代理完成都会触发
+    // Stop，若每次都弹 toast 会出现"7 个专家弹 7 次"。本轮有效 trace >1 时判定多子回合。
+    // v2.24（2026-08-12）：不延后到下次用户提交（那违背"及时弹出"），改为写合并文件 + spawn
+    // 后台 watcher 延迟几秒复查（debounce）——期间无新子回合 → 整轮汇总只弹一次。单 trace 轮
+    // 次行为不变（Stop 立即弹本条）。
     if (!tSame) {
-      const bal = balanceText(); // 自定义 API 的 DeepSeek 模型显示余额（60 秒缓存，每轮 toast 基本都拿实时数）
-      showToast(toastLine1(ts, modelShort, periodNote(ts, pricing), bal), toastLine2(ts, pricing));
+      if (countRoundValidTraces(roundStart, sid, tf) > 1) {
+        // 多子回合（专家团形态）→ 不推进 lastStopAt，由 watcher 弹窗时推进（--flush-delayed）
+        saveSnapshot({ file: tf, stat: ts, lastUserMsgAt: prevSnap.lastUserMsgAt || 0, lastStopAt: prevSnap.lastStopAt || 0 }, sid);
+        writeCoalesce(sid, ts, { traceFile: tf });
+        spawnFlushWatcher(sid);
+      } else {
+        // 单 trace 普通轮 → 立即弹 + 推进 lastStopAt（本轮结束，允许下轮 hook 刷新起点）
+        saveSnapshot({ file: tf, stat: ts, lastUserMsgAt: prevSnap.lastUserMsgAt || 0, lastStopAt: Date.now() }, sid);
+        const bal = balanceText(); // 自定义 API 的 DeepSeek 模型显示余额（60 秒缓存，每轮 toast 基本都拿实时数）
+        showToast(toastLine1(ts, modelShort, periodNote(ts, pricing), bal), toastLine2(ts, pricing));
+      }
     }
     // systemMessage 保留：若未来平台支持即生效，不显示则无副作用；含新模型补录提示
     out({ hookSpecificOutput: { systemMessage: nmNote ? `${line}\n${nmNote}` : line } });
@@ -761,7 +1122,33 @@ function main() {
     // v2.20：--hook 在用户提交消息时运行——记录本轮起点时间戳（供 Stop 端聚合"一轮内所有 trace"），
     // 同时更新"上一轮"文件/统计。无论是否 sameRound 都要刷新起点。
     // v2.21：按 sid 拆分快照（多会话并发各自记录起点，互不覆盖）。
-    saveSnapshot({ file: f, stat, lastUserMsgAt: Date.now() }, sid);
+    // v2.23：多子回合（专家团）Stop 端写合并文件——本次用户提交时补弹。
+    // v2.24：正常路径由 Stop 端后台 watcher 延迟几秒弹（不再依赖下次提交）；这里仅兜底——
+    // watcher 意外未弹（如应用关闭、进程被终止）时，用户下次提交读到残留合并 → 补弹一次并清除。
+    // v2.29：snapshot.file 优先用 payload 的 transcript_path（本会话专属标识）而非全局最新 trace——
+    // 多会话并发时 latestTraceFile 可能返回别的会话的 trace（实测新专家团 snapshot 残留 715.5万
+    // 别的会话数据），导致 sameRound/去重串会话。transcript 路径按 sid 天然隔离，彻底避免污染。
+    const tsPathH = transcriptPathFromPayload(payloadRaw);
+    const hookFile = tsPathH || f;
+    const pendAgg = readCoalesce(sid);
+    if (pendAgg) {
+      const pendModel = shortModelName(pendAgg, pricing);
+      const bal = balanceText();
+      showToast(toastLine1(pendAgg, pendModel, periodNote(pendAgg, pricing), bal), toastLine2(pendAgg, pricing));
+      clearCoalesce(sid);
+      // v2.27：兜底补弹完成 → 该轮已结束，标记 lastStopAt（供下轮起点刷新判断）
+      const psnap = loadSnapshot(sid) || {};
+      saveSnapshot({ file: psnap.file || hookFile, stat: psnap.stat || stat, lastUserMsgAt: psnap.lastUserMsgAt || 0, lastStopAt: Date.now() }, sid);
+    }
+    // v2.27（2026-08-12，起点刷新守卫）：专家团运行中途用户真实提交（system-reminder 触发 hook）
+    // 会把 lastUserMsgAt 刷晚 → Stop 聚合起点变晚 → 漏掉之前的调用（实测 legal 409.3万漏成 159.8万）。
+    // 修复：仅当上一轮已结束（lastStopAt >= lastUserMsgAt，即有过完成的 Stop/watcher 弹窗）才刷新起点；
+    // 专家团进行中（无完成的 Stop）→ 保留旧起点，中途插话不重置本轮。
+    const psnap2 = loadSnapshot(sid) || {};
+    const prevStart = psnap2.lastUserMsgAt || 0;
+    const prevStop = psnap2.lastStopAt || 0;
+    const inProgress = prevStart > 0 && prevStop < prevStart; // 上一轮未结束（专家团进行中）
+    saveSnapshot({ file: hookFile, stat, lastUserMsgAt: inProgress ? prevStart : Date.now(), lastStopAt: psnap2.lastStopAt || 0 }, sid);
   } else if (!sameRound) {
     // 手动模式：新轮次展示该轮统计并记录快照（供后续轮次去重）
     saveSnapshot({ file: f, stat }, sid);
