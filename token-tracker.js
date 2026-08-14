@@ -6,8 +6,10 @@
 // 用法：
 //   node token-tracker.js            -> 输出单行纯文本（供技能指令手动贴到回复末尾）
 //   node token-tracker.js --hook     -> 输出 {"hookSpecificOutput":{"additionalContext":"..."}}（供 UserPromptSubmit hook 注入）
-//   node token-tracker.js --stop     -> 输出 {"hookSpecificOutput":{"systemMessage":"..."}}（供 Stop hook：回答结束后触发，
-//                                       此时本轮 trace 已落盘，读到的就是【本条回答】的精确统计，以系统消息显示给用户）
+//   node token-tracker.js --stop     -> 输出 {"hookSpecificOutput":{}}（Stop hook：回答结束后触发，
+//                                       此时本轮 trace 已落盘，读到的就是【本条回答】的精确统计，
+//                                       通过 Windows 弹窗 toast 呈现给用户；systemMessage 通道
+//                                       WorkBuddy UI 不显示，v2.37 已移除该无效注入）
 //
 // 轮次语义（v2 修复）：
 //   每个 trace_*.json = 一轮完整 LLM 调用，整轮结束后才落盘。因此"当前正在生成的一轮"在回答
@@ -15,7 +17,7 @@
 //     - 快照记录了"上次已统计的文件"；若最新文件 == 快照文件，说明这一轮已显示过（例如上一轮
 //       末尾显示过、或 hook 刚记录过），本次输出标为「上一轮」且不重复更新快照。
 //   --stop 模式特殊：Stop 事件在回答【结束后】触发，此时本轮 trace 已写完，最新文件就是本轮，
-//   因此能拿到本条回答的精确消耗，直接以 systemMessage 呈现。
+//   因此能拿到本条回答的精确消耗，通过 toast 弹窗呈现。
 //   快照只作"轮次去重"用，不做总量 diff —— 直接展示该轮自身统计，天然免疫"换会话/上下文重置
 //   导致总量变小"的负数问题。
 //
@@ -105,6 +107,7 @@ function spawnFlushWatcher(sid) {
 const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
 const MODELS_CFG = path.join(WB, 'models.json'); // 自定义 API 配置（含 apiKey），仅 DeepSeek 官方模型启用余额显示
 const BALANCE_CACHE = path.join(WB, 'skills', 'token-usage-tracker', '.balance.json');
+const DAILY_USAGE_FILE = path.join(WB, 'skills', 'token-usage-tracker', 'daily-usage.json'); // v2.32：当日累计消费（按日期分桶，保留最近 7 天）
 const BALANCE_TTL_MS = 15 * 1000; // 余额缓存 15 秒（v2.18 从 60s 压短：用户要求实时，接口实测 300ms 级；正常轮询间隔 >15s 即每轮拿实时数，15s 内连发才复用）
 // 积分/自定义 API 模式识别（v2.10）：官方文档证实内置模型列表就有 deepseek-v4-flash（与自定义 id 同名），
 // trace/hook payload/transcript 无模式标记，进程级探测（tasklist/wmic/netstat）被本机安全策略禁用——
@@ -126,8 +129,11 @@ function fmtDur(ms) {
   if (s < 60) return `${s.toFixed(1)}s`;
   // 先对总秒取整再拆分，避免 3599.6s → "59m 60s" 的进位溢出
   const totalSec = Math.round(s);
-  const m = Math.floor(totalSec / 60);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
   const r = totalSec % 60;
+  // v2.34：超 1 小时显示 `1h 59m 59s`（此前 `119m 59s` 不直观；宽度不变，不影响布局）
+  if (h > 0) return `${h}h ${m}m ${r}s`;
   return `${m}m ${r}s`;
 }
 
@@ -496,10 +502,48 @@ function saveSnapshot(snap, sid) {
     const p = snapPath(sid);
     fs.mkdirSync(path.dirname(p), { recursive: true });
     fs.writeFileSync(p, JSON.stringify(snap));
+    // v2.36：快照清理——.snapshot-*.json 按会话隔离且无清理会无限积累。
+    // 规则：保留最近 30 天，且最多保留 50 个（当前 sid 永远保留）。每次写入顺手清理，开销可忽略。
+    cleanupSnapshots(sid);
   } catch (e) {
     // 快照写失败不阻断主输出，但按 C2 要求必须在 stderr 暴露，不静默
     process.stderr.write(`[token-tracker] 快照写入失败: ${e.message}\n`);
   }
+}
+
+// v2.36：清理历史会话快照（.snapshot-*.json）。保留规则：最近 30 天 + 最多 50 个 + 当前 sid 永不清。
+function cleanupSnapshots(curSid) {
+  try {
+    const now = Date.now();
+    const cutoff = now - 30 * 24 * 3600 * 1000; // 30 天
+    const files = fs.readdirSync(SNAP_DIR)
+      .filter((f) => /^\.snapshot-.+\.json$/.test(f))
+      .map((f) => {
+        const full = path.join(SNAP_DIR, f);
+        try { return { name: f, full, mtime: fs.statSync(full).mtimeMs }; }
+        catch (e) { return null; }
+      })
+      .filter(Boolean);
+    if (files.length === 0) return;
+    // 按 mtime 从新到旧排序（最新的在前）
+    files.sort((a, b) => b.mtime - a.mtime);
+    const keepName = curSid ? `.snapshot-${String(curSid).replace(/[^a-zA-Z0-9_-]/g, '')}.json` : '';
+    let deleted = 0;
+    // 索引 >= 50 的（即第 51 个之后的所有较旧文件）→ 删除（数量上限）
+    for (let i = 50; i < files.length; i++) {
+      if (files[i].name === keepName) continue;
+      try { fs.unlinkSync(files[i].full); deleted++; } catch (e) { /* 忽略 */ }
+    }
+    // 30 天前的 → 删除（时间上限；注意上面的 keepName 可能已在第 50 名内被保护，这里再兜底一次）
+    for (const f of files) {
+      if (f.mtime >= cutoff) continue;
+      if (f.name === keepName) continue;
+      try { fs.unlinkSync(f.full); deleted++; } catch (e) { /* 忽略 */ }
+    }
+    if (deleted > 0) {
+      process.stderr.write(`[token-tracker] 已清理 ${deleted} 个过期会话快照\n`);
+    }
+  } catch (e) { /* 清理失败不影响主流程 */ }
 }
 
 function lineFor(stat, sameRound, modelShort) {
@@ -643,6 +687,35 @@ function fmtCost(cost) {
   return '¥' + cost.toFixed(2);
 }
 
+// v2.32：当日累计消费统计（不区分模型，按自然日累加，跨天自动开新桶；保留最近 7 天）
+function loadDailyUsage() {
+  try { return JSON.parse(fs.readFileSync(DAILY_USAGE_FILE, 'utf-8')); } catch (e) { return {}; }
+}
+function addTodayUsage(cost) {
+  if (cost == null || !(cost > 0)) return;
+  const d = loadDailyUsage();
+  const t = todayStr();
+  d[t] = Number(d[t] || 0) + cost;
+  const keys = Object.keys(d).sort();
+  while (keys.length > 7) delete d[keys.shift()];
+  try {
+    fs.mkdirSync(path.dirname(DAILY_USAGE_FILE), { recursive: true });
+    fs.writeFileSync(DAILY_USAGE_FILE, JSON.stringify(d));
+  } catch (e) { /* 写失败不影响 toast */ }
+}
+function todayUsageTxt() {
+  const d = loadDailyUsage();
+  const v = Number(d[todayStr()] || 0);
+  if (!(v > 0)) return '';
+  return `今日${fmtCost(v)}`; // 无前导空格，由 toastLine1 统一加
+}
+// 弹 toast 前调用：把本条费用累加进当日，返回「当日累计」文本（含本条）
+function todayDisplay(stat, pricing) {
+  const c = calcCost(stat, pricing);
+  if (c != null) addTodayUsage(c);
+  return todayUsageTxt();
+}
+
 // Windows 系统通知：本条回答结束后把精确消耗以 toast 弹出（系统层面，用户可见）。
 // 用 PowerShell WinRT Toast API，参数走 -EncodedCommand（UTF-16LE Base64）避免中文编码问题。
 // 模板 ToastText02（两行）：行1=耗时/输入/输出，行2=缓存命中+费用。
@@ -651,11 +724,14 @@ function fmtCost(cost) {
 // 失败不阻断主流程（stderr 记录）。
 function showToast(line1, line2) {
   if (process.platform !== 'win32') return;
+  // v2.34：line1 可能含真实换行符 \n（toastLine1 两行大字布局）。先 escapeXml 转义 &<>"'，
+  // 再把 \n 转成 XML 实体 &#10;（若先转再 escapeXml，& 会被转成 &amp; 导致换行失效）
+  const l1 = escapeXml(String(line1 || '')).replace(/\n/g, '&#10;');
   const ps = [
     '[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null',
     '[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null',
     "$xml = New-Object Windows.Data.Xml.Dom.XmlDocument",
-    `$xml.LoadXml('<toast><visual><binding template="ToastText02"><text id="1">${escapeXml(line1)}</text><text id="2">${escapeXml(line2)}</text></binding></visual></toast>')`,
+    `$xml.LoadXml('<toast><visual><binding template="ToastText02"><text id="1">${l1}</text><text id="2">${escapeXml(line2)}</text></binding></visual></toast>')`,
     "$t = New-Object Windows.UI.Notifications.ToastNotification $xml",
     "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('WorkBuddy Token Tracker').Show($t)",
   ].join('; ');
@@ -691,9 +767,22 @@ function dispWidth(s) {
   return w;
 }
 
+// 行1 标题大字专用宽度：中文/全角按 2.5 计（半角 1）。v2.33 修正（2026-08-14 用户实测反馈）：
+//   - v2.17 实测纯半角 47u 不换行、48u 换行 → 标题大字纯半角真实上限 ≈ 47u
+//   - 本次含中文混排 46u（2:1 模型）实测溢出 → 反推标题大字下中文实际 ≈2.5 半角单位，
+//     2:1 模型每中文字低估 0.5u，多字累积导致判定"放得下"实际已溢出
+//   → 行1 必须用此保守模型，不能复用 dispWidth（那是正文小字 2:1 模型，行1/行2 极限本就不同）
+function dispWidthTitle(s) {
+  let w = 0;
+  for (const ch of String(s || '')) {
+    w += /[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]/.test(ch) ? 2.5 : 1;
+  }
+  return w;
+}
+
 // 当前时段价格策略标注（放行1 模型名后，用户要求：第一行有空间，时段信息写第一行）：
-//   - 模型声明 peak_multiplier>1 且当前在高峰时段 → `高峰×N`（如 DeepSeek 原厂系=2：工作日 9-12/14-18 翻倍）
-//   - 预留：未来模型若声明 night_discount（夜间折扣），夜间显示 `夜间N折`
+//   - 模型声明 peak_multiplier>1 且当前在高峰时段 → `高峰双倍`（DeepSeek 原厂系=2）；倍数非 2 显示 `高峰×N`
+//   - 模型声明 night_discount（夜间消耗系数，如 0.2=夜间2折）且当前在折扣时段 → `夜间N折`
 //   - 无时段策略 → 空串不显示（避免噪音）
 function periodNote(stat, pricing) {
   if (!pricing || !stat) return '';
@@ -701,9 +790,26 @@ function periodNote(stat, pricing) {
   if (!hit) return '';
   const m = hit.m;
   const mult = typeof m.peak_multiplier === 'number' ? m.peak_multiplier : 1;
-  if (isPeakHour() && mult > 1) return `高峰`; // v2.14: 只显示「高峰」两字（用户拍板：不带 ×N、保持 1m 40s 耗时格式，省 2u 给余额腾位）
-  // 夜间折扣预留：if (m.night_discount && isNightHour()) return `夜间${m.night_discount}折`;
+  if (isPeakHour() && mult > 1) {
+    // 高峰标注写清倍数：2 倍显示「高峰双倍」，其他倍数显示「高峰×N」
+    return mult === 2 ? '高峰双倍' : `高峰×${mult}`;
+  }
+  // 夜间折扣：模型声明了 night_discount（夜间消耗系数 0<d<1，如 0.2=打2折）且当前在夜间时段
+  const nd = m.night_discount;
+  if (nd != null && nd > 0 && nd < 1 && isNightHour(m)) {
+    return `夜间${nd * 10}折`; // 0.2 → 夜间2折
+  }
   return '';
+}
+
+// 夜间时段判断（默认 00:00-08:00，UTC+8；模型可声明 night_hours=[start,end] 覆盖）
+function isNightHour(m) {
+  const h = new Date().getHours();
+  if (m && Array.isArray(m.night_hours) && m.night_hours.length === 2) {
+    const [s, e] = m.night_hours;
+    return s < e ? (h >= s && h < e) : (h >= s || h < e); // 跨天区间
+  }
+  return h >= 0 && h < 8;
 }
 
 // toast 两行数据（紧凑版，Windows 通知默认只显示两行；ToastText02 模板正文超长会换行变 3 行）。
@@ -715,21 +821,42 @@ function periodNote(stat, pricing) {
 // 分隔符「｜」两侧不加空格以省宽度。两行均有超宽保护，保证绝不触发换行变 3 行。
 const TOAST_LINE_MAX_W = 52; // 一行最大显示宽度单位（正文小字上限；实测用户原行1 约 51u 即"占满"，52 为安全值）
 // v2.17 实测修正：用户弹 5 个通知逐步加空格定位真实极限——测试四（模型名后 4 空格=47u）第一行不换行、测试五（5 空格=48u）换行
-// → 行1 标题大字真实上限 47u（此前 42u 是保守估算值，低估了 5u；放宽后空间充裕可给分隔符两侧加空格）
-const TOAST_ROW1_MAX_W = 47;
-// toast 行1（v2.11：余额紧跟耗时 1 空格——v2.10 的"剩余空间居中"在带高峰标注时标题大字超宽变 3 行，
-// 用户实测反馈后要求"不留空直接紧挨时间"；行1 宽度保护用实测安全值 42u，超宽丢余额）
-// 布局：行1 = 模型名 | 时段标注 | 耗时 余额X（v2.17：实测上限 47u 后空间充裕，分隔符「 | 」两侧各 1 空格——
-// 用户反馈"模型名和分隔符挨太近像一体"；高峰与模型名不再紧贴，可读性优先）
-function toastLine1(stat, modelShort, period, balTxt) {
+// → 行1 标题大字真实上限 47u（纯半角；此前 42u 是保守估算值，低估了 5u）
+// v2.33（2026-08-14）：行1 改用保守模型 dispWidthTitle（中文按 2.5 计）后，阈值定为 45——
+//   留 2u 余量吸收中文实宽的系数误差，保证任何混排内容实际渲染 ≤ 47u（纯半角实测上限），永不换行
+const TOAST_ROW1_MAX_W = 45;
+// toast 标题（v2.35：两行大字布局，换行点从「今日」前移到「时间」前）：
+//   行1（大字） = 模型名 [时段标注]      —— 只装名字+高峰双倍/夜间X折，最长 33u，远低于 41.5u 实测线
+//   行2（大字） = 耗时 时间 今日¥X 余额¥Y —— 耗时/时间从行首开始，今日/余额紧跟；加前缀后极限 43u
+//   返回含真实换行符 \n（showToast 里转成 &#10;），两行都是 ToastText02 标题大字
+// 宽度保护（保守模型 dispWidthTitle）：
+//   行2 用独立更保守阈值 42（上次实测 41.5u 成 / 46.5u 爆，43u 不确定 → 超 42 即降级丢余额，
+//   保「耗时 时间 今日价」30u 绝对安全；再超丢今日价保底耗时 16u）。
+//   行1 最长 33u 无需降级；极端情况超 45 丢时段保模型名。
+const TOAST_ROW2_MAX_W = 42;
+function toastLine1(stat, modelShort, period, balTxt, todayTxt) {
   const head = modelShort || '';
-  // 分隔符「 | 」两侧各 1 空格：有时段 → 模型名 | 时段 | 耗时；无时段 → 模型名 | 耗时；无模型 → 不补
-  const mid = period ? ` | ${period} | ` : (modelShort ? ' | ' : '');
-  const base = `${head}${mid}${fmtDur(stat.durMs)}`;
-  if (!balTxt) return base;
-  const line = `${base} ${balTxt}`; // 耗时↔余额 1 空格分隔
-  // 行1 标题大字超宽（>47u 实测换行）→ 退回无余额 base
-  return dispWidth(line) <= TOAST_ROW1_MAX_W ? line : base;
+  // 行1：模型名 + 时段标注（空格分隔，不占用时间位置）
+  const periodTxt = period ? ` ${period}` : '';
+  const line1 = `${head}${periodTxt}`;
+  // 行2：耗时 时间 今日¥X 余额¥Y（耗时/时间永远行首，今日/余额顺序保持）
+  const durTxt = `耗时 ${fmtDur(stat.durMs)}`;
+  const parts2 = [durTxt];
+  if (todayTxt) parts2.push(todayTxt);
+  if (balTxt) parts2.push(balTxt);
+  let line2 = parts2.join(' ');
+  // 行2 超宽保护：先丢余额，再丢今日价，保底耗时+时间
+  if (dispWidthTitle(line2) > TOAST_ROW2_MAX_W && balTxt) {
+    line2 = [durTxt, todayTxt].filter(Boolean).join(' ');
+  }
+  if (dispWidthTitle(line2) > TOAST_ROW2_MAX_W && todayTxt) {
+    line2 = durTxt;
+  }
+  // 行1（模型名+时段标注）最长 33u，远低于 41.5u 实测线，无需降级；极端情况下若超宽丢时段保模型名
+  if (dispWidthTitle(line1) > TOAST_ROW1_MAX_W) {
+    return `${head}\n${line2}`;
+  }
+  return `${line1}\n${line2}`;
 }
 function toastLine2(stat, pricing) {
   const isLocal = isLocalModel(stat && stat.model);
@@ -740,6 +867,10 @@ function toastLine2(stat, pricing) {
   const ratioPct = input > 0 ? ((cached / input) * 100).toFixed(2) : null;
   const ratioTxt = ratioPct === null ? '' : `缓存${ratioPct}%｜`;
   let line = `输入 ${fmt(stat.in)} / 输出 ${fmt(stat.out)}｜${ratioTxt}${cost}`;
+  // v2.31：价格多源拉取全失败 → 提示「价⚠️」，表示费用按上次价格估算（refresh-prices.js 全源失败时写入 last_refresh_error）
+  if (pricing && pricing.last_refresh_error) {
+    line += '｜价⚠️';
+  }
   // 宽度保护：超宽丢缓存占比，保住价格与核心数字（高峰标注已移至行1，行2 不再有溢出风险）
   if (dispWidth(line) > TOAST_LINE_MAX_W) {
     line = line.replace(ratioTxt, '');
@@ -882,22 +1013,72 @@ function lookupOrPrice(modelName, timeoutMs) {
   }
 }
 
-// 把新模型按 OpenRouter USD 价 × 汇率补入 pricing.json（标注 auto_converted，待人工核验官方价）
-function addModelPrice(pricing, modelName, ref) {
+// v2.31：同步子进程查 llmabacus 国内源（人民币价，含模型级 priceCurrency 判断国内外）。
+// 返回：找到 → { id, in, out, cached, priceCurrency }（priceCurrency='CNY' 为人民币价，'USD' 为美元价）
+//       未找到 → null；网络/解析失败 → undefined。
+function lookupCnPrice(modelName, timeoutMs) {
+  const script = [
+    '(async () => {',
+    "  try {",
+    "    const res = await fetch('https://www.llmabacus.com/api/prices', { headers: { 'User-Agent': 'token-usage-tracker/2.2' } });",
+    "    if (!res.ok) { console.error('HTTP ' + res.status); process.exit(2); }",
+    "    const j = await res.json();",
+    `    const needle = ${JSON.stringify(String(modelName).toLowerCase())};`,
+    "    let hit = null, hitId = '';",
+    "    for (const m of (j.models || [])) { if (String(m.id).toLowerCase() === needle) { hit = m; hitId = m.id; break; } }",
+    "    if (!hit) for (const m of (j.models || [])) { const id = String(m.id).toLowerCase(); if (id && (id.includes(needle) || needle.includes(id))) { hit = m; hitId = m.id; break; } }",
+    "    if (!hit) { console.error('NOT_FOUND'); process.exit(3); }",
+    "    const inP = Number(hit.inputPrice), outP = Number(hit.outputPrice);",
+    "    if (!(inP >= 0 && outP >= 0)) { console.error('NO_PRICE'); process.exit(4); }",
+    "    const cached = hit.cachedInputPrice != null ? Number(hit.cachedInputPrice) : null;",
+    "    console.log(JSON.stringify({ id: hitId, in: inP, out: outP, cached, priceCurrency: hit.priceCurrency || null }));",
+    "  } catch (e) { console.error(String(e && e.message)); process.exit(1); }",
+    '})();',
+  ].join('\n');
+  try {
+    const out = require('child_process').execFileSync(process.execPath, ['-e', script], {
+      timeout: timeoutMs || 10000, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf-8', windowsHide: true,
+    });
+    const lines = out.trim().split('\n');
+    return JSON.parse(lines[lines.length - 1]);
+  } catch (e) {
+    const stderr = String((e && e.stderr) || '').trim();
+    if (stderr.includes('NOT_FOUND') || stderr.includes('NO_PRICE')) return null;
+    process.stderr.write(`[token-tracker] llmabacus 查价失败: ${stderr.slice(0, 150)}\n`);
+    return undefined;
+  }
+}
+
+// 把新模型补入 pricing.json（v2.31 区分国内外：region='CN' 直接人民币价；region='US' USD×汇率换算）
+function addModelPrice(pricing, modelName, ref, region) {
   const name = String(modelName).toLowerCase();
   const rate = Number(pricing.usd_cny_rate) > 0 ? pricing.usd_cny_rate : 7.2;
-  pricing.models[name] = {
+  const m = {
     name: String(modelName),
-    input_price: Number((ref.usdIn * rate).toFixed(2)),
-    cached_price: Number((ref.usdIn * rate * 0.1).toFixed(2)),
-    output_price: Number((ref.usdOut * rate).toFixed(2)),
     peak_multiplier: 1,
-    or_id: ref.id,
-    usd_input_price: Number(ref.usdIn.toFixed(6)),
-    usd_output_price: Number(ref.usdOut.toFixed(6)),
-    auto_converted: true,
-    note: '新模型自动补录（OpenRouter USD×汇率估算，待人工核验官方价；时段策略默认无峰谷，如厂商有高峰/夜间折扣需搜索核验后补 peak_multiplier/night_discount 字段）',
+    region: region || 'CN',
   };
+  if (region === 'CN') {
+    // 国内模型：llmabacus 人民币价直接写入
+    m.input_price = Number(ref.in);
+    m.output_price = Number(ref.out);
+    m.cached_price = ref.cached != null ? Number(ref.cached) : Number((ref.in * 0.1).toFixed(2));
+    m.or_id = ref.id;
+    m.price_source = 'llmabacus(国内)';
+    m.note = '新模型自动补录（llmabacus 国内人民币价）';
+  } else {
+    // 国外模型：USD×汇率换算
+    m.input_price = Number((ref.usdIn * rate).toFixed(2));
+    m.cached_price = Number((ref.usdIn * rate * 0.1).toFixed(2));
+    m.output_price = Number((ref.usdOut * rate).toFixed(2));
+    m.or_id = ref.id;
+    m.usd_input_price = Number(ref.usdIn.toFixed(6));
+    m.usd_output_price = Number(ref.usdOut.toFixed(6));
+    m.price_source = 'usd×汇率(国外源)';
+    m.auto_converted = true;
+    m.note = '新模型自动补录（USD×汇率估算，待人工核验官方价；时段策略默认无峰谷，如厂商有高峰/夜间折扣需搜索核验后补 peak_multiplier/night_discount 字段）';
+  }
+  pricing.models[name] = m;
   try {
     fs.mkdirSync(path.dirname(PRICING), { recursive: true });
     fs.writeFileSync(PRICING, JSON.stringify(pricing, null, 2) + '\n');
@@ -909,7 +1090,7 @@ function addModelPrice(pricing, modelName, ref) {
 }
 
 // 检测未收录模型 → 立即联网补录。返回 { status, note }：
-//   none（已收录/无模型名）| added（自动补录成功）| not-found（OpenRouter 无此模型，记入已查列表）
+//   none（已收录/无模型名）| added（自动补录成功）| not-found（国内外源均无此模型，记入已查列表）
 //   | error（联网失败，不记已查，下次重试）| skipped（已查过未收录，不再重复联网）
 function ensureNewModelPricing(pricing, stat) {
   if (!pricing || !pricing.models || !stat || !stat.model) return { status: 'none', note: '' };
@@ -925,20 +1106,39 @@ function ensureNewModelPricing(pricing, stat) {
   if (looked) {
     return { status: 'skipped', note: `⚠️ 新模型 ${stat.model} 价格已查过未收录，可搜官方定价页人工补录` };
   }
+
+  // v2.31：先查国内源 llmabacus（人民币价，自动判断国内外），再回退 OpenRouter
+  const cnRef = lookupCnPrice(stat.model);
+  if (cnRef && typeof cnRef.id === 'string') {
+    if (cnRef.priceCurrency === 'CNY') {
+      // 国内模型：直接人民币价补录
+      const ok = addModelPrice(pricing, stat.model, cnRef, 'CN');
+      return { status: ok ? 'added' : 'error', note: ok ? `ℹ️ 新模型 ${stat.model} 已从国内源(llmabacus·人民币)自动补录` : `⚠️ 新模型 ${stat.model} 价格写入失败` };
+    } else {
+      // 国外模型（llmabacus 返回 USD 价）→ 按国外定价 USD×汇率
+      const usdRef = { id: cnRef.id, usdIn: cnRef.in, usdOut: cnRef.out };
+      const ok = addModelPrice(pricing, stat.model, usdRef, 'US');
+      return { status: ok ? 'added' : 'error', note: ok ? `ℹ️ 新模型 ${stat.model} 已从 llmabacus(USD·国外定价)自动补录` : `⚠️ 新模型 ${stat.model} 价格写入失败` };
+    }
+  }
+  if (cnRef === undefined) {
+    process.stderr.write(`[token-tracker] 国内源 llmabacus 不可达，回退 OpenRouter 补录\n`);
+  }
+
   const ref = lookupOrPrice(stat.model);
   if (ref === null) {
-    // OpenRouter 确认没有 → 记入已查列表，避免每次运行都联网
+    // 国内外源均确认没有 → 记入已查列表，避免每次运行都联网
     pricing._lookedup_models = pricing._lookedup_models || [];
     if (pricing._lookedup_models.indexOf(name) < 0) pricing._lookedup_models.push(name);
     try { fs.writeFileSync(PRICING, JSON.stringify(pricing, null, 2) + '\n'); }
     catch (e) { process.stderr.write(`[token-tracker] 已查列表写入失败: ${e.message}\n`); }
-    return { status: 'not-found', note: `⚠️ 新模型 ${stat.model} OpenRouter 未收录，请用 unified-search 搜官方定价页补录` };
+    return { status: 'not-found', note: `⚠️ 新模型 ${stat.model} 国内外价格源均未收录，请用 unified-search 搜官方定价页补录` };
   }
   if (ref === undefined) {
-    return { status: 'error', note: `⚠️ 新模型 ${stat.model} 联网查价失败（网络异常），稍后自动重试` };
+    return { status: 'error', note: `⚠️ 新模型 ${stat.model} 联网查价失败（国内外源均不可达），稍后自动重试` };
   }
-  const ok = addModelPrice(pricing, stat.model, ref);
-  return { status: ok ? 'added' : 'error', note: ok ? `ℹ️ 新模型 ${stat.model} 已自动补录估算价（OpenRouter，待核验）；时段折扣策略（高峰/夜间）请用搜索技能核验补录` : `⚠️ 新模型 ${stat.model} 价格写入失败` };
+  const ok = addModelPrice(pricing, stat.model, ref, 'US');
+  return { status: ok ? 'added' : 'error', note: ok ? `ℹ️ 新模型 ${stat.model} 已自动补录估算价（OpenRouter·国外定价，待核验）；时段折扣策略（高峰/夜间）请用搜索技能核验补录` : `⚠️ 新模型 ${stat.model} 价格写入失败` };
 }
 
 function main() {
@@ -963,7 +1163,7 @@ function main() {
     const pricing = loadPricing();
     const agg = info.agg;
     const bal = balanceText();
-    showToast(toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), bal), toastLine2(agg, pricing));
+    showToast(toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), bal, todayDisplay(agg, pricing)), toastLine2(agg, pricing));
     clearCoalesce(fSid);
     // v2.27：watcher 弹窗完成 = 专家团本轮真正结束 → 推进 lastStopAt（供 hook 端起点刷新守卫）
     const ws = loadSnapshot(fSid) || {};
@@ -1021,9 +1221,11 @@ function main() {
         } else {
           saveSnapshot({ file: tsPath, stat: agg, lastUserMsgAt: roundStart0, lastStopAt: Date.now() }, sid);
           const bal = balanceText();
-          showToast(toastLine1(agg, modelShort, periodNote(agg, pricing), bal), toastLine2(agg, pricing));
+          showToast(toastLine1(agg, modelShort, periodNote(agg, pricing), bal, todayDisplay(agg, pricing)), toastLine2(agg, pricing));
         }
-        out({ hookSpecificOutput: { systemMessage: nmNote ? `${line}\n${nmNote}` : line } });
+        // v2.37：systemMessage 通道 WorkBuddy UI 实测不显示（无法注入到对话回复），删除该无效注入；
+        // toast 已在上面弹出。保留空 hook 返回保证进程行为不变。
+        out({ hookSpecificOutput: {} });
         return;
       }
     }
@@ -1110,11 +1312,11 @@ function main() {
         // 单 trace 普通轮 → 立即弹 + 推进 lastStopAt（本轮结束，允许下轮 hook 刷新起点）
         saveSnapshot({ file: tf, stat: ts, lastUserMsgAt: prevSnap.lastUserMsgAt || 0, lastStopAt: Date.now() }, sid);
         const bal = balanceText(); // 自定义 API 的 DeepSeek 模型显示余额（60 秒缓存，每轮 toast 基本都拿实时数）
-        showToast(toastLine1(ts, modelShort, periodNote(ts, pricing), bal), toastLine2(ts, pricing));
+        showToast(toastLine1(ts, modelShort, periodNote(ts, pricing), bal, todayDisplay(ts, pricing)), toastLine2(ts, pricing));
       }
     }
-    // systemMessage 保留：若未来平台支持即生效，不显示则无副作用；含新模型补录提示
-    out({ hookSpecificOutput: { systemMessage: nmNote ? `${line}\n${nmNote}` : line } });
+    // v2.37：systemMessage 通道 WorkBuddy UI 实测不显示，删除该无效注入；toast 已在上方弹出。
+    out({ hookSpecificOutput: {} });
     return;
   }
 
@@ -1134,7 +1336,7 @@ function main() {
     if (pendAgg) {
       const pendModel = shortModelName(pendAgg, pricing);
       const bal = balanceText();
-      showToast(toastLine1(pendAgg, pendModel, periodNote(pendAgg, pricing), bal), toastLine2(pendAgg, pricing));
+      showToast(toastLine1(pendAgg, pendModel, periodNote(pendAgg, pricing), bal, todayDisplay(pendAgg, pricing)), toastLine2(pendAgg, pricing));
       clearCoalesce(sid);
       // v2.27：兜底补弹完成 → 该轮已结束，标记 lastStopAt（供下轮起点刷新判断）
       const psnap = loadSnapshot(sid) || {};

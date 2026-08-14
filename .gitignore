@@ -3,8 +3,10 @@
 .snapshot-*.json
 .stop-probe.json
 .balance.json
+daily-usage.json
 *.log
 
 # 本地版本备份（不入库，Git 历史即版本管理）
 token-tracker.js.bak-*
 token-tracker.js.v2.*
+*.bak-20260814*
