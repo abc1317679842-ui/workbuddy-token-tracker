@@ -1,6 +1,6 @@
 ---
 name: token-usage-tracker
-description: 在每次回答后显示真实 token 消耗与耗时。【仅适配 WorkBuddy 桌面客户端（Windows），不适用于其他 AI 工具/平台——数据源是 WorkBuddy 每轮调用后落盘的 trace 文件，依赖其 hooks 机制】WorkBuddy 客户端不显示 token（内置模式只显示积分、自有 API 模式也不显示），但每轮 LLM 调用结束都会把真实 token/耗时落盘成一个新 trace 文件（~/.workbuddy/traces/<pid>/trace_*.json）。本技能读取该数据，在每次最终回复的最后单独一行附上「耗时 + 输入/输出 token」。当用户说「显示 token」「看消耗」「这次用了多少 token」「统计用量」或任何希望看到每次回答成本时触发。
+description: 在每次回答结束后弹出 Windows 系统通知（toast），显示本条真实 token 消耗、耗时与费用估算。【仅适配 WorkBuddy 桌面客户端（Windows），不适用于其他 AI 工具/平台——数据源是 WorkBuddy 每轮调用后落盘的 trace/transcript 文件，依赖其 hooks 机制】WorkBuddy 客户端不显示 token（内置模式只显示积分、自有 API 模式也不显示），但每轮 LLM 调用结束都会把真实 token/耗时落盘。本技能通过 Stop hook 读取该数据，在每次回答结束后自动弹出 toast（模型名/耗时/今日累计/输入输出 token/费用）；`--hook` 模式在下一轮提交时把上一轮用量注入上下文作兜底。当用户说「显示 token」「看消耗」「这次用了多少 token」「统计用量」或任何希望看到每次回答成本时触发。
 type: skill
 ---
 
@@ -10,6 +10,21 @@ type: skill
 - **仅适配 WorkBuddy / CodeBuddy 桌面端（Windows 10/11）**：本技能的数据源是客户端落盘的 `~/.workbuddy/traces/<pid>/trace_*.json`（每轮模型调用结束自动生成）+ 客户端 hooks 挂载点——**其他 AI 工具/平台（Claude Code、Cursor、ChatGPT 桌面版、其他 OpenClaw 客户端等）没有这套机制，装上也不会工作**，请勿在其他环境安装。
 - **Windows 10/11**：系统通知（toast）仅 Windows 支持；macOS/Linux 可正常手动使用（方式 A），但不弹通知。
 - **Node.js ≥ 20**：脚本零依赖单文件，无需 npm install。
+
+## 当前功能总览（v2.37 · 2026-08-14）
+
+> 本技能以 **Windows 系统通知（toast）** 为唯一展示通道：每次回答结束后，由 `Stop` 钩子读取本轮真实落盘数据，自动弹出本条消耗。以下是当前支持的全部能力：
+
+- **本条精确统计**：`Stop` 钩子在回答完全结束后触发，此时本轮 trace/transcript 已写完，弹出的是**本条回答**的真实 token、耗时与费用（不是上一轮）。
+- **toast 两行大字布局**：行1 标题大字 = 模型完整名 + 时段标注（`高峰双倍`/`夜间X折`）＋ 换行后 = `耗时` + `今日¥X` + `余额¥Y`；行2 正文小字 = `输入/输出 token` + `缓存占比` + `本条费用`。
+- **今日累计**：按自然日累计当天全部模型消费（`daily-usage.json`，保留最近 7 天，跨天自动开新桶），toast 行1 显示 `今日¥X.XX`。
+- **时段标注**：DeepSeek 原厂系支持峰谷定价（工作日北京 9-12/14-18 高峰 ×2），自动标注 `高峰双倍`；其他模型无峰谷。策略存于 `pricing.json` 手动维护字段。
+- **余额显示**：仅 DeepSeek 自定义 API 且开启开关时启用，默认隐藏 + 变化检测（余额变才显示），15 秒 TTL 缓存。
+- **专家团/多子回合聚合**：识别 `Agent`/`TeamCreate` 等团队活动，专家团跑完延迟约 6 秒**只弹一次整轮汇总**，不重复弹 N 次。
+- **多会话隔离**：按 hook payload 的 `session_id` 拆分快照，多会话并发互不串扰。
+- **价格体系（零密钥联网）**：`pricing.json` 官方人民币价 + 每日自动多源刷新（国内 llmabacus/llm-prices-cn + 国外 OpenRouter/LiteLLM/Portkey，按模型 region 区分国内外，取中位数）+ 未收录新模型自动联网补录（国内源优先，人民币价）。默认零密钥：仅余额查询携带 API key（默认关闭）。
+- **快照自动清理**：`.snapshot-<sid>.json` 保留最近 30 天 + 最多 50 个，当前会话永不清。
+- **兜底通道**：`--hook`（UserPromptSubmit）在下一轮提交时把上一轮用量注入上下文；手动运行 `token-tracker.js --stop` 查看最近一轮。
 
 ## 安装与启用（新用户必读：装完必须配 hooks 才自动弹通知）
 从技能市场安装 = 文件拷入 skills 目录，**不会自动挂 hook**。请让 WorkBuddy 助手帮你把下面配置合并进 `settings.json`（或手动添加）：
@@ -40,7 +55,7 @@ WorkBuddy 客户端 UI 不显示每轮对话的 token 用量：内置模型只�
 - 用户明确要求看 token / 消耗 / 用时
 - 或作为默认习惯：**每次生成最终回复时**，都在末尾附上最近一轮用量
 
-## 使用方式（两种，任选/并用）
+## 使用方式（三种，任选/并用；方式 C 为当前主通道）
 
 ### 方式 A：手动（技能指令驱动，最贴合「回复末尾」）
 在生成最终可见回复时，先运行读数脚本，把其输出作为**回复的最后单独一行**：
