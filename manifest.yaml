@@ -1,7 +1,7 @@
 name: token-usage-tracker
 display_name: Token 用量追踪
-version: 2.37.0
-description: 每次回答后显示真实 Token 消耗、耗时与费用。内置大模型也能按官方 API 实际价格精确计算当次消耗，支持每日自动多源刷新价格（国内外区分）、今日累计消费、高峰/夜间时段标注。对 DeepSeek 深度优化——使用自定义 API 时可实时显示账户余额。Windows 系统通知即时推送，零依赖单文件。
+version: 2.38.0
+description: 每次回答结束后弹出 Windows 系统通知（toast），显示本条真实 Token 消耗、耗时与费用。支持今日累计消费、DeepSeek 高峰/夜间时段标注、自定义 API 实时余额、专家团/多子回合自动聚合只弹一次、多会话隔离统计。价格按官方人民币价每日多源自动刷新（国内外区分）+ 新模型自动补录，默认零密钥联网。零依赖单文件。
 category: productivity
 author: abc1317679842-ui
 license: MIT
