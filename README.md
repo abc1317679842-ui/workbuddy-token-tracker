@@ -29,16 +29,17 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 
 | 功能 | 说明 |
 |---|---|
-| 🪟 **每轮即时推送** | 回答结束后，Windows 系统通知（toast）立即弹出本条消耗，两行紧凑布局：行1 = 模型名 + 时段标注 + 耗时 + 余额，行2 = 输入 / 输出 + 缓存占比 + 费用 |
+| 🪟 **每轮即时推送** | 回答结束后，Windows 系统通知（toast）立即弹出本条消耗，**两行大字紧凑布局**：行1 第一行 = 模型名 + 时段标注（高峰双倍/夜间X折）；行1 第二行 = 耗时 + 今日累计消费 + 余额；行2 = 输入 / 输出 + 缓存占比 + 费用 |
+| 📊 **今日累计消费** | 自动按自然日累计当天 24 小时内所有模型的总消费，toast 显示 `今日¥X.XX`（不区分模型）；跨天自动开新桶，保留最近 7 天 |
 | 🧠 **专家团全量聚合** | WorkBuddy 专家团（多个子代理并行 + 主理人汇总）的全部模型调用，一次性聚合成整轮真实消耗——**平台不把子代理调用落盘 traces，本技能直接从主会话 + `subagents/*.jsonl` transcript 读取**，跑完一个专家团弹**一条**整轮汇总，不会弹 N 次 |
 | 🧩 **异步子代理识别** | 专家团子代理是异步 spawn，文件比 Agent 调用晚落盘——检测主会话是否有 `Agent`/`TeamCreate` 等团队活动，未落盘也能判定"这是专家团"→ 走合并延迟弹，不误判为普通轮 |
 | 🛡️ **中途插话守卫** | 专家团运行中你插话不会把统计起点刷晚（`lastStopAt` 轮次边界守卫）——整轮消耗不丢 |
-| 🔒 **快照防串会话** | 多会话并发时 snapshot 按 session_id 隔离、用本会话 transcript 路径标记，不把别的会话的数据串进来 |
-| 💰 **余额显示** | 仅自定义 API 的 DeepSeek 官方模型：调用官方 `GET /user/balance` 接口（Bearer 认证，无需网页登录）在 toast 行1 紧跟耗时显示 `余额¥2.77`；**默认关闭（见下方联网开关），开启后检测到余额变化才显示**；15 秒缓存保实时又不重复请求 |
-| 💰 **费用估算** | 内置 26 个主流模型官方人民币价（元/百万 tokens）；支持 DeepSeek 高峰时段（工作日北京时间 9-12/14-18 价格×2）；不足 ¥0.01 显示 `¥<0.01` |
-| ⏰ **时段价格标注** | 行1 显示 `高峰` 两字（DeepSeek 原厂系峰谷定价）；其他模型统一定价不显示 |
-| 🆕 **新模型自动补录** | 检测到未收录模型立即联网查 OpenRouter（无需 key）自动补录估算价并提示；查不到则提示用搜索技能人工核验官方定价页 |
-| 🔄 **每日价格自动刷新** | 当天首次运行自动拉取 OpenRouter 免费 API 更新 USD 参考价；**当天已刷新则不再联网**；失败保留旧价次日重试 |
+| 🔒 **快照防串会话** | 多会话并发时 snapshot 按 session_id 隔离、用本会话 transcript 路径标记，不把别的会话的数据串进来；**自动清理**（保留最近 30 天 / 最多 50 个，当前会话永不清） |
+| 💰 **余额显示** | 仅自定义 API 的 DeepSeek 官方模型：调用官方 `GET /user/balance` 接口（Bearer 认证，无需网页登录）在 toast 显示 `余额¥2.77`；**默认关闭（见下方联网开关）**，开启后检测到余额变化才显示；15 秒缓存保实时又不重复请求 |
+| 💰 **费用估算** | 内置 26 个主流模型官方人民币价（元/百万 tokens）；支持高峰/夜间时段倍率（见下「时段价格标注」）；不足 ¥0.01 显示 `¥<0.01` |
+| ⏰ **时段价格标注** | 行1 显示时段策略：DeepSeek 原厂系高峰 → **`高峰双倍`**；声明了 `night_discount` 的模型夜间 → **`夜间X折`**。⚠️ **时段策略无公开 API 数据源，需手动维护**（厂商时段政策变动时，请在 `pricing.json` 中提示模型更新 `peak_multiplier`/`night_discount`/`peak_hours`/`night_hours` 字段，代码自动读取） |
+| 🆕 **新模型自动补录** | 检测到未收录模型**立即联网**补录：先查国内源 llmabacus（人民币价，`region=CN`），再回退 OpenRouter（USD×汇率，`region=US`）；查不到则提示用搜索技能人工核验官方定价页 |
+| 🔄 **每日价格自动刷新** | 每天首次运行自动拉 **5 个价格源**（国内 2：llmabacus / llm-prices-cn；国外 3：OpenRouter / LiteLLM / Portkey），按模型 `region` 区分国内外定价（CN 用国内人民币价、US 用三 USD 源中位数×汇率）；**当天已刷新则不再联网**；全源失败 toast 显示「价⚠️」并保留上次价格 |
 | 🔤 **可读性** | 大数自动用「万/亿」单位（287.9万 / 1.5亿），缓存占比精确到两位小数（99.12%） |
 
 ## 🔌 联网功能与开关（v2.30 起）
@@ -49,10 +50,10 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 |---|---|---|---|---|
 | `ENABLE_NETWORK` | `true` | **总开关**——`false` 时下面所有联网功能一律跳过（一键零联网） | — | — |
 | `ENABLE_BALANCE_QUERY` | **`false`** | 余额查询 | 仅 `https://api.deepseek.com/user/balance` | ⚠️ **是**（DeepSeek API key） |
-| `ENABLE_PRICE_REFRESH` | `true` | 每日价格自动刷新 | `https://openrouter.ai/api/v1/models` | 否 |
-| `ENABLE_MODEL_LOOKUP` | `true` | 新模型价格自动补录 | `https://openrouter.ai/api/v1/models` | 否 |
+| `ENABLE_PRICE_REFRESH` | `true` | 每日价格自动刷新 | **5 个公开价格源**：llmabacus（`llmabacus.com/api/prices`）、llm-prices-cn（GitHub raw）、OpenRouter（`openrouter.ai/api/v1/models`）、LiteLLM（GitHub raw）、Portkey（`configs.portkey.ai/pricing/<provider>.json`） | 否 |
+| `ENABLE_MODEL_LOOKUP` | `true` | 新模型价格自动补录 | 同上（llmabacus 优先，OpenRouter 兜底） | 否 |
 
-**默认配置 = 零密钥联网**：唯一携带 API key 的请求（余额查询）默认关闭；两个 OpenRouter 公开请求（无需任何密钥）默认开启，失败自动降级为本地价，不影响统计与 toast。
+**默认配置 = 零密钥联网**：唯一携带 API key 的请求（余额查询）默认关闭；其余联网均为**公开价格源、无需任何密钥**，失败自动降级为本地价，不影响统计与 toast。
 
 ### 如何更改
 
@@ -61,8 +62,8 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 ```js
 const ENABLE_NETWORK = true;        // 总开关：false = 全部联网功能关闭
 const ENABLE_BALANCE_QUERY = false; // 余额查询（默认关，需自定义 API 的 DeepSeek key）
-const ENABLE_PRICE_REFRESH = true;  // 每日价格自动刷新（OpenRouter 公开价表）
-const ENABLE_MODEL_LOOKUP = true;   // 新模型价格自动补录（OpenRouter 公开价表）
+const ENABLE_PRICE_REFRESH = true;  // 每日价格自动刷新（5 个公开价格源）
+const ENABLE_MODEL_LOOKUP = true;   // 新模型价格自动补录（llmabacus + OpenRouter 公开价表）
 ```
 
 ## 🔐 余额查询安全性说明
@@ -77,16 +78,19 @@ const ENABLE_MODEL_LOOKUP = true;   // 新模型价格自动补录（OpenRouter 
 
 ## 预览
 
-实际运行时 Windows 系统通知效果（回答结束后立即弹出，两行紧凑布局）：
+实际运行时 Windows 系统通知效果（回答结束后立即弹出）：
 
 ```
-DeepSeek-V4 Flash | 高峰 | 4m 26s 余额¥2.77
+DeepSeek-V4 Flash 高峰双倍
+耗时 4m 26s 今日¥8.21 余额¥2.77
 输入 391.2万 / 输出 1.9万｜缓存99.74%｜¥0.25
 ```
 
-- **行1（标题大字）**：模型完整名 + 时段标注（`高峰` 两字）+ 耗时（`1m 40s`）+ **余额紧跟耗时**（`余额¥X`，仅开启余额且检测到变化时显示；行1 宽度上限 47u，超宽时余额让位不折叠）
+- **行1（标题大字，分两行）**：
+  - 第一行 = 模型完整名 + 时段标注（`高峰双倍` / `夜间X折`，仅有时段策略的模型显示）
+  - 第二行 = `耗时` + **今日累计消费**（`今日¥X`，当天 24 小时总花费）+ **余额**（`余额¥X`，仅开启余额且检测到变化时显示）
 - **行2（正文小字）**：输入 / 输出 + 缓存占比（两位小数）+ 费用（未收录显示「未收录」）
-- 永远两行不换行（行1 上限 47u、行2 上限 52u，实测验证）
+- 永不溢出换行：行1 第一行 ≤ 33u、行1 第二行 ≤ 42u（超限按「丢余额 → 丢今日价 → 保底耗时」降级）、行2 ≤ 52u，全部实测+保守宽度模型验证
 
 ## 工作原理
 
@@ -162,6 +166,21 @@ Windows 设置 → 系统 → 通知 → 应用通知
 
 ## 更新记录（Changelog）
 
+### v2.37（2026-08-14）—— 布局定稿 + 无效通道清理
+
+1. **toast 两行大字布局定稿**：行1 拆成两行标题大字——第一行 = 模型名 + 时段标注（`高峰双倍`/`夜间X折`），第二行 = `耗时` + `今日¥X` + `余额¥Y`；行2 正文 = 输入/输出+缓存+费用。换行点固定在"时间"前，行1 第二行永远从行首对齐。
+2. **今日累计消费**：`daily-usage.json` 按自然日累计当天所有模型总消费，toast 显示 `今日¥X.XX`（不区分模型），跨天自动开新桶、保留 7 天。
+3. **行1 宽度双模型**：新增 `dispWidthTitle`（标题大字中文按 2.5 半角单位计，v2.17 实测修正），与正文 `dispWidth`（2:1）分开，行1 永不溢出换行；降级链「丢余额 → 丢今日价 → 保底耗时」。
+4. **快照自动清理**：保留最近 30 天 / 最多 50 个，当前会话永不清。
+5. **移除无效 `systemMessage` 注入**：WorkBuddy UI 不渲染 Stop hook 的 systemMessage（弹不进对话回复），删除该死代码；toast 为唯一结算展示通道。
+
+### v2.31~v2.36（2026-08-14）—— 价格多源免维护 + 今日累计 + 布局演进
+
+- **refresh-prices.js v2.2（5 源多源刷新 + 国内外区分）**：并行拉 5 个公开价格源——国内 2（llmabacus 主 / llm-prices-cn 备，人民币价）、国外 3（OpenRouter / LiteLLM / Portkey，USD 中位数×汇率）；按模型 `region` 区分定价（CN 用国内人民币价、US 用美元换算），region 自动从 llmabacus vendors country 推断；人工核验过的官方价不被自动覆盖；**全源失败写 `last_refresh_error`，toast 显示「价⚠️」**。价格从此免维护，厂商调价后 24 小时内自动跟随。
+- **新模型补录国内外区分（v2.31）**：检测到未收录模型**立即联网**——先查国内源 llmabacus（`priceCurrency=CNY` 直接人民币价、`USD` 走美元），再回退 OpenRouter；已收录模型每天只刷新一次。
+- **今日累计（v2.32）**：见上 v2.37 第 2 条。
+- **时段标注升级**：`periodNote` 支持显示 `高峰双倍`（DeepSeek 原厂系，`peak_multiplier=2`）与 `夜间X折`（声明 `night_discount` 的模型）；⚠️ **时段策略无公开 API 数据源，需手动维护**——厂商时段政策变动时，在 `pricing.json` 更新 `peak_multiplier` / `night_discount` / `peak_hours` / `night_hours` 字段即可，代码自动读取显示。
+
 ### v2.30（2026-08-12）—— 最终版：专家团统计全面修复 + 联网开关
 
 **本次版本修复的完整问题清单**（从 v2.23 起累积，均已在真实运行验证）：
@@ -187,9 +206,9 @@ Windows 设置 → 系统 → 通知 → 应用通知
 
 ```
 token-usage-tracker/
-├── token-tracker.js          # 核心脚本：读 trace/transcript、聚合、算费用、弹 toast、联网开关
-├── refresh-prices.js         # 每日价格自动刷新（OpenRouter 免费 API，当天只拉一次）
-├── pricing.json              # 26 个模型官方人民币价格 + OpenRouter or_id 映射 + 高峰倍率
+├── token-tracker.js          # 核心脚本：读 trace/transcript、聚合、算费用、弹 toast、联网开关、今日累计
+├── refresh-prices.js         # 每日价格自动刷新（5 源：国内 llmabacus/llm-prices-cn + 国外 OpenRouter/LiteLLM/Portkey）
+├── pricing.json              # 26 个模型官方人民币价格 + region 国内外标记 + 高峰/夜间时段字段
 └── SKILL.md                  # 技能说明与使用指令（含时序限制说明）
 ```
 

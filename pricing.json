@@ -1,5 +1,5 @@
 {
-  "date": "2026-08-12",
+  "date": "2026-08-14",
   "currency": "CNY",
   "unit": "元/百万 tokens",
   "usd_cny_rate": 7.2,
@@ -22,7 +22,9 @@
       "peak_multiplier": 2,
       "or_id": "deepseek/deepseek-v4-flash",
       "usd_input_price": 0.14,
-      "usd_output_price": 0.28
+      "usd_output_price": 0.28,
+      "price_source": "llmabacus(国内)",
+      "region": "CN"
     },
     "deepseek-v4-pro": {
       "name": "DeepSeek-V4 Pro",
@@ -31,28 +33,34 @@
       "output_price": 6,
       "peak_multiplier": 2,
       "or_id": "deepseek/deepseek-v4-pro",
-      "usd_input_price": 0.63168,
-      "usd_output_price": 1.26336
+      "usd_input_price": 0.435,
+      "usd_output_price": 0.87,
+      "price_source": "llmabacus(国内)",
+      "region": "CN"
     },
     "deepseek-v3-0324": {
       "name": "DeepSeek-V3.2 (chat)",
       "input_price": 2,
-      "cached_price": 0.2,
-      "output_price": 3,
+      "cached_price": 0.5,
+      "output_price": 8,
       "peak_multiplier": 1,
       "or_id": "deepseek/deepseek-chat",
-      "usd_input_price": 0.2574,
-      "usd_output_price": 1.0287
+      "usd_input_price": 0.2687,
+      "usd_output_price": 0.72435,
+      "price_source": "llmabacus(国内)",
+      "region": "CN"
     },
     "deepseek-v3-1": {
       "name": "DeepSeek-V3.1",
       "input_price": 2,
-      "cached_price": 0.2,
-      "output_price": 3,
+      "cached_price": 0.5,
+      "output_price": 8,
       "peak_multiplier": 1,
       "or_id": "deepseek/deepseek-chat",
-      "usd_input_price": 0.2574,
-      "usd_output_price": 1.0287
+      "usd_input_price": 0.2687,
+      "usd_output_price": 0.72435,
+      "price_source": "llmabacus(国内)",
+      "region": "CN"
     },
     "deepseek-v3-1-volc": {
       "name": "DeepSeek-V3.1 (火山)",
@@ -61,8 +69,9 @@
       "output_price": 3,
       "peak_multiplier": 1,
       "or_id": "deepseek/deepseek-chat",
-      "usd_input_price": 0.2574,
-      "usd_output_price": 1.0287
+      "usd_input_price": 0.2687,
+      "usd_output_price": 0.72435,
+      "region": "CN"
     },
     "deepseek-v3-2-volc": {
       "name": "DeepSeek-V3.2 (火山)",
@@ -71,8 +80,9 @@
       "output_price": 3,
       "peak_multiplier": 1,
       "or_id": "deepseek/deepseek-chat",
-      "usd_input_price": 0.2574,
-      "usd_output_price": 1.0287
+      "usd_input_price": 0.2687,
+      "usd_output_price": 0.72435,
+      "region": "CN"
     },
     "deepseek-r1-0528": {
       "name": "DeepSeek-R1 (0528)",
@@ -80,7 +90,10 @@
       "cached_price": 1,
       "output_price": 16,
       "peak_multiplier": 1,
-      "or_id": "deepseek/deepseek-reasoner"
+      "or_id": "deepseek/deepseek-reasoner",
+      "usd_input_price": 0.39,
+      "usd_output_price": 1.285,
+      "region": "CN"
     },
     "glm-5.2": {
       "name": "GLM-5.2",
@@ -89,60 +102,82 @@
       "output_price": 28,
       "peak_multiplier": 1,
       "or_id": "z-ai/glm-5.2",
-      "usd_input_price": 0.5586,
-      "usd_output_price": 1.7556
+      "usd_input_price": 1.015,
+      "usd_output_price": 3.19,
+      "price_source": "llmabacus(国内)",
+      "region": "CN"
     },
     "glm-5.1": {
       "name": "GLM-5.1",
-      "input_price": 8,
-      "cached_price": 2,
-      "output_price": 28,
+      "input_price": 6,
+      "cached_price": 1.3,
+      "output_price": 24,
       "peak_multiplier": 1,
       "note": "官方两档：32k 以下 6/24/1.3，32k+ 8/28/2；此处取 32k+ 主档",
       "or_id": "z-ai/glm-5.1",
       "usd_input_price": 1.4,
-      "usd_output_price": 4.4
+      "usd_output_price": 4.4,
+      "price_source": "llmabacus(国内)",
+      "region": "CN"
     },
     "glm-5-turbo": {
       "name": "GLM-5-Turbo",
-      "input_price": 7,
-      "cached_price": 1.8,
-      "output_price": 26,
+      "input_price": 4,
+      "cached_price": 1,
+      "output_price": 18,
       "peak_multiplier": 1,
-      "note": "官方两档：32k 以下 5/22/1.2，32k+ 7/26/1.8；此处取 32k+ 主档"
+      "note": "官方两档：32k 以下 5/22/1.2，32k+ 7/26/1.8；此处取 32k+ 主档",
+      "usd_input_price": 1.2,
+      "usd_output_price": 4,
+      "region": "CN",
+      "price_source": "llmabacus(国内)"
     },
     "glm-5": {
       "name": "GLM-5",
-      "input_price": 6,
-      "cached_price": 1.5,
-      "output_price": 22,
+      "input_price": 4,
+      "cached_price": 1,
+      "output_price": 18,
       "peak_multiplier": 1,
-      "note": "官方两档：32k 以下 4/18/1，32k+ 6/22/1.5；此处取 32k+ 主档"
+      "note": "官方两档：32k 以下 4/18/1，32k+ 6/22/1.5；此处取 32k+ 主档",
+      "price_source": "llmabacus(国内)",
+      "usd_input_price": 1.015,
+      "usd_output_price": 3.19,
+      "region": "CN"
     },
     "glm-5v-turbo": {
       "name": "GLM-5V-Turbo (视觉)",
-      "input_price": 8.6,
-      "cached_price": 1.7,
-      "output_price": 28.8,
+      "input_price": 4,
+      "cached_price": 1,
+      "output_price": 18,
       "peak_multiplier": 1,
       "note": "z.ai 官方 USD $1.2/$4/$0.24 × 7.2 换算",
       "or_id": "z-ai/glm-5v-turbo",
       "usd_input_price": 1.2,
-      "usd_output_price": 4
+      "usd_output_price": 4,
+      "region": "CN",
+      "price_source": "llmabacus(国内)"
     },
     "glm-4.7": {
       "name": "GLM-4.7",
-      "input_price": 4,
-      "cached_price": 0.8,
-      "output_price": 16,
-      "peak_multiplier": 1
+      "input_price": 2,
+      "cached_price": 0.4,
+      "output_price": 8,
+      "peak_multiplier": 1,
+      "price_source": "llmabacus(国内)",
+      "usd_input_price": 1.155,
+      "usd_output_price": 1.575,
+      "region": "CN"
     },
     "glm-4.7-flash": {
       "name": "GLM-4.7-Flash",
-      "input_price": 0,
-      "cached_price": 0,
-      "output_price": 0,
-      "peak_multiplier": 1
+      "input_price": 2,
+      "cached_price": 0.4,
+      "output_price": 8,
+      "peak_multiplier": 1,
+      "usd_input_price": 0.06025,
+      "usd_output_price": 0.4,
+      "region": "CN",
+      "price_source": "llmabacus(国内)"
     },
     "kimi-k3": {
       "name": "Kimi K3",
@@ -152,7 +187,9 @@
       "peak_multiplier": 1,
       "or_id": "moonshotai/kimi-k3",
       "usd_input_price": 3,
-      "usd_output_price": 15
+      "usd_output_price": 15,
+      "price_source": "llmabacus(国内)",
+      "region": "CN"
     },
     "kimi-k3-1": {
       "name": "Kimi K3 (旧 key)",
@@ -162,7 +199,9 @@
       "peak_multiplier": 1,
       "or_id": "moonshotai/kimi-k3",
       "usd_input_price": 3,
-      "usd_output_price": 15
+      "usd_output_price": 15,
+      "price_source": "llmabacus(国内)",
+      "region": "CN"
     },
     "kimi-k2.7-code": {
       "name": "Kimi K2.7 Code",
@@ -171,8 +210,9 @@
       "output_price": 27,
       "peak_multiplier": 1,
       "or_id": "moonshotai/kimi-k2.7-code",
-      "usd_input_price": 0.7,
-      "usd_output_price": 3.5
+      "usd_input_price": 0.81,
+      "usd_output_price": 3.7,
+      "region": "CN"
     },
     "kimi-k2.7-code-highspeed": {
       "name": "Kimi K2.7 Code HighSpeed",
@@ -180,7 +220,8 @@
       "cached_price": 2.6,
       "output_price": 54,
       "peak_multiplier": 1,
-      "or_id": "moonshotai/kimi-k2.7-code-highspeed"
+      "or_id": "moonshotai/kimi-k2.7-code-highspeed",
+      "region": "CN"
     },
     "kimi-k2.6": {
       "name": "Kimi K2.6",
@@ -190,7 +231,9 @@
       "peak_multiplier": 1,
       "or_id": "moonshotai/kimi-k2.6",
       "usd_input_price": 0.95,
-      "usd_output_price": 4
+      "usd_output_price": 4,
+      "price_source": "llmabacus(国内)",
+      "region": "CN"
     },
     "kimi-k2.5": {
       "name": "Kimi K2.5",
@@ -199,8 +242,9 @@
       "output_price": 21,
       "peak_multiplier": 1,
       "or_id": "moonshotai/kimi-k2.5",
-      "usd_input_price": 0.57,
-      "usd_output_price": 2.85
+      "usd_input_price": 0.585,
+      "usd_output_price": 2.925,
+      "region": "CN"
     },
     "minimax-m3": {
       "name": "MiniMax-M3 (≤512k 标准)",
@@ -211,7 +255,9 @@
       "note": "官方标准价；>512k 档翻倍 8.4/1.68/33.6；促销五折 2.1/0.42/8.4；OpenRouter 显示为五折价",
       "or_id": "minimax/minimax-m3",
       "usd_input_price": 0.3,
-      "usd_output_price": 1.2
+      "usd_output_price": 1.2,
+      "price_source": "llmabacus(国内)",
+      "region": "CN"
     },
     "minimax-m2.7": {
       "name": "MiniMax-M2.7",
@@ -219,14 +265,20 @@
       "cached_price": 0.42,
       "output_price": 8.4,
       "peak_multiplier": 1,
-      "or_id": "minimax/MiniMax-M2.7"
+      "or_id": "minimax/MiniMax-M2.7",
+      "price_source": "llmabacus(国内)",
+      "usd_input_price": 0.45,
+      "usd_output_price": 1.8,
+      "region": "CN"
     },
     "minimax-m2.7-highspeed": {
       "name": "MiniMax-M2.7 HighSpeed",
-      "input_price": 4.2,
+      "input_price": 2.1,
       "cached_price": 0.42,
-      "output_price": 16.8,
-      "peak_multiplier": 1
+      "output_price": 8.4,
+      "peak_multiplier": 1,
+      "region": "CN",
+      "price_source": "llmabacus(国内)"
     },
     "hy3": {
       "name": "Hunyuan-3.0 (Hy3)",
@@ -236,7 +288,9 @@
       "peak_multiplier": 1,
       "or_id": "tencent/hy3",
       "usd_input_price": 0.132,
-      "usd_output_price": 0.528
+      "usd_output_price": 0.528,
+      "price_source": "llmabacus(国内)",
+      "region": "CN"
     },
     "hy3-preview": {
       "name": "Hunyuan-3.0 Preview",
@@ -246,7 +300,9 @@
       "peak_multiplier": 1,
       "or_id": "tencent/hy3-preview",
       "usd_input_price": 0.063,
-      "usd_output_price": 0.21
+      "usd_output_price": 0.21,
+      "price_source": "llmabacus(国内)",
+      "region": "CN"
     },
     "hunyuan-a13b-instruct": {
       "name": "Hunyuan-A13B-Instruct",
@@ -256,11 +312,12 @@
       "peak_multiplier": 1,
       "or_id": "tencent/hunyuan-a13b-instruct",
       "usd_input_price": 0.14,
-      "usd_output_price": 0.57
+      "usd_output_price": 0.57,
+      "region": "CN"
     }
   },
-  "last_source": "openrouter",
-  "last_refresh_note": "2026-08-12T00:30:47.649Z 自动刷新：更新 18 个模型 USD 参考价（汇率 7.2）",
+  "last_source": "multi-source",
+  "last_refresh_note": "2026-08-14T04:52:28.770Z 多源刷新：llmabacus(国内·人民币·主)✓ | llm-prices-cn(国内·人民币·备)✓ | openrouter(USD)✓ | litellm(USD)✓ | portkey(USD)✓；人民币主价更新 19 个，USD参考 24 个，region 设定 26 个（汇率 7.2）",
   "_lookedup_models": [
     "google/gemma-4-12b-qat",
     "qwen3.6-35b-a3b-instruct-revised"
