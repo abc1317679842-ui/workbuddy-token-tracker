@@ -4,6 +4,7 @@
 .stop-probe.json
 .balance.json
 daily-usage.json
+.ledger-watermark.json
 *.log
 
 # 本地版本备份（不入库，Git 历史即版本管理）
