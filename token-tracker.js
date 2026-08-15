@@ -845,6 +845,28 @@ function reportTxt(arg) {
   }
   return lines.join('\n');
 }
+// ===== 每日账本「仅合计」报告（v2.39.1）：--report summary [all|<日期>] =====
+// 只输出每天的总合计（一行/天），不含模型明细——给"快速看某天/全部天数花了多少"用，
+// 让助手只读最下面那行总数，省 token、省缓存占用。
+function reportSummaryTxt(arg) {
+  const d = loadDailyUsage();
+  const today = todayStr();
+  const allDates = Object.keys(d).sort().reverse();
+  let targets;
+  if (arg === 'all') targets = allDates;
+  else if (arg) targets = [arg];
+  else targets = [today];
+  if (!targets.length) return '账本为空';
+  const lines = [];
+  for (const date of targets) {
+    const day = d[date];
+    if (!day) { lines.push(`${date}  （无记录）`); continue; }
+    const total = day.total || dayTotalOf(day.models || {});
+    const tag = date === today ? '（今天）' : '';
+    lines.push(`${date}${tag}  输入 ${fmt(total.in)} / 输出 ${fmt(total.out)} / 缓存 ${fmt(total.cached)} / 总 ${fmt(total.total)} tokens ｜ ${total.cost > 0 ? fmtCost(total.cost) : '¥0.00'}`);
+  }
+  return lines.join('\n');
+}
 
 // Windows 系统通知：本条回答结束后把精确消耗以 toast 弹出（系统层面，用户可见）。
 // 用 PowerShell WinRT Toast API，参数走 -EncodedCommand（UTF-16LE Base64）避免中文编码问题。
@@ -1275,10 +1297,16 @@ function main() {
   const asHook = process.argv.includes('--hook');
   const asStop = process.argv.includes('--stop');
   // v2.39：--report [all|<date>] —— 打印每日账本（今天分模型明细+合计；历史天同样明细+合计）。
+  // v2.39.1：--report summary [all|<date>] —— 只输出总合计（一行/天），让助手/用户只读最下面那行总数。
   // 纯文本输出，不影响 hooks 流程；无参=今天，all=全部天，也可指定日期。
   if (process.argv.includes('--report')) {
     const ri = process.argv.indexOf('--report');
-    process.stdout.write(reportTxt(process.argv[ri + 1] || '') + '\n');
+    const rArg = process.argv[ri + 1] || '';
+    if (rArg === 'summary' || rArg === 'totals') {
+      process.stdout.write(reportSummaryTxt(process.argv[ri + 2] || '') + '\n');
+    } else {
+      process.stdout.write(reportTxt(rArg) + '\n');
+    }
     return;
   }
   // v2.24：--flush-delayed <sid> —— Stop 端 spawn 的 detached 后台 watcher 入口。
@@ -1512,5 +1540,5 @@ module.exports = {
   todayStr, loadDailyUsage, saveDailyUsage, recordUsage, dayTotalOf,
   calcCost, findModel, isLocalModel, fmtCost, cleanModelName,
   readTranscLines, extractUsage, perModelFromRows, aggregatePerModel,
-  todayDisplay, reportTxt, normalizeDailyUsage,
+  todayDisplay, reportTxt, reportSummaryTxt, normalizeDailyUsage,
 };

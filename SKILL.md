@@ -11,7 +11,7 @@ type: skill
 - **Windows 10/11**：系统通知（toast）仅 Windows 支持；macOS/Linux 可正常手动使用（方式 A），但不弹通知。
 - **Node.js ≥ 20**：脚本零依赖单文件，无需 npm install。
 
-## 当前功能总览（v2.39 · 2026-08-15）
+## 当前功能总览（v2.39.1 · 2026-08-15）
 
 > 本技能以 **Windows 系统通知（toast）** 为唯一展示通道：每次回答结束后，由 `Stop` 钩子读取本轮真实落盘数据，自动弹出本条消耗。以下是当前支持的全部能力：
 
@@ -26,7 +26,7 @@ type: skill
 - **价格体系（零密钥联网）**：`pricing.json` 官方人民币价 + 每日自动多源刷新（国内 llmabacus/llm-prices-cn + 国外 OpenRouter/LiteLLM/Portkey，按模型 region 区分国内外，取中位数）+ 未收录新模型自动联网补录（国内源优先，人民币价）。默认零密钥：仅余额查询携带 API key（默认关闭）。
 - **快照自动清理**：`.snapshot-<sid>.json` 保留最近 30 天 + 最多 50 个，当前会话永不清。
 - **兜底通道**：`--hook`（UserPromptSubmit）在下一轮提交时把上一轮用量注入上下文；手动运行 `token-tracker.js --stop` 查看最近一轮。
-- **每日账本报告**：`node token-tracker.js --report [all|<日期>]` 输出每日分模型明细 + 当日合计（今天/历史任意天）。
+- **每日账本报告**：`node token-tracker.js --report [all|<日期>]` 输出每日分模型明细 + 当日合计（今天/历史任意天）；`--report summary [all|<日期>]` 只输出每天**总合计**（一行/天，不含模型明细）——快速看总数、省 token/缓存用。
 
 ## 安装与启用（新用户必读：装完必须配 hooks 才自动弹通知）
 从技能市场安装 = 文件拷入 skills 目录，**不会自动挂 hook**。请让 WorkBuddy 助手帮你把下面配置合并进 `settings.json`（或手动添加）：
@@ -114,6 +114,8 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 > **v2.37（2026-08-14，移除无效 systemMessage 注入）**：用户确认 WorkBuddy UI 不渲染 Stop hook 的 `systemMessage`（无法"弹到对话回复里"），属死代码。删除两处无效注入（transcript 分支 + traces 分支），改为 `out({ hookSpecificOutput: {} })` 空返回保持进程行为；toast 为唯一结算展示通道。`--hook` 的 `additionalContext` 保留（真正注入上下文，即每轮消息头部的 hook 统计）。
 
 > **v2.39（2026-08-15，每日分模型账本 + 长期历史 + --report）**：用户需求——每天按模型记录（输入/输出/缓存命中/总 token/金额），多模型多行；每天还有一个不分模型的总合计；历史长期保存可查。改动：① `daily-usage.json` 结构升级为 `{日期:{models:{模型:{in,out,cached,total,cost}}, total:{in,out,cached,total,cost}}}`，**长期保存不裁剪**（原保留 7 天）；② `todayStr()` 改**本地日期**（原 UTC，UTC+8 用户凌晨 0–8 点跨天错位），`refresh-prices.js` 同步；③ Stop 记账：transcript 数据源按模型分桶（`perModelFromRows`/`aggregatePerModel`，与 `aggregateTranscript` 同口径），专家团 byModel 存进 coalesce 由 watcher 记账，trace 兜底按 stat.model 单桶，每轮只在最终落点记一次（复用现有防重）；④ 新增 `--report [all|<日期>]` 查看今日/历史每日明细+合计；⑤ `require.main===module` 守卫 + `module.exports`（测试/回填脚本复用同一套逻辑）；⑥ 旧格式 `{"date":金额}` 自动迁移。备份：`token-tracker.js.bak-20260815-v2.38`。验证：临时环境 Stop 分模型记账（两模型明细+合计精确）/二次 Stop 累加不覆盖/旧格式迁移/跨天新开桶旧天保留/flush-delayed byModel 记账/--report 全格式 全部通过；真实账本今日回填 673.5万 tokens 与 transcript 一致，旧 08-14 金额 14.14 迁移保留。
+
+> **v2.39.1（2026-08-15，--report summary 仅合计模式）**：用户要求"读前一天时只读最下面那行总数，别每次读一大堆"。新增 `--report summary [all|<日期>]`——只输出每天的总合计（一行/天，不含模型明细），助手/用户看总数只读这一行，省 token、省缓存占用；`--report`（明细版）行为不变。历史天结构确认：每天仅保留 `models`（各模型数量）+ `total`（合计），**不存每轮/每次会话明细**，文件本身就紧凑。
 
 - **Windows 系统通知（toast，标题两行大字 + 正文一行）**：调用 PowerShell WinRT Toast API 弹出（ToastText02，标题 text 内插 `&#10;` 换行符实现标题两行大字）
   ```
