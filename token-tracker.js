@@ -109,6 +109,7 @@ const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
 const MODELS_CFG = path.join(WB, 'models.json'); // 自定义 API 配置（含 apiKey），仅 DeepSeek 官方模型启用余额显示
 const BALANCE_CACHE = path.join(WB, 'skills', 'token-usage-tracker', '.balance.json');
 const DAILY_USAGE_FILE = path.join(WB, 'skills', 'token-usage-tracker', 'daily-usage.json'); // v2.39：每日账本（按本地日期分桶，{日期:{models:{模型:{in,out,cached,total,cost}}, total:{...}}}，长期保存不裁剪）
+const LEDGER_WATERMARK_FILE = path.join(WB, 'skills', 'token-usage-tracker', '.ledger-watermark.json'); // v2.50：增量记账水位线（{sid:{main:已记账主transcript行数, subs:{子代理文件名:已记账行数}}}）
 const BALANCE_TTL_MS = 15 * 1000; // 余额缓存 15 秒（v2.18 从 60s 压短：用户要求实时，接口实测 300ms 级；正常轮询间隔 >15s 即每轮拿实时数，15s 内连发才复用）
 // 积分/自定义 API 模式识别（v2.10）：官方文档证实内置模型列表就有 deepseek-v4-flash（与自定义 id 同名），
 // trace/hook payload/transcript 无模式标记，进程级探测（tasklist/wmic/netstat）被本机安全策略禁用——
@@ -384,6 +385,41 @@ function perModelFromRows(rows, fromTs) {
   }
   return byModel;
 }
+// v2.52：中断补偿——检测 status=incomplete / isPartialAborted 且 usage=0 的被中断调用，
+// 估算其 token 补进账本。依据（真实数据实证）：被中断的调用 WorkBuddy 不落盘 usage（transcript
+// 无 usage、trace 无记录），但云端照常计费（输入上下文是大头，占 98%+；思考输出是小头）。
+// 估算方法：输入=同会话最近一次完整落盘的 input/cached（上下文连续，误差 <5%）；输出=reasoning
+// 文本长度（中文 1字≈1.5 token，英文 4字符≈1 token）。只认 reasoning 行为被中断调用的起点（一个
+// 被中断调用只有一次 reasoning），用 conversationRequestId 天然去重（每个 cid 唯一）。
+function estimateInterrupted(fullRows, newStart, fromTs) {
+  const byModel = {};
+  for (let i = newStart; i < fullRows.length; i++) {
+    const r = fullRows[i];
+    if (fromTs && !(Number(r.timestamp) > fromTs)) continue; // 可选时间戳过滤（弹窗场景：只估本轮）
+    if (r.type !== 'reasoning') continue;
+    const pd = r.providerData || {};
+    if (r.status !== 'incomplete' && !pd.isPartialAborted) continue;
+    const cid = pd.conversationRequestId || pd.messageId;
+    if (!cid) continue;
+    const model = pd.model || pd.requestModelId || 'unknown';
+    // 估算输入：往前找最近一个有 usage 的调用（同会话上下文连续，量级接近）
+    let estIn = 0, estCached = 0;
+    for (let j = i - 1; j >= 0; j--) {
+      const pu = extractUsage((fullRows[j].providerData || {}).usage);
+      if (pu && pu.in > 0) { estIn = pu.in; estCached = pu.cached || 0; break; }
+    }
+    // 估算输出：reasoning 文本长度（中英文混合系数）
+    const c = Array.isArray(r.content) ? r.content.map((x) => (x && x.text) || '').join('') : (typeof r.content === 'string' ? r.content : '');
+    const cjk = (c.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g) || []).length;
+    const other = c.length - cjk;
+    const estOut = Math.round(cjk * 1.5 + other / 4);
+    if (!estIn && !estOut) continue;
+    const b = byModel[model] || (byModel[model] = { in: 0, out: 0, cached: 0, total: 0 });
+    b.in += estIn; b.out += estOut; b.cached += estCached; b.total += estIn + estOut;
+  }
+  return byModel;
+}
+
 // v2.39：主 transcript + 子代理（与 aggregateTranscript 相同口径）按模型分桶
 function aggregatePerModel(tsPath, roundStartMs) {
   const merged = perModelFromRows(readTranscLines(tsPath), roundStartMs);
@@ -478,6 +514,179 @@ function hasNewTranscSince(tsPath, roundStartMs, sinceMs) {
         try { if (fs.statSync(path.join(subDir, f)).mtimeMs > sinceMs) return true; } catch (e) { /* 忽略 */ }
       }
     } catch (e) { /* 忽略 */ }
+  }
+  return false;
+}
+
+// v2.40：读主 transcript 最后几行，判断主模型当前状态——用于 watcher 决定"专家团是否真正结束"。
+// 业界标准（Anthropic stop_reason 语义）：模型输出"无工具调用的最终回复" = end_turn = 本轮结束；
+// 而"最后一行是工具调用/子代理结果回传" = 主模型还在派活/等结果 = 绝不能弹。
+// 返回：'busy'（主模型还在工作，绝不弹）| 'final'（出现候选最终回复）| 'unknown'（异常/空）
+const TEAM_CALL_RE = /^(Agent|TeamCreate|TeamDelete|SendMessage|TaskOutput)$/;
+function lastTranscLine(tsPath) {
+  try {
+    const fd = fs.openSync(tsPath, 'r');
+    const stat = fs.fstatSync(fd);
+    const sz = stat.size;
+    if (sz <= 0) { fs.closeSync(fd); return null; }
+    const buf = Buffer.alloc(sz > 8192 ? 8192 : sz);
+    fs.readSync(fd, buf, 0, buf.length, sz - buf.length);
+    fs.closeSync(fd);
+    const tail = buf.toString('utf-8').split('\n').map((s) => s.trim()).filter(Boolean);
+    for (let i = tail.length - 1; i >= 0; i--) {
+      try { return JSON.parse(tail[i]); } catch (e) { /* 半写行：跳过往前找 */ }
+    }
+  } catch (e) { /* 文件不可读 */ }
+  return null;
+}
+function mainModelState(tsPath) {
+  const r = lastTranscLine(tsPath);
+  if (!r) return 'unknown';
+  const t = r.type;
+  // 工具调用（含团队派活、TaskOutput 等结果、ToolSearch 等内部）→ 主模型还在循环，绝不弹
+  if (t === 'function_call') return 'busy';
+  // 子代理结果刚回传 → 主模型马上要继续，绝不弹
+  if (t === 'function_call_result') return 'busy';
+  // 主模型的回复（assistant message，带真实 usage）→ 候选最终回复
+  if (t === 'message') {
+    const u = extractUsage((r.providerData || {}).usage) || extractUsage((r.message || {}).usage);
+    if (u && r.role !== 'user') return 'final';
+    if (r.role === 'user') return 'busy'; // 用户/子代理回传消息 → 主模型即将继续
+  }
+  return 'unknown'; // reasoning 等中间行 / 异常
+}
+
+// v2.42：子代理活跃检测——判断是否有子代理在 sinceTs 之后仍在写入。
+// 判据（真实 transcript 实证）：主模型 TaskOutput 阻塞等子代理时，主 transcript 会停在
+// assistant message（看似 final），但子代理文件持续写入。所以拿 subagents 目录里每个
+// agent-*.jsonl 的 mtime 与"主模型最后一行的时间戳"比较：有子代理在最后一行之后还在写
+// = 专家团仍在干活，绝不能判结束；全部子代理都在最后一行之前停止 = 才可能真结束。
+function hasActiveSubagentsSince(tsPath, sinceTs) {
+  if (!tsPath) return false;
+  const dir = subagentsDirFromTranscript(tsPath);
+  let entries;
+  try { entries = fs.readdirSync(dir); } catch (e) { return false; } // 无 subagents 目录 → 普通轮，无子代理
+  for (const f of entries) {
+    if (!/^agent-.+\.jsonl$/i.test(f)) continue;
+    try {
+      const st = fs.statSync(path.join(dir, f));
+      if (st.mtimeMs > sinceTs) return true; // 子代理在 sinceTs 之后还在写 → 仍在运行
+    } catch (e) { /* 文件被删/半写：忽略 */ }
+  }
+  return false;
+}
+
+// v2.43：子代理进度检测——基于"spawn vs completed/failed 通知"的语义判据，返回未完成的子代理名列表。
+// spawn：主模型调 Agent（function_call name=Agent），agent 名从 args 的 "name" 字段或 prompt 的 （agent-name） 提取；
+// ended：teammate-message teammate_id="system" summary="X completed / X failed" 系统通知（子代理结束的权威信号）。
+// 名字带轮次后缀（critique-reviewer-3 → critique-reviewer）需 normalize（去尾部 -N）。
+// pending 非空 = 还有子代理未完成/未回传 → 任务未结束，绝不能判 final。
+// 这比 hasActiveSubagentsSince（mtime 判据）可靠得多：子代理可能长思考停顿不写文件（实测停顿超 100 秒），
+// 但只要它还没发 completed/failed 通知，就绝不能判结束——mtime 判据在此场景会漏（v2.42 被用户实测击穿）。
+function subagentPending(tsPath) {
+  const spawned = new Set();
+  const ended = new Set();
+  if (!tsPath) return [];
+  // v2.47：轮次后缀可能是纯数字(-3)或字母+数字(-c1/-c2/-c3)，旧正则 `-\d+$` 只匹配纯数字，
+  // 会漏掉 -c1 这类 → topic-researcher-c1 匹配不上 topic-researcher → pending 卡死。
+  // 改为兼容两者，但限制为"单字母+数字"避免误删 web-developer 这种正常连字符名字。
+  const norm = (n) => String(n).replace(/-(\d+|[a-z]\d+)$/, '');
+  const rows = readTranscLines(tsPath);
+  for (const r of rows) {
+    if (r.type === 'function_call' && r.name === 'Agent') {
+      const args = typeof r.arguments === 'string' ? r.arguments : JSON.stringify(r.arguments || '');
+      let m = args.match(/"name"\s*:\s*"([^"]+)"/);
+      if (!m) m = args.match(/（([a-z][a-z0-9-]*)）/);
+      if (m) spawned.add(m[1]);
+    } else if (r.type === 'message' && r.role === 'user') {
+      const c = Array.isArray(r.content) ? r.content.map((x) => (x && x.text) || '').join('') : (typeof r.content === 'string' ? r.content : '');
+      // v2.44：子代理结束信号有两种——
+      // ① system 系统通知：summary="X completed / X failed"（权威）
+      const m1 = c.match(/teammate-message teammate_id="system"[^>]*summary="([^"]*)"/);
+      if (m1) {
+        const n = m1[1].match(/^([a-z][a-z0-9-]*?)\s+(?:completed|failed)/i);
+        if (n) ended.add(norm(n[1]));
+      }
+      // ② 子代理回传：teammate-message teammate_id="<agent名>" summary="<实际产出>"（非 system、非 reactivated）
+      //    实测 470fb702：critique-reviewer 只有回传（summary=审查报告）没有 system completed 通知，
+      //    只认 system 通知会漏判 → pending 卡死不弹。
+      const m2 = c.match(/teammate-message teammate_id="([^"]+)"[^>]*summary="([^"]*)"/);
+      if (m2 && m2[1] !== 'system' && !/reactivated|processing new|awaiting|waiting/i.test(m2[2])) {
+        ended.add(norm(m2[1]));
+      }
+    }
+  }
+  return [...spawned].filter((s) => !ended.has(norm(s)));
+}
+
+// v2.44：专家团"死寂"检测——子代理文件是否全部停更超过 stagnantMs。
+// 场景：用户手动停止主模型后，子代理可能继续跑完但既无 system completed 通知也无回传
+// （实测 3a35b538：topic-researcher 停止思考后 pending 永远非空）。此时"主模型静止 + 子代理文件全停更"
+// 即为整体死寂，应强制结算弹窗，而不是傻等 pending 空或 30 分钟兜底。
+function subagentsAllStagnant(tsPath, stagnantMs) {
+  if (!tsPath) return false;
+  const dir = subagentsDirFromTranscript(tsPath);
+  let entries;
+  try { entries = fs.readdirSync(dir); } catch (e) { return false; } // 无 subagents 目录 → 普通轮
+  const cutoff = Date.now() - (stagnantMs || 120 * 1000);
+  let hasAny = false;
+  for (const f of entries) {
+    if (!/^agent-.+\.jsonl$/i.test(f)) continue;
+    hasAny = true;
+    try {
+      const st = fs.statSync(path.join(dir, f));
+      if (st.mtimeMs >= cutoff) return false; // 还有子代理最近写过 → 未死寂
+    } catch (e) { /* 文件被删/半写：忽略 */ }
+  }
+  return hasAny; // 有子代理但全部停更超窗口 → 死寂
+}
+
+// v2.47：子代理文件是否仍在活跃（最近 windowMs 内写过）。
+// 用于 pending 假空兜底：中文团队（如"谭溯源"）Agent args 无 name 字段、prompt 里是中文名+音译，
+// spawn 名提取失败 → pending 假空，但子代理可能还在跑（01593e8c 实测 11:12:14 派 6 章节研究员跑到 11:16:02）。
+// 此时不能只信 pending 空，要靠子代理文件 mtime 判断是否真的还有子代理在活跃。
+function hasSubagentsRecentlyActive(tsPath, windowMs) {
+  if (!tsPath) return false;
+  const dir = subagentsDirFromTranscript(tsPath);
+  let entries;
+  try { entries = fs.readdirSync(dir); } catch (e) { return false; } // 无目录 → 无子代理 → 不活跃
+  const cutoff = Date.now() - (windowMs || 60 * 1000);
+  for (const f of entries) {
+    if (!/^agent-.+\.jsonl$/i.test(f)) continue;
+    try {
+      if (fs.statSync(path.join(dir, f)).mtimeMs >= cutoff) return true; // 有子代理最近写过 → 活跃
+    } catch (e) { /* 文件被删/半写：忽略 */ }
+  }
+  return false;
+}
+
+// v2.45：用户手动停止即时信号——WorkBuddy 在主模型生成被用户中断时，
+// 会在 transcript 最后写入 assistant message content="Interrupted by user"（实测 652f2909/7d699843）。
+// 检测到最后一行是 Interrupted → 用户手动停止 → 立即结算弹窗（不等死寂）。
+// 注意：若任务随后恢复（Interrupted 后又追加新行），hasNewTail 会检测到并重置，不会误弹。
+// v2.46：修正——停止标记有时只写在【子代理文件】里，主 transcript 不写（实测 9609fc9f/3a35b538：
+// 主 transcript 无 Interrupted，但子代理文件最后一行是 Interrupted by user）。
+// 之前的实现只查主 transcript 最后一行 → 误判"子代理还在运行"，其实子代理已停止（和用户界面一致）。
+// 现在同时检查主 transcript 与所有子代理文件的最后一行。
+function interruptedByUser(tsPath) {
+  if (!tsPath) return false;
+  const intrIn = (r) => {
+    if (!r || r.type !== 'message') return false;
+    if (r.role !== 'assistant') return false; // v2.49：真正的中断标记是 assistant（主模型输出被中断），排除 role=user 的摘要
+    const c = Array.isArray(r.content) ? r.content.map((x) => (x && x.text) || '').join('') : (typeof r.content === 'string' ? r.content : '');
+    return /^\s*Interrupted by user\s*$/i.test(c); // 精确匹配，排除长摘要里顺带提到 "Interrupted by user"（1686e062 上下文压缩误弹）
+  };
+  // 1. 主 transcript 最后一行
+  if (intrIn(lastTranscLine(tsPath))) return true;
+  // 2. 子代理文件最后一行（v2.46：主 transcript 不写标记时，子代理文件会写）
+  const dir = subagentsDirFromTranscript(tsPath);
+  let entries;
+  try { entries = fs.readdirSync(dir); } catch (e) { return false; } // 无 subagents 目录 → 普通轮
+  for (const f of entries) {
+    if (!/^agent-.+\.jsonl$/i.test(f)) continue;
+    try {
+      if (intrIn(lastTranscLine(path.join(dir, f)))) return true;
+    } catch (e) { /* 文件被删/半写：忽略 */ }
   }
   return false;
 }
@@ -812,6 +1021,61 @@ function todayDisplay(stat, pricing, byModel) {
   return todayUsageTxt();
 }
 
+// ===== 增量记账（v2.50）：借鉴 WorkBuddy 的"逐笔实时记账"，摆脱"判断任务结束" =====
+// 核心：每次 Stop 只累加"水位线之后的新 usage 行"，用行数去重（单调递增，可靠）。
+// 不依赖"任务是否完整结束"——子代理/压缩/停止的每笔 usage 落盘后，在最近一次 Stop 就被记入账本。
+// 记账与弹窗解耦：账本正确性不再受弹窗时机影响（多弹/漏弹都不影响账本）。
+function loadLedgerWatermark() {
+  try { return JSON.parse(fs.readFileSync(LEDGER_WATERMARK_FILE, 'utf-8')); } catch (e) { return {}; }
+}
+function saveLedgerWatermark(wm) {
+  try {
+    fs.mkdirSync(path.dirname(LEDGER_WATERMARK_FILE), { recursive: true });
+    fs.writeFileSync(LEDGER_WATERMARK_FILE, JSON.stringify(wm));
+  } catch (e) { /* 写失败不影响记账 */ }
+}
+// 增量记账：累加主 transcript + 各子代理文件中"水位线之后"的新 usage 行，并推进水位线。
+function incrementalRecord(tsPath, sid) {
+  if (!tsPath || !fs.existsSync(tsPath)) return;
+  const wm = loadLedgerWatermark();
+  const entry = wm[sid] || (wm[sid] = { main: 0, subs: {} });
+  const byModel = {};
+  const merge = (m) => {
+    for (const [n, b] of Object.entries(m)) {
+      const t = byModel[n] || (byModel[n] = { in: 0, out: 0, cached: 0, total: 0 });
+      t.in += b.in; t.out += b.out; t.cached += b.cached; t.total += b.total;
+    }
+  };
+  // 1. 主 transcript 新行（行数水位线，单调递增，slice 可靠）
+  const mainRows = readTranscLines(tsPath);
+  if (mainRows.length > entry.main) {
+    merge(perModelFromRows(mainRows.slice(entry.main), 0));
+    merge(estimateInterrupted(mainRows, entry.main)); // v2.52：中断补偿
+  }
+  entry.main = mainRows.length;
+  // 2. 各子代理文件新行
+  const subDir = subagentsDirFromTranscript(tsPath);
+  if (fs.existsSync(subDir)) {
+    try {
+      for (const f of fs.readdirSync(subDir)) {
+        if (!/^agent-.+\.jsonl$/i.test(f)) continue;
+        const fp = path.join(subDir, f);
+        const subRows = readTranscLines(fp);
+        const start = entry.subs[f] || 0;
+        if (subRows.length > start) {
+          merge(perModelFromRows(subRows.slice(start), 0));
+          merge(estimateInterrupted(subRows, start)); // v2.53：子代理被中断思考也估算
+        }
+        entry.subs[f] = subRows.length;
+      }
+    } catch (e) { /* 忽略 */ }
+  }
+  // 3. 累加进账本（loadDailyUsage + addModelUsage + saveDailyUsage）
+  if (Object.keys(byModel).length) recordUsage({}, loadPricing(), byModel);
+  // 4. 推进水位线
+  saveLedgerWatermark(wm);
+}
+
 // ===== 每日账本报告（v2.39）：--report [all|<date>] =====
 // 无参 → 今天明细+合计；all → 全部历史天；指定日期 → 该天。
 function reportTxt(arg) {
@@ -832,15 +1096,20 @@ function reportTxt(arg) {
     const tag = date === today ? '（今天）' : '';
     lines.push(`===== ${date}${tag} =====`);
     const names = Object.keys(models).sort();
+    // Markdown 表格输出（v2.39.2）：聊天界面渲染真表格列，天然对齐，不依赖空格/字体宽度
+    const cells = (s, bold) => {
+      const f = (v) => (bold ? `**${v}**` : v);
+      return `| ${f(s.label)} | ${f(fmt(s.in))} | ${f(fmt(s.out))} | ${f(fmt(s.cached))} | ${f(fmt(s.total))} | ${f(s.cost > 0 ? fmtCost(s.cost) : '¥0.00')} |`;
+    };
+    lines.push('| 模型 | 输入 | 输出 | 缓存 | 总 token | 金额 |');
+    lines.push('| --- | --- | --- | --- | --- | --- |');
     if (!names.length) {
-      lines.push('  （该日仅有金额合计，无分模型明细）');
+      // 仅有金额合计（旧格式迁移天）：直接输出合计行
+      lines.push(cells({ label: '合计', in: total.in, out: total.out, cached: total.cached, total: total.total, cost: total.cost }, true));
     } else {
-      for (const n of names) {
-        const m = models[n];
-        lines.push(`  ${String(n).padEnd(22)} 输入 ${fmt(m.in)} / 输出 ${fmt(m.out)} / 缓存 ${fmt(m.cached)} / 总 ${fmt(m.total)} tokens ｜ ${m.cost > 0 ? fmtCost(m.cost) : '¥0.00'}`);
-      }
+      for (const n of names) lines.push(cells({ label: n, ...models[n] }, false));
+      lines.push(cells({ label: '合计', ...total }, true));
     }
-    lines.push(`  ${'─'.repeat(2)} 合计 ── 输入 ${fmt(total.in)} / 输出 ${fmt(total.out)} / 缓存 ${fmt(total.cached)} / 总 ${fmt(total.total)} tokens ｜ ${total.cost > 0 ? fmtCost(total.cost) : '¥0.00'}`);
     lines.push('');
   }
   return lines.join('\n');
@@ -1309,30 +1578,150 @@ function main() {
     }
     return;
   }
-  // v2.24：--flush-delayed <sid> —— Stop 端 spawn 的 detached 后台 watcher 入口。
-  // 延迟 DELAY_TOAST_MS 后复查本轮是否还有新调用：无新 → 弹整轮汇总一次并清除合并文件；
-  // 有新（下一子回合在跑）→ 退出不弹（新 Stop 会重写合并文件并再起 watcher）。
-  // v2.25：合并文件若记录 tsPath（transcript 数据源）→ 复查 transcript/subagents 是否有新调用；
-  // 否则按 v2.24 复查最新 trace 文件 mtime。
+  // v2.40：--flush-delayed <sid> —— Stop 端 spawn 的 detached 后台 watcher 入口。
+  // 结束判定改为"锁定主模型"（业界标准 = 模型输出无工具调用的最终回复，即 stop_reason==end_turn）：
+  // 每 3 秒轮询主 transcript 最后一行：
+  //   - 是工具调用（Agent/TeamCreate/SendMessage/TaskOutput 等）或子代理结果回传 → 主模型还在工作，绝不弹，继续等；
+  //   - 是主模型 assistant 最终回复 → 候选结束，进入确认期（连续 10 秒无任何新行追加）→ 才弹一次整轮汇总。
+  // 不再用固定 6 秒赌子代理间隔（前几次反复崩的根因）。加互斥锁 + 30 分钟空闲兜底超时
+  // （仅异常挂起触发，主模型持续活跃时绝不弹——v2.41 修正固定 deadline 会误弹活跃任务的缺陷）。
   if (process.argv.includes('--flush-delayed')) {
     const fSid = process.argv[process.argv.indexOf('--flush-delayed') + 1] || '';
-    sleep(DELAY_TOAST_MS);
-    const info = readCoalesceInfo(fSid);
-    if (!info || !info.agg) return; // 已被清理/已弹 → 直接退出
-    if (info.tsPath) {
-      if (hasNewTranscSince(info.tsPath, info.roundStart || 0, info.at || 0)) return; // 期间又有调用 → 重新计时
-    } else {
-      const nf = latestTraceFile(true);
-      if (nf && (fs.statSync(nf).mtimeMs > (info.at || 0))) return; // 期间又有子回合落盘 → 让新 Stop 重新计时
+    const WATCH_POLL_MS = 3 * 1000;      // 轮询间隔
+    const WATCH_CONFIRM_MS = 6 * 1000;   // 候选最终回复后的确认期（无新行才算真结束）。v2.48：10s→6s，实际弹窗延迟 12s→6s（轮询3s对齐），仍保留2次轮询确认冗余
+    const WATCH_MAX_MS = 30 * 60 * 1000; // 空闲兜底超时（连续无任何活动才强制弹，防僵尸 watcher）
+    const WATCH_LOCK_TTL = 30 * 60 * 1000; // 锁失效时间
+    // 启动即拿锁：若锁已被别人持有且未过期 → 本 watcher 退出（避免并发重复弹）
+    const lockPath = coalescePath(fSid) + '.lock';
+    let gotLock = false;
+    try {
+      fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+      let mine = null;
+      try {
+        mine = JSON.parse(fs.readFileSync(lockPath, 'utf-8'));
+      } catch (e) { /* 无锁或损坏 */ }
+      if (mine && (Date.now() - (mine.at || 0) < WATCH_LOCK_TTL)) {
+        // 锁被持有且未过期 → 退出（有别的 watcher 在负责）
+        return;
+      }
+      fs.writeFileSync(lockPath, JSON.stringify({ at: Date.now(), pid: process.pid }));
+      gotLock = true;
+    } catch (e) { /* 锁写入失败：继续尝试弹窗（退化为无锁） */ }
+
+    // 首查：若合并文件已被清理/已弹 → 退出（释放锁）
+    const info0 = readCoalesceInfo(fSid);
+    if (!info0 || !info0.agg) {
+      if (gotLock) { try { fs.unlinkSync(lockPath); } catch (e) {} }
+      return;
     }
-    const pricing = loadPricing();
-    const agg = info.agg;
-    const bal = balanceText();
-    showToast(toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), bal, todayDisplay(agg, pricing, info.byModel)), toastLine2(agg, pricing));
-    clearCoalesce(fSid);
-    // v2.27：watcher 弹窗完成 = 专家团本轮真正结束 → 推进 lastStopAt（供 hook 端起点刷新守卫）
-    const ws = loadSnapshot(fSid) || {};
-    saveSnapshot({ file: ws.file || '', stat: ws.stat || null, lastUserMsgAt: ws.lastUserMsgAt || 0, lastStopAt: Date.now() }, fSid);
+    const tsPath = info0.tsPath || '';
+    // v2.41：兜底超时改为"空闲超时"。原固定 deadline（启动时刻+30 分钟）是缺陷：任务跑超 30 分钟且主模型仍在
+    // 活跃时会被误弹。现在盯"最后活跃时刻 lastActiveAt"——只要轮询到主模型还在工作（busy / 新行追加）就不断刷新，
+    // 只有连续 WATCH_MAX_MS 完全无任何活动（主模型崩了/App 挂了/transcript 停写）才触发兜底弹窗，杜绝僵尸 watcher。
+    let lastActiveAt = Date.now(); // 最后活跃时刻（空闲超时计时基线）
+    let confirmSince = 0;   // 候选最终回复出现的时刻
+    let lastTailTs = -1;    // 上次轮询时看到的最后一行时间戳（用于检测"新行追加"）
+
+    const pollTail = () => {
+      if (!tsPath) return 'unknown';
+      return mainModelState(tsPath);
+    };
+    const hasNewTail = () => {
+      if (!tsPath) return false;
+      const r = lastTranscLine(tsPath);
+      if (!r) return false;
+      const ts = Number(r.timestamp) || 0;
+      if (ts > lastTailTs) { lastTailTs = ts; return true; }
+      return false;
+    };
+
+    // 首轮记录尾部时间戳基线
+    const baseR = lastTranscLine(tsPath);
+    if (baseR) lastTailTs = Number(baseR.timestamp) || 0;
+
+    // v2.42：记录已知子代理文件集合，用于检测确认期内主模型是否派了新子代理（新 agent 文件出现 = 刚派活 = 未结束）
+    const knownAgents = () => {
+      if (!tsPath) return new Set();
+      try { return new Set(fs.readdirSync(subagentsDirFromTranscript(tsPath)).filter((f) => /^agent-.+\.jsonl$/i.test(f))); }
+      catch (e) { return new Set(); }
+    };
+    let prevAgents = knownAgents();
+
+    while (Date.now() - lastActiveAt < WATCH_MAX_MS) {   // 空闲超时：主模型持续活跃则永不退出、绝不弹
+      const st = pollTail();
+      const newTail = hasNewTail();
+      // v2.43：子代理"未完成"语义判据——还有 spawn 但未发结束信号（system completed/failed 通知或子代理回传）→ 未结束。
+      const pendingSub = subagentPending(tsPath);
+      // v2.45：用户手动停止即时信号——末行 "Interrupted by user" → 立即结算（子代理同步停，实测行ts差0s）。
+      const interrupted = interruptedByUser(tsPath);
+      // v2.44：死寂检测——主模型静止(final) + 有未完成子代理 + 子代理文件全停更超 60 秒 → 手动停止/回传失效，
+      // 强制结算（无 Interrupted 标记的停止，子代理最多多跑 40s，60s 窗口足够覆盖）。
+      const deadTeam = !interrupted && st === 'final' && pendingSub.length > 0 && subagentsAllStagnant(tsPath, 60 * 1000);
+      // 检测是否出现了新子代理文件（主模型刚派新活）
+      const agentsNow = knownAgents();
+      let newAgent = false;
+      for (const a of agentsNow) if (!prevAgents.has(a)) { newAgent = true; break; }
+      prevAgents = agentsNow;
+
+      if (st === 'busy' || newTail || newAgent) {
+        // 主模型还在工作（派活/等子代理/新派子代理/新行）→ 刷新空闲计时 + 取消确认期
+        lastActiveAt = Date.now();
+        confirmSince = 0;
+      } else if (st === 'final' || interrupted) {
+        if (interrupted) {
+          // 用户手动停止 → 确认期弹（子代理同步停，实测行ts差0s）
+          if (confirmSince === 0) {
+            confirmSince = Date.now();
+          } else if (Date.now() - confirmSince >= WATCH_CONFIRM_MS) {
+            break;
+          }
+        } else if (deadTeam) {
+          // 专家团死寂（pending 非空 + 子代理停更 60s）→ 确认期弹
+          if (confirmSince === 0) {
+            confirmSince = Date.now();
+          } else if (Date.now() - confirmSince >= WATCH_CONFIRM_MS) {
+            break;
+          }
+        } else if (pendingSub.length === 0) {
+          // 名字匹配判据说"无未完成子代理"。但中文团队 spawn 名提取失败会 pending 假空，
+          // 子代理可能还在跑 → 需再确认子代理文件确实停更（v2.47 修复）。
+          if (hasSubagentsRecentlyActive(tsPath, 60 * 1000)) {
+            // 子代理文件还在写 → 假空，继续等
+            lastActiveAt = Date.now();
+            confirmSince = 0;
+          } else {
+            // 子代理确实停更 → 确认期弹
+            if (confirmSince === 0) {
+              confirmSince = Date.now();
+            } else if (Date.now() - confirmSince >= WATCH_CONFIRM_MS) {
+              break;
+            }
+          }
+        } else {
+          // 有未完成子代理且仍在活动 → 等待（子代理还在跑，主模型可能即将被唤醒）
+          lastActiveAt = Date.now();
+          confirmSince = 0;
+        }
+      } else {
+        confirmSince = 0;            // unknown（文件异常）→ 重置，继续等
+      }
+      sleep(WATCH_POLL_MS);
+    }
+    // 兜底超时到 / 确认期过 → 弹（释放锁）
+    const info = readCoalesceInfo(fSid);
+    if (info && info.agg) {
+      const pricing = loadPricing();
+      const agg = info.agg;
+      // v2.50：弹窗前补一次增量记账（子代理收尾可能在 Stop 之后才落盘，水位线保证不重复）
+      if (info.tsPath) incrementalRecord(info.tsPath, fSid);
+      const bal = balanceText();
+      showToast(toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), bal, todayUsageTxt()), toastLine2(agg, pricing));
+      clearCoalesce(fSid);
+      // v2.27：watcher 弹窗完成 = 专家团本轮真正结束 → 推进 lastStopAt（供 hook 端起点刷新守卫）
+      const ws = loadSnapshot(fSid) || {};
+      saveSnapshot({ file: ws.file || '', stat: ws.stat || null, lastUserMsgAt: ws.lastUserMsgAt || 0, lastStopAt: Date.now() }, fSid);
+    }
+    if (gotLock) { try { fs.unlinkSync(lockPath); } catch (e) {} }
     return;
   }
   // v2.21：hook 与 stop 都从 payload 读 session_id（快照按会话拆分，多会话并发不互相覆盖）；
@@ -1365,10 +1754,23 @@ function main() {
     const prevSnap0 = loadSnapshot(sid) || {};
     const roundStart0 = prevSnap0.lastUserMsgAt || 0;
     if (tsPath && roundStart0 > 0) {
+      // v2.50：增量记账（借鉴 WorkBuddy 逐笔实时记账）——先累加水位线之后的新 usage 行，
+      // 再走弹窗判断。记账与弹窗解耦：即使弹窗时机错（多弹/漏弹），账本也已正确。
+      incrementalRecord(tsPath, sid);
       let agg = aggregateTranscript(tsPath, roundStart0);
       if (!agg) { sleep(500); agg = aggregateTranscript(tsPath, roundStart0); } // transcript 尾部可能未 flush
       if (!agg) { sleep(1500); agg = aggregateTranscript(tsPath, roundStart0); }
       if (agg) {
+        // v2.53：本轮可能"完整调用（有 usage）+ 被中断思考（无 usage）"混合——合并被中断估算，
+        // 让弹窗显示两边汇总（之前只显示完整调用部分，被中断思考漏了）。
+        const estByModel0 = estimateInterrupted(readTranscLines(tsPath), 0, roundStart0);
+        const estNames0 = Object.keys(estByModel0);
+        if (estNames0.length) {
+          const estIn0 = estNames0.reduce((s, n) => s + estByModel0[n].in, 0);
+          const estOut0 = estNames0.reduce((s, n) => s + estByModel0[n].out, 0);
+          const estCached0 = estNames0.reduce((s, n) => s + estByModel0[n].cached, 0);
+          agg.in += estIn0; agg.out += estOut0; agg.cached += estCached0; agg.total += estIn0 + estOut0;
+        }
         const modelShort = shortModelName(agg, pricing);
         const nmNote = ensureNewModelPricing(pricing, agg).note;
         const line = lineFor(agg, false, modelShort);
@@ -1388,10 +1790,37 @@ function main() {
         } else {
           saveSnapshot({ file: tsPath, stat: agg, lastUserMsgAt: roundStart0, lastStopAt: Date.now() }, sid);
           const bal = balanceText();
-          showToast(toastLine1(agg, modelShort, periodNote(agg, pricing), bal, todayDisplay(agg, pricing, byModel)), toastLine2(agg, pricing));
+          // v2.50：记账已在 incrementalRecord 完成，这里只读账本显示累计
+          showToast(toastLine1(agg, modelShort, periodNote(agg, pricing), bal, todayUsageTxt()), toastLine2(agg, pricing));
         }
         // v2.37：systemMessage 通道 WorkBuddy UI 实测不显示（无法注入到对话回复），删除该无效注入；
         // toast 已在上面弹出。保留空 hook 返回保证进程行为不变。
+        out({ hookSpecificOutput: {} });
+        return;
+      } else {
+        // v2.52：本轮无 usage 行（停止过快 / 思考途中停止，模型输出未落盘 usage）。
+        // 先尝试中断补偿：若本轮有被中断的调用（incomplete reasoning），估算其 token 弹窗显示估算值；
+        // 否则才走"无记录"提示（不 fall through trace 兜底，避免读错并发会话数据）。
+        const estByModel = estimateInterrupted(readTranscLines(tsPath), 0, roundStart0);
+        const estNames = Object.keys(estByModel);
+        if (estNames.length) {
+          const estTotal = estNames.reduce((s, n) => s + estByModel[n].total, 0);
+          const estIn = estNames.reduce((s, n) => s + estByModel[n].in, 0);
+          const estOut = estNames.reduce((s, n) => s + estByModel[n].out, 0);
+          const estStat = { in: estIn, out: estOut, cached: 0, total: estTotal, durMs: 0, model: estNames[0], count: estNames.length };
+          const estModelShort = shortModelName(estStat, pricing);
+          writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sid, sameRound: false, transcriptPath: tsPath, stat: estStat, line: '本轮被中断，估算 token（思考未落盘 usage）', source: 'transcript-interrupted-est', payload: summarizePayload(payloadRaw) });
+          // 注意：估算值已在 incrementalRecord（本函数开头）按水位线记入账本，这里不再重复 recordUsage。
+          const bal = balanceText();
+          showToast(toastLine1(estStat, estModelShort, '（估算）', bal, todayUsageTxt()), toastLine2(estStat, pricing));
+          out({ hookSpecificOutput: {} });
+          return;
+        }
+        // v2.51：真正无记录（本轮既无 usage 也无被中断调用）
+        writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sid, sameRound: false, transcriptPath: tsPath, stat: null, line: '本轮无 token 记录（停止过快，usage 未落盘）', source: 'transcript-empty', payload: summarizePayload(payloadRaw) });
+        const bal0 = balanceText();
+        const today0 = todayUsageTxt();
+        showToast('本轮无 token 记录', (today0 ? '今日累计 ' + today0 : '') + (bal0 ? (today0 ? ' ｜ ' : '') + bal0 : '') || '停止过快，本轮消耗尚未落盘');
         out({ hookSpecificOutput: {} });
         return;
       }
@@ -1541,4 +1970,7 @@ module.exports = {
   calcCost, findModel, isLocalModel, fmtCost, cleanModelName,
   readTranscLines, extractUsage, perModelFromRows, aggregatePerModel,
   todayDisplay, reportTxt, reportSummaryTxt, normalizeDailyUsage,
+  mainModelState, lastTranscLine, coalescePath, hasActiveSubagentsSince, subagentsDirFromTranscript, subagentPending, subagentsAllStagnant, interruptedByUser, hasSubagentsRecentlyActive,
+  incrementalRecord, loadLedgerWatermark, saveLedgerWatermark,
+  estimateInterrupted,
 };
