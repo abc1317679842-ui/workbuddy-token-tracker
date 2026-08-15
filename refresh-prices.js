@@ -70,7 +70,12 @@ const SRC_ID_MAP = {
   'hy3-preview': 'hunyuan-hy3',
 };
 
-function todayStr() { return new Date().toISOString().slice(0, 10); }
+function todayStr() {
+  const d = new Date();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${m}-${dd}`;
+} // v2.39：本地日期（与 token-tracker.js 一致，避免 UTC+8 凌晨错位）
 
 function load() {
   try { return JSON.parse(fs.readFileSync(PRICING, 'utf-8')); }

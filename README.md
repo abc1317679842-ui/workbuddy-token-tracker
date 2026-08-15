@@ -30,7 +30,8 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 | 功能 | 说明 |
 |---|---|
 | 🪟 **每轮即时推送** | 回答结束后，Windows 系统通知（toast）立即弹出本条消耗，**两行大字紧凑布局**：行1 第一行 = 模型名 + 时段标注（高峰双倍/夜间X折）；行1 第二行 = 耗时 + 今日累计消费 + 余额；行2 = 输入 / 输出 + 缓存占比 + 费用 |
-| 📊 **今日累计消费** | 自动按自然日累计当天 24 小时内所有模型的总消费，toast 显示 `今日¥X.XX`（不区分模型）；跨天自动开新桶，保留最近 7 天 |
+| 📊 **今日累计消费** | toast 行1 显示当天总消费 `今日¥X.XX`（读取每日账本 total.cost） |
+| 📓 **每日分模型账本** | 每轮 Stop 自动把消耗**按模型**累计进 `daily-usage.json`（本地日期分桶）：`{日期:{models:{模型:{in,out,cached,total,cost}}, total:{...}}}`——每个模型一行（输入/输出/缓存命中/总 token/金额）+ 不分模型的当日总合计；**长期保存不裁剪**，可查任意历史天。查看：`node token-tracker.js --report`（今天）/ `--report all`（全部天）/ `--report <日期>` |
 | 🧠 **专家团全量聚合** | WorkBuddy 专家团（多个子代理并行 + 主理人汇总）的全部模型调用，一次性聚合成整轮真实消耗——**平台不把子代理调用落盘 traces，本技能直接从主会话 + `subagents/*.jsonl` transcript 读取**，跑完一个专家团弹**一条**整轮汇总，不会弹 N 次 |
 | 🧩 **异步子代理识别** | 专家团子代理是异步 spawn，文件比 Agent 调用晚落盘——检测主会话是否有 `Agent`/`TeamCreate` 等团队活动，未落盘也能判定"这是专家团"→ 走合并延迟弹，不误判为普通轮 |
 | 🛡️ **中途插话守卫** | 专家团运行中你插话不会把统计起点刷晚（`lastStopAt` 轮次边界守卫）——整轮消耗不丢 |
@@ -166,6 +167,16 @@ Windows 设置 → 系统 → 通知 → 应用通知
 
 ## 更新记录（Changelog）
 
+### v2.39（2026-08-15）—— 每日分模型账本 + 长期历史 + --report
+
+1. **每日分模型账本**：`daily-usage.json` 结构升级为 `{日期:{models:{模型:{in,out,cached,total,cost}}, total:{in,out,cached,total,cost}}}`——每天保留**两套统计**：`models` 各模型明细（多模型多行）+ `total` 不分模型的当日总合计（输入/输出/缓存命中/总 token/金额）。
+2. **长期保存**：账本**不裁剪**（原保留最近 7 天），可查任意历史天；数据量极小（一天几百字节）。
+3. **本地日期分桶**：`todayStr()` 改用本地时间（原 UTC，UTC+8 用户凌晨 0–8 点会把当天算成前一天），`refresh-prices.js` 同步。
+4. **按模型记账**：Stop 端 transcript 数据源按模型分桶（`perModelFromRows`/`aggregatePerModel`，与 `aggregateTranscript` 同口径）；专家团 byModel 存进 coalesce 由 watcher 记账；trace 兜底按 stat.model 单桶。每轮只在最终落点记一次（复用现有防重），不重复记账。
+5. **`--report` 命令**：`node token-tracker.js --report`（今天）/ `--report all`（全部天）/ `--report <日期>` 输出每日分模型明细 + 当日合计。
+6. **可复用导出**：`require.main===module` 守卫 + `module.exports`（测试/回填脚本复用同一套逻辑）；旧格式 `{"date":金额}` 自动迁移。
+7. 备份：`token-tracker.js.bak-20260815-v2.38`。
+
 ### v2.37（2026-08-14）—— 布局定稿 + 无效通道清理
 
 1. **toast 两行大字布局定稿**：行1 拆成两行标题大字——第一行 = 模型名 + 时段标注（`高峰双倍`/`夜间X折`），第二行 = `耗时` + `今日¥X` + `余额¥Y`；行2 正文 = 输入/输出+缓存+费用。换行点固定在"时间"前，行1 第二行永远从行首对齐。
@@ -206,11 +217,12 @@ Windows 设置 → 系统 → 通知 → 应用通知
 
 ```
 token-usage-tracker/
-├── token-tracker.js          # 核心脚本：读 trace/transcript、聚合、算费用、弹 toast、联网开关、今日累计
+├── token-tracker.js          # 核心脚本：读 trace/transcript、聚合、算费用、弹 toast、联网开关、每日分模型账本、--report
 ├── refresh-prices.js         # 每日价格自动刷新（5 源：国内 llmabacus/llm-prices-cn + 国外 OpenRouter/LiteLLM/Portkey）
 ├── pricing.json              # 26 个模型官方人民币价格 + region 国内外标记 + 高峰/夜间时段字段
 └── SKILL.md                  # 技能说明与使用指令（含时序限制说明）
 ```
+- `daily-usage.json`（运行时生成，不入库）：每日分模型账本，长期保存；`--report` 查看。
 
 ## 系统要求
 

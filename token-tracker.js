@@ -85,6 +85,7 @@ function writeCoalesce(sid, agg, meta) {
     if (meta.traceFile) payload.traceFile = meta.traceFile;
     if (meta.tsPath) payload.tsPath = meta.tsPath;         // v2.25：transcript 数据源（watcher 复查用）
     if (meta.roundStart) payload.roundStart = meta.roundStart;
+    if (meta.byModel) payload.byModel = meta.byModel;       // v2.39：专家团按模型分桶明细（watcher 记账用）
   }
   try { fs.writeFileSync(coalescePath(sid), JSON.stringify(payload)); }
   catch (e) { process.stderr.write(`[token-tracker] 合并文件写入失败: ${e.message}\n`); }
@@ -107,7 +108,7 @@ function spawnFlushWatcher(sid) {
 const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
 const MODELS_CFG = path.join(WB, 'models.json'); // 自定义 API 配置（含 apiKey），仅 DeepSeek 官方模型启用余额显示
 const BALANCE_CACHE = path.join(WB, 'skills', 'token-usage-tracker', '.balance.json');
-const DAILY_USAGE_FILE = path.join(WB, 'skills', 'token-usage-tracker', 'daily-usage.json'); // v2.32：当日累计消费（按日期分桶，保留最近 7 天）
+const DAILY_USAGE_FILE = path.join(WB, 'skills', 'token-usage-tracker', 'daily-usage.json'); // v2.39：每日账本（按本地日期分桶，{日期:{models:{模型:{in,out,cached,total,cost}}, total:{...}}}，长期保存不裁剪）
 const BALANCE_TTL_MS = 15 * 1000; // 余额缓存 15 秒（v2.18 从 60s 压短：用户要求实时，接口实测 300ms 级；正常轮询间隔 >15s 即每轮拿实时数，15s 内连发才复用）
 // 积分/自定义 API 模式识别（v2.10）：官方文档证实内置模型列表就有 deepseek-v4-flash（与自定义 id 同名），
 // trace/hook payload/transcript 无模式标记，进程级探测（tasklist/wmic/netstat）被本机安全策略禁用——
@@ -363,6 +364,47 @@ function subagentsDirFromTranscript(tsPath) {
   return path.join(path.dirname(tsPath), base, 'subagents');
 }
 
+// v2.39：按模型分桶聚合 transcript 行（与 aggregateTranscLines 完全一致的去重口径），
+// 供每日账本"分模型明细"记账用。返回 { "<模型名>": {in,out,cached,total} }。
+function perModelFromRows(rows, fromTs) {
+  const seen = new Set();
+  const byModel = {};
+  for (const r of rows) {
+    const ts = r.timestamp;
+    if (!(typeof ts === 'number') || ts <= fromTs) continue;
+    const pd = r.providerData || {};
+    const u = extractUsage(pd.usage);
+    if (!u) continue;
+    const key = pd.messageId || pd.conversationRequestId || r.id || (r.type + ':' + ts);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const name = pd.model || pd.requestModelId || 'unknown';
+    const b = byModel[name] || (byModel[name] = { in: 0, out: 0, cached: 0, total: 0 });
+    b.in += u.in; b.out += u.out; b.cached += u.cached; b.total += u.in + u.out;
+  }
+  return byModel;
+}
+// v2.39：主 transcript + 子代理（与 aggregateTranscript 相同口径）按模型分桶
+function aggregatePerModel(tsPath, roundStartMs) {
+  const merged = perModelFromRows(readTranscLines(tsPath), roundStartMs);
+  const subDir = subagentsDirFromTranscript(tsPath);
+  if (fs.existsSync(subDir)) {
+    try {
+      for (const f of fs.readdirSync(subDir)) {
+        if (!/^agent-.*\.jsonl$/.test(f)) continue;
+        const fp = path.join(subDir, f);
+        try { if (fs.statSync(fp).mtimeMs <= roundStartMs) continue; } catch (e) { continue; } // 本轮之前创建的排除
+        const sub = perModelFromRows(readTranscLines(fp), 0); // 子代理文件本身只属于本次专家团
+        for (const [n, b] of Object.entries(sub)) {
+          if (merged[n]) { merged[n].in += b.in; merged[n].out += b.out; merged[n].cached += b.cached; merged[n].total += b.total; }
+          else merged[n] = b;
+        }
+      }
+    } catch (e) { /* subagents 读取失败：忽略子代理部分 */ }
+  }
+  return merged;
+}
+
 // v2.28：检测主 transcript 本轮（roundStart 之后）是否有专家团活动（Agent/Team 工具调用）。
 // 专家团是异步 spawn——子代理文件可能比主理人的 Agent 调用晚 10~20s 才落盘，中途 Stop 聚合时
 // subCount=0 会被误判成"普通轮"立即弹 toast（实测 48 秒专家团弹 3 次 = 中途 2 次误判 + 最终 1 次）。
@@ -598,7 +640,14 @@ function loadPricing() {
   try { return JSON.parse(fs.readFileSync(PRICING, 'utf-8')); } catch (e) { return null; }
 }
 
-function todayStr() { return new Date().toISOString().slice(0, 10); }
+// v2.39（2026-08-15）：日界改用「本地时间」——旧版用 UTC（toISOString），用户在 UTC+8，
+// 凌晨 0–8 点会把当天算成前一天，导致每日账本/定价刷新错位。本地日期才是用户的"每天"。
+function todayStr() {
+  const d = new Date();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${m}-${dd}`;
+}
 
 // 每日价格自动刷新：当天已刷新（date==今天）→ 不联网直接返回；过期 → 同步调 refresh-prices.js
 // 联网拉 OpenRouter 更新（execFileSync 保证刷新完成才继续；失败保留本地价并 stderr 暴露，不静默）。
@@ -687,33 +736,114 @@ function fmtCost(cost) {
   return '¥' + cost.toFixed(2);
 }
 
-// v2.32：当日累计消费统计（不区分模型，按自然日累加，跨天自动开新桶；保留最近 7 天）
-function loadDailyUsage() {
-  try { return JSON.parse(fs.readFileSync(DAILY_USAGE_FILE, 'utf-8')); } catch (e) { return {}; }
+// ===== 每日账本 v2.39（2026-08-15，长期保存 + 分模型明细 + 当日合计）=====
+// daily-usage.json 结构：
+//   { "<YYYY-MM-DD>": {
+//       "models": { "<模型名>": { "in", "out", "cached", "total", "cost" } },   // 单个模型当天累计
+//       "total":  { "in", "out", "cached", "total", "cost" }                     // 不分模型的当日总合计
+//     } }
+// - 按自然日（本地时间，修正 v2.32 用 UTC 导致的凌晨跨天错位）分桶，长期保存不裁剪。
+// - 每天保留两套统计：models 各模型明细 + total 总合计（用户需求：两个总的统计）。
+// - 旧格式（v2.32，{"date": 金额}）首次读取时自动迁移。
+function dayTotalOf(models) {
+  const t = { in: 0, out: 0, cached: 0, total: 0, cost: 0 };
+  for (const m of Object.values(models || {})) {
+    t.in += m.in || 0; t.out += m.out || 0; t.cached += m.cached || 0; t.total += m.total || 0;
+    t.cost += m.cost || 0;
+  }
+  return t;
 }
-function addTodayUsage(cost) {
-  if (cost == null || !(cost > 0)) return;
-  const d = loadDailyUsage();
-  const t = todayStr();
-  d[t] = Number(d[t] || 0) + cost;
-  const keys = Object.keys(d).sort();
-  while (keys.length > 7) delete d[keys.shift()];
+function normalizeDailyUsage(d) {
+  if (!d || typeof d !== 'object' || Array.isArray(d)) return {};
+  const out = {};
+  for (const [date, v] of Object.entries(d)) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const models = v.models || {};
+      out[date] = { models, total: v.total || dayTotalOf(models) }; // 新结构：缺 total 补算
+    } else if (typeof v === 'number') {
+      out[date] = { models: {}, total: { in: 0, out: 0, cached: 0, total: 0, cost: v } }; // v2.32 仅金额
+    }
+  }
+  return out;
+}
+function loadDailyUsage() {
+  try { return normalizeDailyUsage(JSON.parse(fs.readFileSync(DAILY_USAGE_FILE, 'utf-8'))); } catch (e) { return {}; }
+}
+function saveDailyUsage(d) {
   try {
     fs.mkdirSync(path.dirname(DAILY_USAGE_FILE), { recursive: true });
-    fs.writeFileSync(DAILY_USAGE_FILE, JSON.stringify(d));
-  } catch (e) { /* 写失败不影响 toast */ }
+    fs.writeFileSync(DAILY_USAGE_FILE, JSON.stringify(d, null, 2)); // 缩进便于人工查看/汇报
+  } catch (e) { process.stderr.write(`[token-tracker] 账本写入失败: ${e.message}\n`); }
+}
+// 把一条 stat（单模型）累加进某天的 models，并重算该日 total（保证总合计永远=各模型之和）
+function addModelUsage(day, model, stat, pricing) {
+  const name = String(model || '').trim() || 'unknown';
+  const cost = calcCost(Object.assign({ model: name }, stat), pricing);
+  const m = day.models[name] || (day.models[name] = { in: 0, out: 0, cached: 0, total: 0, cost: 0 });
+  m.in += stat.in || 0; m.out += stat.out || 0; m.cached += stat.cached || 0; m.total += stat.total || 0;
+  if (cost != null) m.cost += cost;
+  day.total = dayTotalOf(day.models);
+}
+// 统一记账入口：byModel（transcript 按模型分桶）优先；否则按 stat.model 单桶。
+// 每轮只在最终落点调用一次（普通轮 Stop / watcher 汇总 / hook 兜底补弹），天然不重复记账。
+function recordUsage(stat, pricing, byModel) {
+  const d = loadDailyUsage();
+  const date = todayStr();
+  const day = d[date] || (d[date] = { models: {}, total: { in: 0, out: 0, cached: 0, total: 0, cost: 0 } });
+  if (byModel && Object.keys(byModel).length) {
+    for (const [name, b] of Object.entries(byModel)) addModelUsage(day, name, b, pricing);
+  } else if (stat && ((stat.in || 0) + (stat.out || 0)) > 0) {
+    addModelUsage(day, stat.model || 'unknown', stat, pricing);
+  } else {
+    return;
+  }
+  saveDailyUsage(d);
 }
 function todayUsageTxt() {
   const d = loadDailyUsage();
-  const v = Number(d[todayStr()] || 0);
-  if (!(v > 0)) return '';
-  return `今日${fmtCost(v)}`; // 无前导空格，由 toastLine1 统一加
+  const day = d[todayStr()];
+  const cost = day && day.total ? day.total.cost : 0;
+  if (!(cost > 0)) return '';
+  return `今日${fmtCost(cost)}`; // 无前导空格，由 toastLine1 统一加
 }
-// 弹 toast 前调用：把本条费用累加进当日，返回「当日累计」文本（含本条）
-function todayDisplay(stat, pricing) {
-  const c = calcCost(stat, pricing);
-  if (c != null) addTodayUsage(c);
+// 弹 toast 前调用：把本条记入当日账本（含该模型/各模型），返回「当日累计」文本（含本条）
+function todayDisplay(stat, pricing, byModel) {
+  recordUsage(stat, pricing, byModel);
   return todayUsageTxt();
+}
+
+// ===== 每日账本报告（v2.39）：--report [all|<date>] =====
+// 无参 → 今天明细+合计；all → 全部历史天；指定日期 → 该天。
+function reportTxt(arg) {
+  const d = loadDailyUsage();
+  const today = todayStr();
+  const allDates = Object.keys(d).sort().reverse();
+  let targets;
+  if (arg === 'all') targets = allDates;
+  else if (arg) targets = [arg];
+  else targets = [today];
+  if (!targets.length) return '账本为空（暂无记录）';
+  const lines = [];
+  for (const date of targets) {
+    const day = d[date];
+    if (!day) { lines.push(`===== ${date} =====\n  （无记录）`); continue; }
+    const models = day.models || {};
+    const total = day.total || dayTotalOf(models);
+    const tag = date === today ? '（今天）' : '';
+    lines.push(`===== ${date}${tag} =====`);
+    const names = Object.keys(models).sort();
+    if (!names.length) {
+      lines.push('  （该日仅有金额合计，无分模型明细）');
+    } else {
+      for (const n of names) {
+        const m = models[n];
+        lines.push(`  ${String(n).padEnd(22)} 输入 ${fmt(m.in)} / 输出 ${fmt(m.out)} / 缓存 ${fmt(m.cached)} / 总 ${fmt(m.total)} tokens ｜ ${m.cost > 0 ? fmtCost(m.cost) : '¥0.00'}`);
+      }
+    }
+    lines.push(`  ${'─'.repeat(2)} 合计 ── 输入 ${fmt(total.in)} / 输出 ${fmt(total.out)} / 缓存 ${fmt(total.cached)} / 总 ${fmt(total.total)} tokens ｜ ${total.cost > 0 ? fmtCost(total.cost) : '¥0.00'}`);
+    lines.push('');
+  }
+  return lines.join('\n');
 }
 
 // Windows 系统通知：本条回答结束后把精确消耗以 toast 弹出（系统层面，用户可见）。
@@ -1144,6 +1274,13 @@ function ensureNewModelPricing(pricing, stat) {
 function main() {
   const asHook = process.argv.includes('--hook');
   const asStop = process.argv.includes('--stop');
+  // v2.39：--report [all|<date>] —— 打印每日账本（今天分模型明细+合计；历史天同样明细+合计）。
+  // 纯文本输出，不影响 hooks 流程；无参=今天，all=全部天，也可指定日期。
+  if (process.argv.includes('--report')) {
+    const ri = process.argv.indexOf('--report');
+    process.stdout.write(reportTxt(process.argv[ri + 1] || '') + '\n');
+    return;
+  }
   // v2.24：--flush-delayed <sid> —— Stop 端 spawn 的 detached 后台 watcher 入口。
   // 延迟 DELAY_TOAST_MS 后复查本轮是否还有新调用：无新 → 弹整轮汇总一次并清除合并文件；
   // 有新（下一子回合在跑）→ 退出不弹（新 Stop 会重写合并文件并再起 watcher）。
@@ -1163,7 +1300,7 @@ function main() {
     const pricing = loadPricing();
     const agg = info.agg;
     const bal = balanceText();
-    showToast(toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), bal, todayDisplay(agg, pricing)), toastLine2(agg, pricing));
+    showToast(toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), bal, todayDisplay(agg, pricing, info.byModel)), toastLine2(agg, pricing));
     clearCoalesce(fSid);
     // v2.27：watcher 弹窗完成 = 专家团本轮真正结束 → 推进 lastStopAt（供 hook 端起点刷新守卫）
     const ws = loadSnapshot(fSid) || {};
@@ -1215,13 +1352,15 @@ function main() {
         // watcher 弹窗完成时推进（见 --flush-delayed）。
         // v2.28：判定专家团 = subCount>0 或 teamActive（子代理异步落盘，中途 Stop 时 subCount 可能
         // 为 0，但主 transcript 本轮已有 Agent/TeamCreate 调用 → 仍按专家团合并，避免误弹多次）。
+        // v2.39：本轮按模型分桶明细（每日账本"分模型"用，与 aggregateTranscript 同口径）
+        const byModel = aggregatePerModel(tsPath, roundStart0);
         if (agg.subCount > 0 || agg.teamActive) {
-          writeCoalesce(sid, agg, { tsPath, roundStart: roundStart0 });
+          writeCoalesce(sid, agg, { tsPath, roundStart: roundStart0, byModel });
           spawnFlushWatcher(sid);
         } else {
           saveSnapshot({ file: tsPath, stat: agg, lastUserMsgAt: roundStart0, lastStopAt: Date.now() }, sid);
           const bal = balanceText();
-          showToast(toastLine1(agg, modelShort, periodNote(agg, pricing), bal, todayDisplay(agg, pricing)), toastLine2(agg, pricing));
+          showToast(toastLine1(agg, modelShort, periodNote(agg, pricing), bal, todayDisplay(agg, pricing, byModel)), toastLine2(agg, pricing));
         }
         // v2.37：systemMessage 通道 WorkBuddy UI 实测不显示（无法注入到对话回复），删除该无效注入；
         // toast 已在上面弹出。保留空 hook 返回保证进程行为不变。
@@ -1366,4 +1505,12 @@ function main() {
     : (nmNote ? `${line}\n${nmNote}` : line));
 }
 
-main();
+// v2.39：被 require 时不执行 main()（hooks/手动仍走 node token-tracker.js，main 正常跑）；
+// 导出内部函数供测试/回填脚本复用同一套记账逻辑，避免逻辑复制漂移。
+if (require.main === module) main();
+module.exports = {
+  todayStr, loadDailyUsage, saveDailyUsage, recordUsage, dayTotalOf,
+  calcCost, findModel, isLocalModel, fmtCost, cleanModelName,
+  readTranscLines, extractUsage, perModelFromRows, aggregatePerModel,
+  todayDisplay, reportTxt, normalizeDailyUsage,
+};
