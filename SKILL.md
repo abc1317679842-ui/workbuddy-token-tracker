@@ -11,7 +11,7 @@ type: skill
 - **Windows 10/11**：系统通知（toast）仅 Windows 支持；macOS/Linux 可正常手动使用（方式 A），但不弹通知。
 - **Node.js ≥ 20**：脚本零依赖单文件，无需 npm install。
 
-## 当前功能总览（v2.39.1 · 2026-08-15）
+## 当前功能总览（v2.53 · 2026-08-15）
 
 > 本技能以 **Windows 系统通知（toast）** 为唯一展示通道：每次回答结束后，由 `Stop` 钩子读取本轮真实落盘数据，自动弹出本条消耗。以下是当前支持的全部能力：
 
@@ -27,6 +27,7 @@ type: skill
 - **快照自动清理**：`.snapshot-<sid>.json` 保留最近 30 天 + 最多 50 个，当前会话永不清。
 - **兜底通道**：`--hook`（UserPromptSubmit）在下一轮提交时把上一轮用量注入上下文；手动运行 `token-tracker.js --stop` 查看最近一轮。
 - **每日账本报告**：`node token-tracker.js --report [all|<日期>]` 输出每日分模型明细 + 当日合计（今天/历史任意天）；`--report summary [all|<日期>]` 只输出每天**总合计**（一行/天，不含模型明细）——快速看总数、省 token/缓存用。
+- **展示格式约束（v2.39.2，强制）**：`--report` 输出为 **Markdown 表格**（表头 + 每个模型一行 + 合计行加粗）。助手向用户展示账本数据时**必须**直接用该 Markdown 表格（聊天界面渲染为真表格列，天然对齐），**禁止**手排空格对齐、**禁止**转成纯文本再手工补位。原因：空格对齐依赖字体宽度，不同环境渲染必歪（用户反复纠正过的坑）。
 
 ## 安装与启用（新用户必读：装完必须配 hooks 才自动弹通知）
 从技能市场安装 = 文件拷入 skills 目录，**不会自动挂 hook**。请让 WorkBuddy 助手帮你把下面配置合并进 `settings.json`（或手动添加）：
@@ -116,6 +117,14 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 > **v2.39（2026-08-15，每日分模型账本 + 长期历史 + --report）**：用户需求——每天按模型记录（输入/输出/缓存命中/总 token/金额），多模型多行；每天还有一个不分模型的总合计；历史长期保存可查。改动：① `daily-usage.json` 结构升级为 `{日期:{models:{模型:{in,out,cached,total,cost}}, total:{in,out,cached,total,cost}}}`，**长期保存不裁剪**（原保留 7 天）；② `todayStr()` 改**本地日期**（原 UTC，UTC+8 用户凌晨 0–8 点跨天错位），`refresh-prices.js` 同步；③ Stop 记账：transcript 数据源按模型分桶（`perModelFromRows`/`aggregatePerModel`，与 `aggregateTranscript` 同口径），专家团 byModel 存进 coalesce 由 watcher 记账，trace 兜底按 stat.model 单桶，每轮只在最终落点记一次（复用现有防重）；④ 新增 `--report [all|<日期>]` 查看今日/历史每日明细+合计；⑤ `require.main===module` 守卫 + `module.exports`（测试/回填脚本复用同一套逻辑）；⑥ 旧格式 `{"date":金额}` 自动迁移。备份：`token-tracker.js.bak-20260815-v2.38`。验证：临时环境 Stop 分模型记账（两模型明细+合计精确）/二次 Stop 累加不覆盖/旧格式迁移/跨天新开桶旧天保留/flush-delayed byModel 记账/--report 全格式 全部通过；真实账本今日回填 673.5万 tokens 与 transcript 一致，旧 08-14 金额 14.14 迁移保留。
 
 > **v2.39.1（2026-08-15，--report summary 仅合计模式）**：用户要求"读前一天时只读最下面那行总数，别每次读一大堆"。新增 `--report summary [all|<日期>]`——只输出每天的总合计（一行/天，不含模型明细），助手/用户看总数只读这一行，省 token、省缓存占用；`--report`（明细版）行为不变。历史天结构确认：每天仅保留 `models`（各模型数量）+ `total`（合计），**不存每轮/每次会话明细**，文件本身就紧凑。
+
+> **v2.40~v2.49（2026-08-15，专家团"结束信号"逐个击穿与修复）**：v2.25 换 transcript 数据源后数字对了，但"专家团何时真正结束、该结算"成了新噩梦——每个版本修一个边界、下一个又被真实场景击穿。v2.40 watcher 结束信号只查主 transcript 最后一行 + 固定 6s 窗口 + mtime 均不可靠；v2.41 兜底超时改"空闲超时"（原固定 deadline 会误弹跑超 30 分钟仍活跃的任务）；v2.42 子代理活跃检测（mtime 判据后被击穿）；v2.43 语义化子代理判定（按 spawn vs completed/failed 通知，mtime 判据在子代理未发结束信号时会漏）；v2.44 子代理结束信号两种 + "死寂"检测（文件全停更超 60s）；v2.45 用户手动停止即时信号（`Interrupted by user`）；v2.46 中断标记有时只写在子代理文件、主 transcript 不写；v2.47 中文团队 spawn 失败（pending false-empty）+ 轮次后缀正则（`-3`/`-c1`）+ 子代理收尾确认；v2.48 确认期 10s→6s；v2.49 真正中断标记是 assistant role（排除 role=user 的摘要）、上下文压缩误触发修复。
+
+> **v2.50（2026-08-15，架构重写：增量记账，摆脱"判断任务结束"）**：v2.40~v2.49 证明"判断任务结束"这个前提本身不可靠——每个结束信号都能被真实场景击穿。v2.50 彻底放弃该思路，借鉴 WorkBuddy 自己的逐笔实时记账，改用**增量记账**：水位线 `.ledger-watermark.json`（`{sid:{main:已记账主 transcript 行数, subs:{子代理文件名:已记账行数}}}`）逐行累加 transcript 的 usage，每个子代理文件独立记录行数，**落盘一行记一行、绝不重复**；任务有没有结束不再影响记账正确性。
+
+> **v2.51~v2.53（2026-08-15，增量记账收尾边界）**：v2.51 修复"停太快无 usage"的 fall-through bug；v2.52 中断补偿（`estimateInterrupted`——被中断的不完整调用按最后一条完整调用的输入 + 推理文本长度估算）；v2.53 混合场景合并（同一轮既有完整调用 usage 又有被中断思考无 usage）+ 子代理文件被中断思考估算。
+
+> **诚实复盘（用户要求写清"为什么几次修复说烂了结果还是没修复"）**：两层根因——① v2.23/v2.24 在**错误数据源**（traces）上打补丁，专家团 token 根本不落盘 traces（真实在 transcript），弹窗次数调对了、数字差 147 倍；② v2.25 换对数据源后，"判断任务结束"成为不可靠前提，每个结束信号都被击穿，直到 v2.50 架构重写成增量记账才彻底摆脱。详见 README changelog「v2.40~v2.53」。
 
 - **Windows 系统通知（toast，标题两行大字 + 正文一行）**：调用 PowerShell WinRT Toast API 弹出（ToastText02，标题 text 内插 `&#10;` 换行符实现标题两行大字）
   ```
