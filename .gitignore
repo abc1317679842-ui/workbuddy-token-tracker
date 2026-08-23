@@ -7,6 +7,21 @@ daily-usage.json
 .ledger-watermark.json
 *.log
 
+# 运行时合并/锁/调试残留（本地生成，不入库）
+.coalesce-*.json
+.coalesce-*.json.lock
+.coalesce-*.json.watch-debug
+coalesce-*.json
+.transcript-*.jsonl
+.snapshot-dbg*.json
+.stop-probe*.json
+.stop-probe-*.json
+.watch-debug-*.jsonl
+.watch-debug-*.json
+
+# 账本备份（不入库，Git 历史即版本管理）
+daily-usage.json.bak-*
+
 # 本地版本备份（不入库，Git 历史即版本管理）
 token-tracker.js.bak-*
 token-tracker.js.v2.*
