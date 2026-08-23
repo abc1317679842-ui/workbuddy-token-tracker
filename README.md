@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v2.53.0-blue)
+![Version](https://img.shields.io/badge/version-v2.59.0-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -166,6 +166,29 @@ Windows 设置 → 系统 → 通知 → 应用通知
 本技能的 toast 使用**独立应用名「WorkBuddy Token Tracker」** 直接调用 Windows 系统通知 API 弹出，**不经过 WorkBuddy 客户端设置**——关闭 WorkBuddy 自带通知**不影响 Token 通知**。若想连 Token 通知一起关：在通知列表单独关闭「WorkBuddy Token Tracker」即可。
 
 ## 更新记录（Changelog）
+
+### v2.54~v2.59（2026-08-23）—— DeepSeek 官方定价直连 + 峰谷时段通用跟随 + 生效时间机制
+
+**v2.59（2026-08-23，当前版本）—— 生效时间机制落地：**
+- `isPeakHour(rules, now)`：新增时间注入参数（测试/模拟用）；优先读 `pricing.deepseek_rules`（官方时段 + 周末开关），**官方改任何时段/周末规则，判定自动跟随**；无规则回退内置默认（9-12/14-18 + 周末低峰）。
+- **生效时间分流（pending 机制）**：官方页面若标注"将于...起"（未来生效），解析出 `effective_at` 存 `deepseek_rules_pending`，**生效前当前规则不动**；到点自动提升为当前规则。示例：官方 8-22 预告"8-23 00:00 起周末统一低谷"，22 号当天仍按旧规则计费，23 号起自动切换。
+- **失败重试**：官方抓取失败立即重试（默认 2 次、间隔 60s，`DS_RETRIES`/`DS_RETRY_DELAY_MS` 可配），仍失败 → 非零退出 + `FAIL_REASON`，回落聚合源 + toast「官价⚠️」+ 输出"当前数据更新失败，排查原因"。
+
+**v2.59（2026-08-23）—— 官方定价直连抓取（新增 `deepseek-official.js`）：**
+- 直连 DeepSeek 官方定价页 `api-docs.deepseek.com/zh-cn/quick_start/pricing`，正则解析：模型清单 + 三组价格（缓存命中/未命中/输出 × 空闲/高峰）+ 时段 + 周末规则。
+- **官方优先**：DeepSeek 系模型官方清单有 → 用官方价（空闲价 + peak_multiplier=2）；官方没有（如已下线 V3 系列）→ 回落聚合源价。
+- **模型清单自动对齐**：官方有本地没有 → 自动新增；官方没有本地有 → 自动标 `retired:true`（历史账本保留、不再计费）。vision-exp 官方在售已自动收录。
+- 刷新流程：`refresh-prices.js` 每日先跑官方抓取器 → DeepSeek 系官方价；其余模型照旧聚合源；官方失败不中断整体刷新。
+
+**v2.54~v2.58（2026-08-18~23，此前已闭合）：**
+- 本地模型识别增强（v2.54~55）：localhost/127.0.0.1/局域网已知端口 → 本地模型免计费，防止本地模型撞云端同名误计费。
+- P0-1 回归修复（v2.59 含）：watcher compaction 期间 unknown 误弹（R1 回归）——`readTailRaw` 末行内容对比识别 transient unknown，改写中续等不弹、真停写才 6s 收口。
+- `--report` 展示约定固化 + `daily-usage.json` 顶层 `_instructions` 字段（v2.58）：读取方（AI 助手）直接读文件即见展示规则（Markdown 表格原文 / 中文数字简写 / 人民币 ¥）。
+
+**已知限制（当前版本）**：
+- **DeepSeek 第三方 API 无法区分**：价格以 DeepSeek 官方定价锚定；若通过第三方中转/聚合 API 调用同名 DeepSeek 模型，仍按官方价计费，无法自动识别第三方渠道实际价格。
+- 官方页面为 Docusaurus HTML，解析靠正则（官方改版可能需适配）；官方抓取失败时自动回落聚合源价并提示。
+- 本地非 DeepSeek 系模型价格仍由聚合源（llmabacus 等 5 源）维护，源缺失时保留上次价。
 
 ### v2.40~v2.53（2026-08-15）—— 专家团结算彻底修复 + 增量记账架构重写
 
