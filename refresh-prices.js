@@ -34,9 +34,11 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { spawnSync } = require('child_process');
 
 const WB = process.env.WB_ROOT || path.join(os.homedir(), '.workbuddy');
 const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
+const DS_OFFICIAL = process.env.DS_OFFICIAL || path.join(__dirname, 'deepseek-official.js'); // 可覆盖（测试/镜像）
 const TIMEOUT_MS = 12000;
 const DEFAULT_RATE = 7.2;
 const FORCE = process.argv.includes('--force');
@@ -50,7 +52,6 @@ const SOURCES = {
   portkey: { name: 'portkey(USD)', url: 'https://configs.portkey.ai/pricing/deepseek.json' },
 };
 
-// 本地 pricing.json 的 key → llm-prices-cn / llmabacus 的 id（归一化匹配兜不住的特殊映射）
 const SRC_ID_MAP = {
   'deepseek-v4-flash': 'deepseek-v4-flash',
   'deepseek-v4-pro': 'deepseek-v4-pro',
@@ -75,7 +76,7 @@ function todayStr() {
   const m = String(d.getMonth() + 1).padStart(2, '0');
   const dd = String(d.getDate()).padStart(2, '0');
   return `${d.getFullYear()}-${m}-${dd}`;
-} // v2.39：本地日期（与 token-tracker.js 一致，避免 UTC+8 凌晨错位）
+}
 
 function load() {
   try { return JSON.parse(fs.readFileSync(PRICING, 'utf-8')); }
@@ -87,17 +88,13 @@ function save(p) {
   fs.writeFileSync(PRICING, JSON.stringify(p, null, 2) + '\n');
 }
 
-// 名称归一化：小写 + 去所有非字母数字（glm-5-2 → glm52；glm5.2 → glm52）
 function norm(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
 
 async function fetchJson(url) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   try {
-    const res = await fetch(url, {
-      signal: ctrl.signal,
-      headers: { 'User-Agent': 'token-usage-tracker/2.2 (WorkBuddy skill)' },
-    });
+    const res = await fetch(url, { signal: ctrl.signal, headers: { 'User-Agent': 'token-usage-tracker/2.2 (WorkBuddy skill)' } });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   } finally {
@@ -113,7 +110,6 @@ function median(arr) {
   return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
 }
 
-// ===== 源 A：llmabacus（国内主源，人民币；含 vendors country/currency） =====
 function parseLlma(j) {
   const vendors = {};
   for (const v of (j.vendors || [])) vendors[v.id] = { country: v.country, currency: v.currency };
@@ -122,17 +118,11 @@ function parseLlma(j) {
     const inP = Number(m.inputPrice), outP = Number(m.outputPrice);
     if (!(inP >= 0 && outP >= 0)) continue;
     const cached = m.cachedInputPrice != null ? Number(m.cachedInputPrice) : null;
-    models[m.id] = {
-      in: inP, out: outP, cached,
-      vendorId: m.vendorId,
-      country: (vendors[m.vendorId] || {}).country || null,
-      currency: (vendors[m.vendorId] || {}).currency || null,
-    };
+    models[m.id] = { in: inP, out: outP, cached, vendorId: m.vendorId, country: (vendors[m.vendorId] || {}).country || null, currency: (vendors[m.vendorId] || {}).currency || null };
   }
   return models;
 }
 
-// ===== 源 B：llm-prices-cn（国内备份源，人民币） =====
 function parseLlc(j) {
   const out = {};
   for (const m of (j.models || [])) {
@@ -145,7 +135,6 @@ function parseLlc(j) {
   return out;
 }
 
-// ===== 源 C：OpenRouter（USD/token → USD/1M） =====
 function parseOr(j) {
   const out = {};
   for (const m of (j.data || [])) {
@@ -157,7 +146,6 @@ function parseOr(j) {
   return out;
 }
 
-// ===== 源 D：LiteLLM（USD/token → USD/1M） =====
 function parseLitellm(j) {
   const out = {};
   for (const key of Object.keys(j)) {
@@ -171,7 +159,6 @@ function parseLitellm(j) {
   return out;
 }
 
-// ===== 源 E：Portkey（美分/token → ×1e4 = USD/1M） =====
 function parsePortkey(j) {
   const out = {};
   for (const key of Object.keys(j)) {
@@ -197,7 +184,6 @@ function usdFind(usdIndex, localKey, orId, localNorm) {
   return null;
 }
 
-// 在人民币源索引里找模型：先 srcId（归一化），再精确，再包含
 function cnFind(cnIndex, srcId, localNorm) {
   if (!cnIndex) return null;
   if (srcId && cnIndex[srcId]) return cnIndex[srcId];
@@ -209,6 +195,23 @@ function cnFind(cnIndex, srcId, localNorm) {
 }
 
 async function main() {
+  let officialOk = false;
+  let official = null;
+  if (!NO_NET) {
+    try {
+      const sp = spawnSync(process.execPath, [DS_OFFICIAL], { encoding: 'utf-8', timeout: 120000, env: { ...process.env, DS_RETRIES: '0' } });
+      if (sp.status === 0) {
+        const j = JSON.parse(sp.stdout);
+        if (j.ok && j.official) { official = j; officialOk = true; }
+      } else {
+        const reason = (sp.stderr.match(/FAIL_REASON=([^\n]+)/) || [])[1] || sp.stderr.trim().slice(0, 200);
+        process.stderr.write(`[refresh-prices] DeepSeek 官方定价抓取失败（回落聚合源）: ${reason || '未知'}\n`);
+      }
+    } catch (e) {
+      process.stderr.write(`[refresh-prices] DeepSeek 官方抓取器执行异常（回落聚合源）: ${e.message}\n`);
+    }
+  }
+
   let pricing;
   try { pricing = load(); }
   catch (e) { process.stderr.write(`[refresh-prices] ${e.message}\n`); process.exit(1); }
@@ -219,7 +222,6 @@ async function main() {
     return;
   }
 
-  // 并行拉 5 源
   const results = NO_NET
     ? Object.fromEntries(Object.keys(SOURCES).map((k) => [k, { ok: false, err: 'WB_NO_NET=1' }]))
     : await Promise.all(Object.entries(SOURCES).map(async ([k, s]) => {
@@ -235,7 +237,6 @@ async function main() {
   const cnOk = (results.llma.ok || results.llc.ok);
   const usdOk = (results.or.ok || results.litellm.ok || results.portkey.ok);
 
-  // 全源失败 → 写错误标记，date 不变（次日重试），token-tracker 会 toast 提示
   if (okCount === 0) {
     const errMsg = Object.entries(results).map(([k, r]) => `${SOURCES[k].name}: ${r.err || '?'}`).join('；');
     pricing.last_refresh_error = `所有价格源拉取失败（${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}）：${errMsg}`;
@@ -245,7 +246,6 @@ async function main() {
     process.exit(1);
   }
 
-  // 解析各源
   const llma = results.llma.ok ? parseLlma(results.llma.data) : null;
   const llc = results.llc.ok ? parseLlc(results.llc.data) : null;
   const or = results.or.ok ? parseOr(results.or.data) : null;
@@ -261,20 +261,17 @@ async function main() {
   for (const key of Object.keys(models)) {
     const m = models[key];
     if (!m || typeof m !== 'object') continue;
-
     const localNorm = norm(key);
     const srcId = SRC_ID_MAP[key] || null;
     const llmaHit = llma ? cnFind(llma, srcId, localNorm) : null;
     const llcHit = llc ? cnFind(llc, srcId, localNorm) : null;
 
-    // region 推断：模型无 region 字段时，优先用 llmabacus vendors country（US→US，其余→CN）
     if (!m.region) {
       if (llmaHit && llmaHit.country === 'US') m.region = 'US';
-      else m.region = 'CN'; // 默认国内（现有模型均为国产）
+      else m.region = 'CN';
       regionSet++;
     }
 
-    // USD 参考价：三 USD 源中位数（所有模型都更新）
     const usdIn = median(usdSources.map((u) => usdFind(u, key, m.or_id, localNorm)?.usdIn));
     const usdOut = median(usdSources.map((u) => usdFind(u, key, m.or_id, localNorm)?.usdOut));
     if (usdIn != null && usdOut != null) {
@@ -284,9 +281,19 @@ async function main() {
     }
 
     if (m.region === 'CN') {
-      // 国内模型：人民币主价优先国内源（llmabacus → llm-prices-cn）
       const cnHit = llmaHit || llcHit;
-      if (cnHit) {
+      const officialBlk = officialOk && official.official[key];
+      if (officialBlk) {
+        m.input_price = officialBlk.input_price;
+        m.cached_price = officialBlk.cached_price;
+        m.output_price = officialBlk.output_price;
+        m.peak_multiplier = officialBlk.peak_multiplier || 2;
+        m.price_source = 'deepseek官方';
+        delete m.auto_converted;
+        delete m.retired;
+        updatedMain++;
+      } else if (m.lock === true) {
+      } else if (cnHit) {
         const oldIn = m.input_price, oldOut = m.output_price;
         m.input_price = cnHit.in;
         m.output_price = cnHit.out;
@@ -294,14 +301,12 @@ async function main() {
         m.price_source = llmaHit ? 'llmabacus(国内)' : 'llm-prices-cn(国内)';
         delete m.auto_converted;
         updatedMain++;
-        // 峰谷模型价差大 → 提示核验
         if (typeof m.peak_multiplier === 'number' && m.peak_multiplier > 1) {
           const dIn = oldIn ? Math.abs(m.input_price - oldIn) / oldIn : 0;
           const dOut = oldOut ? Math.abs(m.output_price - oldOut) / oldOut : 0;
           if (dIn > 0.6 || dOut > 0.6) bigDiff.push(`${key}(±${Math.max(dIn, dOut).toFixed(0)}%)`);
         }
       } else if (m.auto_converted === true) {
-        // 国内源也没有 → 原本是估算价的才用 USD 换算兜底
         if (usdIn != null && usdOut != null) {
           m.input_price = Number((usdIn * rate).toFixed(2));
           m.output_price = Number((usdOut * rate).toFixed(2));
@@ -310,9 +315,7 @@ async function main() {
           autoConverted++;
         }
       }
-      // 非估算模型且国内源无 → 保留本地人工/官方价
     } else {
-      // 国外模型：人民币主价 = USD 源 × 汇率（国外定价）
       if (usdIn != null && usdOut != null) {
         m.input_price = Number((usdIn * rate).toFixed(2));
         m.output_price = Number((usdOut * rate).toFixed(2));
@@ -335,7 +338,12 @@ async function main() {
     const r = results[k];
     noteParts.push(`${s.name}${r.ok ? '✓' : `✗(${r.err || '?'})`}`);
   }
-  pricing.last_refresh_note = `${new Date().toISOString()} 多源刷新：${noteParts.join(' | ')}；人民币主价更新 ${updatedMain} 个${autoConverted ? `，USD换算 ${autoConverted} 个` : ''}，USD参考 ${usdUpdated} 个，region 设定 ${regionSet} 个（汇率 ${rate}）${bigDiff.length ? `；⚠️峰谷模型价差>60%需核验：${bigDiff.join('、')}` : ''}`;
+  if (officialOk && official) {
+    delete pricing.deepseek_refresh_error;
+  } else {
+    pricing.deepseek_refresh_error = `DeepSeek 官方定价抓取失败（${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}），DeepSeek 系价格沿用本地/聚合源价`;
+  }
+  pricing.last_refresh_note = `${new Date().toISOString()} 多源刷新：${noteParts.join(' | ')}；人民币主价更新 ${updatedMain} 个${autoConverted ? `，USD换算 ${autoConverted} 个` : ''}，USD参考 ${usdUpdated} 个，region 设定 ${regionSet} 个（汇率 ${rate}）${bigDiff.length ? `；⚠️峰谷模型价差>60%需核验：${bigDiff.join('、')}` : ''}${officialOk ? '；DeepSeek官方价✓' : '；DeepSeek官方价✗(回落聚合源)'}`;
 
   try { save(pricing); }
   catch (e) { process.stderr.write(`[refresh-prices] 写入失败: ${e.message}\n`); process.exit(1); }
