@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// token-usage-tracker v2.59 (2026-08-23)
 // token-tracker.js — 读取 WorkBuddy 最新 trace 的真实 token / 耗时。
 // 数据来源：~/.workbuddy/traces/<pid>/trace_*.json 中的 trace.modelInfo / trace.duration
 // （WorkBuddy 每轮 LLM 调用结束都会落盘成一个新 trace 文件，但 UI 不显示，这里把它读出来）。
@@ -86,6 +87,7 @@ function writeCoalesce(sid, agg, meta) {
     if (meta.tsPath) payload.tsPath = meta.tsPath;         // v2.25：transcript 数据源（watcher 复查用）
     if (meta.roundStart) payload.roundStart = meta.roundStart;
     if (meta.byModel) payload.byModel = meta.byModel;       // v2.39：专家团按模型分桶明细（watcher 记账用）
+    if (meta.terminalError) payload.terminalError = meta.terminalError; // v2.57：主模型终态错误标记（429/5xx/timeout），供 watcher 首查感知
   }
   try { fs.writeFileSync(coalescePath(sid), JSON.stringify(payload)); }
   catch (e) { process.stderr.write(`[token-tracker] 合并文件写入失败: ${e.message}\n`); }
@@ -109,6 +111,14 @@ const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
 const MODELS_CFG = path.join(WB, 'models.json'); // 自定义 API 配置（含 apiKey），仅 DeepSeek 官方模型启用余额显示
 const BALANCE_CACHE = path.join(WB, 'skills', 'token-usage-tracker', '.balance.json');
 const DAILY_USAGE_FILE = path.join(WB, 'skills', 'token-usage-tracker', 'daily-usage.json'); // v2.39：每日账本（按本地日期分桶，{日期:{models:{模型:{in,out,cached,total,cost}}, total:{...}}}，长期保存不裁剪）
+// v2.59：写入 daily-usage.json 顶层的「读取方指令」，AI 直接读文件即可看到展示要求，无需翻技能说明。
+// 仅作读取参考，展示给用户时务必剥离本字段（见 normalizeDailyUsage 跳过逻辑）。
+const DAILY_INSTRUCTIONS = {
+  _comment: '本字段仅供读取方（AI助手）参考，向用户展示时请勿包含本字段',
+  show_table: '向用户展示以上账本时，必须使用 Markdown 表格原文（完整 7 列：模型、输入、输出、缓存、缓存命中、总 token、金额），不要手排、不要转纯文本、不要汇总',
+  number_format: '数字用中文简写展示，如 10000 显示为 1万，1000000 显示为 100万，保留合适精度',
+  currency: '成本字段 cost 单位为人民币，展示时使用 ¥ 符号，无需换算'
+};
 const LEDGER_WATERMARK_FILE = path.join(WB, 'skills', 'token-usage-tracker', '.ledger-watermark.json'); // v2.50：增量记账水位线（{sid:{main:已记账主transcript行数, subs:{子代理文件名:已记账行数}}}）
 const BALANCE_TTL_MS = 15 * 1000; // 余额缓存 15 秒（v2.18 从 60s 压短：用户要求实时，接口实测 300ms 级；正常轮询间隔 >15s 即每轮拿实时数，15s 内连发才复用）
 // 积分/自定义 API 模式识别（v2.10）：官方文档证实内置模型列表就有 deepseek-v4-flash（与自定义 id 同名），
@@ -307,6 +317,52 @@ function extractUsage(u) {
   if (Array.isArray(det)) { for (const d of det) { if (d && d.cached_tokens) cached += d.cached_tokens; } }
   else if (det && typeof det === 'object') cached = det.cached_tokens || 0;
   return { in: inT, out: outT, cached };
+}
+
+// v2.57（第一阶段修复）：从 transcript 整行提取 usage，兼容三个实际存在的数据位点：
+//   providerData.usage（camelCase，主路径）、providerData.rawUsage（实测承载 raw 计费 usage，
+//   含 snake_case 的 total_tokens 等）、message.usage（function_call 行的 usage 有时只落在这里）。
+// 不改变现有增量记账体系（记账仍以 providerData.usage 为主，raw/message 作为兼容补充），
+// 只修复"usage 只存在于 rawUsage/message.usage 时提取不到"的兼容性问题（本次 429 会话实测：
+// 大量 hy3 function_call 行 usage 只在 rawUsage，主路径 providerData.usage 为 null）。
+function extractUsageFromRow(r) {
+  if (!r || typeof r !== 'object') return null;
+  const pd = r.providerData || {};
+  return extractUsage(pd.usage) || extractUsage(pd.rawUsage) || extractUsage(r.message && r.message.usage) || null;
+}
+
+// v2.57（第一阶段修复）：主模型终态错误判定——仅当有"明确的错误证据"才算 terminal-error。
+// 判据（本次 Bug 会话实测）：末行 role=assistant + status=incomplete 本身不算终态
+// （思考途中被中断的 incomplete 无 error 是常态，绝不能误弹）；
+// 必须结合 providerData.error 存在且 status 命中 429 / 5xx / timeout / 明确的 error 信息，
+// 或 role=assistant 且 status=incomplete + error.status 为上述之一。
+// 注意：status=incomplete 单独出现（无 error）返回 false（合法未知/被中断，等待后续行）。
+function terminalErrorFromRow(r) {
+  if (!r || typeof r !== 'object') return null;
+  if (r.role !== 'assistant' && r.type !== 'message') return null; // 只看主模型末行
+  const pd = r.providerData || {};
+  const err = (pd && pd.error) || (r.error) || null;
+  if (!err || typeof err !== 'object') return null;
+  const s = String(err.status || err.code || '').toLowerCase();
+  if (s.startsWith('429') || /^5\d\d/.test(s)) return `http-${s}`;
+  if (s === 'timeout' || /timeout|rate.?limit|overload|server.?error|internal.?error|quota/i.test(String(err.type || err.message || ''))) return s || 'error';
+  return null;
+}
+// 主 transcript 末行是否为明确的终态错误（供 watcher / Stop 判定复用同一口径）。
+function terminalError(tsPath) {
+  const r = lastTranscLine(tsPath);
+  if (!r) return null;
+  const te = terminalErrorFromRow(r);
+  if (te) return te;
+  // 兜底顺带排查：末行前 1 行（Stop 触发时 429 末行可能还没完全落盘，但前一行已是错误行）
+  if (r.type !== 'message') {
+    const rows = readTranscLines(tsPath);
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const te2 = terminalErrorFromRow(rows[i]);
+      if (te2) return te2;
+    }
+  }
+  return null;
 }
 
 // 从 Stop payload 拿主 transcript 路径（payload.transcript_path；兼容 .json / 实际落盘 .jsonl）
@@ -539,17 +595,36 @@ function lastTranscLine(tsPath) {
   } catch (e) { /* 文件不可读 */ }
   return null;
 }
+// v2.59/P0-1：读 transcript 文件【原始末行】（不做 JSON.parse），用于识别 compaction 重写中的
+// transient unknown。compaction 是覆盖末行的截断重写，原始末行会持续抖动；真结束静默时末行不变。
+function readTailRaw(tsPath) {
+  try {
+    const fd = fs.openSync(tsPath, 'r');
+    const sz = fs.fstatSync(fd).size;
+    if (sz <= 0) { fs.closeSync(fd); return ''; }
+    const buf = Buffer.alloc(sz > 4096 ? 4096 : sz);
+    fs.readSync(fd, buf, 0, buf.length, sz - buf.length);
+    fs.closeSync(fd);
+    const lines = buf.toString('utf-8').split('\n').map((s) => s.trim()).filter(Boolean);
+    return lines.length ? lines[lines.length - 1] : '';
+  } catch (e) { return ''; }
+}
 function mainModelState(tsPath) {
   const r = lastTranscLine(tsPath);
   if (!r) return 'unknown';
   const t = r.type;
+  // v2.57（第一阶段修复）：终态错误优先——末行携带明确错误（429/5xx/timeout/明确 error）→
+  // 主模型已经坏掉，本轮不可能再续跑，直接返回 'terminal-error'（watcher 据此走确认期收口）。
+  // status=incomplete 单独出现（无 error）不算终态（可能是被中断/思考途中，等待后续行）。
+  const te = terminalErrorFromRow(r);
+  if (te) return 'terminal-error';
   // 工具调用（含团队派活、TaskOutput 等结果、ToolSearch 等内部）→ 主模型还在循环，绝不弹
   if (t === 'function_call') return 'busy';
   // 子代理结果刚回传 → 主模型马上要继续，绝不弹
   if (t === 'function_call_result') return 'busy';
   // 主模型的回复（assistant message，带真实 usage）→ 候选最终回复
   if (t === 'message') {
-    const u = extractUsage((r.providerData || {}).usage) || extractUsage((r.message || {}).usage);
+    const u = extractUsageFromRow(r);
     if (u && r.role !== 'user') return 'final';
     if (r.role === 'user') return 'busy'; // 用户/子代理回传消息 → 主模型即将继续
   }
@@ -900,10 +975,62 @@ function findModel(pricing, modelName) {
   return best;
 }
 
-// 本地/自定义模型识别：custom-local: 前缀或 localhost/127.0.0.1 端点 → 本地免费，不计费
+// 本地模型集合（v2.54，2026-08-18）：从 WorkBuddy models.json 读取 url 指向 localhost/127.0.0.1 的模型。
+// 本地部署（Ollama / LM Studio / llama.cpp 等）的模型名往往不含标识（如 qwen3.8-27b 会与云端同名），
+// 但 models.json 里 url 明确指向本地 → 一律免费、只统计 token 不计费。
+// 主流本地模型服务的固定端口（host 为本机时无需端口匹配；局域网 IP 访问时要求端口命中）。
+//   Ollama:11434 / LM Studio:1234 / llama.cpp·llamafile·LocalAI:8080 / vLLM:8000 / Jan:1337 /
+//   GPT4All:4891 / koboldcpp·oobabooga:5000·5001 / TabbyAPI:5000
+const LOCAL_MODEL_PORTS = new Set([11434, 1234, 8080, 8000, 1337, 4891, 5000, 5001]);
+
+function isLocalHost(host) {
+  const h = String(host || '').toLowerCase();
+  return h === 'localhost' || h === '127.0.0.1' || h === '0.0.0.0' || h === '::1' || h === '[::1]';
+}
+
+function isLanIp(host) {
+  const h = String(host || '').toLowerCase();
+  return /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h);
+}
+
+let _localModelNames = null;
+function localModelNames() {
+  if (_localModelNames) return _localModelNames;
+  const set = new Set();
+  try {
+    const cfgPath = path.join(WB, 'models.json');
+    if (fs.existsSync(cfgPath)) {
+      const arr = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+      for (const m of Array.isArray(arr) ? arr : []) {
+        let local = false;
+        const urlStr = String(m.url || '').toLowerCase();
+        try {
+          const u = new URL(urlStr);
+          const port = u.port ? Number(u.port) : null;
+          if (isLocalHost(u.hostname)) local = true;                                             // 本机 → 无条件本地
+          else if (isLanIp(u.hostname) && port && LOCAL_MODEL_PORTS.has(port)) local = true;     // 局域网 + 已知本地端口
+        } catch (e) {
+          local = urlStr.includes('localhost') || urlStr.includes('127.0.0.1');                   // URL 解析失败兜底
+        }
+        if (local) {
+          if (m.id) set.add(String(m.id).toLowerCase());
+          if (m.name) set.add(String(m.name).toLowerCase());
+        }
+      }
+    }
+  } catch (e) { /* models.json 不可读时不豁免，保持原行为 */ }
+  _localModelNames = set;
+  return set;
+}
+
+// 本地/自定义模型识别：custom-local: 前缀 / localhost/127.0.0.1 端点 / models.json 中 url 指向本地的模型 → 本地免费，不计费
 function isLocalModel(name) {
   const n = String(name || '').toLowerCase();
-  return n.includes('custom-local') || n.includes('localhost') || n.includes('127.0.0.1');
+  if (n.includes('custom-local') || n.includes('localhost') || n.includes('127.0.0.1')) return true;
+  for (const lm of localModelNames()) {
+    if (n === lm || n.includes(lm) || lm.includes(n)) return true;
+  }
+  return false;
 }
 
 // 模型显示名清理：去掉 provider 前缀与组织前缀（custom-local:qwen/qwen3.6-35b-a3b → qwen3.6-35b-a3b）
@@ -917,8 +1044,48 @@ function cleanModelName(name) {
 }
 
 // 高峰时段（北京时间，本地时区即北京）：9:00-12:00、14:00-18:00，价格翻倍
-function isPeakHour() {
-  const h = new Date().getHours();
+// 峰谷时段判定（北京时间，v2.59 适配 2026-08-23 DeepSeek 新规：周末全天统一空闲价）
+// 时段来源（v2.59 通用跟随）：优先读 pricing.deepseek_rules（refresh 每日从官方页解析写入）——
+//   peak_schedule：官方高峰时段原文，如 "9:00 - 12:00、14:00 - 18:00"，官方调整时段则本地自动跟随；
+//   weekend_off_peak：官方是否声明"周末统一低谷"，官方取消/改规则则自动跟随；
+//   无 rules（抓取失败/旧数据）→ 回退内置默认（9-12/14-18 + 周末低峰）。
+// 返回布尔：当前时刻是否处于高峰时段。
+function parsePeakSchedule(sched) {
+  // 支持 "9:00 - 12:00、14:00 - 18:00" / "9:00-12:00,14:00-18:00" 等
+  const ranges = [];
+  const parts = String(sched || '').split(/[、,，;；]/).map((s) => s.trim()).filter(Boolean);
+  for (const p of parts) {
+    const m = p.match(/(\d{1,2}):?(\d{2})?\s*[-–—~至到]\s*(\d{1,2}):?(\d{2})?/);
+    if (!m) continue;
+    const sH = Number(m[1]), eH = Number(m[3]);
+    if (isNaN(sH) || isNaN(eH)) continue;
+    ranges.push({ s: sH, e: eH });
+  }
+  return ranges;
+}
+function isPeakHour(rules, now) {
+  const t = now || new Date();
+  const day = t.getDay();
+  const h = t.getHours() + t.getMinutes() / 60;
+  // 有官方规则 → 完全按官方来（通用跟随：官方改任何时段/周末规则都自动生效）
+  if (rules && typeof rules === 'object') {
+    const weekendOff = rules.weekend_off_peak === true || rules.weekend_off_peak === 'true';
+    if (weekendOff && (day === 0 || day === 6)) return false; // 官方声明周末统一低谷
+    const ranges = parsePeakSchedule(rules.peak_schedule);
+    if (ranges.length) {
+      for (const r of ranges) {
+        // 区间为小时数（0-24）；跨午夜区间（s>e）按 23:59 封顶处理简化（官方当前无跨午夜档）
+        if (r.e <= r.s) continue;
+        if (h >= r.s && h < r.e) return true;
+      }
+      return false;
+    }
+    // rules 存在但时段解析不出 → 回退内置默认（但保留周末开关）
+    if (day === 0 || day === 6) return false;
+    return (h >= 9 && h < 12) || (h >= 14 && h < 18);
+  }
+  // 无 rules → 内置默认（v2.59 周末低峰兜底）
+  if (day === 0 || day === 6) return false;
   return (h >= 9 && h < 12) || (h >= 14 && h < 18);
 }
 
@@ -929,8 +1096,13 @@ function calcCost(stat, pricing) {
   const hit = findModel(pricing, stat.model || 'deepseek-v4-flash');
   if (!hit) return null;
   const m = hit.m;
-  // 峰谷倍率：显式声明了才翻倍（DeepSeek 原厂系=2），未声明默认无峰谷，避免高峰误翻倍
-  const mult = isPeakHour() ? (typeof m.peak_multiplier === 'number' ? m.peak_multiplier : 1) : 1;
+  // 峰谷倍率：DeepSeek 系（不论后缀）统一执行峰谷规则 + 周末低峰（v2.59 用户规则）。
+  // 判定：模型名含 'deepseek' 即强制套用峰谷倍率（peak_multiplier 缺省按 2），
+  // 再经 isPeakHour()（已含周末→全天×1）；非 DeepSeek 系维持原行为：显式声明 peak_multiplier 才翻倍。
+  const isDeepSeek = /(^|[\/\-_])deepseek/i.test(String(stat.model || ''));
+  const peakMult = isDeepSeek ? (typeof m.peak_multiplier === 'number' ? m.peak_multiplier : 2) : (typeof m.peak_multiplier === 'number' ? m.peak_multiplier : 1);
+  // 时段判定跟随官方 deepseek_rules（通用：官方调时段/周末规则自动生效）
+  const mult = isPeakHour(pricing.deepseek_rules) ? peakMult : 1;
   const cached = stat.cached || 0;
   const uncached = Math.max(0, (stat.in || 0) - cached);
   const cost = (uncached / 1e6) * (m.input_price || 0) * mult
@@ -948,24 +1120,32 @@ function fmtCost(cost) {
 // ===== 每日账本 v2.39（2026-08-15，长期保存 + 分模型明细 + 当日合计）=====
 // daily-usage.json 结构：
 //   { "<YYYY-MM-DD>": {
-//       "models": { "<模型名>": { "in", "out", "cached", "total", "cost" } },   // 单个模型当天累计
-//       "total":  { "in", "out", "cached", "total", "cost" }                     // 不分模型的当日总合计
+//       "models": { "<模型名>": { "in", "out", "cached", "hit", "total", "cost" } },   // 单个模型当天累计；hit = 缓存命中率%（两位小数，cached/in）
+//       "total":  { "in", "out", "cached", "hit", "total", "cost" }                     // 不分模型的当日总合计；hit 同样为总命中率%
 //     } }
 // - 按自然日（本地时间，修正 v2.32 用 UTC 导致的凌晨跨天错位）分桶，长期保存不裁剪。
 // - 每天保留两套统计：models 各模型明细 + total 总合计（用户需求：两个总的统计）。
 // - 旧格式（v2.32，{"date": 金额}）首次读取时自动迁移。
+// 缓存命中率（缓存命中 / 总输入，两位小数百分比，口径与 toast「缓存NN.NN%」一致）
+function hitRate(inTok, cachedTok) {
+  const denom = inTok || 0;
+  if (!(denom > 0)) return 0;
+  return Math.round((cachedTok / denom) * 10000) / 100; // 保留两位小数
+}
 function dayTotalOf(models) {
   const t = { in: 0, out: 0, cached: 0, total: 0, cost: 0 };
   for (const m of Object.values(models || {})) {
     t.in += m.in || 0; t.out += m.out || 0; t.cached += m.cached || 0; t.total += m.total || 0;
     t.cost += m.cost || 0;
   }
+  t.hit = hitRate(t.in, t.cached);
   return t;
 }
 function normalizeDailyUsage(d) {
   if (!d || typeof d !== 'object' || Array.isArray(d)) return {};
   const out = {};
   for (const [date, v] of Object.entries(d)) {
+    if (date === '_instructions') continue; // v2.59：跳过读取方指令字段，不当作日期键
     if (v && typeof v === 'object' && !Array.isArray(v)) {
       const models = v.models || {};
       out[date] = { models, total: v.total || dayTotalOf(models) }; // 新结构：缺 total 补算
@@ -981,7 +1161,9 @@ function loadDailyUsage() {
 function saveDailyUsage(d) {
   try {
     fs.mkdirSync(path.dirname(DAILY_USAGE_FILE), { recursive: true });
-    fs.writeFileSync(DAILY_USAGE_FILE, JSON.stringify(d, null, 2)); // 缩进便于人工查看/汇报
+    // v2.59：每次保存都注入/保留顶层 _instructions 读取方指令，避免被数据覆盖或丢失。
+    const merged = Object.assign({ _instructions: DAILY_INSTRUCTIONS }, d);
+    fs.writeFileSync(DAILY_USAGE_FILE, JSON.stringify(merged, null, 2)); // 缩进便于人工查看/汇报
   } catch (e) { process.stderr.write(`[token-tracker] 账本写入失败: ${e.message}\n`); }
 }
 // 把一条 stat（单模型）累加进某天的 models，并重算该日 total（保证总合计永远=各模型之和）
@@ -990,6 +1172,7 @@ function addModelUsage(day, model, stat, pricing) {
   const cost = calcCost(Object.assign({ model: name }, stat), pricing);
   const m = day.models[name] || (day.models[name] = { in: 0, out: 0, cached: 0, total: 0, cost: 0 });
   m.in += stat.in || 0; m.out += stat.out || 0; m.cached += stat.cached || 0; m.total += stat.total || 0;
+  m.hit = hitRate(m.in, m.cached);
   if (cost != null) m.cost += cost;
   day.total = dayTotalOf(day.models);
 }
@@ -1099,10 +1282,12 @@ function reportTxt(arg) {
     // Markdown 表格输出（v2.39.2）：聊天界面渲染真表格列，天然对齐，不依赖空格/字体宽度
     const cells = (s, bold) => {
       const f = (v) => (bold ? `**${v}**` : v);
-      return `| ${f(s.label)} | ${f(fmt(s.in))} | ${f(fmt(s.out))} | ${f(fmt(s.cached))} | ${f(fmt(s.total))} | ${f(s.cost > 0 ? fmtCost(s.cost) : '¥0.00')} |`;
+      // hit 列：优先读已存字段，旧数据兜底现算；两位小数 %
+      const hit = (s.hit != null ? s.hit : (s.in > 0 ? hitRate(s.in, s.cached) : 0)).toFixed(2) + '%';
+      return `| ${f(s.label)} | ${f(fmt(s.in))} | ${f(fmt(s.out))} | ${f(fmt(s.cached))} | ${f(hit)} | ${f(fmt(s.total))} | ${f(s.cost > 0 ? fmtCost(s.cost) : '¥0.00')} |`;
     };
-    lines.push('| 模型 | 输入 | 输出 | 缓存 | 总 token | 金额 |');
-    lines.push('| --- | --- | --- | --- | --- | --- |');
+    lines.push('| 模型 | 输入 | 输出 | 缓存 | 缓存命中 | 总 token | 金额 |');
+    lines.push('| --- | --- | --- | --- | --- | --- | --- |');
     if (!names.length) {
       // 仅有金额合计（旧格式迁移天）：直接输出合计行
       lines.push(cells({ label: '合计', in: total.in, out: total.out, cached: total.cached, total: total.total, cost: total.cost }, true));
@@ -1110,6 +1295,12 @@ function reportTxt(arg) {
       for (const n of names) lines.push(cells({ label: n, ...models[n] }, false));
       lines.push(cells({ label: '合计', ...total }, true));
     }
+    // v2.58（2026-08-22）：展示约定固化的提示行——每次 --report 读数据，最下面这行字直接告诉
+    // 调用方（AI 助手）"向用户展示账本必须用上面的 Markdown 表格原文"，无需再翻技能规定。
+    // 固定贴在最底部（合计行之后），任何日期档都输出。
+    // v2.59：与 daily-usage.json 顶层 _instructions 保持同一套要求（表格原文 7 列 / 中文简写 / 人民币 ¥），避免 AI 看到两套说法。
+    // 本行仅作读取参考，展示给用户时务必剥离。
+    lines.push('> 【读取方指令】向用户展示以上账本时，必须使用 Markdown 表格原文（完整 7 列：模型、输入、输出、缓存、缓存命中、总 token、金额），不要手排、不要转纯文本、不要汇总；数字用中文简写（10000→1万，1000000→100万）；cost 单位为人民币，用 ¥ 符号，无需换算。本行仅供读取方参考，向用户展示请勿包含本行。');
     lines.push('');
   }
   return lines.join('\n');
@@ -1211,7 +1402,7 @@ function periodNote(stat, pricing) {
   if (!hit) return '';
   const m = hit.m;
   const mult = typeof m.peak_multiplier === 'number' ? m.peak_multiplier : 1;
-  if (isPeakHour() && mult > 1) {
+  if (isPeakHour(pricing.deepseek_rules) && mult > 1) {
     // 高峰标注写清倍数：2 倍显示「高峰双倍」，其他倍数显示「高峰×N」
     return mult === 2 ? '高峰双倍' : `高峰×${mult}`;
   }
@@ -1291,6 +1482,10 @@ function toastLine2(stat, pricing) {
   // v2.31：价格多源拉取全失败 → 提示「价⚠️」，表示费用按上次价格估算（refresh-prices.js 全源失败时写入 last_refresh_error）
   if (pricing && pricing.last_refresh_error) {
     line += '｜价⚠️';
+  }
+  // v2.59：DeepSeek 官方定价抓取失败（回落聚合源）→ 提示「官价⚠️」，表示 DeepSeek 系按本地/聚合源价估算
+  if (pricing && pricing.deepseek_refresh_error) {
+    line += '｜官价⚠️';
   }
   // 宽度保护：超宽丢缓存占比，保住价格与核心数字（高峰标注已移至行1，行2 不再有溢出风险）
   if (dispWidth(line) > TOAST_LINE_MAX_W) {
@@ -1590,28 +1785,86 @@ function main() {
     const WATCH_POLL_MS = 3 * 1000;      // 轮询间隔
     const WATCH_CONFIRM_MS = 6 * 1000;   // 候选最终回复后的确认期（无新行才算真结束）。v2.48：10s→6s，实际弹窗延迟 12s→6s（轮询3s对齐），仍保留2次轮询确认冗余
     const WATCH_MAX_MS = 30 * 60 * 1000; // 空闲兜底超时（连续无任何活动才强制弹，防僵尸 watcher）
+    // v2.59（2026-08-23）：纯 busy 无后续绝对上限。原逻辑 busy 末行无条件刷新 lastActiveAt →
+    // WATCH_MAX_MS 永不超时 → 纯 busy（如主模型卡在 function_call 后崩溃/App 挂起，转录停写但末行仍 busy）
+    // 可能长期不退出、不弹窗（比 30min 兜底更糟）。现：busy 不在"末行仍 busy"时刷新 lastActiveAt，
+    // 仅 newTail/newAgent（真有新活动）才刷新；并给 busy 设独立绝对上限（默认 2min，测试可 env 缩短），
+    // 纯 busy 无后续达到上限即兜底弹，绝不无限挂起。
+    const WATCH_BUSY_MAX_MS = Number(process.env.WATCH_BUSY_MAX_MS) || (2 * 60 * 1000);
+    // v2.59/P0-1：transient unknown 宽限——transcript mtime 在此时长内更新过，视为正在写入/重写中（如
+    // Context Compaction 重写末行导致半写不可读），不进确认期、重置确认窗继续等，杜绝 compaction 期间
+    // 因 unknown 持续 >6s 被误判结束而提前弹窗（R1 回归）。只有转录确实停写（mtime 旧）的 unknown 才收口。
+    const WATCH_COMPACT_GRACE_MS = Number(process.env.WATCH_COMPACT_GRACE_MS) || (3 * 1000);
     const WATCH_LOCK_TTL = 30 * 60 * 1000; // 锁失效时间
-    // 启动即拿锁：若锁已被别人持有且未过期 → 本 watcher 退出（避免并发重复弹）
+    // 启动即拿锁：R3（2026-08-23）stale lock 接管 + R4（2026-08-23）原子 acquire 消除 TOCTOU。
+    // 旧逻辑只查 at<TTL 从不验证 pid 存活：残留锁 owner 已死 → 新 watcher 误判锁有效 → watchStarts=0
+    // 漏弹（B 类 Missing，repro_r3_lock.js 已确认）。且仅 readFileSync→writeFileSync 非原子 → 并发
+    // TOCTOU 双启动（R4，前序 S4 starts=2 + repro_r4_logic.js 确定性临界窗）。
+    // 修复：open('wx') 原子建锁；EEXIST 时评估锁有效性（pid 探活区分"可确认死亡/无法确认"），
+    // 仅可确认死亡或 TTL 过期才安全接管；释放只删自己持有的锁（校验 pid===自己）。
     const lockPath = coalescePath(fSid) + '.lock';
     let gotLock = false;
-    try {
-      fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-      let mine = null;
+    const myPid = process.pid;
+    const acquireWatchLock = () => {
+      try { fs.mkdirSync(path.dirname(lockPath), { recursive: true }); } catch (e) {}
+      // 先尝试原子建锁（R4 核心）：不存在才创建，EEXIST 表示已有人持有
       try {
-        mine = JSON.parse(fs.readFileSync(lockPath, 'utf-8'));
-      } catch (e) { /* 无锁或损坏 */ }
-      if (mine && (Date.now() - (mine.at || 0) < WATCH_LOCK_TTL)) {
-        // 锁被持有且未过期 → 退出（有别的 watcher 在负责）
-        return;
+        const fd = fs.openSync(lockPath, 'wx');
+        fs.writeSync(fd, JSON.stringify({ at: Date.now(), pid: myPid }));
+        fs.closeSync(fd);
+        return true; // 原子获取成功
+      } catch (e) {
+        if (e.code !== 'EEXIST') return false; // 其他 IO 错误：退化为无锁（继续尝试弹窗）
       }
-      fs.writeFileSync(lockPath, JSON.stringify({ at: Date.now(), pid: process.pid }));
-      gotLock = true;
-    } catch (e) { /* 锁写入失败：继续尝试弹窗（退化为无锁） */ }
+      // 已存在锁 → 评估有效性（R3）
+      let mine = null;
+      try { mine = JSON.parse(fs.readFileSync(lockPath, 'utf-8')); } catch (e) { mine = null; }
+      const fresh = mine && (Date.now() - (mine.at || 0) < WATCH_LOCK_TTL);
+      if (!fresh) {
+        // TTL 过期 → 锁失效，安全接管：删旧锁后重新原子建锁
+        try { fs.unlinkSync(lockPath); } catch (e) {}
+        try {
+          const fd = fs.openSync(lockPath, 'wx');
+          fs.writeSync(fd, JSON.stringify({ at: Date.now(), pid: myPid }));
+          fs.closeSync(fd);
+          return true;
+        } catch (e) { return false; }
+      }
+      // TTL 未过期 → 需判断 owner 是否存活
+      const pid = mine && Number(mine.pid);
+      if (!pid || pid <= 0 || !Number.isFinite(pid)) {
+        // 无 pid / 非法 pid（旧格式或损坏）→ 无法确认死亡，保守保持互斥，不接管
+        return false;
+      }
+      let alive = false;
+      try { process.kill(pid, 0); alive = true; } // 无异常=进程存在（含无权限的 EPERM 也视为存活）
+      catch (e) {
+        if (e.code === 'ESRCH') alive = false;     // 进程不存在 → 可确认死亡
+        else if (e.code === 'EPERM') alive = true; // 存在但无权限（跨进程/系统）→ 无法确认，保守视为存活
+        else alive = true;                          // 其他异常 → 无法确认，保守存活
+      }
+      if (alive) return false; // owner 仍存活 → 保持互斥，本 watcher 退出
+      // owner 已可确认死亡 → 安全接管
+      try { fs.unlinkSync(lockPath); } catch (e) {}
+      try {
+        const fd = fs.openSync(lockPath, 'wx');
+        fs.writeSync(fd, JSON.stringify({ at: Date.now(), pid: myPid }));
+        fs.closeSync(fd);
+        return true;
+      } catch (e) { return false; }
+    };
+    gotLock = acquireWatchLock();
+    if (!gotLock) {
+      // 未获取锁（锁有效/无法确认/原子竞争失败）→ 退出，避免并发重复弹
+      appendWatchDebug({ type: 'lock-denied', ts: Date.now(), sid: fSid, pid: myPid });
+      return;
+    }
 
     // 首查：若合并文件已被清理/已弹 → 退出（释放锁）
     const info0 = readCoalesceInfo(fSid);
     if (!info0 || !info0.agg) {
-      if (gotLock) { try { fs.unlinkSync(lockPath); } catch (e) {} }
+      // R4（2026-08-23）：释放只删自己持有的锁（校验 pid===自己），避免误删新 owner 的锁
+      if (gotLock) { try { const o = JSON.parse(fs.readFileSync(lockPath, 'utf-8')); if (o && o.pid === myPid) fs.unlinkSync(lockPath); } catch (e) {} }
       return;
     }
     const tsPath = info0.tsPath || '';
@@ -1619,8 +1872,13 @@ function main() {
     // 活跃时会被误弹。现在盯"最后活跃时刻 lastActiveAt"——只要轮询到主模型还在工作（busy / 新行追加）就不断刷新，
     // 只有连续 WATCH_MAX_MS 完全无任何活动（主模型崩了/App 挂了/transcript 停写）才触发兜底弹窗，杜绝僵尸 watcher。
     let lastActiveAt = Date.now(); // 最后活跃时刻（空闲超时计时基线）
+    let busySince = 0;             // v2.59：连续"末行 busy 且无新行"的起算时刻（绝对上限计时）
+    // v2.57：coalesce 携带的终态错误标记（Stop 端写入，末行明确 429/5xx/timeout）。
+    // 作为初态假设：仅当首轮 pollTail 返回 unknown（末行被覆盖/尾行半写）时使用，避免误判。
+    const initialTerminalError = info0.terminalError || null;
     let confirmSince = 0;   // 候选最终回复出现的时刻
     let lastTailTs = -1;    // 上次轮询时看到的最后一行时间戳（用于检测"新行追加"）
+    let firstPollDone = false; // v2.58：initialTerminalError 提升仅限首轮（修复 compaction 误弹）
 
     const pollTail = () => {
       if (!tsPath) return 'unknown';
@@ -1647,8 +1905,49 @@ function main() {
     };
     let prevAgents = knownAgents();
 
+    // v2.57（第一阶段修复）：watcher 调试日志——detached watcher 的 stdio 被丢弃（stdio:'ignore'），
+    // 以往发生问题后无法知道内部状态。这里把每轮轮询判定落盘到 .watch-debug-<sid>.jsonl。
+    // 清理策略：只保留最近 2000 行（约 100 分钟轮询），超出的旧行截断，避免无限增长。
+    // v2.59：改为环境变量开关（WATCH_DEBUG=1 才落盘），默认关闭——生产不产生残留文件、无 I/O 开销；
+    // 排查 watcher 状态时设 WATCH_DEBUG=1 运行即复现调试日志（watch-debug 曾实证定位 compaction 回归）。
+    const watchDebugPath = coalescePath(fSid) + '.watch-debug';
+    const maxDebugRows = 2000;
+    const watchDebugOn = process.env.WATCH_DEBUG === '1';
+    const appendWatchDebug = (o) => {
+      if (!watchDebugOn) return;
+      try {
+        const line = JSON.stringify(o) + '\n';
+        fs.appendFileSync(watchDebugPath, line);
+        const buf = fs.readFileSync(watchDebugPath, 'utf-8');
+        const ls = buf.split('\n');
+        if (ls.length > maxDebugRows + 20) {
+          fs.writeFileSync(watchDebugPath, ls.slice(ls.length - maxDebugRows).filter((x) => x !== '').join('\n') + '\n');
+        }
+      } catch (e) { /* 日志写入失败：不阻塞主逻辑 */ }
+    };
+    // 记录本 watcher 启动（含 sid / 起点 / 合并文件是否存在）
+    appendWatchDebug({ type: 'start', ts: Date.now(), sid: fSid, tsPath, roundStart: info0.roundStart || 0, hasCoalesce: !!(info0 && info0.agg) });
+
+    // v2.57（第一阶段修复）：unknown 计数日志——unknown 语义是"无法确定当前状态"，
+    // 本阶段【不】用 unknown 超时当自动弹窗依据（误弹风险），但连续 unknown 需要可观测。
+    let unknownStreak = 0;
+    let lastUnknownTs = 0;
+    let lastTailRaw = ''; // v2.59/P0-1：上一次 poll 的 transcript 原始末行，用于识别"正在改写中"的 transient unknown
+
     while (Date.now() - lastActiveAt < WATCH_MAX_MS) {   // 空闲超时：主模型持续活跃则永不退出、绝不弹
-      const st = pollTail();
+      let st = pollTail();
+      // v2.57→v2.58：初态终态错误继承——coalesce 已标记 terminalError，首轮 poll 因末行被覆盖/尾行半写
+      // 返回 unknown 时，继承该终态（Stop 端写入时已确认末行 429/5xx/timeout）。
+      // 【修复】原代码每次轮询都做提升，违背「仅首轮」注释：本会话只要曾出现一次真实终态错误，
+      // 此后任意一次 poll 遇到 Context Compaction 重写 transcript 导致短暂读不到（tail=null → unknown），
+      // 都会被错误提升成 terminal-error → 进入确认期 → watcher 误判 Run 结束 → 提前弹窗
+      // （实证 aa64e728 watch-debug：compaction 继续指令 message:user 之后 tail=null + terminal-error → break 误弹）。
+      // 现严格限制为首轮 poll，且只信任「末行被覆盖/半写」这种确实读不到的场景；后续轮询一律以实际
+      // 可读末行为准（真实终态错误由 terminalErrorFromRow 直接识别，无需继承），杜绝 compaction 误弹。
+      if (st === 'unknown' && initialTerminalError && !firstPollDone) {
+        st = 'terminal-error';
+      }
+      firstPollDone = true;
       const newTail = hasNewTail();
       // v2.43：子代理"未完成"语义判据——还有 spawn 但未发结束信号（system completed/failed 通知或子代理回传）→ 未结束。
       const pendingSub = subagentPending(tsPath);
@@ -1656,18 +1955,71 @@ function main() {
       const interrupted = interruptedByUser(tsPath);
       // v2.44：死寂检测——主模型静止(final) + 有未完成子代理 + 子代理文件全停更超 60 秒 → 手动停止/回传失效，
       // 强制结算（无 Interrupted 标记的停止，子代理最多多跑 40s，60s 窗口足够覆盖）。
-      const deadTeam = !interrupted && st === 'final' && pendingSub.length > 0 && subagentsAllStagnant(tsPath, 60 * 1000);
+      // v2.57：扩展——主模型终态错误(terminal-error) + 未完成子代理全停更同理视为死寂：
+      // 主模型已 429/5xx 坏掉不会唤醒子代理，等子代理只是空等；停更超窗同样强制收口。
+      const deadTeam = !interrupted && (st === 'final' || st === 'terminal-error') && pendingSub.length > 0 && subagentsAllStagnant(tsPath, 60 * 1000);
+      // v2.57：末行终态错误检测（与 mainModelState 同口径，供日志记录 reason）
+      const teNow = st === 'terminal-error' ? (terminalError(tsPath) || 'terminal-error') : null;
       // 检测是否出现了新子代理文件（主模型刚派新活）
       const agentsNow = knownAgents();
       let newAgent = false;
       for (const a of agentsNow) if (!prevAgents.has(a)) { newAgent = true; break; }
       prevAgents = agentsNow;
 
-      if (st === 'busy' || newTail || newAgent) {
-        // 主模型还在工作（派活/等子代理/新派子代理/新行）→ 刷新空闲计时 + 取消确认期
+      // v2.57：本轮判定落盘（state/reason/confirmSince/pendingSub/tailTs/terminalError）——解决
+      // detached watcher 内部状态不可观测问题。unknownStreak 只记录，不作为弹窗依据。
+      const tailLine = lastTranscLine(tsPath);
+      appendWatchDebug({
+        type: 'poll', ts: Date.now(), state: st, newTail, newAgent,
+        confirmSince, pendingSub: pendingSub.length, terminalError: teNow,
+        tail: tailLine ? (tailLine.type + (tailLine.role ? ':' + tailLine.role : '') + '@' + (tailLine.timestamp || '-')) : 'null',
+        unknownStreak,
+      });
+
+      if (newTail || newAgent) {
+        // v2.59：仅有"真正的新活动"（新行追加 / 新子代理派活）才刷新空闲计时 + 取消确认期。
+        // 不再把"末行仍是 busy"当作活跃信号（那是缺陷根因：纯 busy 无后续会持续刷新 lastActiveAt
+        // 导致 WATCH_MAX_MS 永不超时）。新活动出现 → 重置 busy 连续计时。
         lastActiveAt = Date.now();
         confirmSince = 0;
-      } else if (st === 'final' || interrupted) {
+        busySince = 0;
+        unknownStreak = 0;
+      } else if (st === 'busy') {
+        // v2.59：末行仍是 busy 但本轮无新行 → 主模型可能只是停在工具调用等待（正常），也可能已崩溃挂起。
+        // 取消确认期（不收口），但【不】刷新 lastActiveAt（让空闲兜底能生效）；并启动 busy 绝对上限计时，
+        // 纯 busy 无后续达到 WATCH_BUSY_MAX_MS 即兜底弹，杜绝长期不退出。
+        confirmSince = 0;
+        unknownStreak = 0;
+        if (busySince === 0) busySince = Date.now();
+        else if (Date.now() - busySince > WATCH_BUSY_MAX_MS) break;
+      } else if (st === 'final' || interrupted || st === 'terminal-error' || st === 'unknown') {
+        // v2.57：terminal-error（末行明确 429/5xx/timeout）与 final 同级——进入确认期收口。
+        // 不把 status=incomplete（无 error）当终态；terminal-error 只产生于有明确错误证据的末行。
+        // v2.59：unknown 末行进入确认期（与 terminal-error 同级）——原逻辑 unknown 永不弹、靠 30min 兜底，
+        // 与"unknown 应 6s 弹"预期不符。现：unknown 表示转录停写且读不到确定状态，6s 确认期内若仍无新行
+        // （没变 busy/final）→ 视为真结束收口弹窗；若期间出现新行/新子代理（newTail/newAgent）会被上方
+        // 分支重置 confirmSince，不会误弹活跃会话。兼顾 compaction 瞬时 unknown 的安全（有新行即取消）。
+        if (st === 'unknown') {
+          // v2.59/P0-1 修复：transient unknown 不进确认期。unknown 成因：① 真结束（转录彻底停写）；
+          // ② compaction 重写/半写导致末行瞬时不可读（transcript 正在被改写）。
+          // 判定 transient：读文件【原始末行】（不 JSON.parse）与上一次 poll 比对，不同 → 文件正在被改写
+          // （写入/重写中）→ 重置确认期 + 续等，不收口。只有连续两次 poll 原始末行相同（转录确已停写）的
+          // unknown 才收口。
+          // 选"原始末行对比"而非 size/mtime：compaction 是覆盖末行的截断重写，lastTranscLine 会回退到
+          // 前半部旧完整行导致内容不变、而 size 在等长的重写下也可能不变——都会漏判 transient 而提前弹
+          // （R1 回归）。原始末行在重写时必然抖动，静默时稳定，最能区分"正在改写"与"已停写"。
+          try {
+            const tailRaw = readTailRaw(tsPath);
+            if (lastTailRaw !== '' && tailRaw !== lastTailRaw) {
+              lastTailRaw = tailRaw;
+              confirmSince = 0; busySince = 0; lastActiveAt = Date.now();
+              sleep(WATCH_POLL_MS);
+              continue;
+            }
+            lastTailRaw = tailRaw;
+          } catch (e) { /* 文件不可读 → 视为停写 unknown，继续走下方确认期 */ }
+          // 非 transient（转录确已停写）的 unknown → 落入下方确认期逻辑收口
+        }
         if (interrupted) {
           // 用户手动停止 → 确认期弹（子代理同步停，实测行ts差0s）
           if (confirmSince === 0) {
@@ -1689,6 +2041,7 @@ function main() {
             // 子代理文件还在写 → 假空，继续等
             lastActiveAt = Date.now();
             confirmSince = 0;
+            busySince = 0;
           } else {
             // 子代理确实停更 → 确认期弹
             if (confirmSince === 0) {
@@ -1699,11 +2052,12 @@ function main() {
           }
         } else {
           // 有未完成子代理且仍在活动 → 等待（子代理还在跑，主模型可能即将被唤醒）
+          // v2.57：terminal-error 同理——主模型已坏但子代理还在跑，不提前结算团队，继续等；
+          // 子代理停更后由上方 deadTeam（已扩展含 terminal-error）确认期收口。
           lastActiveAt = Date.now();
           confirmSince = 0;
+          busySince = 0;
         }
-      } else {
-        confirmSince = 0;            // unknown（文件异常）→ 重置，继续等
       }
       sleep(WATCH_POLL_MS);
     }
@@ -1721,7 +2075,8 @@ function main() {
       const ws = loadSnapshot(fSid) || {};
       saveSnapshot({ file: ws.file || '', stat: ws.stat || null, lastUserMsgAt: ws.lastUserMsgAt || 0, lastStopAt: Date.now() }, fSid);
     }
-    if (gotLock) { try { fs.unlinkSync(lockPath); } catch (e) {} }
+    // R4（2026-08-23）：释放只删自己持有的锁（校验 pid===自己），避免异常路径误删新 owner 的锁
+    if (gotLock) { try { const o = JSON.parse(fs.readFileSync(lockPath, 'utf-8')); if (o && o.pid === myPid) fs.unlinkSync(lockPath); } catch (e) {} }
     return;
   }
   // v2.21：hook 与 stop 都从 payload 读 session_id（快照按会话拆分，多会话并发不互相覆盖）；
@@ -1742,6 +2097,11 @@ function main() {
   if (pricing && pricing.date !== todayStr()) {
     process.stderr.write(`[token-tracker] 定价数据过期（${pricing.date}），自动刷新未成功，请手动运行 refresh-prices.js\n`);
   }
+  // v2.59：DeepSeek 官方定价抓取失败 → stderr 返回给模型（hook 场景由 additionalContext 暴露），
+  // 供 AI 向用户说明「当前数据更新失败，排查原因」；DeepSeek 系费用按本地/聚合源价估算。
+  if (pricing && pricing.deepseek_refresh_error) {
+    process.stderr.write(`[token-tracker] ${pricing.deepseek_refresh_error}\n`);
+  }
 
   // v2.25（2026-08-12）：Stop 优先 transcript 数据源——WorkBuddy 5.3.11 专家团（Agent 工具
   // spawn 子代理）的模型调用**不落盘 traces**（实测 KET 专家团真实 675.8万 tokens，traces 只
@@ -1751,9 +2111,32 @@ function main() {
   // 的全部调用。无 payload（手动 --stop）或本轮无 transcript 数据 → 退回下方 traces 兜底逻辑。
   if (asStop) {
     const tsPath = transcriptPathFromPayload(payloadRaw);
+    // v2.57（第一阶段修复）：Stop payload 无 stopReason 字段（实测只有 session_id/transcript_path/
+    // cwd/hook_event_name/stop_hook_active/agent_type/last_assistant_message/...），stopReason 只存在于
+    // SessionHookManager 内部日志。因此这里用 transcript 末行终态错误判定（与 mainModelState 同口径）：
+    // terminal-error（末行明确 429/5xx/timeout，非 merely incomplete）= 强终态信号，写入探针供审计；
+    // 不改变弹窗路径（专家团/team 生命周期照旧由 watcher 复查收口，仅记录 + 交由 watcher 的
+    // terminal-error 分支快速收口）。
+    const teAtStop = tsPath ? terminalError(tsPath) : null;
+    if (teAtStop) {
+      writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sid,
+        sameRound: false, note: 'terminal-error-detected', source: 'transcript-terminal-error',
+        terminalError: teAtStop, transcriptPath: tsPath, payload: summarizePayload(payloadRaw) });
+    }
+    // v2.56：子代理路径守卫——如果 transcript_path 含 /subagents/，必然是子代理。
+    // 只记账、不弹 toast。
+    if (tsPath && (/\bsubagents\b/i.test(tsPath.replace(/\\/g, '/')))) {
+      incrementalRecord(tsPath, sid);
+      writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sid,
+        sameRound: false, note: 'subagent-skip-toast', source: 'transcript-subagent-path',
+        transcriptPath: tsPath, payload: summarizePayload(payloadRaw) });
+      out({ hookSpecificOutput: {} });
+      return;
+    }
+
     const prevSnap0 = loadSnapshot(sid) || {};
     const roundStart0 = prevSnap0.lastUserMsgAt || 0;
-    if (tsPath && roundStart0 > 0) {
+        if (tsPath && roundStart0 > 0) {
       // v2.50：增量记账（借鉴 WorkBuddy 逐笔实时记账）——先累加水位线之后的新 usage 行，
       // 再走弹窗判断。记账与弹窗解耦：即使弹窗时机错（多弹/漏弹），账本也已正确。
       incrementalRecord(tsPath, sid);
@@ -1784,15 +2167,15 @@ function main() {
         // 为 0，但主 transcript 本轮已有 Agent/TeamCreate 调用 → 仍按专家团合并，避免误弹多次）。
         // v2.39：本轮按模型分桶明细（每日账本"分模型"用，与 aggregateTranscript 同口径）
         const byModel = aggregatePerModel(tsPath, roundStart0);
-        if (agg.subCount > 0 || agg.teamActive) {
-          writeCoalesce(sid, agg, { tsPath, roundStart: roundStart0, byModel });
-          spawnFlushWatcher(sid);
-        } else {
-          saveSnapshot({ file: tsPath, stat: agg, lastUserMsgAt: roundStart0, lastStopAt: Date.now() }, sid);
-          const bal = balanceText();
-          // v2.50：记账已在 incrementalRecord 完成，这里只读账本显示累计
-          showToast(toastLine1(agg, modelShort, periodNote(agg, pricing), bal, todayUsageTxt()), toastLine2(agg, pricing));
-        }
+        // R2 修复（2026-08-23）：plain 路径结构性零确认问题——原逻辑在 Stop 端 0ms 确认窗直接弹窗并
+        // 立即推进 lastStopAt，导致"Stop 但主模型同轮续跑/恢复"被误判为轮次结束（A 类 Premature，
+        // repro_r2.js 35/35 全 PREMATURE，历史实证 652f2909）。
+        // 修复：统一改走 coalesce + watcher 确认窗（与专家团一致），由 --flush-delayed 的 6s 确认期
+        // 判定真结束；确认窗内检测到 busy/新行/新子代理（续跑/恢复信号）则取消 pending，绝不弹。
+        // Stop/idle/unknown/tool-end/网络错误/transcript 暂不可读均不再直接等价于 Run 真正结束。
+        // watcher 弹窗完成时统一推进 lastStopAt（见 --flush-delayed）。
+        writeCoalesce(sid, agg, { tsPath, roundStart: roundStart0, byModel, terminalError: teAtStop || undefined });
+        spawnFlushWatcher(sid);
         // v2.37：systemMessage 通道 WorkBuddy UI 实测不显示（无法注入到对话回复），删除该无效注入；
         // toast 已在上面弹出。保留空 hook 返回保证进程行为不变。
         out({ hookSpecificOutput: {} });
@@ -1817,17 +2200,44 @@ function main() {
           return;
         }
         // v2.51：真正无记录（本轮既无 usage 也无被中断调用）
-        writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sid, sameRound: false, transcriptPath: tsPath, stat: null, line: '本轮无 token 记录（停止过快，usage 未落盘）', source: 'transcript-empty', payload: summarizePayload(payloadRaw) });
+        // v2.53.1：文案升级——明确"应用层本地都无数据 + 常见原因"，避免用户误以为技能坏了。
+        writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sid, sameRound: false, transcriptPath: tsPath, stat: null, line: '本轮无 token 消耗记录（本地/应用层均无该轮数据：请求未发出或网络中断）', source: 'transcript-empty', payload: summarizePayload(payloadRaw) });
         const bal0 = balanceText();
         const today0 = todayUsageTxt();
-        showToast('本轮无 token 记录', (today0 ? '今日累计 ' + today0 : '') + (bal0 ? (today0 ? ' ｜ ' : '') + bal0 : '') || '停止过快，本轮消耗尚未落盘');
+        const reason0 = '本地与应用层均无该轮数据（请求未发出/网络中断）';
+        const aux0 = (today0 ? '今日累计 ' + today0 + ' ｜ ' : '') + (bal0 ? bal0 + ' ｜ ' : '');
+        // 宽度保护：原因优先，今日累计/余额超宽时丢弃（v2.53.1 原因提示是用户最想看的，保它）
+        const body0 = dispWidth(aux0 + reason0) > TOAST_LINE_MAX_W ? reason0 : (aux0 + reason0);
+        showToast('本轮无 token 消耗记录', body0);
         out({ hookSpecificOutput: {} });
         return;
       }
     }
   }
 
+  // v2.56：traces 兜底路径的子代理守卫——如果 entry trace 的 sessionId != Stop payload 的 session_id，
+  // 说明这个 Stop 事件的"本会话"和 trace 所属不是同一个会话，该 Stop 大概率来自子代理。
+  // 子代理没有自己的 traces（v2.25 已验证），读到的是父会话或其他会话的 trace，不应弹 toast。
   const f = latestTraceFile(true);
+  if (f && asStop) {
+    try {
+      const fTrace = readTrace(f);
+      const fSessionId = (fTrace && fTrace.trace && fTrace.trace.sessionId) || '';
+      if (fSessionId && fSessionId !== sid) {
+        // entry trace 的 sessionId 和 Stop payload 不一致 → 跨会话了，跳过弹窗。
+        // 此时依然尝试记账（若该子代理有自己的转录则累加）
+        if (asStop) {
+          const tsPathAlt = transcriptPathFromPayload(payloadRaw);
+          if (tsPathAlt) incrementalRecord(tsPathAlt, sid);
+        }
+        writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sid,
+          sameRound: false, note: 'subagent-skip-toast-cross-session',
+          traceSessionId: fSessionId, payload: summarizePayload(payloadRaw) });
+        out({ hookSpecificOutput: {} });
+        return;
+      }
+    } catch (e) { /* trace 半写/损坏：跳过检查 */ }
+  }
   if (!f) {
     // v2.25：hook 无 trace 时也要记录本轮起点（否则全新会话第一轮 Stop 时 roundStart=0 无法聚合）
     // v2.27：同样应用起点刷新守卫——专家团进行中（无完成的 Stop）插话不刷新起点
@@ -1905,10 +2315,12 @@ function main() {
         writeCoalesce(sid, ts, { traceFile: tf });
         spawnFlushWatcher(sid);
       } else {
-        // 单 trace 普通轮 → 立即弹 + 推进 lastStopAt（本轮结束，允许下轮 hook 刷新起点）
-        saveSnapshot({ file: tf, stat: ts, lastUserMsgAt: prevSnap.lastUserMsgAt || 0, lastStopAt: Date.now() }, sid);
-        const bal = balanceText(); // 自定义 API 的 DeepSeek 模型显示余额（60 秒缓存，每轮 toast 基本都拿实时数）
-        showToast(toastLine1(ts, modelShort, periodNote(ts, pricing), bal, todayDisplay(ts, pricing)), toastLine2(ts, pricing));
+        // R2 修复（2026-08-23）：单 trace 普通轮原 0ms 确认窗立即弹并推进 lastStopAt，存在 Premature
+        // 风险（同轮续跑/恢复被误判结束）。统一改走 coalesce + watcher 6s 确认窗，由 --flush-delayed
+        // 判定真结束并推进 lastStopAt（与专家团/transcript 源 plain 路径一致）。
+        saveSnapshot({ file: tf, stat: ts, lastUserMsgAt: prevSnap.lastUserMsgAt || 0, lastStopAt: prevSnap.lastStopAt || 0 }, sid);
+        writeCoalesce(sid, ts, { traceFile: tf });
+        spawnFlushWatcher(sid);
       }
     }
     // v2.37：systemMessage 通道 WorkBuddy UI 实测不显示，删除该无效注入；toast 已在上方弹出。
@@ -1966,11 +2378,12 @@ function main() {
 // 导出内部函数供测试/回填脚本复用同一套记账逻辑，避免逻辑复制漂移。
 if (require.main === module) main();
 module.exports = {
-  todayStr, loadDailyUsage, saveDailyUsage, recordUsage, dayTotalOf,
+  todayStr, loadDailyUsage, saveDailyUsage, recordUsage, dayTotalOf, hitRate,
   calcCost, findModel, isLocalModel, fmtCost, cleanModelName,
   readTranscLines, extractUsage, perModelFromRows, aggregatePerModel,
   todayDisplay, reportTxt, reportSummaryTxt, normalizeDailyUsage,
   mainModelState, lastTranscLine, coalescePath, hasActiveSubagentsSince, subagentsDirFromTranscript, subagentPending, subagentsAllStagnant, interruptedByUser, hasSubagentsRecentlyActive,
   incrementalRecord, loadLedgerWatermark, saveLedgerWatermark,
   estimateInterrupted,
+  extractUsageFromRow, terminalErrorFromRow, terminalError,
 };
