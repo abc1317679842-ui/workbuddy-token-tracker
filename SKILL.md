@@ -225,17 +225,28 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 
 ## 维护与排查
 
-### 调试日志
-- 代码支持调试日志，受环境变量 `TOKEN_TRACKER_DEBUG` 控制。
-- 开启方式：运行前设置 `TOKEN_TRACKER_DEBUG=1`。
-- 日志文件路径：`~/.workbuddy/token-tracker-debug.log`
-- 日志会自动记录每次 poll 的关键状态，并在弹窗触发时写入一行标记：`==== TOAST TRIGGER ====`
-- 排查"提前弹窗"或"漏弹"问题时，先读取该日志，搜索 `TOAST TRIGGER` 附近内容，分析触发时的 `sessionId`、判定原因、`lineCount`、`stableCount`、`tailRaw` 变化等信息。
-- 日志文件超过 5MB 会自动清空。
+### 弹窗诊断日志
+- 每次弹窗时，代码**自动**向 `~/.workbuddy/token-tracker-toast.log` 追加一行 JSON 诊断记录（无需任何开关，默认开启）。
+- 记录内容包含：`ts`（时间）、`reason`（触发原因）、`sessionId`、`watchStartTime`（本次 watcher 启动时间）、`lineCount`、`stableCount`、`compactionSuspected`、`compactionMode`、`lastMarkerId`、`tailRawPrefix`、`lastTailRawPrefix`、`pendingSubCount`、`hasNewTail`、`traceFile`（当前处理的 trace 文件名，获取不到为 null）、`toastText`（弹窗真实文本前 200 字符）。
+- `reason` 取值：`busy-timeout` / `interrupted` / `deadTeam` / `stableCount>=3` / `idle-timeout` / `estimate` / `no-token` / `hook-fallback`。
+- 日志文件超过 5MB 会自动清空后重新追加，避免无限增长。
+- 写入失败（权限/磁盘问题）被 try-catch 吞掉，绝不影响弹窗主流程。
 
 ### 常见排查步骤
-1. 如果用户反馈"压缩上下文后仍然弹窗"，先确认是否开启了 `TOKEN_TRACKER_DEBUG=1`，再让用户复现一次。
-2. 打开 `~/.workbuddy/token-tracker-debug.log`，搜索 `==== TOAST TRIGGER ====`。
-3. 查看 `reason` 是 `stableCount>=3` 还是 `interrupted` 或其他。
-4. 检查触发前 10~20 行的 `[poll]` 日志，观察 `tailRaw` 是否在弹窗前已经连续多帧不变，以及是否出现过 `compaction-continue` 事件。
-5. 根据日志判断是判定逻辑问题还是数据源问题，不要凭记忆修改代码。
+1. 如果用户反馈"压缩上下文后仍然弹窗"或"漏弹"，直接打开 `~/.workbuddy/token-tracker-toast.log`。
+2. 搜索最近的记录，查看 `reason` 是 `stableCount>=3` 还是 `interrupted` 或其他。
+3. 查看该记录的 `compactionMode` / `lastMarkerId` / `tailRawPrefix`，判断触发时是否处于压缩上下文过渡态。
+4. 根据日志判断是判定逻辑问题还是数据源问题，不要凭记忆修改代码。
+
+### 故障排查速查表
+
+| 现象 | 优先查看文件 | 关键判断依据 |
+|---|---|---|
+| 完全无弹窗 | `.stop-probe.json`（mtime 是否更新）、`token-tracker-toast.log`（是否存在） | 若 probe 未更新，说明 Stop hook 未触发或命令失败；若 toast.log 无记录，说明判定未收口 |
+| 弹窗延迟过长 | `token-tracker-toast.log` | 查看 `reason` 是否为 `stableCount>=3`，并看 `ts` 与 run 结束时间差 |
+| 压缩上下文后提前弹窗 | `token-tracker-toast.log` + transcript 尾部 | 查看 `compactionSuspected`/`compactionMode`/`lastMarkerId`，以及 `tailRawPrefix` 是否在弹窗前已连续多帧不变 |
+| 弹窗内容异常（会话错乱） | `token-tracker-toast.log` + trace 文件 | 查看 `sessionId` 是否为空或与实际会话不一致；检查 trace 的 `sessionId` 字段 |
+| 账本数据未更新 | `daily-usage.json`（mtime）、`.ledger-watermark.json` | 若 mtime 停在某时间，说明 Stop 路径未执行；结合 probe 判断 |
+| 弹窗频繁重复 | `.ledger-watermark.json` + `token-tracker-toast.log` | 查看 watermark 去重是否生效，以及 toast.log 中同一 `reason` 是否反复出现 |
+
+> ⚠️ **hooks 命令铁律**：所有 hook 命令必须保持**纯净的 `node` 调用**（如 `node C:/.../token-tracker.js --stop`），**禁止使用 `cmd /c` 包装或环境变量前缀**（如 `cmd /c "set X=1 && node ..."`）。此类包装会被 WorkBuddy 判为无效 hook 配置（`Invalid hook config`），导致整个事件组（Stop / UserPromptSubmit）跳过、进程瞬间失败且无任何日志产物。调试日志已改为弹窗时自动记录，无需通过环境变量或命令前缀开启。
