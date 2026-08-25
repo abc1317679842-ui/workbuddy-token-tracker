@@ -11,7 +11,9 @@ type: skill
 - **Windows 10/11**：系统通知（toast）仅 Windows 支持；macOS/Linux 可正常手动使用（方式 A），但不弹通知。
 - **Node.js ≥ 20**：脚本零依赖单文件，无需 npm install。
 
-## 当前功能总览（v2.59 · 2026-08-23）
+## 当前功能总览（v2.61 · 2026-08-25）
+
+> **⚠️ 强制（查询触发总纲）：所有统计查询必须调用 `--report` 命令并原样贴出脚本输出，禁止自行解析 JSON。** 无论用户问「今日消耗」「今天用了多少」「账本」「报告」「统计」「花费」还是历史某天，一律先跑 `node token-tracker.js --report`（或 `--report <日期>`），再把脚本打印的 Markdown 表格原文贴给用户；不得自行读取 `daily-usage.json`、不得自行汇总、不得转成列表/纯文本/代码块。详细规则见下方「查询触发规则（强制）」与「展示格式约束（强制）」。
 
 > **v2.59（2026-08-23，DeepSeek 官方定价直连 + 生效时间机制 + P0-1 回归修复）：**
 > - **官方定价直连抓取**：新增 `deepseek-official.js`，每日直连 DeepSeek 官方定价页解析模型清单 + 价格（空闲/高峰）+ 时段 + 周末规则。DeepSeek 系官方优先、官方没有的（已下线 V3 等）回落聚合源；模型清单自动对齐（官方新增自动收录、官方下线自动标 `retired`，如 vision-exp 已自动收录）。
@@ -19,6 +21,18 @@ type: skill
 > - **生效时间机制**：官方"将于...起"预告 → 存 `deepseek_rules_pending`，生效前用旧规则、到点自动切换（如 8-23 00:00 起周末统一低谷）。
 > - **P0-1 回归修复**：watcher compaction 期间 unknown 误弹（R1 回归）——`readTailRaw` 末行内容对比识别 transient unknown，改写中续等不弹、真停写才 6s 收口。
 > - **调试清理**：临时 DBG 探针已删除；watch-debug 改为 `WATCH_DEBUG=1` 环境变量开关（默认关）。
+
+> **v2.60（2026-08-25，统一稳定帧保护 + 去冗余确认窗 + 修复 compaction 后 final 提前弹窗）：**
+> - **统一所有终态稳定帧保护**：将 `unknown` 分支的 `stableCount >= 3` 门槛扩展到 `final` / `terminal-error` 分支（原 `final` 仅靠单一 6s `confirmSince`，compaction 等长重写后末行被判为 `final` 且模型静默 >6s 即误弹）。`interrupted` 为真终态保留立即判定，仅享受 transient 重置保护。
+> - **去除冗余确认窗口**：`stableCount >= 3` 即直接收口（触发弹窗），不再启动/检查 `confirmSince` 6s 等待；正常回合结束弹窗延迟从 ~12–15s 收敛回 ~6–9s（仅 3 稳定帧）。
+> - **保留子代理安全闸门**：`final`/`terminal-error` 收口前仍校验 `pendingSub` 与子代理文件活跃度（v2.43/v2.47/deadTeam），活跃团队运行期间绝不提前结算。
+> - **重置一致性**：`hasNewTail()`/`newAgent` 新活动与 compaction 检测、文件不可读均正确归零 `stableCount`，杜绝计数残留误判。
+
+> **v2.61（2026-08-25，清理 + 性能 + 可观测性 + 弹窗回归修复）：**
+> - **【关键修复】showToast 回归修复**：v2.59 的 compaction-fix 误将同步 `execFileSync` 改为 `spawn('powershell.exe', […], { detached: true, stdio: 'ignore' }) + child.unref()`，导致 watcher 进程退出时 PowerShell 子进程被提前终止、toast 通知丢失（表现为「完全无弹窗」）。本版回退为原同步 `execFileSync`（带 `timeout: 10000`、`stdio: 'ignore'`、`windowsHide: true`），保证 toast 弹出后父进程才退出。
+> - **清理残留**：删除已不再使用的 `WATCH_CONFIRM_MS` 常量与 `confirmSince` 变量的全部声明/赋值/读取及关联注释（v2.60 已用 `stableCount>=3` 直接收口取代 6s 确认窗，该变量成为死代码）。
+> - **`getTranscriptStats` 性能优化**：① 不再 `split('\n')` 生成整文件行数组，改用 `'\n'` 字符计数（`换行符数 + 1`，与原 `split` 行数在所有情形一致，已用边界用例验证）；② 新增模块级 `transcriptStatsCache`，当 `path` 与 `mtimeMs` 均命中时直接返回缓存，跳过 `fs.readFileSync` + 整文件扫描（对 91MB transcript 每轮 3s poll 的 I/O/GC 压力显著下降）。
+> - **调试日志**：新增 `writeDebugLog(message)`（受 `TOKEN_TRACKER_DEBUG=1` 开关控制，默认关闭；日志落 `~/.workbuddy/token-tracker-debug.log`，超 5MB 自动清空）。每轮 poll 落完整状态（ts/sessionId/lineCount/stableCount/st/hasNewTail/pendingSubCount/interrupted/deadTeam/tailRawPrefix/lastTailRawPrefix），compaction 期间单独落 `compaction-continue`；任一 `break` 触发弹窗前落 `==== TOAST TRIGGER ====` 含 `reason`（`busy-timeout`/`interrupted`/`deadTeam`/`stableCount>=3`/`idle-timeout`）与关键状态，便于排查提前弹窗与 compaction 误判。
 
 > **v2.58（2026-08-22，展示约定固化）：`--report`（明细版）每天合计行正下方固定输出一行「展示约定」提示**——「向用户展示以上账本时，请直接使用上面的 Markdown 表格原文（保留完整 7 列，不要手排/转纯文本/缩写）」。目的：调用方（AI 助手）读取账本数据时，最下面这行字即告知展示规则，无需再翻技能规定的展示格式约束。适用所有日期档（今天/历史/all）。
 
@@ -44,6 +58,14 @@ type: skill
 - **兜底通道**：`--hook`（UserPromptSubmit）在下一轮提交时把上一轮用量注入上下文；手动运行 `token-tracker.js --stop` 查看最近一轮。
 - **每日账本报告**：`node token-tracker.js --report [all|<日期>]` 输出每日分模型明细 + 当日合计（今天/历史任意天）；`--report summary [all|<日期>]` 只输出每天**总合计**（一行/天，不含模型明细）——仅供助手内部快速判断/调试用，**禁止**作为给用户的展示输出。
 - **展示格式约束（v2.39.2，强制）**：向用户展示账本数据**一律用 `--report`（明细版）**，其输出为 **Markdown 表格**（表头 + 每个模型一行 + 合计行加粗，**含单模型明细与总计**），**表格列为 `模型 | 输入 | 输出 | 缓存 | 缓存命中 | 总 token | 金额`**，其中「缓存命中」列 = 缓存命中率百分比（两位小数，`cached/in`，如 `96.89%`），每条数据行与合计行都带该列。**必须**直接把脚本输出的 Markdown 表格原文贴给用户（聊天界面渲染为真表格列，天然对齐），**禁止**手排空格对齐、**禁止**转成纯文本/代码块、**禁止**改用 summary 一行式。原因：空格对齐依赖字体宽度，不同环境渲染必歪（用户反复纠正过的坑）。
+
+## 查询触发规则（强制）
+
+- 当用户以任何形式询问「今日消耗」「今天用了多少」「账本」「报告」「统计」「花费」等查询类请求时，**必须首先执行**：`node token-tracker.js --report`（或 `node token-tracker.js --report <日期>` 查询历史）。
+- 然后**原样贴出脚本输出的 Markdown 表格**，不得自行读取 daily-usage.json、不得自行汇总、不得转换成列表/纯文本/代码块。
+- 如果用户只问某一天的消耗，也使用 `--report <日期>` 并原样贴出。
+- 如果用户问的是 summary（只要总合计，不要模型明细），才允许使用 `--report summary`，但同样必须贴出脚本输出，不得自行加工。
+- 任何情况下，禁止绕过脚本直接解析账本 JSON 后手工格式化输出。
 
 ## 安装与启用（新用户必读：装完必须配 hooks 才自动弹通知）
 从技能市场安装 = 文件拷入 skills 目录，**不会自动挂 hook**。请让 WorkBuddy 助手帮你把下面配置合并进 `settings.json`（或手动添加）：
@@ -200,3 +222,20 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 - 不要伪造数字：脚本读的是平台真实落盘数据，直接输出即可；读不到/解析失败时如实显示"暂无数据/尚未完成写入"，绝不编造。
 - 若输出显示「上一轮」，说明这一轮已统计过（数字与上次相同属正常）。
 - 本技能不修改任何平台文件，仅读取 traces 与维护自身快照。
+
+## 维护与排查
+
+### 调试日志
+- 代码支持调试日志，受环境变量 `TOKEN_TRACKER_DEBUG` 控制。
+- 开启方式：运行前设置 `TOKEN_TRACKER_DEBUG=1`。
+- 日志文件路径：`~/.workbuddy/token-tracker-debug.log`
+- 日志会自动记录每次 poll 的关键状态，并在弹窗触发时写入一行标记：`==== TOAST TRIGGER ====`
+- 排查"提前弹窗"或"漏弹"问题时，先读取该日志，搜索 `TOAST TRIGGER` 附近内容，分析触发时的 `sessionId`、判定原因、`lineCount`、`stableCount`、`tailRaw` 变化等信息。
+- 日志文件超过 5MB 会自动清空。
+
+### 常见排查步骤
+1. 如果用户反馈"压缩上下文后仍然弹窗"，先确认是否开启了 `TOKEN_TRACKER_DEBUG=1`，再让用户复现一次。
+2. 打开 `~/.workbuddy/token-tracker-debug.log`，搜索 `==== TOAST TRIGGER ====`。
+3. 查看 `reason` 是 `stableCount>=3` 还是 `interrupted` 或其他。
+4. 检查触发前 10~20 行的 `[poll]` 日志，观察 `tailRaw` 是否在弹窗前已经连续多帧不变，以及是否出现过 `compaction-continue` 事件。
+5. 根据日志判断是判定逻辑问题还是数据源问题，不要凭记忆修改代码。
