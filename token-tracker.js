@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-// token-usage-tracker v2.59 (2026-08-23)
+// token-usage-tracker v2.61 (2026-08-25)
+// v2.61：修复 showToast 回归——v2.59 的 compaction-fix 误将 execFileSync 改为 spawn(detached+unref)，
+// 导致 watcher 退出时 PowerShell 子进程被提前终止、toast 丢失。本版回退为同步 execFileSync。
 // token-tracker.js — 读取 WorkBuddy 最新 trace 的真实 token / 耗时。
 // 数据来源：~/.workbuddy/traces/<pid>/trace_*.json 中的 trace.modelInfo / trace.duration
 // （WorkBuddy 每轮 LLM 调用结束都会落盘成一个新 trace 文件，但 UI 不显示，这里把它读出来）。
@@ -1402,9 +1404,10 @@ function reportSummaryTxt(arg) {
 // 模板 ToastText02（两行）：行1=耗时/输入/输出，行2=缓存命中+费用。
 // 用 PowerShell WinRT Toast API，参数走 -EncodedCommand（UTF-16LE Base64）避免中文编码问题。
 // 模板 ToastText02（两行）：行1=耗时/输入/输出，行2=缓存命中+费用。
-// v2.59/compaction-fix（步骤6）：改为非阻塞 spawn（detached + unref），避免同步 execFileSync 阻塞
-// watcher 主循环导致锁不释放 / coalesce 不清（对应 BACKLOG P0-2）。detached 使 toast 进程脱离父进程
-// 独立运行，父进程（hook）退出后通知仍能弹出；unref 使事件循环不等待该子进程。
+// v2.61：必须用同步 execFileSync（非 spawn+detached+unref）。原因：showToast 在 watcher 循环结束后才调用，
+// 调用后立即清 coalesce / 释放锁 / return 退出；若用 detached+unref 异步 spawn，父进程（watcher）退出时
+// PowerShell 子进程会被一起带走（宿主 job object 管理 hook 进程树，detached 不一定能脱离），toast 还没弹出就丢失。
+// 同步 execFileSync 阻塞几百毫秒保证 toast 弹出后父进程才退出，与本函数调用位置（循环收口后）完全契合，不存在阻塞副作用。
 // 失败不阻断主流程（stderr 记录）。
 function showToast(line1, line2) {
   if (process.platform !== 'win32') return;
@@ -1421,8 +1424,7 @@ function showToast(line1, line2) {
   ].join('; ');
   try {
     const enc = Buffer.from(ps, 'utf16le').toString('base64');
-    const child = require('child_process').spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', enc], { detached: true, stdio: 'ignore', windowsHide: true });
-    child.unref();
+    require('child_process').execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', enc], { timeout: 10000, stdio: 'ignore', windowsHide: true });
   } catch (e) {
     process.stderr.write(`[token-tracker] toast 失败: ${e.message}\n`);
   }
