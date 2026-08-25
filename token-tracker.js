@@ -1,5 +1,12 @@
 #!/usr/bin/env node
-// token-usage-tracker v2.61 (2026-08-25)
+// token-usage-tracker v2.63 (2026-08-25)
+// v2.63：调试日志机制重构——废弃 TOKEN_TRACKER_DEBUG 环境变量开关 + poll 全量记录，改为「弹窗时自动记录」：
+//   每次 showToast 无条件向 ~/.workbuddy/token-tracker-toast.log 追加一行 JSON 诊断（原因/sessionId/行数/稳定计数/compaction 状态等）。
+// v2.62：compaction 检测由"行数减少>5"改为"扫描 transcript 末尾 30 行识别压缩标记（compactionMode 方案）"。
+//   原因：该客户端 transcript 为 append-only，行数永不减少，旧方案在该客户端永远不触发、检测失效。
+//   新方案：每轮 poll 用 readTailRawLines 读末尾 30 行，若最新压缩标记（role=user 且内容以
+//   <conversation_history_summary> 或 <cb_summary> 开头）的 id 与上一轮不同（新标记）→ compactionMode=true、
+//   重置稳定计数并暂停本轮收口；之后标记不再新增时进入正常 stableCount>=3 收口。旧 showToast 同步修复见 v2.61。
 // v2.61：修复 showToast 回归——v2.59 的 compaction-fix 误将 execFileSync 改为 spawn(detached+unref)，
 // 导致 watcher 退出时 PowerShell 子进程被提前终止、toast 丢失。本版回退为同步 execFileSync。
 // token-tracker.js — 读取 WorkBuddy 最新 trace 的真实 token / 耗时。
@@ -66,18 +73,40 @@ const PROBE = path.join(WB, 'skills', 'token-usage-tracker', '.stop-probe.json')
 // 单 trace 普通轮次行为不变（Stop 立即弹本条）。--hook 端保留兜底：watcher 意外未弹（如应用
 // 关闭）时用户下次提交补弹一次。
 const DELAY_TOAST_MS = 6 * 1000; // debounce 窗口：最后一个子回合结束后延迟几秒弹汇总（技能要求"可延迟几秒"）
-// v2.61/debug：调试日志（默认关闭，设环境变量 TOKEN_TRACKER_DEBUG=1 才落盘）。
-// 仅用于排查 watcher 提前弹窗 / compaction 判定问题，生产默认不产生文件、额外 I/O 可控。
-const DEBUG_LOG_PATH = path.join(os.homedir(), '.workbuddy', 'token-tracker-debug.log');
-const MAX_DEBUG_LOG_SIZE = 5 * 1024 * 1024; // 5MB 轮清：超过即清空后重新追加，避免无限增长
-function writeDebugLog(message) {
-  if (process.env.TOKEN_TRACKER_DEBUG !== '1') return;
+// v2.63：弹窗诊断日志——取代旧的 TOKEN_TRACKER_DEBUG 环境变量调试机制。
+// 每次弹窗无条件向 ~/.workbuddy/token-tracker-toast.log 追加一行 JSON 诊断，便于事后排查弹窗原因/compaction 判定。
+const TOAST_LOG_PATH = path.join(os.homedir(), '.workbuddy', 'token-tracker-toast.log');
+const MAX_TOAST_LOG_SIZE = 5 * 1024 * 1024; // 5MB 轮清：超过即清空后重新追加，避免无限增长
+// 最近一次 watcher 轮询状态快照；showToast 内部据此补全诊断字段。
+// 循环外调用（估算/无记录/挂起聚合补弹）时可能为 null，writeToastLog 须容忍缺失字段。
+let gLastWatchState = null;
+// v2.63.1：最近一次弹窗所涉 trace 文件名（basename），供 writeToastLog 记录；获取不到则为 null。
+let gLastTraceFile = null;
+function writeToastLog(reason, state) {
   try {
     try {
-      const sz = fs.statSync(DEBUG_LOG_PATH).size;
-      if (sz > MAX_DEBUG_LOG_SIZE) fs.writeFileSync(DEBUG_LOG_PATH, '', 'utf8'); // 超阈值先清空
+      const sz = fs.statSync(TOAST_LOG_PATH).size;
+      if (sz > MAX_TOAST_LOG_SIZE) fs.writeFileSync(TOAST_LOG_PATH, '', 'utf8'); // 超阈值先清空
     } catch (e) { /* 文件不存在 / 无权限读取：忽略，直接走下方追加 */ }
-    fs.appendFileSync(DEBUG_LOG_PATH, message + '\n', 'utf8');
+    const st = state || {};
+    const rec = {
+      ts: new Date().toISOString(),
+      reason: reason || 'unknown',
+      sessionId: st.sessionId != null ? st.sessionId : null,
+      lineCount: st.lineCount != null ? st.lineCount : null,
+      stableCount: st.stableCount != null ? st.stableCount : null,
+      compactionSuspected: st.compactionSuspected != null ? st.compactionSuspected : null,
+      compactionMode: st.compactionMode != null ? st.compactionMode : null,
+      lastMarkerId: st.lastMarkerId != null ? st.lastMarkerId : null,
+      tailRawPrefix: String(st.tailRawPrefix || '').slice(0, 80),
+      lastTailRawPrefix: String(st.lastTailRawPrefix || '').slice(0, 80),
+      pendingSubCount: st.pendingSubCount != null ? st.pendingSubCount : null,
+      hasNewTail: st.hasNewTail != null ? st.hasNewTail : null,
+      watchStartTime: st.watchStartTime != null ? st.watchStartTime : null,
+      traceFile: st.traceFile != null ? st.traceFile : (gLastTraceFile != null ? gLastTraceFile : null),
+      toastText: st.toastText != null ? String(st.toastText).slice(0, 200) : null,
+    };
+    fs.appendFileSync(TOAST_LOG_PATH, JSON.stringify(rec) + '\n', 'utf8');
   } catch (e) { /* 日志写入失败：绝不阻塞主逻辑 */ }
 }
 function coalescePath(sid) {
@@ -624,6 +653,45 @@ function readTailRaw(tsPath) {
     const lines = buf.toString('utf-8').split('\n').map((s) => s.trim()).filter(Boolean);
     return lines.length ? lines[lines.length - 1] : '';
   } catch (e) { return ''; }
+}
+// v2.62/compactionMode：读 transcript 文件【原始末 n 行】（不做 JSON.parse）。用于扫描末尾窗口内的
+// 压缩标记（append-only transcript 行数永不减少，旧 lineCount 检测方案失效）。n 行可能较长，故取末尾
+// 64KB 足以覆盖；返回按文件顺序（旧→新）的最后 n 条非空行。
+function readTailRawLines(tsPath, n) {
+  try {
+    const fd = fs.openSync(tsPath, 'r');
+    const sz = fs.fstatSync(fd).size;
+    if (sz <= 0) { fs.closeSync(fd); return []; }
+    const chunk = sz > 65536 ? 65536 : sz;
+    const buf = Buffer.alloc(chunk);
+    fs.readSync(fd, buf, 0, buf.length, sz - buf.length);
+    fs.closeSync(fd);
+    const lines = buf.toString('utf-8').split('\n').map((s) => s.trim()).filter(Boolean);
+    return lines.length > n ? lines.slice(-n) : lines;
+  } catch (e) { return []; }
+}
+// v2.62/compactionMode：判断一条原始 transcript 行是否为"压缩标记"——
+// 一条 role=user 的消息，内容以 <conversation_history_summary>（新格式）或 <cb_summary>（旧格式外包一层）开头。
+// 命中则返回该标记的稳定 id（uuid/timestamp 优先，缺失时退回内容前缀 hash），否则返回 null。
+// 稳定 id 用于跨轮 poll 识别"新出现的压缩标记"（同一压缩事件产生唯一 user 消息，id 不重复）。
+function compactionMarkerId(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  let obj;
+  try { obj = JSON.parse(raw); } catch (e) { return null; }
+  if (!obj || obj.type !== 'message' || obj.role !== 'user') return null;
+  const c = Array.isArray(obj.content)
+    ? obj.content.map((x) => (x && x.text) || '').join('')
+    : (typeof obj.content === 'string' ? obj.content : '');
+  const s = (c || '').trimStart();
+  if (s.startsWith('<conversation_history_summary>') || s.startsWith('<cb_summary>')) {
+    if (obj.uuid) return 'u:' + obj.uuid;
+    if (obj.timestamp) return 't:' + obj.timestamp;
+    let h = 0;
+    const pre = s.slice(0, 64);
+    for (let i = 0; i < pre.length; i++) h = (h * 31 + pre.charCodeAt(i)) >>> 0;
+    return 'h:' + h;
+  }
+  return null;
 }
 // v2.59/compaction-fix（步骤2）：获取 transcript 统计信息，用于 watcher 检测 Context Compaction。
 // 注：原指令假设存在 getTranscriptPath()，但实际 v2.59 主 transcript 路径由 watcher 循环的 tsPath
@@ -1409,7 +1477,12 @@ function reportSummaryTxt(arg) {
 // PowerShell 子进程会被一起带走（宿主 job object 管理 hook 进程树，detached 不一定能脱离），toast 还没弹出就丢失。
 // 同步 execFileSync 阻塞几百毫秒保证 toast 弹出后父进程才退出，与本函数调用位置（循环收口后）完全契合，不存在阻塞副作用。
 // 失败不阻断主流程（stderr 记录）。
-function showToast(line1, line2) {
+function showToast(line1, line2, reason) {
+  // v2.63.1：把实际文案拼进诊断日志；合并最近 watcher 轮询快照字段（gLastWatchState），
+  // 字段缺失时 writeToastLog 内部以 null 兜底，绝不因诊断而影响弹窗。
+  const toastState = Object.assign({}, gLastWatchState || {});
+  toastState.toastText = String(line1 || '') + ' | ' + String(line2 || '');
+  writeToastLog(reason, toastState);
   if (process.platform !== 'win32') return;
   // v2.34：line1 可能含真实换行符 \n（toastLine1 两行大字布局）。先 escapeXml 转义 &<>"'，
   // 再把 \n 转成 XML 实体 &#10;（若先转再 escapeXml，& 会被转成 &amp; 导致换行失效）
@@ -2012,31 +2085,45 @@ function main() {
 
     let toastReason = null;     // v2.61/debug：触发弹窗的原因（break 时赋值，用于去重日志）
     let lastPollSnapshot = null; // v2.61/debug：最近一次 poll 的状态快照，供 idle-timeout 兜底日志使用
+    // v2.62/compactionMode：压缩标记追踪状态。
+    // - processedMarkers：已处理过的压缩标记 id 集合（仅用于观测 processedMarkerCount）。
+    // - compactionMode：一旦检测到压缩标记即置 true，整个 watcher 生命周期内保持（不重置回 false）。
+    // - lastMarkerId：上一轮 poll 检测到的最新压缩标记 id（null 表示尚未见过）。
+    const processedMarkers = new Set();
+    let compactionMode = false;
+    let lastMarkerId = null;
     while (Date.now() - lastActiveAt < WATCH_MAX_MS) {   // 空闲超时：主模型持续活跃则永不退出、绝不弹
-      // v2.59/compaction-fix（步骤3/5）：每次 poll 开始时检测 Context Compaction。
+      // v2.62/compactionMode：每次 poll 开始时扫描 transcript 末尾窗口，识别压缩标记。
+      // 该客户端 transcript 为 append-only，行数永不减少，旧"行数减少>5 行"检测恒不触发、已失效。
+      // 真实 compaction 特征：一条 role=user 的消息，内容以 <conversation_history_summary>（新）或
+      // <cb_summary>（旧）开头。系统在压缩时把历史摘要作为一条 user 消息追加进 transcript。
       const currentStats = getTranscriptStats(tsPath);
-      // 检测 compaction 特征：仅当行数显著减少（超过 5 行）时判定（不再使用 mtime，避免误判）
       let compactionSuspected = false;
-      if (lastStats && currentStats.lineCount < lastStats.lineCount - 5) {
-        compactionSuspected = true;
+      // 扫描末尾 30 行，取最新（最后命中）的压缩标记 id；无标记则 curMarkerId=null。
+      let curMarkerId = null;
+      const tailRawLines = readTailRawLines(tsPath, 30);
+      for (const ln of tailRawLines) {
+        const mid = compactionMarkerId(ln);
+        if (mid !== null) curMarkerId = mid; // 同窗口内多条时取最新一条
       }
-      // 如果检测到 compaction，重置稳定计数，并且本次 poll 不做"停写"判断
-      if (compactionSuspected) {
-        stableCount = 0;
-        lastStats = currentStats;
-        busySince = Date.now(); // 步骤5：重置 busy 计时，防止 2min 误弹
-        lastActiveAt = Date.now(); // 刷新空闲超时时间戳，防止 compaction 期间被空闲超时误弹
-        // v2.61/debug：compaction 期间每轮 poll 落日志（此时 st/newTail 尚未计算，记为 compaction-continue）
-        writeDebugLog('[poll] ' + JSON.stringify({
-          ts: new Date().toISOString(), sessionId: currentStats.sessionId, event: 'compaction-continue',
-          lineCount: currentStats.lineCount, stableCount, compactionSuspected: true,
-          tailRawPrefix: readTailRaw(tsPath).slice(0, 80), lastTailRawPrefix: lastTailRaw.slice(0, 80),
-        }));
-        // 继续等待，不进入结束判定逻辑
+      // 发现"新"压缩标记：当前最新标记非空且不同于上一轮记录的最新标记（已滑出窗口的 null 不视为新标记）。
+      if (curMarkerId !== null && curMarkerId !== lastMarkerId) {
+        if (lastMarkerId !== null) processedMarkers.add(lastMarkerId); // 旧标记已处理完，入集合观测
+        if (!compactionMode) {
+          // 首次进入 compaction：完整重置——清空稳定计数并刷新空闲/busy 计时，避免压缩期间误收口。
+          stableCount = 0;
+          lastStats = currentStats;
+          busySince = Date.now();
+          lastActiveAt = Date.now();
+          lastTailRaw = '';
+        }
+        compactionMode = true;
+        compactionSuspected = true;
+        lastMarkerId = curMarkerId;
         sleep(WATCH_POLL_MS);
         continue;
       }
-      // 更新 lastStats
+      // 未发现新标记：compactionSuspected=false，compactionMode 保持不变（不重置），进入正常收口逻辑。
       lastStats = currentStats;
       let st = pollTail();
       // v2.57→v2.58：初态终态错误继承——coalesce 已标记 terminalError，首轮 poll 因末行被覆盖/尾行半写
@@ -2079,18 +2166,18 @@ function main() {
         unknownStreak,
       });
 
-      // v2.61/debug：每轮 poll 落完整状态（TOKEN_TRACKER_DEBUG=1 才写）。注意：hasNewTail 会修改 lastTailTs，
-      // 故此处复用已算出的 newTail 变量，不再调用 hasNewTail()。
       const pollState = {
-        ts: new Date().toISOString(), sessionId: currentStats.sessionId,
+        ts: new Date().toISOString(), sessionId: (fSid && fSid !== 'unknown') ? fSid : currentStats.sessionId,
+        watchStartTime: watchStartTime != null ? new Date(watchStartTime).toISOString() : null,
         lineCount: currentStats.lineCount, stableCount,
         st, hasNewTail: newTail, newAgent,
         pendingSubCount: pendingSub.length, interrupted, deadTeam,
         compactionSuspected: false,
+        lastMarkerId, processedMarkerCount: processedMarkers.size, compactionMode,
         tailRawPrefix: readTailRaw(tsPath).slice(0, 80),
         lastTailRawPrefix: lastTailRaw.slice(0, 80),
       };
-      writeDebugLog('[poll] ' + JSON.stringify(pollState));
+      gLastWatchState = pollState; // 最近快照供 showToast 内部 writeToastLog 补全诊断字段
       lastPollSnapshot = pollState; // 供循环退出后的 idle-timeout 日志复用
 
       if (newTail || newAgent) {
@@ -2109,14 +2196,6 @@ function main() {
         unknownStreak = 0;
         if (busySince === 0) busySince = Date.now();
         else if (Date.now() - busySince > WATCH_BUSY_MAX_MS) {
-          // v2.61/debug：busy 绝对上限兜底触发弹窗
-          writeDebugLog('==== TOAST TRIGGER ==== ' + JSON.stringify({
-            ts: new Date().toISOString(), sessionId: currentStats.sessionId,
-            watchStartTime: new Date(watchStartTime).toISOString(), currentTime: new Date().toISOString(),
-            reason: 'busy-timeout', lineCount: currentStats.lineCount, stableCount,
-            tailRawPrefix: readTailRaw(tsPath).slice(0, 80), lastTailRawPrefix: lastTailRaw.slice(0, 80),
-            compactionSuspected: false, st, hasNewTail: newTail, pendingSubCount: pendingSub.length,
-          }));
           toastReason = 'busy-timeout';
           break;
         }
@@ -2153,24 +2232,10 @@ function main() {
         }
         if (interrupted) {
           // 用户手动停止 → 真终态立即收口（子代理同步停，实测行ts差0s）
-          writeDebugLog('==== TOAST TRIGGER ==== ' + JSON.stringify({
-            ts: new Date().toISOString(), sessionId: currentStats.sessionId,
-            watchStartTime: new Date(watchStartTime).toISOString(), currentTime: new Date().toISOString(),
-            reason: 'interrupted', lineCount: currentStats.lineCount, stableCount,
-            tailRawPrefix: readTailRaw(tsPath).slice(0, 80), lastTailRawPrefix: lastTailRaw.slice(0, 80),
-            compactionSuspected: false, st, hasNewTail: newTail, pendingSubCount: pendingSub.length,
-          }));
           toastReason = 'interrupted';
           break;
         } else if (deadTeam) {
           // 专家团死寂（pending 非空 + 子代理停更 60s）→ 立即收口
-          writeDebugLog('==== TOAST TRIGGER ==== ' + JSON.stringify({
-            ts: new Date().toISOString(), sessionId: currentStats.sessionId,
-            watchStartTime: new Date(watchStartTime).toISOString(), currentTime: new Date().toISOString(),
-            reason: 'deadTeam', lineCount: currentStats.lineCount, stableCount,
-            tailRawPrefix: readTailRaw(tsPath).slice(0, 80), lastTailRawPrefix: lastTailRaw.slice(0, 80),
-            compactionSuspected: false, st, hasNewTail: newTail, pendingSubCount: pendingSub.length,
-          }));
           toastReason = 'deadTeam';
           break;
         } else if (pendingSub.length === 0) {
@@ -2182,13 +2247,6 @@ function main() {
             busySince = 0;
           } else {
             // 子代理确实停更 + 末行已稳定 >=3 帧 → 立即收口（v2.60：无确认窗口）
-            writeDebugLog('==== TOAST TRIGGER ==== ' + JSON.stringify({
-              ts: new Date().toISOString(), sessionId: currentStats.sessionId,
-              watchStartTime: new Date(watchStartTime).toISOString(), currentTime: new Date().toISOString(),
-              reason: 'stableCount>=3', lineCount: currentStats.lineCount, stableCount,
-              tailRawPrefix: readTailRaw(tsPath).slice(0, 80), lastTailRawPrefix: lastTailRaw.slice(0, 80),
-              compactionSuspected: false, st, hasNewTail: newTail, pendingSubCount: pendingSub.length,
-            }));
             toastReason = 'stableCount>=3';
             break;
           }
@@ -2202,33 +2260,20 @@ function main() {
       }
       sleep(WATCH_POLL_MS);
     }
-    // v2.61/debug：idle-timeout 兜底日志（循环因 WATCH_MAX_MS 条件退出，非 break 触发；避免与上方 break 日志重复）
+    // idle-timeout：循环因 WATCH_MAX_MS 条件退出（非 break 触发）。toastReason 在 showToast 内部记录为 idle-timeout。
     if (!toastReason) {
-      writeDebugLog('==== TOAST TRIGGER ==== ' + JSON.stringify({
-        ts: new Date().toISOString(),
-        sessionId: lastPollSnapshot ? lastPollSnapshot.sessionId : '',
-        watchStartTime: new Date(watchStartTime).toISOString(), currentTime: new Date().toISOString(),
-        reason: 'idle-timeout',
-        lineCount: lastPollSnapshot ? lastPollSnapshot.lineCount : null,
-        stableCount: lastPollSnapshot ? lastPollSnapshot.stableCount : null,
-        tailRawPrefix: lastPollSnapshot ? lastPollSnapshot.tailRawPrefix : null,
-        lastTailRawPrefix: lastPollSnapshot ? lastPollSnapshot.lastTailRawPrefix : null,
-        compactionSuspected: lastPollSnapshot ? lastPollSnapshot.compactionSuspected : null,
-        st: lastPollSnapshot ? lastPollSnapshot.st : null,
-        hasNewTail: lastPollSnapshot ? lastPollSnapshot.hasNewTail : null,
-        pendingSubCount: lastPollSnapshot ? lastPollSnapshot.pendingSubCount : null,
-      }));
       toastReason = 'idle-timeout';
     }
     // 兜底超时到 / 确认期过 → 弹（释放锁）
     const info = readCoalesceInfo(fSid);
     if (info && info.agg) {
+      gLastTraceFile = info.traceFile || null; // v2.63.1：供下方 showToast 诊断记录 trace 文件名
       const pricing = loadPricing();
       const agg = info.agg;
       // v2.50：弹窗前补一次增量记账（子代理收尾可能在 Stop 之后才落盘，水位线保证不重复）
       if (info.tsPath) incrementalRecord(info.tsPath, fSid);
       const bal = balanceText();
-      showToast(toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), bal, todayUsageTxt()), toastLine2(agg, pricing));
+      showToast(toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), bal, todayUsageTxt()), toastLine2(agg, pricing), toastReason);
       clearCoalesce(fSid);
       // v2.27：watcher 弹窗完成 = 专家团本轮真正结束 → 推进 lastStopAt（供 hook 端起点刷新守卫）
       const ws = loadSnapshot(fSid) || {};
@@ -2333,8 +2378,14 @@ function main() {
         // 判定真结束；确认窗内检测到 busy/新行/新子代理（续跑/恢复信号）则取消 pending，绝不弹。
         // Stop/idle/unknown/tool-end/网络错误/transcript 暂不可读均不再直接等价于 Run 真正结束。
         // watcher 弹窗完成时统一推进 lastStopAt（见 --flush-delayed）。
-        writeCoalesce(sid, agg, { tsPath, roundStart: roundStart0, byModel, terminalError: teAtStop || undefined });
-        spawnFlushWatcher(sid);
+        // v2.63.3：transcript 路径也记录 traceFile / sessionId，供弹窗日志不再为 null/unknown。
+        // sessionId 优先用 payload 的 sid，缺失时从 transcript 路径 basename 提取（如 7386b18a-….jsonl）。
+        const latestTrace = latestTraceFile(true);
+        const traceFile = latestTrace ? path.basename(latestTrace) : null;
+        const sidFromPath = tsPath ? path.basename(tsPath, '.jsonl') : null;
+        const effSid = sid || sidFromPath;
+        writeCoalesce(effSid, agg, { tsPath, roundStart: roundStart0, byModel, terminalError: teAtStop || undefined, traceFile });
+        spawnFlushWatcher(effSid);
         // v2.37：systemMessage 通道 WorkBuddy UI 实测不显示（无法注入到对话回复），删除该无效注入；
         // toast 已在上面弹出。保留空 hook 返回保证进程行为不变。
         out({ hookSpecificOutput: {} });
@@ -2354,7 +2405,7 @@ function main() {
           writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sid, sameRound: false, transcriptPath: tsPath, stat: estStat, line: '本轮被中断，估算 token（思考未落盘 usage）', source: 'transcript-interrupted-est', payload: summarizePayload(payloadRaw) });
           // 注意：估算值已在 incrementalRecord（本函数开头）按水位线记入账本，这里不再重复 recordUsage。
           const bal = balanceText();
-          showToast(toastLine1(estStat, estModelShort, '（估算）', bal, todayUsageTxt()), toastLine2(estStat, pricing));
+          showToast(toastLine1(estStat, estModelShort, '（估算）', bal, todayUsageTxt()), toastLine2(estStat, pricing), 'estimate');
           out({ hookSpecificOutput: {} });
           return;
         }
@@ -2367,7 +2418,7 @@ function main() {
         const aux0 = (today0 ? '今日累计 ' + today0 + ' ｜ ' : '') + (bal0 ? bal0 + ' ｜ ' : '');
         // 宽度保护：原因优先，今日累计/余额超宽时丢弃（v2.53.1 原因提示是用户最想看的，保它）
         const body0 = dispWidth(aux0 + reason0) > TOAST_LINE_MAX_W ? reason0 : (aux0 + reason0);
-        showToast('本轮无 token 消耗记录', body0);
+        showToast('本轮无 token 消耗记录', body0, 'no-token');
         out({ hookSpecificOutput: {} });
         return;
       }
@@ -2500,10 +2551,12 @@ function main() {
     const tsPathH = transcriptPathFromPayload(payloadRaw);
     const hookFile = tsPathH || f;
     const pendAgg = readCoalesce(sid);
+    const pendInfo = readCoalesceInfo(sid);
     if (pendAgg) {
+      if (pendInfo && pendInfo.traceFile) gLastTraceFile = pendInfo.traceFile; // v2.63.1：诊断记录 trace 文件名
       const pendModel = shortModelName(pendAgg, pricing);
       const bal = balanceText();
-      showToast(toastLine1(pendAgg, pendModel, periodNote(pendAgg, pricing), bal, todayDisplay(pendAgg, pricing)), toastLine2(pendAgg, pricing));
+      showToast(toastLine1(pendAgg, pendModel, periodNote(pendAgg, pricing), bal, todayDisplay(pendAgg, pricing)), toastLine2(pendAgg, pricing), 'hook-fallback');
       clearCoalesce(sid);
       // v2.27：兜底补弹完成 → 该轮已结束，标记 lastStopAt（供下轮起点刷新判断）
       const psnap = loadSnapshot(sid) || {};
