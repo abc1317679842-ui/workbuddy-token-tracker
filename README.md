@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v2.63.0-blue)
+![Version](https://img.shields.io/badge/version-v2.75.0-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -166,6 +166,53 @@ Windows 设置 → 系统 → 通知 → 应用通知
 本技能的 toast 使用**独立应用名「WorkBuddy Token Tracker」** 直接调用 Windows 系统通知 API 弹出，**不经过 WorkBuddy 客户端设置**——关闭 WorkBuddy 自带通知**不影响 Token 通知**。若想连 Token 通知一起关：在通知列表单独关闭「WorkBuddy Token Tracker」即可。
 
 ## 更新记录（Changelog）
+
+### v2.60~v2.75（2026-08-25~29）—— 稳定帧收口 + 性能 + 数据完整性 + 显示名/耗时口径修正
+
+**v2.75（2026-08-29）—— 弹窗显示名还原原始短名：**
+- `shortModelName` 非本地模型分支优先用应用原始模型名（hy3、deepseek-v4-flash 等），不再取 pricing.json 的 `name` 字段；计费路径（findModel 'price'）不变。修复弹窗模型名从 hy3 变 Hunyuan-3.0 的问题。
+
+**v2.74（2026-08-29）—— 耗时统一口径：**
+- Stop 聚合优先用 trace 墙钟（startedAt→endedAt），与 WorkBuddy 显示一致；trace 不可用回退 transcript 口径。修复弹窗耗时与 WorkBuddy 差 ~53s 的问题（transcript 首条 usage 行在生成完成后落盘，起点右移首轮生成耗时）。
+
+**v2.73~v2.72**：内部迭代，无独立公开记录。
+
+**v2.71（2026-08-28）—— findModel 双模式：**
+- 默认（精确）模式只认归一化完全相等；新增 `mode='price'` 计费模式（精确失败后双向 includes 子串近似取价，如 hy3-x→hy3）。统计桶名保持原始名，计费与统计解耦。
+
+**v2.70（2026-08-28）—— 上下文超长前兆检测 + toast 去重：**
+- 模型返回 "input length too long" 等错误后启动压缩前，watcher 进入压缩等待窗口（默认 120s），避免压缩期间提前弹窗。
+- 同文案 toast 10 分钟内只弹一次（防 Stop 与 watcher 兜底重复弹）。
+
+**v2.69（2026-08-28）—— 增量记账性能优化：**
+- `readTranscLinesFrom` 只解析水位线之后的新行（字节缓冲定位，100MB 文件从 233ms → 24ms），统计口径不变；`estimateInterruptedInc` 快路径 + 历史行回退。
+
+**v2.68（2026-08-28）—— 数据完整性 4 项 + 锁逻辑同步：**
+- 记账失败不再推进水位线（防用量永久丢失）；transcript 截断不回退水位线（Math.max，防重复计费）；水位线键消除跨项目串扰（无 sid 用完整路径哈希）；锁抢占只认持有者 pid 存活（存活绝不抢、已死立即接管），TTL 30s→300s。
+
+**v2.67（2026-08-28）—— 模型名严格精确匹配：**
+- `findModel` 只认归一化后完全相等的模型名，一个字符不同即不同模型；删除 includes 模糊匹配/版本后缀归并/`.`与`-`等价替换。日期后缀模型价格不可靠相同（r1 vs r1-0528 等实证）。
+
+**v2.66（2026-08-28）—— 数据完整性 10 项 + 3 个额外 bug：**
+- 原子写（临时文件+rename）；损坏自愈（.corrupt 备份）；并发锁（recordUsage/saveDailyUsage/addModelPrice 锁内重读盘合并）；记账口径统一 extractUsageFromRow（pd.usage/rawUsage/message.usage）；刷新超时 15s→60s。额外修复：require('refresh-prices.js') 触发联网（加 require.main 守卫）、addModelPrice 小写模型名、水位线损坏重复计费。
+
+**v2.65（2026-08-28）—— 价格刷新改由 Hook 触发 + 清理长期未用模型：**
+- 全量刷新从 --stop 移到 --hook（避免 Stop 被联网阻塞）；刷新时删除超 14 天未用模型（lock:true 三个 DeepSeek 模型保留）。
+
+**v2.64（2026-08-28）—— 新模型首用 cost 丢失修复：**
+- Stop 路径改为先补价再记账（原增量记账先于 ensureNewModelPricing，新模型首用 pricing 未落盘导致金额静默丢弃）。
+
+**v2.63（2026-08-25）—— 弹窗诊断日志机制重构：**
+- 废弃 TOKEN_TRACKER_DEBUG 开关，改为每次 showToast 无条件写 ~/.workbuddy/token-tracker-toast.log 一行 JSON（reason/sessionId/traceFile/toastText 等），5MB 轮清。
+
+**v2.62（2026-08-25）—— compactionMode 方案：**
+- 原"行数减少>5"检测在 append-only transcript 上永不触发、彻底失效；改为扫描末尾 30 行识别压缩标记（role=user 且以 <conversation_history_summary>/<cb_summary> 开头），出现新标记暂停收口。
+
+**v2.61（2026-08-25）—— showToast 回归修复 + 性能 + 可观测性：**
+- 回退 spawn(detached+unref) 为同步 execFileSync（防 watcher 退出时 PowerShell 子进程被终止、toast 丢失）；getTranscriptStats 用 '\n' 计数 + mtime 缓存（91MB transcript 轮询压力显著下降）。
+
+**v2.60（2026-08-25）—— 统一稳定帧保护 + 去冗余确认窗：**
+- stableCount>=3 门槛扩展到 final/terminal-error 分支（原 final 仅靠 6s 确认窗，compaction 长重写后误弹）；去除冗余确认窗，正常回合弹窗延迟收敛到 ~6-9s。
 
 ### v2.54~v2.59（2026-08-23）—— DeepSeek 官方定价直连 + 峰谷时段通用跟随 + 生效时间机制
 
