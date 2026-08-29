@@ -93,7 +93,7 @@ function parseOfficial(html) {
   const grab = (tr, baseIdx) => {
     const c = cellText(tr);
     // 行内形如：| 高峰时段 | 0.10元 | 0.30元 | 0.10元 |
-    const nums = c.map((s) => { const m = s.match(/^(\d+(\.\d+)?)/); return m ? Number(m[1]) : NaN; });
+    const nums = c.map((s) => { const m = s.match(/^(\d+(?:\.\d+)?)/); return m ? Number(m[1]) : NaN; });
     const vals = nums.filter((v) => !isNaN(v));
     return vals.length >= n ? vals.slice(0, n) : null;
   };
