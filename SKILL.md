@@ -11,9 +11,36 @@ type: skill
 - **Windows 10/11**：系统通知（toast）仅 Windows 支持；macOS/Linux 可正常手动使用（方式 A），但不弹通知。
 - **Node.js ≥ 20**：脚本零依赖单文件，无需 npm install。
 
-## 当前功能总览（v2.61 · 2026-08-25）
+## 当前功能总览（v2.68 · 2026-08-28）
 
 > **⚠️ 强制（查询触发总纲）：所有统计查询必须调用 `--report` 命令并原样贴出脚本输出，禁止自行解析 JSON。** 无论用户问「今日消耗」「今天用了多少」「账本」「报告」「统计」「花费」还是历史某天，一律先跑 `node token-tracker.js --report`（或 `--report <日期>`），再把脚本打印的 Markdown 表格原文贴给用户；不得自行读取 `daily-usage.json`、不得自行汇总、不得转成列表/纯文本/代码块。详细规则见下方「查询触发规则（强制）」与「展示格式约束（强制）」。
+
+> **v2.68（2026-08-28，数据完整性 4 项 + 锁逻辑同步）：** 备份 `token-tracker.js.bak-dataintegrity-20260828`。
+> - **记账失败不再推进水位线**：`saveDailyUsageRaw` 返回成败 → `recordUsage` 回传 → `incrementalRecord` 先算候选水位线，**仅记账成功才提交**。此前账本写入失败（Windows 下 `rename` 覆盖被占用文件会 EPERM）而水位线照推进，这部分用量**永久丢失**且只留一行 stderr。现失败则保持旧水位线、下轮补记。
+> - **transcript 截断不回退水位线**：`entry.main` / `entry.subs[f]` 改取 `Math.max(旧值, 当前行数)`。此前 transcript 行数下降（Context Compaction 重写、外部工具截断）会把水位线拉回小值，文件重新长回原长时**重复计费**。代价：截断后被重写到同行位置的内容不再重记（少记优于多记）。
+> - **水位线键消除跨项目串扰**：新增 `ledgerKey(sid, tsPath)`——有 `session_id` 用原值（行为不变），无则用 transcript **完整路径** sha1 前 16 位。此前 watcher 用 `sid || basename`、记账用原始 `sid`（空串），两处不一致且 basename 跨项目同名会撞键，实测两个 `default.jsonl` 只记一半用量。已确认线上 79 个键全是真实 session_id，换键不触发重记。
+> - **锁抢占安全化**：`withFileLock`（及 `refresh-prices.js` 的 `withPricingLock`）抢占规则改为**只看持有者 pid 存活**——存活绝不抢、已死立即接管、解析不出 pid 才退化为 TTL 判定；TTL 30s → 300s。此前超 30s 就抢，会把仍在工作（只是慢）的持有者的锁抢走 → 两进程同时写。重试上限 5s，不会死等。
+
+> **v2.67（2026-08-28，模型名严格精确匹配）：** `findModel` 只认**归一化后完全相等**的模型名，一个字符不同即视为不同模型、分开统计分开计费。
+> - 删除：双向 `includes` 模糊匹配、版本/日期后缀归并（`isVersionSuffix`）、`.` 与 `-` 等价替换（`normalizeModelKey`）、自动推断的别名表条目。
+> - 保留：归一化 = 统一小写 + 去首尾空格 + 连续空格合并（仅此三件）；`MODEL_ALIASES` 保留为空表，供人工核实后手动添加等价名。
+> - 依据（源数据核查）：日期后缀模型价格**不可靠地相同**——`deepseek-r1`(0.700/2.500) vs `r1-0528`(0.500/2.150) 日期版更便宜；`chat-v3-0324`(0.250/1.000) vs `chat-v3.1`(0.550/1.650) 新版更贵 2.2×；`v4-pro`(0.870/1.740) vs `v4-pro-0813`(0.660/1.980) 交叉（输入便宜、输出更贵）。
+> - 影响：未收录模型返回 `null` → 走 `ensureNewModelPricing` 联网补价；补价失败则记 token 不记金额（宁可不计价也不算错价）。
+
+> **v2.66（2026-08-28，数据完整性 10 项 + 3 个额外 bug）：** 备份 `*.bak-full-fix-20260828`。
+> - 原子写：水位线 / `daily-usage.json` / `pricing.json` 全部改为「临时文件 + rename」，写失败不动原文件。
+> - 损坏自愈：`loadDailyUsage` 解析失败 → 备份 `.corrupt-<时间戳>` + 本轮禁写（不用空对象覆盖历史）；`loadLedgerWatermarkSafe` 三级降级（主文件 → `.bak` → 跳过记账）；`autoRefreshPricing` 遇 null/非对象自动重建。
+> - 并发锁：`recordUsage` / `saveDailyUsage` / `addModelPrice` 全部加锁；`addModelPrice` 在**锁内重新读盘再合并**（防读改写竞态丢更新）。
+> - 记账口径统一 `extractUsageFromRow`（兼容 `pd.usage` / `pd.rawUsage` / `message.usage`）；模型名归一化（大小写/空格）避免同模型拆多条。
+> - 其它：刷新超时 15s → 60s；`findModel` 先去掉模糊 includes 改为严格三级匹配；`sessionId` 解析失败回退 basename（不再用 `'unknown'`）并兼容 `sessionId`/`session_id` 写法。
+> - 额外修复 3 个 bug：`require('refresh-prices.js')` 会触发 `main()` 联网刷新（加 `require.main === module` 守卫）；`addModelPrice` 内部会把模型名转小写（文档口径统一）；水位线损坏即重复计费。
+> - 验证：9 个测试脚本 94 条断言全通过；真实数据冒烟无回归。
+
+> **v2.65（2026-08-28，价格刷新改由 Hook 触发 + 清理长期未用模型）：**
+> - **刷新时机挪位**：全量刷新从 `--stop` 路径移到 `--hook`（用户提问时触发）。避免 Stop 路径被联网阻塞、拖慢弹窗。`--stop` 仍保留新模型补价。
+> - **清理陈旧模型**：`refresh-prices.js` 刷新时删除「未出现在 `daily-usage.json` 或超过 14 天未使用」的模型，`lock: true` 的（`deepseek-v4-flash` / `-vision-exp` / `v4-pro`）始终保留。被删模型在用时会由 `ensureNewModelPricing` 自动补回。
+
+> **v2.64（2026-08-28，新模型首用 cost 丢失修复）：** Stop 路径中 `incrementalRecord`（记账）原本在 `ensureNewModelPricing`（补价）**之前**执行，而记账内部 `loadPricing()` 读的是磁盘——新模型首用时定价尚未落盘 → `calcCost` 返回 null → **token 记了、金额静默丢弃**。改为**先补价再记账**。已收录模型不受影响（`findModel` 命中即直接返回，不联网）。
 
 > **v2.59（2026-08-23，DeepSeek 官方定价直连 + 生效时间机制 + P0-1 回归修复）：**
 > - **官方定价直连抓取**：新增 `deepseek-official.js`，每日直连 DeepSeek 官方定价页解析模型清单 + 价格（空闲/高峰）+ 时段 + 周末规则。DeepSeek 系官方优先、官方没有的（已下线 V3 等）回落聚合源；模型清单自动对齐（官方新增自动收录、官方下线自动标 `retired`，如 vision-exp 已自动收录）。
@@ -32,7 +59,24 @@ type: skill
 > - **【关键修复】showToast 回归修复**：v2.59 的 compaction-fix 误将同步 `execFileSync` 改为 `spawn('powershell.exe', […], { detached: true, stdio: 'ignore' }) + child.unref()`，导致 watcher 进程退出时 PowerShell 子进程被提前终止、toast 通知丢失（表现为「完全无弹窗」）。本版回退为原同步 `execFileSync`（带 `timeout: 10000`、`stdio: 'ignore'`、`windowsHide: true`），保证 toast 弹出后父进程才退出。
 > - **清理残留**：删除已不再使用的 `WATCH_CONFIRM_MS` 常量与 `confirmSince` 变量的全部声明/赋值/读取及关联注释（v2.60 已用 `stableCount>=3` 直接收口取代 6s 确认窗，该变量成为死代码）。
 > - **`getTranscriptStats` 性能优化**：① 不再 `split('\n')` 生成整文件行数组，改用 `'\n'` 字符计数（`换行符数 + 1`，与原 `split` 行数在所有情形一致，已用边界用例验证）；② 新增模块级 `transcriptStatsCache`，当 `path` 与 `mtimeMs` 均命中时直接返回缓存，跳过 `fs.readFileSync` + 整文件扫描（对 91MB transcript 每轮 3s poll 的 I/O/GC 压力显著下降）。
-> - **调试日志**：新增 `writeDebugLog(message)`（受 `TOKEN_TRACKER_DEBUG=1` 开关控制，默认关闭；日志落 `~/.workbuddy/token-tracker-debug.log`，超 5MB 自动清空）。每轮 poll 落完整状态（ts/sessionId/lineCount/stableCount/st/hasNewTail/pendingSubCount/interrupted/deadTeam/tailRawPrefix/lastTailRawPrefix），compaction 期间单独落 `compaction-continue`；任一 `break` 触发弹窗前落 `==== TOAST TRIGGER ====` 含 `reason`（`busy-timeout`/`interrupted`/`deadTeam`/`stableCount>=3`/`idle-timeout`）与关键状态，便于排查提前弹窗与 compaction 误判。
+> - **调试日志**：（v2.61 原始实现，v2.63 已重构，见下）新增 `writeDebugLog(message)`（受 `TOKEN_TRACKER_DEBUG=1` 开关控制，默认关闭；日志落 `~/.workbuddy/token-tracker-debug.log`，超 5MB 自动清空）。每轮 poll 落完整状态（ts/sessionId/lineCount/stableCount/st/hasNewTail/pendingSubCount/interrupted/deadTeam/tailRawPrefix/lastTailRawPrefix），compaction 期间单独落 `compaction-continue`；任一 `break` 触发弹窗前落 `==== TOAST TRIGGER ====` 含 `reason`（`busy-timeout`/`interrupted`/`deadTeam`/`stableCount>=3`/`idle-timeout`）与关键状态，便于排查提前弹窗与 compaction 误判。
+
+> **v2.63（2026-08-25，弹窗诊断日志——调试日志机制重构）：废弃环境变量开关，改为「弹窗即记录」。**
+> - **废弃 `TOKEN_TRACKER_DEBUG` 开关 + poll 全量记录**：旧方案默认关闭、打开后每轮 poll 全量落盘，噪音大且排查时必须先验开启。改为**每次 `showToast` 无条件**向 `~/.workbuddy/token-tracker-toast.log` 追加一行 JSON 诊断，**无需任何环境变量开关**——弹窗这个动作本身就是最值得记录的事件，排查「为什么弹了 / 为什么没弹」直接翻这个文件即可。
+> - **日志字段**（`writeToastLog(reason, state)` 写入的单行 JSON）：`ts`、`reason`（触发原因：`busy-timeout`/`interrupted`/`deadTeam`/`stableCount>=3`/`idle-timeout`，取不到为 `unknown`）、`sessionId`、`traceFile`、`toastText`（实际弹出的文本，截断 200 字符）、`lineCount`、`stableCount`、`compactionSuspected`、`compactionMode`、`lastMarkerId`、`tailRawPrefix`/`lastTailRawPrefix`（各截断 80 字符）、`pendingSubCount`、`hasNewTail`、`watchStartTime`。字段缺失一律写 `null`，**日志写入失败静默吞掉、绝不阻塞弹窗**。
+> - **轮清策略**：`MAX_TOAST_LOG_SIZE = 5MB`，超过即清空后重新追加，避免无限增长。
+> - **配套提取（v2.63.1 / v2.63.3）**：`traceFile` 由 `latestTraceFile(true)` 取 basename（模块级 `gLastTraceFile` 兜底，循环外调用也能带上）；`sessionId` **优先用 payload 的 `sid`，缺失时才从 `tsPath` 的 basename 提取**（去 `.jsonl`，如 `7386b18a-….jsonl` → `7386b18a-…`）。目的：诊断日志里 sessionId / traceFile 不再为 `null`/`unknown`，多会话并发时每条日志都能归属到具体会话与 trace 文件。
+> - **诊断状态来源**：watcher 轮询把状态快照存入 `gLastWatchState`，`showToast` 内部据此补全字段；循环外调用（估算 / 无记录 / 挂起聚合补弹）该快照可能为 `null`，故 `writeToastLog` 必须容忍字段缺失。
+
+> **v2.62（2026-08-25，compactionMode 方案——替换失效的行数减少检测）：**
+> - **背景/根因**：原压缩检测为「transcript 行数减少 > 5 → 判定发生了上下文压缩」。但本客户端 transcript 是 **append-only**（只追加、不回删），行数永不减少 —— 该方案在此客户端**永远不触发、检测彻底失效**，导致压缩期间收口逻辑被误判为「正常稳定」而提前弹窗。
+> - **新方案（compactionMode）**：每轮 poll 用 `readTailRawLines` 读 transcript **末尾 30 行**，识别压缩标记（`role=user` 且内容以 `<conversation_history_summary>` 或 `<cb_summary>` 开头）：
+>   - **出现新压缩标记**（当前最新标记非空且 id ≠ 上一轮 `lastMarkerId`，已滑出窗口的 `null` 不视为新标记）→ 置 `compactionMode = true`、`compactionSuspected = true`，本轮 `continue` 跳过收口（不弹窗）；
+>     - **首次进入**（`compactionMode` 原为 false）额外做**完整重置**：`stableCount = 0` + 刷新 `busySince` / `lastActiveAt` + 清空 `lastTailRaw`，避免压缩期间误收口；
+>     - **后续新标记**只做「暂停本轮」，**不重复重置**（否则多轮压缩会反复归零、永不收口）。
+>   - **无新标记** → `compactionSuspected = false`，直接进入正常收口逻辑；`compactionMode` **置 true 后整个 watcher 生命周期内保持，不回退为 false**（历史事实标记，供诊断日志与后续判定参考）。
+> - **状态变量**：`compactionMode` / `lastMarkerId` / `processedMarkers`（已处理标记 id 集合，仅用于观测计数 `processedMarkerCount`）。
+> - 备份：`token-tracker.js.bak-before-compactionMode-fix`（已归档至 `docs/archive/`）。
 
 > **v2.58（2026-08-22，展示约定固化）：`--report`（明细版）每天合计行正下方固定输出一行「展示约定」提示**——「向用户展示以上账本时，请直接使用上面的 Markdown 表格原文（保留完整 7 列，不要手排/转纯文本/缩写）」。目的：调用方（AI 助手）读取账本数据时，最下面这行字即告知展示规则，无需再翻技能规定的展示格式约束。适用所有日期档（今天/历史/all）。
 
@@ -170,14 +214,15 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
   耗时 4m 26s 今日¥8.21 余额¥2.77
   输入 391.2万 / 输出 1.9万｜缓存99.74%｜¥0.25
   ```
-  ——**布局原则（v2.34/2.35 两行大字定稿；演进史见后）**：行1（标题大字）分两行——第一行 = 模型完整名 + 时段标注（`高峰双倍`/`夜间X折`，仅有时段策略的模型显示，空格分隔）；第二行 = `耗时` + `今日¥X` + `余额¥Y`（今日价 = 当天 24 小时总消费，余额仅开启余额查询且检测到变化时显示）。行2（正文小字）= 输入/输出 + 缓存占比（两位小数）+ 费用（未收录显示「未收录」）。**换行点固定在「时间」前**——行1 第二行永远从行首对齐，与第一行长度无关。**宽度双模型（v2.33）**：行1 标题大字用 `dispWidthTitle`（中文按 2.5 半角单位，v2.17 纯半角实测上限 47u、含中文更紧）+ 阈值 45u；行2 正文小字用 `dispWidth`（中文按 2）+ 阈值 52u。**降级链（v2.35 定稿）**：行1 第二行超 42u → 丢余额 → 再超丢今日价 → 保底 `耗时`（绝对安全）；行1 第一行超宽（长模型名）→ 丢时段标注保模型名。**时段标注 `periodNote()`**：`peak_multiplier>1`（DeepSeek 原厂系=2）且当前在高峰时段（北京时间 9-12/14-18）→ `高峰双倍`；`night_discount`（如 0.5）且当前在 `night_hours` → `夜间X折`；无时段策略不显示。**布局演进（历史）**：v2.6 行1 带时段标注 → v2.8 余额移至行1 → v2.11 余额紧跟时间 → v2.14 时段只显示「高峰」两字 → v2.17 实测上限 47u + 分隔符两侧加空格 → v2.18 恢复「¥」符号 → v2.32 加今日累计 → v2.33 行1 中文按 2.5 宽度模型 → v2.34/2.35 换行点移到时间前、两行大字布局定稿。**实现说明**：旧式 ToastText 系列无展开按钮，ToastText04 的第 3 个 text 元素在部分环境不渲染（v2.34 实测被吞），故用「ToastText02 标题 text 内插 `&#10;` 换行符」实现两行大字（用户实测 A1 方案成功）。这是当前唯一确认有效的"本条可见"通道（UI 内 `systemMessage` 通道实测不显示，v2.37 已移除该死代码）
+  ——**布局原则（v2.34/2.35 两行大字定稿；演进史见后）**：行1（标题大字）分两行——第一行 = 模型完整名 + 时段标注（`高峰双倍`/`夜间X折`，仅有时段策略的模型显示，空格分隔）；第二行 = `耗时` + `今日¥X` + `余额¥Y`（今日价 = 当天 24 小时总消费，余额仅开启余额查询且检测到变化时显示）。行2（正文小字）= 输入/输出 + 缓存占比（两位小数）+ 费用（未收录显示「未收录」）。**换行点固定在「时间」前**——行1 第二行永远从行首对齐，与第一行长度无关。**宽度双模型（v2.33）**：行1 标题大字用 `dispWidthTitle`（中文按 2.5 半角单位，v2.17 纯半角实测上限 47u、含中文更紧）+ 阈值 45u（= `TOAST_ROW1_MAX_W`，**以代码为准**）；行1 第二行阈值 42u（= `TOAST_ROW2_MAX_W`，**以代码为准**）；行2 正文小字用 `dispWidth`（中文按 2）+ 阈值 52u（= `TOAST_LINE_MAX_W`，**以代码为准**）。**降级链（v2.35 定稿）**：行1 第二行超 42u → 丢余额 → 再超丢今日价 → 保底 `耗时`（绝对安全）；行1 第一行超宽（长模型名）→ 丢时段标注保模型名。**时段标注 `periodNote()`**：`peak_multiplier>1`（DeepSeek 原厂系=2）且当前在高峰时段（北京时间 9-12/14-18）→ `高峰双倍`；`night_discount`（如 0.5）且当前在 `night_hours` → `夜间X折`；无时段策略不显示。**布局演进（历史）**：v2.6 行1 带时段标注 → v2.8 余额移至行1 → v2.11 余额紧跟时间 → v2.14 时段只显示「高峰」两字 → v2.17 实测上限 47u + 分隔符两侧加空格 → v2.18 恢复「¥」符号 → v2.32 加今日累计 → v2.33 行1 中文按 2.5 宽度模型 → v2.34/2.35 换行点移到时间前、两行大字布局定稿。**实现说明**：旧式 ToastText 系列无展开按钮，ToastText04 的第 3 个 text 元素在部分环境不渲染（v2.34 实测被吞），故用「ToastText02 标题 text 内插 `&#10;` 换行符」实现两行大字（用户实测 A1 方案成功）。这是当前唯一确认有效的"本条可见"通道（UI 内 `systemMessage` 通道实测不显示，v2.37 已移除该死代码）
 - **时段折扣数据（2026-08-05 搜索核验 + 手动维护）**：目前仅 **DeepSeek 原厂系**有峰谷定价（V4 起推出，工作日北京时间 9-12/14-18 高峰，所有计费项 ×2，含缓存价；原因=算力挤兑削峰填谷；2025 年的「夜间错峰优惠」已被高峰溢价模式取代）。智谱 GLM / MiniMax / Kimi / 混元均为统一定价无峰谷；小米 MiMo 是 2026-05 永久降价 99%（非时段折扣）。⚠️ **时段策略无公开 API 数据源，需手动维护**：厂商时段政策（高峰/低谷/夜间折扣/取消）变动时，在 `pricing.json` 更新 `peak_multiplier`/`night_discount`/`peak_hours`/`night_hours` 字段，代码自动读取显示（可在对话中提示模型更新）；新模型自动补录默认 `peak_multiplier:1`。
 - Stop 端输出 `hookSpecificOutput:{}`（v2.37：`systemMessage` 通道 WorkBuddy UI 实测不显示、弹不进对话回复，已移除该无效注入；toast 为唯一结算展示通道）。
 - 探针 `.stop-probe.json` 记录每次触发：`sameRound=false`+`waited=ok` = 成功拿到本条；`waited=timeout` = 3 秒内 trace 未落盘，退化为「上一轮」且不弹通知。
 - 若用户不需要系统通知，可删除 `settings.json` 中 `hooks.Stop` 配置（`--hook`/手动模式不受影响）。
 
 ## 费用估算（pricing.json + 高峰时段 + 每日自动刷新）
-- 模型名读取：`trace.modelInfo.models[0]`（空壳 trace 从 spans 的 `toolOutput[].model` 取）；带厂商前缀的模型名（如 `moonshotai/kimi-k2.7-code`、`deepseek/deepseek-v4-flash`）由 `findModel()` 做包含匹配，自动落到本地 key。
+- 模型名读取：`trace.modelInfo.models[0]`（空壳 trace 从 spans 的 `toolOutput[].model` 取）。
+- **模型匹配（v2.67 起严格化）**：`findModel()` 只认**归一化后完全相等**的键，一个字符不同即视为不同模型。归一化仅做三件事：统一小写、去首尾空格、连续空格合并为单空格。**不做**前后缀/包含/版本号/日期归并，`.` 与 `-` 也不再等价（如 `glm-5.2` ≠ `glm-5-2`）。带厂商前缀的名字（如 `moonshotai/kimi-k2.7-code`）必须原样收录在 `pricing.json` 才能命中，不会自动剥离前缀去匹配。匹配不上返回 `null` → 走新模型联网补价，补不到就只记 token 不记金额。
 - 价格缓存：`~/.workbuddy/skills/token-usage-tracker/pricing.json`（官方人民币价：输入/缓存命中输入/输出，元每百万 tokens；`region` 国内外标记 CN/US；`peak_multiplier` 高峰倍率、`night_discount`/`night_hours` 夜间折扣字段（手动维护）；`or_id` 关联 OpenRouter 模型 id；`usd_input_price/usd_output_price` 为自动刷新写入的 USD 参考价）。
 - **已收录模型**（2026-08-04 官方定价页 + OpenRouter 交叉核对）：deepseek-v4-flash(1/0.02/2,峰谷×2)/v4-pro(3/0.025/6,峰谷×2)/v3.2/v3.1/r1、glm-5.2(8/2/28)/5.1(8/2/28)/5-turbo(7/1.8/26)/5(6/1.5/22)/5v-turbo(8.6/1.7/28.8)/4.7/4.7-flash(免费)、kimi-k3(20/2/100)/k2.7-code(6.5/1.3/27)/k2.7-code-highspeed(13/2.6/54)/k2.6(6.5/1.1/27)/k2.5(4/0.7/21)、minimax-m3(≤512k 标准 4.2/0.84/16.8，>512k 翻倍，促销五折 2.1/0.42/8.4)/m2.7(2.1/0.42/8.4)、hy3(1/0.25/4)/hy3-preview/hunyuan-a13b。
 - **新模型自动补录（v2.31，国内源优先；用户要求"检测到未收录模型立即联网查"）**：trace 读到**未收录模型**（pricing.json 无匹配且无 input_price）时，`token-tracker.js` 自动执行：
@@ -197,12 +242,13 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
   - **余额变了**（降=消费 / 升=充值）→ 显示 `余额¥X`（自定义 API 模式，或其他处用同一 key，显示的是真实余额）；
   - **余额不变** → 不显示（积分模式余额恒定 → 永不显示）；
   - **首次观测**只记录 baseline 不显示（用户："宁愿先几轮不显示"）。
-- **显示位置**：Stop toast **行1 紧跟耗时**（1 空格分隔）`余额¥2.77`（金额两位小数，**带 ¥ 符号**——v2.18 恢复：实测行1 上限 47u 后空间充裕，峰值场景 46u 仍有富余）。放行1 的原因：行2 已满（实测约 49u/上限 52u），追加余额会折叠变 3 行。**行1 是标题大字，宽度上限 `TOAST_ROW1_MAX_W=47u`（v2.17 实测：47u 不换行 / 48u 换行）**；超宽（长模型名）时余额自动让位，不折叠。**v2.17 定稿：行1 分隔符用半角 `|`（全角「｜」dispWidth 算 2u 太浪费）且两侧各 1 空格**——`模型名 | 高峰 | 耗时 余额¥X`，模型名与分隔符不再贴死。
+- **显示位置**：Stop toast **行1 紧跟耗时**（1 空格分隔）`余额¥2.77`（金额两位小数，**带 ¥ 符号**——v2.18 恢复：实测行1 上限 47u 后空间充裕，峰值场景 46u 仍有富余）。放行1 的原因：行2 已满（实测约 49u/上限 52u，= `TOAST_LINE_MAX_W`，**以代码为准**），追加余额会折叠变 3 行。**行1 是标题大字，宽度上限 `TOAST_ROW1_MAX_W=45`（**以代码为准**；v2.33 由 47 下调至 45，留 2u 余量，v2.63 保持该值不变）**；超宽（长模型名）时余额自动让位，不折叠。**v2.17 定稿：行1 分隔符用半角 `|`（全角「｜」dispWidth 算 2u 太浪费）且两侧各 1 空格**——`模型名 | 高峰 | 耗时 余额¥X`，模型名与分隔符不再贴死。
 - **缓存（实时性）**：余额写入 `.balance.json`（含 history 数组，保留最近 20 条观测），**15 秒 TTL**（v2.18 从 60s 压短：用户要求实时，接口实测 300ms 级，正常轮询间隔 >15s 即每轮拿实时数；15s 内连发 toast 才复用缓存秒回）——查询失败降级用旧缓存，无缓存则隐藏余额（不报错、不影响 toast）。
 - **隐私**：API key 仅用于本机向官方 `api.deepseek.com` 发请求，缓存文件只存余额数值与观测历史、不存 key；脚本不打印、不上传 key。
 - **每日刷新策略（用户要求"当天第一次打开软件/第一次回答才搜，当天搜过就不搜"）**：
-  - 脚本自动兜底：每次运行 `token-tracker.js` 时检查 `pricing.json` 的 `date`——**过期才**同步调用 `refresh-prices.js` 联网刷新。**v2.2（2026-08-14，多源 + 国内外区分）**：并行拉 **5 源**——国内 2 个：llmabacus（`llmabacus.com/api/prices`，**主**，每日自动核价、人民币、含 vendors country）、llm-prices-cn（`raw.githubusercontent.com/szp2005/llm-prices-cn/main/prices.json`，**备份**，llmabacus 每日镜像）；国外 3 个：OpenRouter（USD，接近实时）、LiteLLM `model_prices_and_context_window.json`（USD，1-3 天滞后）、Portkey `configs.portkey.ai/pricing/<provider>.json`（USD，美分/token）；**按模型 `region` 区分国内外**（CN=国内模型主价来自国内源人民币价；US=国外模型主价用三 USD 源中位数×汇率），region 自动从 llmabacus vendors country 推断；USD 参考价取三源中位数；国内源都没有的模型仅当本地原本是 `auto_converted` 才用 USD 兜底，人工核验过的官方价保留不被覆盖；**全源失败写 `last_refresh_error`，token-tracker 在 toast 显示「价⚠️」提示费用按上次价格估算**；当天已刷新则直接跳过、不联网；`--force` 可强制刷新。备份：`refresh-prices.js.bak-20260814`。
-  - 新模型补录（v2.31）：`ensureNewModelPricing` 检测到未收录模型时**立即联网补录**——先查国内源 llmabacus（`priceCurrency=CNY` 直接人民币价补录 region=CN；`USD` 走 USD×汇率 region=US），再回退 OpenRouter（region=US）。已收录模型不触发，只有真遇到新模型才联网。
+  - 脚本自动兜底（**v2.65 起触发点收敛**）：**仅 `--hook`（用户提交提问时）**才检查 `pricing.json` 的 `date`，**过期才**同步调用 `refresh-prices.js` 联网刷新；`--stop` 路径**不再**做全量刷新（此前会在 Stop 时联网，阻塞弹窗）。判定仍是「当天已刷新则直接跳过、不联网」。手动运行 `node refresh-prices.js`（加 `--force` 可强制）随时可刷。**v2.66 补充**：`pricing.json` 缺失或损坏时会自动尝试重建；刷新子进程超时为 60 秒。**v2.2（2026-08-14，多源 + 国内外区分）**：并行拉 **5 源**——国内 2 个：llmabacus（`llmabacus.com/api/prices`，**主**，每日自动核价、人民币、含 vendors country）、llm-prices-cn（`raw.githubusercontent.com/szp2005/llm-prices-cn/main/prices.json`，**备份**，llmabacus 每日镜像）；国外 3 个：OpenRouter（USD，接近实时）、LiteLLM `model_prices_and_context_window.json`（USD，1-3 天滞后）、Portkey `configs.portkey.ai/pricing/<provider>.json`（USD，美分/token）；**按模型 `region` 区分国内外**（CN=国内模型主价来自国内源人民币价；US=国外模型主价用三 USD 源中位数×汇率），region 自动从 llmabacus vendors country 推断；USD 参考价取三源中位数；国内源都没有的模型仅当本地原本是 `auto_converted` 才用 USD 兜底，人工核验过的官方价保留不被覆盖；**全源失败写 `last_refresh_error`，token-tracker 在 toast 显示「价⚠️」提示费用按上次价格估算**；当天已刷新则直接跳过、不联网；`--force` 可强制刷新。备份：`refresh-prices.js.bak-20260814`。
+  - 新模型补录（v2.31）：`ensureNewModelPricing` 检测到未收录模型时**立即联网补录**——先查国内源 llmabacus（`priceCurrency=CNY` 直接人民币价补录 region=CN；`USD` 走 USD×汇率 region=US），再回退 OpenRouter（region=US）。已收录模型不触发，只有真遇到新模型才联网。**v2.67 起匹配变严格后**，新模型/新构建名更容易落到这条路径（找不到精确键即触发）。
+  - 陈旧模型清理（v2.65）：每次刷新时删除「未出现在 `daily-usage.json` 或超过 14 天未使用」的模型，`lock: true` 的三个（deepseek-v4-flash / -vision-exp / v4-pro）始终保留。被删模型再次使用时会由上面的新模型补录自动回补。
   - 人工权威核验（兜底）：**每日首次对话时**，若发现自动刷新覆盖的国内源价格与厂商官方定价页有出入（尤其峰谷模型如 DeepSeek 的基准价口径），按 SKILL.md 数据源清单核对官方定价页后修正 `pricing.json`。自动刷新的 `last_refresh_note` 会在峰谷模型价差 >60% 时提示人工核验。
   - 开源/实时价格源清单（已全部接入自动刷新）：**llmabacus.com/api/prices**（国内人民币主源，每日自动核价，szp2005/llm-prices-cn 的上游，含 vendors country/currency）、**llm-prices-cn**（国内人民币备份源，每日镜像同步）、OpenRouter API（USD，接近实时）、LiteLLM `model_prices_and_context_window.json`（USD，社区 PR 1-3 天滞后）、Portkey `https://configs.portkey.ai/pricing/<provider>.json`（USD，美分/token，SaaS 即时）、厂商官方定价页（权威，兜底人工核验）。国内网页参考（不可程序化）：51token.com / jingxialai.com / tokenbijia.com。
 
