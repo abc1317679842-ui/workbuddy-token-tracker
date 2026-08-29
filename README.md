@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v2.59.0-blue)
+![Version](https://img.shields.io/badge/version-v2.63.0-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -91,7 +91,7 @@ DeepSeek-V4 Flash 高峰双倍
   - 第一行 = 模型完整名 + 时段标注（`高峰双倍` / `夜间X折`，仅有时段策略的模型显示）
   - 第二行 = `耗时` + **今日累计消费**（`今日¥X`，当天 24 小时总花费）+ **余额**（`余额¥X`，仅开启余额且检测到变化时显示）
 - **行2（正文小字）**：输入 / 输出 + 缓存占比（两位小数）+ 费用（未收录显示「未收录」）
-- 永不溢出换行：行1 第一行 ≤ 33u、行1 第二行 ≤ 42u（超限按「丢余额 → 丢今日价 → 保底耗时」降级）、行2 ≤ 52u，全部实测+保守宽度模型验证
+- 永不溢出换行：行1 第一行 ≤ 45u（`TOAST_ROW1_MAX_W=45`）、行1 第二行 ≤ 42u（`TOAST_ROW2_MAX_W=42`，超限按「丢余额 → 丢今日价 → 保底耗时」降级）、行2 ≤ 52u（`TOAST_LINE_MAX_W=52`）——**以上三个阈值均以代码为准**（见 `token-tracker.js` 常量定义），文档若与代码冲突一律以代码为准
 
 ## 工作原理
 
@@ -169,7 +169,7 @@ Windows 设置 → 系统 → 通知 → 应用通知
 
 ### v2.54~v2.59（2026-08-23）—— DeepSeek 官方定价直连 + 峰谷时段通用跟随 + 生效时间机制
 
-**v2.59（2026-08-23，当前版本）—— 生效时间机制落地：**
+**v2.59（2026-08-23）—— 生效时间机制落地：**
 - `isPeakHour(rules, now)`：新增时间注入参数（测试/模拟用）；优先读 `pricing.deepseek_rules`（官方时段 + 周末开关），**官方改任何时段/周末规则，判定自动跟随**；无规则回退内置默认（9-12/14-18 + 周末低峰）。
 - **生效时间分流（pending 机制）**：官方页面若标注"将于...起"（未来生效），解析出 `effective_at` 存 `deepseek_rules_pending`，**生效前当前规则不动**；到点自动提升为当前规则。示例：官方 8-22 预告"8-23 00:00 起周末统一低谷"，22 号当天仍按旧规则计费，23 号起自动切换。
 - **失败重试**：官方抓取失败立即重试（默认 2 次、间隔 60s，`DS_RETRIES`/`DS_RETRY_DELAY_MS` 可配），仍失败 → 非零退出 + `FAIL_REASON`，回落聚合源 + toast「官价⚠️」+ 输出"当前数据更新失败，排查原因"。
