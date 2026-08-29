@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v2.63 (2026-08-25)
+// token-usage-tracker v2.75 (2026-08-29)
 // v2.63：调试日志机制重构——废弃 TOKEN_TRACKER_DEBUG 环境变量开关 + poll 全量记录，改为「弹窗时自动记录」：
 //   每次 showToast 无条件向 ~/.workbuddy/token-tracker-toast.log 追加一行 JSON 诊断（原因/sessionId/行数/稳定计数/compaction 状态等）。
 // v2.62：compaction 检测由"行数减少>5"改为"扫描 transcript 末尾 30 行识别压缩标记（compactionMode 方案）"。
@@ -82,6 +82,11 @@ const MAX_TOAST_LOG_SIZE = 5 * 1024 * 1024; // 5MB 轮清：超过即清空后�
 let gLastWatchState = null;
 // v2.63.1：最近一次弹窗所涉 trace 文件名（basename），供 writeToastLog 记录；获取不到则为 null。
 let gLastTraceFile = null;
+// v2.70：弹窗去重状态（仅内存、不落盘）——同文案 toast 在 TOAST_DEDUP_MS（10 分钟）内只弹一次，
+// 防同一会话的 Stop 弹窗与 watcher 兜底弹窗重复出现。去重跳过时仍写诊断日志（writeToastLog 先行）。
+let gLastToastText = null;
+let gLastToastTs = 0;
+const TOAST_DEDUP_MS = 10 * 60 * 1000;
 function writeToastLog(reason, state) {
   try {
     try {
@@ -153,6 +158,7 @@ function spawnFlushWatcher(sid) {
   } catch (e) { process.stderr.write(`[token-tracker] 延迟弹窗 watcher 启动失败: ${e.message}\n`); }
 }
 const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
+const PRICING_LOCK_FILE = path.join(WB, 'skills', 'token-usage-tracker', '.pricing.lock'); // 修复6：pricing 并发写锁
 const MODELS_CFG = path.join(WB, 'models.json'); // 自定义 API 配置（含 apiKey），仅 DeepSeek 官方模型启用余额显示
 const BALANCE_CACHE = path.join(WB, 'skills', 'token-usage-tracker', '.balance.json');
 const DAILY_USAGE_FILE = path.join(WB, 'skills', 'token-usage-tracker', 'daily-usage.json'); // v2.39：每日账本（按本地日期分桶，{日期:{models:{模型:{in,out,cached,total,cost}}, total:{...}}}，长期保存不裁剪）
@@ -172,6 +178,133 @@ const BALANCE_TTL_MS = 15 * 1000; // 余额缓存 15 秒（v2.18 从 60s 压短�
 // 余额会变 = DeepSeek 账户在真实消耗 = 自定义 API 模式（或其他处使用同一 key），这正是"有密钥才有消耗"的等价信号；
 // 积分模式余额恒定 → 永不显示。
 const BALANCE_HISTORY_MAX = 20;        // 缓存里保留的余额观测条数（用于与上次对比判定"是否变化"）
+
+// ===== v2.66 通用工具：模型名归一化 + 文件锁 + 原子写 =====
+// 账本文件曾损坏 → 本轮禁止写回空对象以免覆盖历史（损坏文件已备份为 .corrupt）
+let gDailyCorrupt = false;
+
+// 模型名归一化：去首尾空格、连续空格合并为单空格、统一小写（兼容 "GPT-4 " / "gpt-4" 等变体）
+function normalizeModelName(n) {
+  return String(n == null ? '' : n).replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+// v2.67：模型名归一化的唯一口径 = normalizeModelName（上面 182 行），即「统一小写 + 去首尾空格 +
+// 连续空格合并为单空格」三件事，不做任何字符等价替换。
+// 已删除 normalizeModelKey（原先把 "." 视为 "-"，会让 glm-5.2 与 glm-5-2 互为同一模型）——
+// 按"一个字符不同就是不同模型"的要求，这类等价替换一律取消。
+
+// 显式别名表：仅限人工逐一核实过的等价名称（如厂商改名、历史遗留 key）。
+// 当前为空表——需要时手动添加，格式：'实际使用的名字': 'pricing.json 里的 key'。
+// 注意：这里每加一条就等价于放行一次"不同名同价"，务必人工核实二者确实是同一模型且同价后再加。
+const MODEL_ALIASES = {};
+
+// 通用文件锁（复用 watch 锁思路：原子 openSync 'wx' + TTL + pid 存活探测）。
+// 返回 { ok, result, skipped }。acquire 失败（被其他进程持有）→ 重试 retries 次，仍失败则 skipped
+// （调用方应跳过写，避免覆盖）。
+// v2.68 修复4：**抢占前必须确认持有者已死**。
+//   原逻辑只看"锁是否超过 TTL(30s)"就直接接管，会把仍在工作（只是慢）的持有者的锁抢走，
+//   导致两个进程同时认为自己持锁 → 并发写 → 丢更新（实测：伪造 at=40s 前、pid 存活的锁会被抢）。
+//   现规则（按优先级）：
+//     1) 锁不存在 → 直接创建并持有；
+//     2) 能解析出 pid 且该 pid 仍存活 → **绝不抢占**，返回 false 让上层重试；
+//     3) pid 已死（进程被杀/崩溃残留）→ 立即接管（不看 TTL，快速自愈）；
+//     4) 解析不出 pid（锁文件为空/损坏）→ 退化为按 TTL 判定，超时后才接管。
+//   死锁防护：重试次数有上限（retries×retryDelay，默认 5s），到点返回 skipped 而非无限等待；
+//   全程无嵌套加锁（4 个调用点互不嵌套），不会自锁。
+function withFileLock(lockPath, fn, opts) {
+  opts = opts || {};
+  const ttl = opts.ttl || 300000; // v2.68：30s → 300s（只用于"解析不出 pid"的退化分支）
+  const retries = opts.retries != null ? opts.retries : 50;
+  const retryDelay = opts.retryDelay || 100;
+  const myPid = process.pid;
+  const tryCreate = () => {
+    try {
+      const fd = fs.openSync(lockPath, 'wx');
+      fs.writeSync(fd, JSON.stringify({ at: Date.now(), pid: myPid }));
+      fs.closeSync(fd);
+      return true;
+    } catch (e) { return false; }
+  };
+  const pidAlive = (pid) => {
+    let alive = false;
+    try { process.kill(pid, 0); alive = true; }
+    catch (e2) { if (e2.code === 'ESRCH') alive = false; else if (e2.code === 'EPERM') alive = true; else alive = true; }
+    return alive;
+  };
+  const acquire = () => {
+    try { fs.mkdirSync(path.dirname(lockPath), { recursive: true }); } catch (e) {}
+    // 1) 锁不存在 → 创建
+    if (tryCreate()) return true;
+    let mine = null;
+    try { mine = JSON.parse(fs.readFileSync(lockPath, 'utf-8')); } catch (e) { mine = null; }
+    const pid = mine && Number(mine.pid);
+    if (pid && pid > 0 && Number.isFinite(pid)) {
+      // 2)(3) 有 pid → 只认存活与否，与 TTL 无关
+      if (pidAlive(pid)) return false;     // 持有者还活着 → 不抢，等下一轮重试
+      // 持有者已死 → 落到下面统一接管
+    } else {
+      // 4) 解析不出 pid → 退化为 TTL 判定，未超时则保守等待
+      const fresh = mine && (Date.now() - (mine.at || 0) < ttl);
+      if (fresh) return false;
+    }
+    try { fs.unlinkSync(lockPath); } catch (e2) {}
+    return tryCreate();
+  };
+  let got = false;
+  for (let i = 0; i < retries; i++) {
+    got = acquire();
+    if (got) break;
+    const end = Date.now() + retryDelay;
+    while (Date.now() < end) { /* 短暂停，避免引入 timer 依赖 */ }
+  }
+  if (!got) return { ok: false, skipped: true };
+  try {
+    return { ok: true, result: fn() };
+  } finally {
+    try {
+      const o = JSON.parse(fs.readFileSync(lockPath, 'utf-8'));
+      if (o && o.pid === myPid) fs.unlinkSync(lockPath);
+    } catch (e2) {}
+  }
+}
+
+// 账本原子写（无锁，由调用方负责加锁或单次调用）。写临时文件成功后 rename 覆盖，写失败保留原文件。
+// v2.68 修复1：返回 true/false 表示写成功/失败——调用方（incrementalRecord）据此决定是否推进水位线，
+// 否则记账失败而水位线照推进，这部分用量就再也不会被补记（永久丢失，且只留一行 stderr）。
+function saveDailyUsageRaw(d) {
+  const tmp = DAILY_USAGE_FILE + '.tmp';
+  try {
+    fs.mkdirSync(path.dirname(DAILY_USAGE_FILE), { recursive: true });
+    const merged = Object.assign({ _instructions: DAILY_INSTRUCTIONS }, d);
+    fs.writeFileSync(tmp, JSON.stringify(merged, null, 2));
+    fs.renameSync(tmp, DAILY_USAGE_FILE);
+    return true;
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch (e2) {}
+    process.stderr.write(`[token-tracker] 账本写入失败: ${e.message}\n`);
+    return false;
+  }
+}
+
+// pricing 原子写（带锁，跨进程协调 token-tracker.js 与 refresh-prices.js 的并发写）。
+function savePricing(pricing) {
+  const lockPath = PRICING + '.lock';
+  const r = withFileLock(lockPath, () => {
+    const tmp = PRICING + '.tmp';
+    try {
+      fs.mkdirSync(path.dirname(PRICING), { recursive: true });
+      fs.writeFileSync(tmp, JSON.stringify(pricing, null, 2) + '\n');
+      fs.renameSync(tmp, PRICING);
+      return true;
+    } catch (e) {
+      try { fs.unlinkSync(tmp); } catch (e2) {}
+      process.stderr.write(`[token-tracker] pricing 写入失败: ${e.message}\n`);
+      return false;
+    }
+  }, { ttl: 300000, retries: 50 });
+  if (!r.ok) process.stderr.write(`[token-tracker] pricing 锁获取失败，写入跳过（避免并发覆盖）\n`);
+  return r.ok ? r.result : false;
+}
 
 function fmt(n) {
   n = Number(n || 0);
@@ -393,6 +526,50 @@ function terminalErrorFromRow(r) {
   if (s === 'timeout' || /timeout|rate.?limit|overload|server.?error|internal.?error|quota/i.test(String(err.type || err.message || ''))) return s || 'error';
   return null;
 }
+// v2.70：上下文超长前兆检测——模型返回 400 "input length too long" 等错误后，系统随即启动
+// contextSummary 压缩，压缩期间 transcript 不写入（压缩标记要等压缩完成后才写入，watcher 检测不到）。
+// 若 watcher 按"末行冻结 3 帧"误判回合结束会提前弹窗（本 Bug 根因）。
+// 判据：读取 transcript 末尾 N 行（默认 5），存在 role=assistant 且 status=incomplete 且
+// 错误/消息内容含超长关键词（input length too long / context length / too many tokens /
+// context_window / maximum context）的行 → 判定"上下文超长，压缩即将发生或正在发生"。
+// contextOverflowOmenTs 返回末尾 N 行内"最新一条前兆行"的 timestamp（无前兆返回 null）——
+// watcher 用它做"新前兆"守卫：同一场停滞（末行冻结无新行）不会在超时/恢复后每轮重复进入等待窗口。
+function contextOverflowOmenTs(tsPath, n) {
+  const rawLines = readTailRawLines(tsPath, n || 5);
+  let latestTs = null;
+  for (const raw of rawLines) {
+    let r;
+    try { r = JSON.parse(raw); } catch (e) { continue; }
+    if (!r || typeof r !== 'object') continue;
+    if (r.role !== 'assistant' || r.status !== 'incomplete') continue;
+    const texts = [];
+    const err = (r.providerData && r.providerData.error) || r.error || null;
+    if (typeof err === 'string') texts.push(err);
+    else if (err && typeof err === 'object') {
+      if (err.message != null) texts.push(String(err.message));
+      if (err.type != null) texts.push(String(err.type));
+      if (err.code != null) texts.push(String(err.code));
+    }
+    const msg = r.message;
+    if (msg && typeof msg === 'object') {
+      if (typeof msg.error === 'string') texts.push(msg.error);
+      const mc = msg.content;
+      if (typeof mc === 'string') texts.push(mc);
+      else if (Array.isArray(mc)) texts.push(mc.map((x) => (x && x.text) || '').join(''));
+    }
+    if (typeof r.content === 'string') texts.push(r.content);
+    else if (Array.isArray(r.content)) texts.push(r.content.map((x) => (x && x.text) || '').join(''));
+    // 关键词允许下划线/连字符/空格分隔（如 input_length_too_long / input-length-too-long）
+    if (/input\s*[-_ ]*length\s+too\s+long|context\s*[-_ ]*length|too\s*[-_ ]*many\s*tokens|context\s*[-_ ]*window|maximum\s*context/i.test(texts.join('\n'))) {
+      const ts = Number(r.timestamp) || 0;
+      if (latestTs === null || ts > latestTs) latestTs = ts;
+    }
+  }
+  return latestTs;
+}
+function contextOverflowOmen(tsPath, n) {
+  return contextOverflowOmenTs(tsPath, n) !== null;
+}
 // 主 transcript 末行是否为明确的终态错误（供 watcher / Stop 判定复用同一口径）。
 function terminalError(tsPath) {
   const r = lastTranscLine(tsPath);
@@ -436,6 +613,54 @@ function readTranscLines(tsPath) {
   return rows;
 }
 
+// 解析一段 transcript 文本为行数组（容错口径与 readTranscLines 完全一致：跳过空行与半写行）
+function parseTranscChunk(chunk) {
+  const rows = [];
+  for (const line of chunk.split('\n')) {
+    const s = line.trim();
+    if (!s) continue;
+    try { rows.push(JSON.parse(s)); } catch (e) { /* 半写行跳过 */ }
+  }
+  return rows;
+}
+
+// v2.69 性能：只解析"水位线之后的新行"（incrementalRecord 专用，不改任何统计口径）。
+// 背景：原实现每次 Stop 都 readTranscLines 全量 JSON.parse（实测 100MB/15476 行：399ms + 295MB 峰值）。
+// 等价性依据（实测 44 个 transcript，最大 100MB/15476 行）：文件总以 '\n' 结尾、无空行、无可解析失败行，
+// 因此"已解析行数" ≡ "原始行号"，定位第 fromLine 行后取后缀，与"解析后按下标 slice"完全等价。
+//
+// 用字节缓冲而非字符串（实测，100MB/15476 行、水位线 15466）：
+//   readFileSync(utf-8) 全量解码 = 233.8ms ← 真正的瓶颈；indexOf 定位仅 3.8ms；解析 10 行仅 3.4ms
+//   readFileSync(Buffer)         =  23.7ms（不解码，1/10）
+// 故：整文件一次性读入 Buffer（仍是 fs.readFileSync 全量读入，非流式），按字节 indexOf(0x0A) 定位，
+// 只对尾部小块做 utf-8 解码 + split + JSON.parse。
+// 安全性：UTF-8 的续字节恒 >= 0x80，0x0A 只可能作为换行符出现，绝不会落在多字节序列内部，
+// 因此在换行边界按字节切分永远落在合法 UTF-8 边界上，解码结果与整串解码再取后缀逐字符相同。
+//
+// 返回 { rows, totalLines }：
+//   rows       —— 第 fromLine 行（含，行号从 0 开始）之后解析成功的行，即 slice(fromLine) 的等价物
+//   totalLines —— fromLine + rows.length；行数只按"解析成功"推进，半写行不会被越过，下一轮仍会补记
+//                 （与旧实现 mainRows.length 同口径；读文件失败时返回 0，交由 Math.max 保护水位线）
+function readTranscLinesFrom(tsPath, fromLine) {
+  let buf;
+  try { buf = fs.readFileSync(tsPath); } catch (e) { return { rows: [], totalLines: 0 }; }
+  const start = fromLine > 0 ? fromLine : 0;
+  if (start === 0) {
+    // 水位线为 0（首次记账）→ 全量解析，行为与 readTranscLines 一致
+    const rows = parseTranscChunk(buf.toString('utf-8'));
+    return { rows, totalLines: rows.length };
+  }
+  // 定位到第 start 行的起始位置：跳过 start 个 '\n'（0x0A）
+  let off = 0;
+  for (let i = 0; i < start; i++) {
+    const nl = buf.indexOf(0x0a, off);
+    if (nl === -1) { off = buf.length; break; } // 文件被截断（行数 < 水位线）→ 无新行，水位线不前进
+    off = nl + 1;
+  }
+  const rows = parseTranscChunk(buf.toString('utf-8', off));
+  return { rows, totalLines: start + rows.length };
+}
+
 // 聚合 transcript 中 timestamp > fromTs 的全部调用（按 messageId/conversationRequestId 去重）
 function aggregateTranscLines(rows, fromTs) {
   const seen = new Set();
@@ -445,7 +670,8 @@ function aggregateTranscLines(rows, fromTs) {
     const ts = r.timestamp;
     if (!(typeof ts === 'number') || ts <= fromTs) continue;
     const pd = r.providerData || {};
-    const u = extractUsage(pd.usage);
+    // v2.66：统一用 extractUsageFromRow，兼容 pd.usage / pd.rawUsage / message.usage
+    const u = extractUsageFromRow(r);
     if (!u) continue;
     const key = pd.messageId || pd.conversationRequestId || r.id || (r.type + ':' + ts);
     if (seen.has(key)) continue;
@@ -458,6 +684,34 @@ function aggregateTranscLines(rows, fromTs) {
   }
   if (!count) return null;
   return { in: inSum, out: outSum, cached: cachedSum, total: inSum + outSum, durMs: Math.max(0, lastTs - (firstTs || lastTs)), model, firstTs, lastTs, count };
+}
+
+// v2.69：estimateInterrupted 的增量版包装（只改解析范围，不改统计口径）。
+// 背景：estimateInterrupted 估算"被中断调用"的输入基数时，会**从当前行往前回溯最近一次完整 usage**
+// （for j = i-1 … 0）。只解析新行后，这个回溯可能越过水位线进入历史行 —— 直接传新行会让基数变成 0，
+// 导致统计结果与全量解析不一致（已由 verify-v269 实测复现：合成/真实 transcript 均有命中）。
+// 保证逐位一致的做法：
+//   新行内回溯就能找到 usage  → 直接估（快路径，绝大多数轮次，回溯结果必然与全量解析相同：
+//     新行是全文的后缀，能找到即说明"最近一次 usage"就在水位线之后，与全量扫描同解）
+//   新行内回溯找不到 usage    → 说明基数在历史行里 → 回退全量解析，用旧口径 (fullRows, watermark) 估算
+// 只有第二种情况才多付一次全量解析，且这种情况极罕见（见 verify-v269 的回退率统计）。
+function estimateInterruptedInc(tsPath, rows, watermark) {
+  if (!rows || !rows.length) return {};
+  let needHistory = false;
+  for (let i = 0; i < rows.length && !needHistory; i++) {
+    const r = rows[i];
+    if (r.type !== 'reasoning') continue;
+    const pd = r.providerData || {};
+    if (r.status !== 'incomplete' && !pd.isPartialAborted) continue;
+    if (!(pd.conversationRequestId || pd.messageId)) continue;
+    let found = false;
+    for (let j = i - 1; j >= 0; j--) {
+      const u = extractUsageFromRow(rows[j]);
+      if (u && u.in > 0) { found = true; break; }
+    }
+    if (!found) needHistory = true;
+  }
+  return needHistory ? estimateInterrupted(readTranscLines(tsPath), watermark) : estimateInterrupted(rows, 0);
 }
 
 // 子代理 transcript 目录：主 transcript 同级 <session名>/subagents/（session 名 = 主文件去扩展名）
@@ -475,12 +729,14 @@ function perModelFromRows(rows, fromTs) {
     const ts = r.timestamp;
     if (!(typeof ts === 'number') || ts <= fromTs) continue;
     const pd = r.providerData || {};
-    const u = extractUsage(pd.usage);
+    // v2.66：统一用 extractUsageFromRow，兼容 pd.usage / pd.rawUsage / message.usage 三处落点
+    const u = extractUsageFromRow(r);
     if (!u) continue;
     const key = pd.messageId || pd.conversationRequestId || r.id || (r.type + ':' + ts);
     if (seen.has(key)) continue;
     seen.add(key);
-    const name = pd.model || pd.requestModelId || 'unknown';
+    // v2.66：模型名归一化（去空格/统一小写），避免同模型因大小写/空格拆成多条
+    const name = normalizeModelName(pd.model || pd.requestModelId || 'unknown');
     const b = byModel[name] || (byModel[name] = { in: 0, out: 0, cached: 0, total: 0 });
     b.in += u.in; b.out += u.out; b.cached += u.cached; b.total += u.in + u.out;
   }
@@ -502,11 +758,12 @@ function estimateInterrupted(fullRows, newStart, fromTs) {
     if (r.status !== 'incomplete' && !pd.isPartialAborted) continue;
     const cid = pd.conversationRequestId || pd.messageId;
     if (!cid) continue;
-    const model = pd.model || pd.requestModelId || 'unknown';
+    // v2.66：模型名归一化（与 perModelFromRows 一致）
+    const model = normalizeModelName(pd.model || pd.requestModelId || 'unknown');
     // 估算输入：往前找最近一个有 usage 的调用（同会话上下文连续，量级接近）
     let estIn = 0, estCached = 0;
     for (let j = i - 1; j >= 0; j--) {
-      const pu = extractUsage((fullRows[j].providerData || {}).usage);
+      const pu = extractUsageFromRow(fullRows[j]);
       if (pu && pu.in > 0) { estIn = pu.in; estCached = pu.cached || 0; break; }
     }
     // 估算输出：reasoning 文本长度（中英文混合系数）
@@ -698,6 +955,32 @@ function compactionMarkerId(raw) {
 // 变量持有，故此处直接接收 tsPath 参数，不新增全局路径函数。
 // v2.61/perf+缓存：transcript 在单次 watcher 运行内路径不变，且每轮 poll（3s）都调本函数。
 // 文件内容未变（mtimeMs 相同）时直接返回上次结果，避免反复 fs.readFileSync + 扫描整文件。
+// 修复8：从 transcript 路径提取 sessionId（去 .jsonl 后缀）。路径 basename 天然唯一，
+// 作为「首行解析失败」的兜底，避免所有解析失败的会话共用 'unknown' 而互相串扰。
+function sidFromPath(tsPath) {
+  try { return tsPath ? path.basename(String(tsPath), '.jsonl') : ''; } catch (e) { return ''; }
+}
+
+// v2.68 修复3：水位线键（ledger key）统一生成。
+// 背景：水位线是"每个会话已记账到第几行"的凭据，键撞了就会互相打断（实测两个同名 default.jsonl
+// 只记到一半用量）。原先两处生成逻辑不一致——记账用原始 sid（payload 缺 session_id 时是空串），
+// watcher 用 sid || basename；而 basename 在**跨项目同名文件**时仍会撞。
+// 规则：
+//   1) 有真实 session_id（非空）→ 直接用，保持既有行为（同一会话的多个 transcript 片段仍归到一起）；
+//   2) 无 session_id → 用 transcript **完整路径**的 sha1 前 16 位，同文件恒唯一、跨项目不撞。
+// 注意：getTranscriptStats 里的 basename 回退（870 行）只用于诊断日志展示，不参与水位线键。
+function ledgerKey(sid, tsPath) {
+  const s = String(sid == null ? '' : sid).trim();
+  if (s) return s;
+  if (!tsPath) return 'unknown';
+  try {
+    return 'path-' + require('crypto').createHash('sha1')
+      .update(path.resolve(String(tsPath))).digest('hex').slice(0, 16);
+  } catch (e) {
+    return sidFromPath(tsPath) || 'unknown';
+  }
+}
+
 const transcriptStatsCache = { path: '', mtimeMs: 0, lineCount: -1, sessionId: 'error' };
 function getTranscriptStats(tsPath) {
   try {
@@ -722,15 +1005,21 @@ function getTranscriptStats(tsPath) {
       if (content.charCodeAt(i) === 10) newlineCount++;
     }
     const lineCount = newlineCount + 1;
-    // 尝试从第一行提取 session id，如果找不到就用文件路径的 hash 代替
-    let sessionId = 'unknown';
+    // 尝试从第一行提取 session id；提取不到时回退到 transcript 路径 basename（去 .jsonl）。
+    // 修复8：不再回退 'unknown'——'unknown' 是常量，会导致所有解析失败的会话共用同一个 sessionId，
+    // 进而互相串扰（水位线错记到别的会话 / 跨会话记账串台）。路径 basename 天然唯一。
+    let sessionId = '';
     try {
       const firstLineEnd = content.indexOf('\n');
       const firstLine = firstLineEnd === -1 ? content : content.slice(0, firstLineEnd);
       if (firstLine && firstLine.includes('session')) {
-        sessionId = firstLine.match(/session["']?\s*[:=]\s*["']?([^"'\s]+)/i)?.[1] || 'unknown';
+        // 修复8：兼容多种写法——sessionId / session_id / session-id / session（原正则只认 "session" 后紧跟
+        // : 或 =，遇到真实 transcript 里的 "sessionId":"xxx" 会匹配不上，只能回退）。
+        // 捕获组排除引号/空白/逗号/右括号，避免把 JSON 的收尾符号吃进来。
+        sessionId = firstLine.match(/session[\w-]*["']?\s*[:=]\s*["']?([^"'\s,}\]]+)/i)?.[1] || '';
       }
     } catch (e) {}
+    if (!sessionId) sessionId = sidFromPath(tsPath) || 'unknown';
     transcriptStatsCache.path = tsPath;
     transcriptStatsCache.mtimeMs = stat.mtimeMs;
     transcriptStatsCache.lineCount = lineCount;
@@ -1075,7 +1364,25 @@ function todayStr() {
 // 每日价格自动刷新：当天已刷新（date==今天）→ 不联网直接返回；过期 → 同步调 refresh-prices.js
 // 联网拉 OpenRouter 更新（execFileSync 保证刷新完成才继续；失败保留本地价并 stderr 暴露，不静默）。
 function autoRefreshPricing(pricing) {
-  if (!pricing) return null;
+  if (!pricing || typeof pricing !== 'object') {
+    // v2.66：pricing 缺失/损坏 → 尝试重建（联网拉取）。成功返回新 pricing；失败返回 null（不崩）。
+    if (!(ENABLE_NETWORK && ENABLE_PRICE_REFRESH)) return null;
+    const script = path.join(path.dirname(PRICING), 'refresh-prices.js');
+    if (!fs.existsSync(script)) {
+      process.stderr.write(`[token-tracker] refresh-prices.js 不存在，pricing 重建失败\n`);
+      return null;
+    }
+    try {
+      require('child_process').execFileSync(process.execPath, [script], {
+        timeout: 60000, stdio: 'pipe', windowsHide: true, env: Object.assign({}, process.env, { WB_ROOT: WB }),
+      });
+    } catch (e) {
+      process.stderr.write(`[token-tracker] pricing 重建失败（沿用本地价）: ${String(e.message).slice(0, 200)}\n`);
+      return null;
+    }
+    const rebuilt = loadPricing();
+    return rebuilt || null;
+  }
   // v2.30：联网开关——总开关或分开关关闭时跳过自动刷新（沿用本地价，不联网）
   if (!(ENABLE_NETWORK && ENABLE_PRICE_REFRESH)) return pricing;
   if (pricing.date === todayStr()) return pricing;
@@ -1086,7 +1393,7 @@ function autoRefreshPricing(pricing) {
   }
   try {
     require('child_process').execFileSync(process.execPath, [script], {
-      timeout: 15000, stdio: 'pipe', windowsHide: true, env: Object.assign({}, process.env, { WB_ROOT: WB }),
+      timeout: 60000, stdio: 'pipe', windowsHide: true, env: Object.assign({}, process.env, { WB_ROOT: WB }),
     });
     return loadPricing(); // 刷新成功 → 重新读取（含新 date）
   } catch (e) {
@@ -1096,22 +1403,55 @@ function autoRefreshPricing(pricing) {
   }
 }
 
-// 模型匹配：trace 里的模型名可能带厂商前缀（如 moonshotai/kimi-k2.7-code / deepseek/deepseek-v4-flash）。
-// 先精确匹配，再对每个已收录 key 做包含匹配（任一方包含另一方即命中，取最长的那个避免误匹配）。
-function findModel(pricing, modelName) {
+// 模型匹配（v2.71 起双模式；v2.67 曾严格化为"只认归一化完全相等"）。
+// 模式：
+// - 默认（精确）：只认「归一化后完全相等」的模型名，失败返回 null。统计分桶/别名判定用。
+// - 计费（mode='price'）：归一化精确匹配失败后，遍历 pricing 所有 key 做双向 includes
+//   子串匹配（原始名.includes(key) 或 key.includes(原始名)），命中多个取 key 长度最长的；
+//   仍失败才返回 null。用于计费/显示/时段标注/补录判定——让 hy3-x 按 hy3 计价、
+//   deepseek-ai/DeepSeek-V4-Flash 按 deepseek-v4-flash 计价，而统计桶名保持原始名（分开统计）。
+// 依据（v2.67 源数据核查仍有效）：日期后缀模型的价格并不可靠相同——deepseek-r1 vs r1-0528、
+// deepseek-chat-v3-0324 vs chat-v3.1、deepseek-v4-pro vs v4-pro-0813 价格均不同；
+// 因此【精确模式】不做后缀归并（宁可不计价也不算错价）；【计费模式】仅做双向子串匹配
+// 近似取价（精确优先，宽松兜底），且统计与计费解耦——桶名永不受影响。
+function findModel(pricing, modelName, mode) {
   if (!pricing || !pricing.models || !modelName) return null;
-  const name = String(modelName).toLowerCase();
-  const direct = pricing.models[name];
-  if (direct) return { key: name, m: direct };
-  let best = null, bestLen = 0;
-  for (const key of Object.keys(pricing.models)) {
-    const k = key.toLowerCase();
-    if (k && (name.includes(k) || k.includes(name)) && k.length > bestLen) {
-      best = { key, m: pricing.models[key] };
-      bestLen = k.length;
+  const norm = normalizeModelName(modelName);
+  if (!norm) return null;
+  const models = pricing.models;
+  const keys = Object.keys(models);
+
+  // 1) 精确匹配：归一化后字符串完全相等（大小写/首尾空格/连续空格差异视为同一个）
+  if (models[norm]) return { key: norm, m: models[norm] };
+  for (const key of keys) {
+    if (normalizeModelName(key) === norm) return { key, m: models[key] };
+  }
+
+  // 2) 显式别名表：人工维护，当前为空表 → 不生效（见 MODEL_ALIASES 定义处说明）
+  const alias = MODEL_ALIASES[norm];
+  if (alias) {
+    const ak = normalizeModelName(alias);
+    if (models[ak]) return { key: ak, m: models[ak] };
+    for (const key of keys) {
+      if (normalizeModelName(key) === ak) return { key, m: models[key] };
     }
   }
-  return best;
+
+  // 3) 计费模式：双向 includes 子串匹配，取 key 长度最长的命中（v2.71）
+  if (mode === 'price') {
+    let best = null; // { key, m, len }
+    for (const key of keys) {
+      const kn = normalizeModelName(key);
+      if (!kn) continue;
+      if (norm.includes(kn) || kn.includes(norm)) {
+        if (!best || kn.length > best.len) best = { key, m: models[key], len: kn.length };
+      }
+    }
+    if (best) return { key: best.key, m: best.m };
+  }
+
+  // 4) 到此为止：不做版本号 / 日期构建号等任何形式的模糊归并
+  return null;
 }
 
 // 本地模型集合（v2.54，2026-08-18）：从 WorkBuddy models.json 读取 url 指向 localhost/127.0.0.1 的模型。
@@ -1232,7 +1572,7 @@ function isPeakHour(rules, now) {
 function calcCost(stat, pricing) {
   if (!pricing || !stat) return null;
   if (isLocalModel(stat.model)) return null; // 本地模型不计费（即使 pricing 误收录也不按云端价算）
-  const hit = findModel(pricing, stat.model || 'deepseek-v4-flash');
+  const hit = findModel(pricing, stat.model || 'deepseek-v4-flash', 'price'); // v2.71：计费模式（精确失败后双向子串近似取价）
   if (!hit) return null;
   const m = hit.m;
   // 峰谷倍率：DeepSeek 系（不论后缀）统一执行峰谷规则 + 周末低峰（v2.59 用户规则）。
@@ -1295,15 +1635,30 @@ function normalizeDailyUsage(d) {
   return out;
 }
 function loadDailyUsage() {
-  try { return normalizeDailyUsage(JSON.parse(fs.readFileSync(DAILY_USAGE_FILE, 'utf-8'))); } catch (e) { return {}; }
+  try {
+    gDailyCorrupt = false;
+    return normalizeDailyUsage(JSON.parse(fs.readFileSync(DAILY_USAGE_FILE, 'utf-8')));
+  } catch (e) {
+    if (e.code === 'ENOENT') {
+      // 文件尚不存在（首次运行）→ 视为空账本，非损坏，不禁止后续写入
+      gDailyCorrupt = false;
+      return {};
+    }
+    // 损坏文件：重命名为 .corrupt-<时间戳> 备份（保留历史数据），本轮禁止写回空对象以免覆盖
+    try {
+      if (fs.existsSync(DAILY_USAGE_FILE)) {
+        const corruptPath = DAILY_USAGE_FILE + '.corrupt-' + Date.now();
+        fs.renameSync(DAILY_USAGE_FILE, corruptPath);
+        process.stderr.write(`[token-tracker] 账本损坏，已备份为 ${path.basename(corruptPath)}（本轮不写回覆盖）\n`);
+      }
+    } catch (e2) { process.stderr.write(`[token-tracker] 账本损坏文件处理失败: ${e2.message}\n`); }
+    gDailyCorrupt = true;
+    return {};
+  }
 }
 function saveDailyUsage(d) {
-  try {
-    fs.mkdirSync(path.dirname(DAILY_USAGE_FILE), { recursive: true });
-    // v2.59：每次保存都注入/保留顶层 _instructions 读取方指令，避免被数据覆盖或丢失。
-    const merged = Object.assign({ _instructions: DAILY_INSTRUCTIONS }, d);
-    fs.writeFileSync(DAILY_USAGE_FILE, JSON.stringify(merged, null, 2)); // 缩进便于人工查看/汇报
-  } catch (e) { process.stderr.write(`[token-tracker] 账本写入失败: ${e.message}\n`); }
+  // 独立调用场景：加锁保护整段写，避免与其他进程并发覆盖
+  withFileLock(DAILY_USAGE_FILE + '.lock', () => saveDailyUsageRaw(d), { ttl: 300000, retries: 50 });
 }
 // 把一条 stat（单模型）累加进某天的 models，并重算该日 total（保证总合计永远=各模型之和）
 function addModelUsage(day, model, stat, pricing) {
@@ -1317,18 +1672,30 @@ function addModelUsage(day, model, stat, pricing) {
 }
 // 统一记账入口：byModel（transcript 按模型分桶）优先；否则按 stat.model 单桶。
 // 每轮只在最终落点调用一次（普通轮 Stop / watcher 汇总 / hook 兜底补弹），天然不重复记账。
+// v2.68 修复1：返回 true/false 表示本轮用量是否真的落盘。调用方（incrementalRecord）必须据此
+// 决定是否推进水位线——记账失败却推进水位线 = 这部分用量永久丢失。
+// 返回 false 的三种情形：账本此前损坏 / 锁获取失败 / 无用量可记；写盘失败也返回 false。
 function recordUsage(stat, pricing, byModel) {
-  const d = loadDailyUsage();
-  const date = todayStr();
-  const day = d[date] || (d[date] = { models: {}, total: { in: 0, out: 0, cached: 0, total: 0, cost: 0 } });
-  if (byModel && Object.keys(byModel).length) {
-    for (const [name, b] of Object.entries(byModel)) addModelUsage(day, name, b, pricing);
-  } else if (stat && ((stat.in || 0) + (stat.out || 0)) > 0) {
-    addModelUsage(day, stat.model || 'unknown', stat, pricing);
-  } else {
-    return;
+  if (gDailyCorrupt) {
+    // 账本此前损坏：跳过写入，避免用空对象覆盖历史（历史已备份为 .corrupt 文件）
+    process.stderr.write(`[token-tracker] 账本此前损坏，本轮跳过写入以免覆盖历史（备份在 .corrupt 文件）\n`);
+    return false;
   }
-  saveDailyUsage(d);
+  const r = withFileLock(DAILY_USAGE_FILE + '.lock', () => {
+    const d = loadDailyUsage();
+    const date = todayStr();
+    const day = d[date] || (d[date] = { models: {}, total: { in: 0, out: 0, cached: 0, total: 0, cost: 0 } });
+    if (byModel && Object.keys(byModel).length) {
+      for (const [name, b] of Object.entries(byModel)) addModelUsage(day, name, b, pricing);
+    } else if (stat && ((stat.in || 0) + (stat.out || 0)) > 0) {
+      addModelUsage(day, stat.model || 'unknown', stat, pricing);
+    } else {
+      return false; // 无用量可记：不算失败也不算成功（调用方无需推进水位线，因为没记任何东西）
+    }
+    return saveDailyUsageRaw(d);
+  }, { ttl: 300000, retries: 50 });
+  if (!r.ok) process.stderr.write(`[token-tracker] 账本锁获取失败，本轮记账跳过（避免并发覆盖）\n`);
+  return r.ok ? Boolean(r.result) : false;
 }
 function todayUsageTxt() {
   const d = loadDailyUsage();
@@ -1350,17 +1717,56 @@ function todayDisplay(stat, pricing, byModel) {
 function loadLedgerWatermark() {
   try { return JSON.parse(fs.readFileSync(LEDGER_WATERMARK_FILE, 'utf-8')); } catch (e) { return {}; }
 }
+// 修复1 补充（对应最终验证"损坏场景不重复计费"）：水位线损坏时的安全降级。
+// 水位线是"已记账到第几行"的唯一凭据，一旦丢失就会被当成从第 0 行开始，导致整段历史用量被重复计费。
+// 三级降级：主文件 → .bak 备份（saveLedgerWatermark 每次写入前保留的上一版）→ 都不可用则跳过本轮记账。
+// 注意：真损坏时**不**重命名/删除主文件——文件"缺失"会被 readTranscLines 从头记，同样重复计费；
+// 保留损坏文件 + 每轮告警，由人工确认后手动删除（显式重记）更安全。
+function loadLedgerWatermarkSafe() {
+  try {
+    const j = JSON.parse(fs.readFileSync(LEDGER_WATERMARK_FILE, 'utf-8'));
+    if (j && typeof j === 'object') return { wm: j, corrupt: false };
+  } catch (e) { /* 主文件缺失或损坏 → 继续降级 */ }
+  const bak = LEDGER_WATERMARK_FILE + '.bak';
+  try {
+    const j = JSON.parse(fs.readFileSync(bak, 'utf-8'));
+    if (j && typeof j === 'object') {
+      process.stderr.write(`[token-tracker] 水位线主文件不可用，已回退 .bak 备份\n`);
+      return { wm: j, corrupt: false };
+    }
+  } catch (e) { /* .bak 也不可用 */ }
+  if (fs.existsSync(LEDGER_WATERMARK_FILE)) {
+    process.stderr.write(`[token-tracker] 水位线已损坏且无可用备份，本轮跳过记账以避免重复计费（确认后请手动删除 ${path.basename(LEDGER_WATERMARK_FILE)} 再重记）\n`);
+    return { wm: null, corrupt: true };
+  }
+  return { wm: {}, corrupt: false }; // 首次运行文件不存在 → 正常空水位线
+}
 function saveLedgerWatermark(wm) {
+  const tmp = LEDGER_WATERMARK_FILE + '.tmp';
+  const bak = LEDGER_WATERMARK_FILE + '.bak';
   try {
     fs.mkdirSync(path.dirname(LEDGER_WATERMARK_FILE), { recursive: true });
-    fs.writeFileSync(LEDGER_WATERMARK_FILE, JSON.stringify(wm));
-  } catch (e) { /* 写失败不影响记账 */ }
+    // 保留上一版为 .bak 备份（损坏时可回滚）
+    try { if (fs.existsSync(LEDGER_WATERMARK_FILE)) fs.copyFileSync(LEDGER_WATERMARK_FILE, bak); } catch (e2) {}
+    // 先写临时文件，成功后原子 rename 覆盖；写失败则原文件完好、不清空
+    fs.writeFileSync(tmp, JSON.stringify(wm));
+    fs.renameSync(tmp, LEDGER_WATERMARK_FILE);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch (e2) {}
+    process.stderr.write(`[token-tracker] 水位线写入失败: ${e.message}\n`);
+  }
 }
 // 增量记账：累加主 transcript + 各子代理文件中"水位线之后"的新 usage 行，并推进水位线。
 function incrementalRecord(tsPath, sid) {
   if (!tsPath || !fs.existsSync(tsPath)) return;
-  const wm = loadLedgerWatermark();
-  const entry = wm[sid] || (wm[sid] = { main: 0, subs: {} });
+  // 修复1 补充：水位线损坏时跳过记账，宁可少记也不重复计费
+  const lw = loadLedgerWatermarkSafe();
+  if (lw.corrupt) return;
+  const wm = lw.wm;
+  // 修复3：键统一由 ledgerKey(sid, tsPath) 生成——有 session_id 用 session_id，
+  // 没有则退化为 transcript 完整路径的哈希（跨项目同名文件不再撞键）。
+  const key = ledgerKey(sid, tsPath);
+  const entry = wm[key] || (wm[key] = { main: 0, subs: {} });
   const byModel = {};
   const merge = (m) => {
     for (const [n, b] of Object.entries(m)) {
@@ -1369,32 +1775,51 @@ function incrementalRecord(tsPath, sid) {
     }
   };
   // 1. 主 transcript 新行（行数水位线，单调递增，slice 可靠）
-  const mainRows = readTranscLines(tsPath);
-  if (mainRows.length > entry.main) {
-    merge(perModelFromRows(mainRows.slice(entry.main), 0));
-    merge(estimateInterrupted(mainRows, entry.main)); // v2.52：中断补偿
+  // v2.68 修复1：先算出"候选新水位线"，记账成功后再落；失败则保持旧值，下轮重扫重记。
+  // v2.68 修复2：候选值取 Math.max —— transcript 可能被截断（Context Compaction 覆盖重写、
+  // 外部工具清空重建、磁盘故障），行数会**下降**。若直接赋新值，水位线被拉回小值，
+  // 之后文件重新长到原长度时会把已记过的行再记一遍 = 重复计费。水位线只许前进不许后退。
+  // v2.69 性能：只读 + 只解析"水位线之后的新行"。
+  // 统计口径完全不变：rows 等价于旧实现的 mainRows.slice(entry.main)，totalLines 等价于 mainRows.length。
+  const { rows: mainRows, totalLines } = readTranscLinesFrom(tsPath, entry.main || 0);
+  const nextMain = Math.max(entry.main || 0, totalLines);
+  if (totalLines > entry.main) {
+    merge(perModelFromRows(mainRows, 0));
+    merge(estimateInterruptedInc(tsPath, mainRows, entry.main || 0)); // v2.52：中断补偿
   }
-  entry.main = mainRows.length;
   // 2. 各子代理文件新行
+  const nextSubs = {};
   const subDir = subagentsDirFromTranscript(tsPath);
   if (fs.existsSync(subDir)) {
     try {
       for (const f of fs.readdirSync(subDir)) {
         if (!/^agent-.+\.jsonl$/i.test(f)) continue;
         const fp = path.join(subDir, f);
-        const subRows = readTranscLines(fp);
+        // v2.69 性能：与主 transcript 同口径，只解析水位线之后的新行
         const start = entry.subs[f] || 0;
-        if (subRows.length > start) {
-          merge(perModelFromRows(subRows.slice(start), 0));
-          merge(estimateInterrupted(subRows, start)); // v2.53：子代理被中断思考也估算
+        const { rows: subRows, totalLines: subTotal } = readTranscLinesFrom(fp, start);
+        if (subTotal > start) {
+          merge(perModelFromRows(subRows, 0));
+          merge(estimateInterruptedInc(fp, subRows, start)); // v2.53：子代理被中断思考也估算
         }
-        entry.subs[f] = subRows.length;
+        // 修复2：子代理水位线同样只许前进（子代理 transcript 也会被 compaction 截断重写）
+        nextSubs[f] = Math.max(entry.subs[f] || 0, subTotal);
       }
     } catch (e) { /* 忽略 */ }
   }
   // 3. 累加进账本（loadDailyUsage + addModelUsage + saveDailyUsage）
-  if (Object.keys(byModel).length) recordUsage({}, loadPricing(), byModel);
-  // 4. 推进水位线
+  //    无用量的轮次视为成功（无需落盘，推进水位线无害）；有用量时必须确认真的写进去了。
+  let recorded = true;
+  if (Object.keys(byModel).length) recorded = recordUsage({}, loadPricing(), byModel);
+  if (!recorded) {
+    // 记账失败（账本损坏 / 锁获取失败 / 写盘失败）→ 绝不推进水位线，
+    // 否则这些用量再也不会被补记 = 永久丢失。保持旧水位线，下轮重新记账。
+    process.stderr.write(`[token-tracker] 本轮用量未落盘，水位线保持 ${entry.main} 不推进（下轮重试，避免用量永久丢失）\n`);
+    return;
+  }
+  // 4. 记账成功 → 推进水位线
+  entry.main = nextMain;
+  for (const f of Object.keys(nextSubs)) entry.subs[f] = nextSubs[f];
   saveLedgerWatermark(wm);
 }
 
@@ -1483,6 +1908,15 @@ function showToast(line1, line2, reason) {
   const toastState = Object.assign({}, gLastWatchState || {});
   toastState.toastText = String(line1 || '') + ' | ' + String(line2 || '');
   writeToastLog(reason, toastState);
+  // v2.70：弹窗去重——本次文案与上次完全相同且间隔 <10 分钟 → 跳过本次弹窗（诊断日志已写，
+  // 去重状态仅内存不落盘）。防同一会话 Stop 弹窗与 watcher 兜底弹窗同文案重复弹出。
+  const now = Date.now();
+  if (gLastToastText !== null && toastState.toastText === gLastToastText && (now - gLastToastTs) < TOAST_DEDUP_MS) {
+    process.stderr.write(`[token-tracker] toast 去重跳过: ${reason}\n`);
+    return;
+  }
+  gLastToastText = toastState.toastText;
+  gLastToastTs = now;
   if (process.platform !== 'win32') return;
   // v2.34：line1 可能含真实换行符 \n（toastLine1 两行大字布局）。先 escapeXml 转义 &<>"'，
   // 再把 \n 转成 XML 实体 &#10;（若先转再 escapeXml，& 会被转成 &amp; 导致换行失效）
@@ -1511,9 +1945,10 @@ function shortModelName(stat, pricing) {
   if (isLocalModel(raw)) {
     name = cleanModelName(raw); // 本地模型：去 provider/组织前缀显示干净名
   } else {
-    const hit = findModel(pricing, raw);
-    if (hit && hit.m && hit.m.name) name = String(hit.m.name);
-    else name = raw;
+    // v2.75：显示名使用应用原始模型名（如 hy3、deepseek-v4-flash），不取 pricing 的 name 字段。
+    // 价格匹配仍由 findModel('price') 在计费路径（calcCost/periodNote/ensureNewModelPricing）完成，与此处显示解耦。
+    const hit = findModel(pricing, raw, 'price');
+    name = raw || (hit && hit.m && hit.m.name) || '';
   }
   return name.replace(/\(.*?\)/g, '').trim();
 }
@@ -1546,7 +1981,7 @@ function dispWidthTitle(s) {
 //   - 无时段策略 → 空串不显示（避免噪音）
 function periodNote(stat, pricing) {
   if (!pricing || !stat) return '';
-  const hit = findModel(pricing, stat.model);
+  const hit = findModel(pricing, stat.model, 'price'); // v2.71：计费模式（时段标注与计价口径一致）
   if (!hit) return '';
   const m = hit.m;
   const mult = typeof m.peak_multiplier === 'number' ? m.peak_multiplier : 1;
@@ -1814,6 +2249,21 @@ function lookupCnPrice(modelName, timeoutMs) {
 }
 
 // 把新模型补入 pricing.json（v2.31 区分国内外：region='CN' 直接人民币价；region='US' USD×汇率换算）
+// 修复6：pricing 原子写（无锁，由调用方负责加锁）。写临时文件成功后 rename 覆盖，写失败保留原文件。
+function savePricingAtomic(pricing) {
+  const tmp = PRICING + '.tmp';
+  try {
+    fs.mkdirSync(path.dirname(PRICING), { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(pricing, null, 2) + '\n');
+    fs.renameSync(tmp, PRICING);
+    return true;
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch (e2) {}
+    process.stderr.write(`[token-tracker] 价格写入失败: ${e.message}\n`);
+    return false;
+  }
+}
+
 function addModelPrice(pricing, modelName, ref, region) {
   const name = String(modelName).toLowerCase();
   const rate = Number(pricing.usd_cny_rate) > 0 ? pricing.usd_cny_rate : 7.2;
@@ -1842,15 +2292,21 @@ function addModelPrice(pricing, modelName, ref, region) {
     m.auto_converted = true;
     m.note = '新模型自动补录（USD×汇率估算，待人工核验官方价；时段策略默认无峰谷，如厂商有高峰/夜间折扣需搜索核验后补 peak_multiplier/night_discount 字段）';
   }
-  pricing.models[name] = m;
-  try {
-    fs.mkdirSync(path.dirname(PRICING), { recursive: true });
-    fs.writeFileSync(PRICING, JSON.stringify(pricing, null, 2) + '\n');
-    return true;
-  } catch (e) {
-    process.stderr.write(`[token-tracker] 新模型价格写入失败: ${e.message}\n`);
+  pricing.models[name] = m; // 内存侧即时更新（供本进程 findModel 命中）
+  // 修复6：加锁 + 锁内重新读盘合并，避免与 refresh-prices.js 并发读改写丢失更新
+  const res = withFileLock(PRICING_LOCK_FILE, () => {
+    let base;
+    try { base = JSON.parse(fs.readFileSync(PRICING, 'utf-8')); } catch (e) { base = null; }
+    if (!base || typeof base !== 'object' || !base.models || typeof base.models !== 'object') base = pricing;
+    base.models[name] = m;
+    if (pricing.usd_cny_rate != null) base.usd_cny_rate = pricing.usd_cny_rate;
+    return savePricingAtomic(base);
+  }, { ttl: 300000, retries: 50, retryDelay: 100 });
+  if (res.skipped) {
+    process.stderr.write(`[token-tracker] 新模型价格写入跳过（被其他进程持锁，稍后重试）\n`);
     return false;
   }
+  return res.ok;
 }
 
 // 检测未收录模型 → 立即联网补录。返回 { status, note }：
@@ -1863,7 +2319,7 @@ function ensureNewModelPricing(pricing, stat) {
     return { status: 'skipped', note: `ℹ️ 新模型 ${stat.model} 价格自动补录已关闭（ENABLE_MODEL_LOOKUP=false），请手动补录` };
   }
   if (isLocalModel(stat.model)) return { status: 'none', note: '' }; // 本地模型不计费，禁止自动补录云端价
-  const hit = findModel(pricing, stat.model);
+  const hit = findModel(pricing, stat.model, 'price'); // v2.71：计费模式——宽松命中（如 hy3-x→hy3）即视为已收录，避免无谓联网补录
   if (hit && typeof hit.m.input_price === 'number') return { status: 'none', note: '' };
   const name = String(stat.model).toLowerCase();
   const looked = (pricing._lookedup_models || []).indexOf(name) >= 0;
@@ -1894,8 +2350,9 @@ function ensureNewModelPricing(pricing, stat) {
     // 国内外源均确认没有 → 记入已查列表，避免每次运行都联网
     pricing._lookedup_models = pricing._lookedup_models || [];
     if (pricing._lookedup_models.indexOf(name) < 0) pricing._lookedup_models.push(name);
-    try { fs.writeFileSync(PRICING, JSON.stringify(pricing, null, 2) + '\n'); }
-    catch (e) { process.stderr.write(`[token-tracker] 已查列表写入失败: ${e.message}\n`); }
+    // 修复6：加锁写，避免与 refresh-prices.js 并发覆盖
+    const lr = withFileLock(PRICING_LOCK_FILE, () => savePricingAtomic(pricing), { ttl: 300000, retries: 50, retryDelay: 100 });
+    if (lr.skipped) process.stderr.write(`[token-tracker] 已查列表写入跳过（被其他进程持锁）\n`);
     return { status: 'not-found', note: `⚠️ 新模型 ${stat.model} 国内外价格源均未收录，请用 unified-search 搜官方定价页补录` };
   }
   if (ref === undefined) {
@@ -1942,6 +2399,11 @@ function main() {
     // Context Compaction 重写末行导致半写不可读），不进确认期、重置确认窗继续等，杜绝 compaction 期间
     // 因 unknown 持续 >6s 被误判结束而提前弹窗（R1 回归）。只有转录确实停写（mtime 旧）的 unknown 才收口。
     const WATCH_COMPACT_GRACE_MS = Number(process.env.WATCH_COMPACT_GRACE_MS) || (3 * 1000);
+    // v2.70：上下文超长前兆等待窗——检测到"input length too long"等前兆后，压缩（contextSummary）
+    // 启动期间 transcript 冻结，watcher 若按"末行冻结 3 帧"误判回合结束会提前弹窗。
+    // 此窗口内暂停稳定帧收口、继续轮询不弹窗；超过该时长仍无新内容则恢复正常收口，
+    // 避免无限等待（默认 120s 覆盖压缩最长耗时，测试可 env 缩短）。
+    const COMPRESSION_WAIT_MAX_MS = Number(process.env.COMPRESSION_WAIT_MAX_MS) || (120 * 1000);
     const WATCH_LOCK_TTL = 30 * 60 * 1000; // 锁失效时间
     // 启动即拿锁：R3（2026-08-23）stale lock 接管 + R4（2026-08-23）原子 acquire 消除 TOCTOU。
     // 旧逻辑只查 at<TTL 从不验证 pid 存活：残留锁 owner 已死 → 新 watcher 误判锁有效 → watchStarts=0
@@ -2092,6 +2554,15 @@ function main() {
     const processedMarkers = new Set();
     let compactionMode = false;
     let lastMarkerId = null;
+    // v2.70：上下文超长前兆 → 压缩等待窗口状态。
+    // compressionPending=true：暂停稳定帧收口（继续轮询但不弹窗），直到 transcript 出现
+    // 新的 assistant 消息（非 incomplete，= 压缩完成模型继续输出）或等待超时才恢复收口。
+    // compressionWaitStart：进入等待窗口的时刻（超过 COMPRESSION_WAIT_MAX_MS 即恢复收口）。
+    let compressionPending = false;
+    let compressionWaitStart = 0;
+    // lastOmenTs：最近一次进入压缩等待窗口时"最新前兆行"的 timestamp。前兆检测仅当新前兆
+    // （timestamp 更大）才再次进入等待——防同一场停滞在超时/恢复后每轮重复触发、无限等待。
+    let lastOmenTs = null;
     while (Date.now() - lastActiveAt < WATCH_MAX_MS) {   // 空闲超时：主模型持续活跃则永不退出、绝不弹
       // v2.62/compactionMode：每次 poll 开始时扫描 transcript 末尾窗口，识别压缩标记。
       // 该客户端 transcript 为 append-only，行数永不减少，旧"行数减少>5 行"检测恒不触发、已失效。
@@ -2122,6 +2593,46 @@ function main() {
         lastMarkerId = curMarkerId;
         sleep(WATCH_POLL_MS);
         continue;
+      }
+      // v2.70：上下文超长前兆检测——模型返回 400 "input length too long" 等错误后，系统随即启动
+      // contextSummary 压缩，压缩期间 transcript 不写入、压缩标记未落盘，watcher 若按"末行冻结
+      // 3 帧"误判回合结束会提前弹窗。前兆命中 → 进入压缩等待窗口：清稳定帧、暂停收口、继续轮询。
+      // 窗口内每轮检查恢复条件：① transcript 出现新的 assistant 消息（非 incomplete）= 压缩完成
+      // 模型继续输出 → 恢复收口；② 超过 COMPRESSION_WAIT_MAX_MS 仍无新内容 → 恢复正常收口，
+      // 避免无限等待。
+      // 注意：仅"新前兆"（最新前兆行 timestamp 比上次处理过的大）才进入等待窗口——同一场停滞
+      // 的旧错误行在超时/恢复后仍停留在末尾，若每轮重触发会永远等下去（实测 bug）。
+      if (!compressionPending) {
+        const omenTs = contextOverflowOmenTs(tsPath, 5);
+        if (omenTs !== null && (lastOmenTs === null || omenTs > lastOmenTs)) {
+          compressionPending = true;
+          compressionWaitStart = Date.now();
+          lastOmenTs = omenTs;
+          stableCount = 0;
+          lastTailRaw = '';
+          busySince = 0;
+          lastActiveAt = Date.now();
+          compactionSuspected = true;
+          appendWatchDebug({ type: 'compression-omen', ts: Date.now(), sid: fSid, compressionPending: true, omenTs });
+        }
+      }
+      if (compressionPending) {
+        const r = lastTranscLine(tsPath);
+        const resumed = r && r.type === 'message' && r.role === 'assistant' && r.status !== 'incomplete';
+        if (resumed) {
+          // 压缩完成、模型已输出新的 assistant 消息 → 恢复正常收口（稳定帧从 0 重新累计）
+          compressionPending = false;
+          stableCount = 0;
+          appendWatchDebug({ type: 'compression-resumed', ts: Date.now(), sid: fSid });
+        } else if (Date.now() - compressionWaitStart > COMPRESSION_WAIT_MAX_MS) {
+          // 最长等待已过仍无新内容 → 恢复正常收口，交由下方稳定帧判定决定是否弹窗
+          compressionPending = false;
+          appendWatchDebug({ type: 'compression-timeout', ts: Date.now(), sid: fSid });
+        } else {
+          // 仍在压缩等待窗口：暂停本轮收口判定（不弹窗），继续轮询
+          sleep(WATCH_POLL_MS);
+          continue;
+        }
       }
       // 未发现新标记：compactionSuspected=false，compactionMode 保持不变（不重置），进入正常收口逻辑。
       lastStats = currentStats;
@@ -2172,7 +2683,7 @@ function main() {
         lineCount: currentStats.lineCount, stableCount,
         st, hasNewTail: newTail, newAgent,
         pendingSubCount: pendingSub.length, interrupted, deadTeam,
-        compactionSuspected: false,
+        compactionSuspected: compactionSuspected,
         lastMarkerId, processedMarkerCount: processedMarkers.size, compactionMode,
         tailRawPrefix: readTailRaw(tsPath).slice(0, 80),
         lastTailRawPrefix: lastTailRaw.slice(0, 80),
@@ -2224,6 +2735,7 @@ function main() {
           }
           lastTailRaw = tailRaw;
           stableCount++; // 末行连续相同 → 计数（>=3 才视为真停写）
+          pollState.stableCount = stableCount; // v2.70：日志记录自增后的真实值（原日志在自增前，与触发判定的值差 1）
         } catch (e) { stableCount = 0; /* 文件不可读 → 可能仍在写，重置计数续等 */ sleep(WATCH_POLL_MS); continue; }
         // 末行已稳定，final/unknown/terminal-error 需连续 >=3 帧稳定才收口（无确认窗口）；interrupted 免此门槛直接收口
         if (stableGateRequired && stableCount < 3) {
@@ -2296,14 +2808,18 @@ function main() {
   const plain = (msg) => (asHook ? { hookSpecificOutput: { additionalContext: msg } } : msg);
 
   // v2.25：pricing 提前加载（transcript 数据源分支同样需要）
-  const pricing = autoRefreshPricing(loadPricing());
-  // 刷新失败/文件缺失时的提醒（不静默）
-  if (pricing && pricing.date !== todayStr()) {
+  let pricing = loadPricing();
+  // v2.65：每日全量价格刷新改在 --hook（用户提问时）触发，避免 Stop 弹窗被刷新阻塞。
+  // --stop 路径不再做全量刷新（只走各分支的 ensureNewModelPricing 补价），弹窗不被延迟。
+  // 风险可接受：若当天第一次使用就是 Stop（罕见），价格用旧的，下次 --hook 会刷新。
+  if (asHook) pricing = autoRefreshPricing(pricing);
+  // 刷新失败/文件缺失时的提醒（不静默）；仅 --hook 路径（刷新实际发生处）提示，避免 --stop 误报"过期"
+  if (asHook && pricing && pricing.date !== todayStr()) {
     process.stderr.write(`[token-tracker] 定价数据过期（${pricing.date}），自动刷新未成功，请手动运行 refresh-prices.js\n`);
   }
   // v2.59：DeepSeek 官方定价抓取失败 → stderr 返回给模型（hook 场景由 additionalContext 暴露），
   // 供 AI 向用户说明「当前数据更新失败，排查原因」；DeepSeek 系费用按本地/聚合源价估算。
-  if (pricing && pricing.deepseek_refresh_error) {
+  if (asHook && pricing && pricing.deepseek_refresh_error) {
     process.stderr.write(`[token-tracker] ${pricing.deepseek_refresh_error}\n`);
   }
 
@@ -2341,9 +2857,6 @@ function main() {
     const prevSnap0 = loadSnapshot(sid) || {};
     const roundStart0 = prevSnap0.lastUserMsgAt || 0;
         if (tsPath && roundStart0 > 0) {
-      // v2.50：增量记账（借鉴 WorkBuddy 逐笔实时记账）——先累加水位线之后的新 usage 行，
-      // 再走弹窗判断。记账与弹窗解耦：即使弹窗时机错（多弹/漏弹），账本也已正确。
-      incrementalRecord(tsPath, sid);
       let agg = aggregateTranscript(tsPath, roundStart0);
       if (!agg) { sleep(500); agg = aggregateTranscript(tsPath, roundStart0); } // transcript 尾部可能未 flush
       if (!agg) { sleep(1500); agg = aggregateTranscript(tsPath, roundStart0); }
@@ -2358,9 +2871,30 @@ function main() {
           const estCached0 = estNames0.reduce((s, n) => s + estByModel0[n].cached, 0);
           agg.in += estIn0; agg.out += estOut0; agg.cached += estCached0; agg.total += estIn0 + estOut0;
         }
+        // v2.74：耗时统一口径——优先用 trace 墙钟(startedAt→endedAt)，与 WorkBuddy 显示一致。
+        // transcript 的 durMs 取"首条 usage 行→末条 usage 行"，而 usage 行在生成完成时落盘，
+        // 起点被右移了首轮生成耗时（常 50s+），与 WorkBuddy 不一致。trace 不可读/时间戳缺失
+        // （或归属非本会话）时回退 transcript 口径，绝不抛错。
+        try {
+          const lt = latestTraceFile(true);
+          if (lt) {
+            const ltj = readTrace(lt);
+            const tr = (ltj && ltj.trace) || {};
+            const tsa = Date.parse(tr.startedAt || '');
+            const tea = Date.parse(tr.endedAt || '');
+            const trSid = tr.sessionId ? String(tr.sessionId) : '';
+            if (tsa > 0 && tea >= tsa && (!trSid || trSid === String(sid))) {
+              agg.durMs = tea - tsa;
+            }
+          }
+        } catch (e) { /* trace 半写/损坏：保留 transcript 口径 */ }
         const modelShort = shortModelName(agg, pricing);
-        const nmNote = ensureNewModelPricing(pricing, agg).note;
-        const line = lineFor(agg, false, modelShort);
+      const nmNote = ensureNewModelPricing(pricing, agg).note;
+      // v2.64：补价完成后再记账——确保新模型首用时 pricing.json 已含该模型价格，
+      // 否则 incrementalRecord 内 loadPricing() 读不到价、calcCost 返回 null，cost 被静默丢弃。
+      // 记账与弹窗解耦：即使弹窗时机错（多弹/漏弹），账本也已正确。
+      incrementalRecord(tsPath, sid);
+      const line = lineFor(agg, false, modelShort);
         writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sid, sameRound: false, transcriptPath: tsPath, stat: agg, line, source: 'transcript', payload: summarizePayload(payloadRaw) });
         // 只有专家团（本轮有子代理 subagents 或有团队活动）才走合并延迟弹一次汇总——避免普通
         // 多工具轮也延迟；普通轮（无 subagents 且无团队活动）无论几次调用都立即弹整轮聚合（v2.20）
@@ -2382,8 +2916,9 @@ function main() {
         // sessionId 优先用 payload 的 sid，缺失时从 transcript 路径 basename 提取（如 7386b18a-….jsonl）。
         const latestTrace = latestTraceFile(true);
         const traceFile = latestTrace ? path.basename(latestTrace) : null;
-        const sidFromPath = tsPath ? path.basename(tsPath, '.jsonl') : null;
-        const effSid = sid || sidFromPath;
+        // 修复3：与 incrementalRecord 的记账键统一走 ledgerKey（原先这里用 basename 回退，
+        // 而记账用的是原始 sid —— 两者不一致，且 basename 跨项目会撞）。
+        const effSid = ledgerKey(sid, tsPath);
         writeCoalesce(effSid, agg, { tsPath, roundStart: roundStart0, byModel, terminalError: teAtStop || undefined, traceFile });
         spawnFlushWatcher(effSid);
         // v2.37：systemMessage 通道 WorkBuddy UI 实测不显示（无法注入到对话回复），删除该无效注入；
@@ -2592,10 +3127,13 @@ if (require.main === module) main();
 module.exports = {
   todayStr, loadDailyUsage, saveDailyUsage, recordUsage, dayTotalOf, hitRate,
   calcCost, findModel, isLocalModel, fmtCost, cleanModelName,
-  readTranscLines, extractUsage, perModelFromRows, aggregatePerModel,
+  readTranscLines, parseTranscChunk, readTranscLinesFrom, extractUsage, perModelFromRows, aggregatePerModel,
   todayDisplay, reportTxt, reportSummaryTxt, normalizeDailyUsage,
   mainModelState, lastTranscLine, coalescePath, hasActiveSubagentsSince, subagentsDirFromTranscript, subagentPending, subagentsAllStagnant, interruptedByUser, hasSubagentsRecentlyActive,
   incrementalRecord, loadLedgerWatermark, saveLedgerWatermark,
-  estimateInterrupted,
-  extractUsageFromRow, terminalErrorFromRow, terminalError,
+  estimateInterrupted, estimateInterruptedInc,
+  extractUsageFromRow, terminalErrorFromRow, terminalError, contextOverflowOmen,
+  showToast,
+  loadPricing, autoRefreshPricing, addModelPrice, savePricing, normalizeModelName, saveDailyUsageRaw,
+  getTranscriptStats, sidFromPath, ledgerKey,
 };
