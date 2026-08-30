@@ -26,3 +26,8 @@ daily-usage.json.bak-*
 token-tracker.js.bak-*
 token-tracker.js.v2.*
 *.bak-20260814*
+
+# 其他备份/临时（不入库）
+*.bak
+*.bak-*
+*.tmp

@@ -158,6 +158,14 @@ function spawnFlushWatcher(sid) {
   } catch (e) { process.stderr.write(`[token-tracker] 延迟弹窗 watcher 启动失败: ${e.message}\n`); }
 }
 const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
+// ===== 本地官方价格库（v2.80, 2026-08-31）=====
+// 各厂商官网直抓（人民币官方价），由 python 流水线每日重建：
+//   fetch-cn-prices.py && parse_tokenhub.py && build_index.py → prices/index.json（原子写，含 built_at 闸门）
+// 可用环境变量覆盖路径；默认指向价格库项目目录。
+const CN_PRICE_DIR = process.env.CN_PRICE_DB_DIR || 'C:\\Users\\14779\\WorkBuddy\\2026-08-30-22-25-15\\prices';
+const CN_PRICE_DB = path.join(CN_PRICE_DIR, 'index.json');
+const CN_PRICE_PIPELINE_DIR = process.env.CN_PRICE_PIPELINE_DIR || 'C:\\Users\\14779\\WorkBuddy\\2026-08-30-22-25-15';
+const CN_PRICE_REFRESH_LOCK = path.join(CN_PRICE_DIR, '.refresh.lock');
 const PRICING_LOCK_FILE = path.join(WB, 'skills', 'token-usage-tracker', '.pricing.lock'); // 修复6：pricing 并发写锁
 const MODELS_CFG = path.join(WB, 'models.json'); // 自定义 API 配置（含 apiKey），仅 DeepSeek 官方模型启用余额显示
 const BALANCE_CACHE = path.join(WB, 'skills', 'token-usage-tracker', '.balance.json');
@@ -1348,8 +1356,167 @@ function escapeXml(s) {
 }
 
 // ===== 费用计算（基于 pricing.json 的官方 API 价格，支持高峰时段） =====
+// ===== 本地官方价格库合并 + 每日刷新（v2.80, 2026-08-31）=====
+// 归一化口径：本库 key 已是「小写去连字符/点」形态，与 normalizeModelName(保留连字符) 不同。
+// 同模型识别用 alnumKey（仅字母数字），避免 glm-5.3-flash 与 glm53flash 出现双条目。
+function alnumKey(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
+
+// 峰谷绝对价 → 倍数（非整齐倍数时保留换算值并由 tier_note 提示人工核验）
+function peakMultiplierOf(peak) {
+  if (!peak || !peak.idle || !peak.peak) return null;
+  const i = Number(peak.idle.in), p = Number(peak.peak.in);
+  if (!(i > 0) || !(p > 0)) return null;
+  return Math.round((p / i) * 100) / 100;
+}
+
+// 把 prices/index.json 合并进内存 pricing（每次 loadPricing 都重读 → 永远用当天/最近一份完整库）。
+// 优先级：pricing.json 的 lock 项 > 本地官方库 > pricing.json 其他（聚合自动补录）。
+// 合并条目只存在于内存（price_source 以「本地官方库」开头），写盘前由 stripLocalDbEntries 剥离。
+function mergeLocalPriceDb(pricing) {
+  if (!pricing || typeof pricing !== 'object') return pricing;
+  if (!pricing.models || typeof pricing.models !== 'object') pricing.models = {};
+  let db = null;
+  // v2.81.2：Windows 下 os.replace 与读取并发时可能读到空文件 → 失败重读一次（60ms 后），
+  // 仍失败则沿用 pricing.json（原子写保证旧完整版仍在，只是恰好撞上替换窗口）
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { db = JSON.parse(fs.readFileSync(CN_PRICE_DB, 'utf-8')); break; }
+    catch (e) { if (attempt === 0) { require('child_process').execSync('ping -n 1 -w 60 127.0.0.1 >NUL', { stdio: 'ignore' }); } }
+  }
+  if (!db) return pricing; // 库缺失/损坏 → 沿用 pricing.json
+  const byAlnum = {};
+  for (const key of Object.keys(pricing.models)) {
+    const ak = alnumKey(key);
+    if (ak && !byAlnum[ak]) byAlnum[ak] = key;
+  }
+  let mergedCount = 0;
+  for (const [k, v] of Object.entries(db.models || {})) {
+    if (!v || typeof v.in_price !== 'number' || typeof v.out_price !== 'number') continue; // 坏数据不收
+    const ak = alnumKey(k);
+    const existingKey = byAlnum[ak];
+    if (existingKey && pricing.models[existingKey] && pricing.models[existingKey].lock === true) continue; // lock 永远赢
+    const rec = {
+      name: v.name || k,
+      input_price: v.in_price,
+      output_price: v.out_price,
+      // v2.81：官方页未列缓存价 → 不能按 0 元计（calcCost 对 null 取 0 会把缓存 token 免单），
+      // 保守按输入价计（= 无缓存折扣假设），宁可略微高估也不算错账
+      cached_price: (typeof v.cache_hit === 'number') ? v.cache_hit : v.in_price,
+      region: 'CN',
+      price_source: '本地官方库(' + String(v.primary_source || '').replace(/^本地官方库\(|\)$/g, '').slice(0, 40) + ')',
+    };
+    if (typeof v.cache_hit !== 'number') {
+      rec.tier_note = '缓存价官方未列，按输入价保守计';
+    }
+    if (v.peak && v.peak.idle && v.peak.peak) {
+      const mult = peakMultiplierOf(v.peak);
+      if (mult && Math.abs(mult - 2) < 0.05) rec.peak_multiplier = 2;
+      else if (mult) { rec.peak_multiplier = mult; rec.tier_note = '峰谷非整数倍(' + mult + '×)，需人工核验'; }
+    }
+    if (v.tier_note) rec.tier_note = (rec.tier_note ? rec.tier_note + '；' : '') + String(v.tier_note).slice(0, 80);
+    if (existingKey) Object.assign(pricing.models[existingKey], rec); // 覆盖非 lock 旧条目（聚合旧价→今日官方价），保留原 key 名
+    else { pricing.models[k] = rec; byAlnum[ak] = k; }
+    mergedCount++;
+  }
+  if (Array.isArray(db.peak_rules) && db.peak_rules.length) pricing.peak_rules = db.peak_rules;
+  pricing.local_db = { built_at: db.built_at || null, models: mergedCount };
+  return pricing;
+}
+
+// 写盘前剥离本地官方库合并条目 + 峰谷规则（它们由 index.json 每日重建，不入 pricing.json，
+// 避免与聚合源复检互相覆盖/膨胀；peak_rules 仅本地库持有）
+function stripLocalDbEntries(pricing) {
+  let out;
+  try { out = JSON.parse(JSON.stringify(pricing)); } catch (e) { return pricing; }
+  if (out.models) {
+    for (const k of Object.keys(out.models)) {
+      const ps = out.models[k] && out.models[k].price_source;
+      if (typeof ps === 'string' && ps.indexOf('本地官方库') === 0) delete out.models[k];
+    }
+  }
+  delete out.local_db;
+  delete out.peak_rules;
+  return out;
+}
+
+// 每日强制更新本地官方库（非阻塞）：built_at != 今天 → 后台跑抓取流水线（实测约12s），不等它。
+// 刷新没跑完时 loadPricing 读到的仍是磁盘上 last 一份完整 index.json（前一天），天然兜底。
+// v2.81 失败治理（用户要求）：退避重试 3min→10min→30min→60min，当日失败满 5 次熔断——
+//   防止「整天失败=整天无限重拉」；熔断期间沿用前一天库+聚合源，次日自动恢复。
+// python 不存在时自动回退 python3（ENOENT 才回退，其他错误照常计失败）。
+// 弹窗提示：失败/熔断期间 periodNote 会带 ⚠价库M/D 标注（见 dbStaleTag），用户可见可修。
+let gLocalDbRefreshKicked = false;
+let gPythonExe = null; // 缓存已解析的 python 绝对路径
+// 解析可用的 python（绝对路径优先）：裸 `python` 若不在 PATH，cmd 会把 .py 当文档执行→
+// 弹「选择打开方式」对话框（v2.81 实测用户被弹）。顺序：CN_PYTHON env → WorkBuddy 自带 → python → python3。
+function resolvePython(cb) {
+  if (gPythonExe) return cb(gPythonExe);
+  const cands = [];
+  if (process.env.CN_PYTHON) cands.push(process.env.CN_PYTHON);
+  try {
+    const base = path.join(os.homedir(), '.workbuddy', 'binaries', 'python', 'versions');
+    const vers = fs.readdirSync(base).filter((d) => /^3\d*\.\d+/.test(d)).sort().reverse();
+    for (const v of vers) cands.push(path.join(base, v, 'python.exe'));
+  } catch (e) {}
+  cands.push('python', 'python3');
+  let i = 0;
+  const tryNext = () => {
+    if (i >= cands.length) return cb(null);
+    const exe = cands[i++];
+    let c;
+    try { c = require('child_process').spawn(exe, ['-c', 'print(1)'], { windowsHide: true, stdio: 'ignore', shell: false }); }
+    catch (e) { return tryNext(); }
+    let settled = false;
+    const fin = (ok) => { if (!settled) { settled = true; if (ok) { gPythonExe = exe; cb(exe); } else tryNext(); } };
+    c.on('exit', (code) => fin(code === 0));
+    c.on('error', () => fin(false));
+  };
+  tryNext();
+}
+
+function maybeRefreshLocalDb() {
+  const BACKOFF = [180000, 600000, 1800000, 3600000]; // 第1/2/3/4次失败后分别等 3/10/30/60 分钟
+  const MAX_ATTEMPTS = 5;                              // 当日第5次起熔断
+  const readLock = () => {
+    try { return JSON.parse(fs.readFileSync(CN_PRICE_REFRESH_LOCK, 'utf-8')); } catch (e) { return null; }
+  };
+  if (gLocalDbRefreshKicked) return;
+  let builtAt = '';
+  try { builtAt = String(JSON.parse(fs.readFileSync(CN_PRICE_DB, 'utf-8')).built_at || ''); } catch (e) { builtAt = ''; }
+  if (builtAt === todayStr()) return; // 今天已重建成功
+  const lk = readLock();
+  const attempts = (lk && lk.day === todayStr()) ? (Number(lk.attempts) || 0) : 0;
+  if (attempts >= MAX_ATTEMPTS) return; // 当日熔断
+  if (attempts > 0) {
+    const wait = BACKOFF[Math.min(attempts - 1, BACKOFF.length - 1)];
+    if (Date.now() - Number(lk.at) < wait) return; // 退避窗口内不重试
+  }
+  gLocalDbRefreshKicked = true;
+  try {
+    fs.writeFileSync(CN_PRICE_REFRESH_LOCK, JSON.stringify({ at: Date.now(), attempts: attempts + 1, day: todayStr() }));
+    // v2.81.1 修复：每一段都必须带 python 前缀——裸 .py 会被 cmd 按文档关联执行，
+    // 弹「选择打开方式」对话框（实测用户被弹）。exe 用绝对路径（resolvePython 解析）。
+    resolvePython((exe) => {
+      if (!exe) return; // 系统无 python：保留锁按退避节奏静默重试，弹窗⚠标注可见
+      const q = (p) => (/\s/.test(p) ? `"${p}"` : p);
+      const cmd = `${q(exe)} fetch-cn-prices.py && ${q(exe)} parse_tokenhub.py && ${q(exe)} build_index.py`;
+      let c;
+      try { c = require('child_process').spawn(cmd, { cwd: CN_PRICE_PIPELINE_DIR, shell: true, windowsHide: true, stdio: 'ignore' }); }
+      catch (e) { return; }
+      c.on('exit', (code) => {
+        if (code === 0) { try { fs.unlinkSync(CN_PRICE_REFRESH_LOCK); } catch (e) {} }
+        // 失败：保留锁文件（attempts 已递增），下次调用按退避表重试；满 MAX_ATTEMPTS 当日熔断
+      });
+      c.on('error', () => {});
+    });
+  } catch (e) { /* 静默：刷新失败沿用旧库，弹窗会有 ⚠价库 标注 */ }
+}
+
 function loadPricing() {
-  try { return JSON.parse(fs.readFileSync(PRICING, 'utf-8')); } catch (e) { return null; }
+  let p = null;
+  try { p = JSON.parse(fs.readFileSync(PRICING, 'utf-8')); } catch (e) { return null; }
+  try { p = mergeLocalPriceDb(p); } catch (e) {}
+  try { if (ENABLE_NETWORK) maybeRefreshLocalDb(); } catch (e) {}
+  return p;
 }
 
 // v2.39（2026-08-15）：日界改用「本地时间」——旧版用 UTC（toISOString），用户在 UTC+8，
@@ -1979,7 +2146,30 @@ function dispWidthTitle(s) {
 //   - 模型声明 peak_multiplier>1 且当前在高峰时段 → `高峰双倍`（DeepSeek 原厂系=2）；倍数非 2 显示 `高峰×N`
 //   - 模型声明 night_discount（夜间消耗系数，如 0.2=夜间2折）且当前在折扣时段 → `夜间N折`
 //   - 无时段策略 → 空串不显示（避免噪音）
+// v2.81：本地官方库状态标注（模型名后，格式同「（估算）」系列；超宽由行1守卫自动丢弃）
+//   库停在昨天（刷新失败/熔断中）→ ⚠价库M/D（标出数据日期，用户可见可修）
+//   库文件缺失（合并失败）     → ⚠价库缺失
+//   今天已更新正常             → 空串（弹窗与原来一字不差）
+function dbStaleTag(pricing) {
+  if (!pricing) return '';
+  const ldb = pricing.local_db;
+  if (!ldb) return '⚠价库缺失';
+  if (ldb.built_at && ldb.built_at !== todayStr()) {
+    const p = String(ldb.built_at).split('-');
+    return `⚠价库${Number(p[1])}/${Number(p[2])}`;
+  }
+  return '';
+}
+
 function periodNote(stat, pricing) {
+  const base = periodPeakNote(stat, pricing);
+  const tag = dbStaleTag(pricing);
+  if (!base) return tag;
+  if (!tag) return base;
+  return `${base} ${tag}`;
+}
+
+function periodPeakNote(stat, pricing) {
   if (!pricing || !stat) return '';
   const hit = findModel(pricing, stat.model, 'price'); // v2.71：计费模式（时段标注与计价口径一致）
   if (!hit) return '';
@@ -2029,6 +2219,20 @@ const TOAST_ROW1_MAX_W = 45;
 //   保「耗时 时间 今日价」30u 绝对安全；再超丢今日价保底耗时 16u）。
 //   行1 最长 33u 无需降级；极端情况超 45 丢时段保模型名。
 const TOAST_ROW2_MAX_W = 42;
+// 超长模型名中间缩略（v2.81，用户要求）：保留开头组织名+结尾型号名，中间 …。
+// 修老毛病：此前超宽守卫直接丢耗时行，超长名自动换行把「耗时/今日/余额」整行挤没。
+function shrinkTitle(s, maxW) {
+  if (dispWidthTitle(s) <= maxW) return s;
+  const chars = [...String(s)];
+  const ell = '…';
+  const take = Math.max(4, Math.floor((maxW - dispWidthTitle(ell)) / 2)); // 每侧宽度预算
+  let head = '', w = 0;
+  for (const ch of chars) { const cw = dispWidthTitle(ch); if (w + cw > take) break; head += ch; w += cw; }
+  let tail = ''; w = 0;
+  for (let i = chars.length - 1; i >= 0; i--) { const cw = dispWidthTitle(chars[i]); if (w + cw > take) break; tail = chars[i] + tail; w += cw; }
+  return head + ell + tail;
+}
+
 function toastLine1(stat, modelShort, period, balTxt, todayTxt) {
   const head = modelShort || '';
   // 行1：模型名 + 时段标注（空格分隔，不占用时间位置）
@@ -2047,9 +2251,17 @@ function toastLine1(stat, modelShort, period, balTxt, todayTxt) {
   if (dispWidthTitle(line2) > TOAST_ROW2_MAX_W && todayTxt) {
     line2 = durTxt;
   }
-  // 行1（模型名+时段标注）最长 33u，远低于 41.5u 实测线，无需降级；极端情况下若超宽丢时段保模型名
+  // 行1 超宽守卫（v2.81 重写）：标注优先保住——缩略名字给标注留位；名字+标注都放不下才丢标注；
+  // 耗时行（line2）任何情况不丢。TOAST_ROW1_MAX_W=45。
   if (dispWidthTitle(line1) > TOAST_ROW1_MAX_W) {
-    return `${head}\n${line2}`;
+    if (periodTxt) {
+      const budget = TOAST_ROW1_MAX_W - dispWidthTitle(periodTxt);
+      if (budget >= 8 && dispWidthTitle(head) + dispWidthTitle(periodTxt) > TOAST_ROW1_MAX_W) {
+        return `${shrinkTitle(head, budget)}${periodTxt}\n${line2}`;
+      }
+    }
+    const headFit = dispWidthTitle(head) > TOAST_ROW1_MAX_W ? shrinkTitle(head, TOAST_ROW1_MAX_W) : head;
+    return `${headFit}\n${line2}`;
   }
   return `${line1}\n${line2}`;
 }
@@ -2350,8 +2562,10 @@ function ensureNewModelPricing(pricing, stat) {
     // 国内外源均确认没有 → 记入已查列表，避免每次运行都联网
     pricing._lookedup_models = pricing._lookedup_models || [];
     if (pricing._lookedup_models.indexOf(name) < 0) pricing._lookedup_models.push(name);
-    // 修复6：加锁写，避免与 refresh-prices.js 并发覆盖
-    const lr = withFileLock(PRICING_LOCK_FILE, () => savePricingAtomic(pricing), { ttl: 300000, retries: 50, retryDelay: 100 });
+    // 修复6：加锁写，避免与 refresh-prices.js 并发覆盖。
+    // v2.80：内存 pricing 含本地官方库合并条目（只属于 index.json），写盘前剥离，防止两源互相覆盖/膨胀
+    const persist = stripLocalDbEntries(pricing);
+    const lr = withFileLock(PRICING_LOCK_FILE, () => savePricingAtomic(persist), { ttl: 300000, retries: 50, retryDelay: 100 });
     if (lr.skipped) process.stderr.write(`[token-tracker] 已查列表写入跳过（被其他进程持锁）\n`);
     return { status: 'not-found', note: `⚠️ 新模型 ${stat.model} 国内外价格源均未收录，请用 unified-search 搜官方定价页补录` };
   }
