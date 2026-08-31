@@ -95,6 +95,14 @@ function load() {
 // 旧逻辑只看"锁是否超过 TTL"就抢，会把仍在工作（只是慢）的持有者的锁抢走，
 // 导致两个进程同时认为自己持锁 → pricing.json 并发写 → 丢模型价格。
 // 死锁防护：重试有上限（retries×retryDelay = 5s），到点返回 false 而非无限等待。
+function syncSleepMs(ms) { // v2.82.3：真睡眠替代 while 空转（Atomics.wait 零依赖不烧 CPU；异常降级空转）
+  const ia = _SLEEP_IA;
+  try { Atomics.wait(ia, 0, 0, ms); }
+  catch (e) { const end = Date.now() + ms; while (Date.now() < end) {} }
+}
+const _SLEEP_SAB = new SharedArrayBuffer(4);
+const _SLEEP_IA = new Int32Array(_SLEEP_SAB);
+
 function withPricingLock(fn) {
   const ttl = 300000; // v2.68：30s → 300s（只用于"解析不出 pid"的退化分支）
   const retries = 50;
@@ -137,8 +145,7 @@ function withPricingLock(fn) {
   for (let i = 0; i < retries; i++) {
     got = acquire();
     if (got) break;
-    const end = Date.now() + retryDelay;
-    while (Date.now() < end) { /* 短暂停，避免引入 timer 依赖 */ }
+    syncSleepMs(retryDelay); // v2.82.3：真睡眠（原 while 空转烧 CPU）
   }
   if (!got) return false;
   try { fn(); return true; }
@@ -387,7 +394,13 @@ async function main() {
         if (nk && (normUsed[nk] == null || date > normUsed[nk])) normUsed[nk] = date;
       }
     }
+    // v2.82（2026-09-01）修复：原代码写 `if (lu == null || lu < cutoffStr)`，与上方注释
+    // 「从未出现在 daily-usage 的一律保留」完全相反 —— lu==null 被无条件删除。
+    // 后果：每次刷新都清掉所有不在 daily-usage 里的模型（含人工核验的官方价），
+    // pricing.json 从 26~30 个模型被刷到只剩 6 个。正确条件是 lu != null && lu < cutoffStr。
+    const keysBefore = Object.keys(models).length;
     let removed = 0;
+    const doomed = [];
     for (const key of Object.keys(models)) {
       const m = models[key];
       if (!m || typeof m !== 'object') continue;
@@ -395,9 +408,18 @@ async function main() {
       const lu = lastUsed[key] || normUsed[norm(key)];
       // 护栏 A：仅删除「曾出现在 daily-usage 且最后使用超过 14 天」的模型；
       // 从未出现在 daily-usage（lastUsed=none，如新加/手动/未记账模型）一律保留。
-      if (lu == null || lu < cutoffStr) { delete models[key]; removed++; }
+      if (lu != null && lu < cutoffStr) doomed.push(key);
     }
-    if (removed) console.log(`[refresh-prices] 已清理 ${removed} 个超过14天未使用的模型`);
+    // 护栏 B（v2.82）：反常规模熔断。正常每日清理是个位数；若一次要删掉超过半数
+    // 且多于 10 个，判定为逻辑异常（如护栏 A 再次写反 / daily-usage 损坏被清空），
+    // 直接放弃本次清理并告警，宁可膨胀也不能把价格库刷空。
+    if (doomed.length > 10 && doomed.length > keysBefore * 0.5) {
+      console.log(`[refresh-prices] ⚠清理熔断：本次拟删 ${doomed.length}/${keysBefore} 个，超过半数且>10，判定异常，已跳过清理`);
+      console.log(`[refresh-prices]   拟删清单（前10）: ${doomed.slice(0, 10).join(', ')}`);
+    } else {
+      for (const key of doomed) { delete models[key]; removed++; }
+      if (removed) console.log(`[refresh-prices] 已清理 ${removed} 个超过14天未使用的模型（共 ${keysBefore} 个）`);
+    }
   }
 
   let updatedMain = 0, autoConverted = 0, usdUpdated = 0, regionSet = 0, bigDiff = [];
