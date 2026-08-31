@@ -15,6 +15,32 @@ type: skill
 
 > **⚠️ 强制（查询触发总纲）：所有统计查询必须调用 `--report` 命令并原样贴出脚本输出，禁止自行解析 JSON。** 无论用户问「今日消耗」「今天用了多少」「账本」「报告」「统计」「花费」还是历史某天，一律先跑 `node token-tracker.js --report`（或 `--report <日期>`），再把脚本打印的 Markdown 表格原文贴给用户；不得自行读取 `daily-usage.json`、不得自行汇总、不得转成列表/纯文本/代码块。详细规则见下方「查询触发规则（强制）」与「展示格式约束（强制）」。
 
+> **v2.82.2（2026-09-01，全方位审查三修）：** 备份含于 `*.bak-before-fix-20260901`。
+> - **findModel 计费匹配收紧（中一）**：v2.71 双向 includes 任意子串会把未收录模型撞到无关 key（glm-5.3-air→glm-5 价、kimi→kimik25 价），且因「宽松命中=已收录」不再联网补真价 → 错价永久化。改为**单向边界分隔匹配**：仅允许 norm 较长、key 是 norm 的边界子串（`-/_:空格/中文` 为边界，`.` 不算——glm-5.3 与 glm-5 是不同模型）。hy3-x→hy3、deepseek-ai/DeepSeek-V4-Flash→deepseek-v4-flash 仍命中；kimi/gemini-3.7/glm-5.3-air → null 走补价。
+> - **incrementalRecord 竞态锁（中二）**：watcher(--flush-delayed) 与新一轮 Stop 并发时读同一旧水位线 → 同一批行各记一遍（专家团 6s 确认窗 ∩ 新 Stop 可触发）。整个「读水位线→算增量→记账→推进」放入 `.ledger-watermark.lock`；拿不到锁本轮跳过、下轮补记（不丢不重）。`withFileLock` 已导出供测试。
+> - **自动补录缓存价不估算（中三）**：llmabacus/USD 无缓存价时原按输入价×10% 拍脑袋（DeepSeek 实际 3.3% 高估 3 倍、glm 25% 低估）→ 改为 `cached_price: null`（按 0 计，宁少算不估错），note 标注待人工核验。
+> - **缺名不记价（用户 03:42 反馈）**：`calcCost` 旧代码 `stat.model || 'deepseek-v4-flash'`——模型名缺失时把 token 按 v4-flash 价入账（错价）。现空名 / 'unknown' 一律返回 null（只记 token 不记钱）；`aggregateTranscLines` 缺名时输出 'unknown' 而非空串（弹窗可见、可追查）。
+> - **锁等待去忙等（v2.82.3）**：`withFileLock` / `withPricingLock` 重试等待原为 `while(Date.now()<end)` 空转（50×100ms 白烧一个核）→ 改 `Atomics.wait` 真睡眠（零依赖，catch 降级空转保底）。复查：锁嵌套顺序固定 wm→daily→pricing 无死锁；watcher 轮询与 trace 等待循环内部均有 sleep（Atomics.wait 实现），非忙等；无连锁影响。全套 105 项 0 失败 + 账本对账 0 差异。
+> - **专家团双记集成验收（test-expert-race.js）**：造真实形态多子代理 transcript（主 20 行 + subagents 5 行），两进程并发调 incrementalRecord（模拟 watcher 与 Stop 同窗）——账本只记一次（in=20000/2500 精确，双记会是 40000/5000）；第二轮并发仍不重复（水位线已推进）。锁失败→本轮跳过下轮补记（不丢不重）；嵌套顺序固定无死锁；崩溃残留锁由 pidAlive 接管。全套 62+13+16+14+3 = 108 项 0 失败，测试自备份自恢复不污染真实账本。
+> - **退役模型自动淘汰确认**：refresh-prices 每日以聚合源为基准合并，官方已下线的 deepseek V3 系（retired:true，账本零记录）在刷新时被自然淘汰（31→26），无需手动清理；当前 pricing.json 26 个全部为官方在售模型。
+> - 验证：新增 `test-audit-fixes.js` 14 项（findModel 边界矩阵/缓存价 null/锁互斥两进程实测）+ 全套回归 62+13+16 = 105 项 0 失败 + audit-ledger 全天账本对账 0 差异。
+
+> **v2.82.1（2026-09-01，弹窗耗时口径根修）：** 备份含于 `*.bak-before-fix-20260901`。
+> - **耗时 = 最新 trace `endedAt` − 用户提交时刻(roundStart0)**。v2.74 用「单 trace 文件 startedAt→endedAt」，但长任务落盘多个 trace（切分时机由客户端决定、不可预测）：实测 11:27 的任务只显示 4:22；有时单文件恰好覆盖全轮又显示对——「时对时错、修了还犯」的根源。WorkBuddy 显示的就是「提交→最后一次 LLM 结束」墙钟，实测新公式 687.0s 与其 11:27 **分毫不差**（旧公式 262s 错 62%）。
+> - 计算核心提为 `traceWallDurMs(ltPath, roundStartMs, sid)`（已导出，可独立测试）：roundStart0 缺失 / endedAt 缺失或早于起点（防负数）/ 异会话归属 / trace 损坏 → 一律回退 transcript 口径，绝不抛错。
+> - **hook 起点语义实证**：snapshot 证明 `lastUserMsgAt` = 用户点发送瞬间（与系统时间分毫不差）；用户连点多次提交时 hook 记最后一次（与 WorkBuddy 入列计时一致）。同毫秒证据：user 行落盘时刻 = 当次 trace.startedAt。
+> - **fetch-cn-prices 联动修复**：`parse_pricing_deepseek()` 只合并 `lock=True` 条目——回填的非 lock 兜底价（8-23 聚合源）曾被标成 first_party「用户已校对官方价」混入本地库且下架模型永久冒充新鲜数据；现在缺失模型走沿用逻辑（`carried_from`/`missing_since` 标记，7 天自动淘汰）。
+> - 测试：`test-duration-fix.js` 16 项（真实 4-trace 重放 + 单 trace 回归 + 合成 9 场景）+ 回归 62+13 项，共 **91 项 0 失败**。
+
+> **v2.82（2026-09-01，本地价格库四连修 + 并发加固）：** 备份 `*.bak-before-fix-20260901`（tracker/refresh/pricing + 流水线三脚本，可整体回滚）。
+> - **resolvePython 补 venv 候选（根因主修）**：旧候选表只有托管 python（无 requests）与裸 python，唯一带 requests 的 venv（`binaries/python/envs/default`）不在表里 → 本地价格库自动刷新**从上线起就没成功过**，`.refresh.lock` 常驻、弹窗永远「⚠价库8/31」。现 venv（Win `Scripts/python.exe` / POSIX `bin/python`）排最前。
+> - **刷新子进程超时保护**：180s SIGKILL（旧版网络 hang → 锁永久卡死不再重试）；捕获 stdout/stderr，失败写 `.refresh.error` 留档（旧版 `stdio:'ignore'` 全静默，出了问题无处可查）。
+> - **refresh-prices 护栏A修复**：`lu == null || lu < cutoff` → `lu != null && lu < cutoff`——注释写「未用过的保留」，代码却在删，每次刷新把不在 daily-usage 的模型全删空（26→6，4 个靠 lock 幸免）。实测 `--force` 后零丢失。
+> - **findModel 跨库 alnum 桥接**：本地价库 key 是去标点的 `glm53`，findModel 只做大小写归一 → `glm-5.3` 永远未命中、反复联网补录。现严格匹配失败后追加「两边都去标点且**完全相等**才命中」的桥接——不违反 v2.67 严格匹配（不做库内模糊归并，`deepseek-v4-flash` 与 `-vision-exp` 仍严格区分）。
+> - **流水线并发加固（fetch/parse/build 三脚本）**：写盘全改「唯一 tmp(PID)+os.replace」——多会话并发时两个 build_index 互写 `index.json.tmp` → PermissionError exit=1；fetch 裸写 latest.json 会让并发的 build 读到半截 JSON。
+> - **build_index 逐模型沿用**：旧版按「厂商当天整体缺席」判断，Moonshot 官网改版（chat-k25/chat-v1 软404）当天仍抓到 4 个 → 缺失的 kimik25 等 4 个被静默丢弃（35→31，用户用这些模型当天按 0 元计）。现任何上一版有、本次缺失的都沿用旧价并标 `carried_from`，`missing_since` 超 7 天才淘汰。
+> - 验证：62+13 项测试 0 失败；完整流水线并发×3 全 exit=0（11.5s）；强制刷新后 pricing.json 零丢失。
+
 > **v2.68（2026-08-28，数据完整性 4 项 + 锁逻辑同步）：** 备份 `token-tracker.js.bak-dataintegrity-20260828`。
 > - **记账失败不再推进水位线**：`saveDailyUsageRaw` 返回成败 → `recordUsage` 回传 → `incrementalRecord` 先算候选水位线，**仅记账成功才提交**。此前账本写入失败（Windows 下 `rename` 覆盖被占用文件会 EPERM）而水位线照推进，这部分用量**永久丢失**且只留一行 stderr。现失败则保持旧水位线、下轮补记。
 > - **transcript 截断不回退水位线**：`entry.main` / `entry.subs[f]` 改取 `Math.max(旧值, 当前行数)`。此前 transcript 行数下降（Context Compaction 重写、外部工具截断）会把水位线拉回小值，文件重新长回原长时**重复计费**。代价：截断后被重写到同行位置的内容不再重记（少记优于多记）。

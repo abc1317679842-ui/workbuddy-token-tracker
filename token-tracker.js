@@ -166,6 +166,7 @@ const CN_PRICE_DIR = process.env.CN_PRICE_DB_DIR || 'C:\\Users\\14779\\WorkBuddy
 const CN_PRICE_DB = path.join(CN_PRICE_DIR, 'index.json');
 const CN_PRICE_PIPELINE_DIR = process.env.CN_PRICE_PIPELINE_DIR || 'C:\\Users\\14779\\WorkBuddy\\2026-08-30-22-25-15';
 const CN_PRICE_REFRESH_LOCK = path.join(CN_PRICE_DIR, '.refresh.lock');
+const CN_PRICE_REFRESH_ERR = path.join(CN_PRICE_DIR, '.refresh.error'); // v2.82：刷新失败原因留档
 const PRICING_LOCK_FILE = path.join(WB, 'skills', 'token-usage-tracker', '.pricing.lock'); // 修复6：pricing 并发写锁
 const MODELS_CFG = path.join(WB, 'models.json'); // 自定义 API 配置（含 apiKey），仅 DeepSeek 官方模型启用余额显示
 const BALANCE_CACHE = path.join(WB, 'skills', 'token-usage-tracker', '.balance.json');
@@ -219,6 +220,17 @@ const MODEL_ALIASES = {};
 //     4) 解析不出 pid（锁文件为空/损坏）→ 退化为按 TTL 判定，超时后才接管。
 //   死锁防护：重试次数有上限（retries×retryDelay，默认 5s），到点返回 skipped 而非无限等待；
 //   全程无嵌套加锁（4 个调用点互不嵌套），不会自锁。
+// v2.82.3：同步睡眠（Atomics.wait，零依赖、不耗 CPU）。
+// 锁重试等待用——旧实现 while 空转 50×100ms 白烧一个核；Atomics.wait 阻塞事件循环但不再
+// 空耗 CPU。适用于 Stop hook 这类单任务短命进程（阻塞期间无并发任务需要响应）。
+// 极端环境 Atomics.wait 不可用时降级回空转（保底行为不变）。
+const _SLEEP_SAB = new SharedArrayBuffer(4);
+const _SLEEP_IA = new Int32Array(_SLEEP_SAB);
+function syncSleepMs(ms) {
+  try { Atomics.wait(_SLEEP_IA, 0, 0, ms); }
+  catch (e) { const end = Date.now() + ms; while (Date.now() < end) {} }
+}
+
 function withFileLock(lockPath, fn, opts) {
   opts = opts || {};
   const ttl = opts.ttl || 300000; // v2.68：30s → 300s（只用于"解析不出 pid"的退化分支）
@@ -262,8 +274,7 @@ function withFileLock(lockPath, fn, opts) {
   for (let i = 0; i < retries; i++) {
     got = acquire();
     if (got) break;
-    const end = Date.now() + retryDelay;
-    while (Date.now() < end) { /* 短暂停，避免引入 timer 依赖 */ }
+    syncSleepMs(retryDelay); // v2.82.3：真睡眠（原 while 空转烧 CPU）
   }
   if (!got) return { ok: false, skipped: true };
   try {
@@ -360,6 +371,27 @@ function latestTraceFile(skipInvalid) {
     }
   }
   return null;
+}
+
+// v2.82.1（2026-09-01）：弹窗耗时统一口径的计算核心（Stop 路径与测试复用）。
+// 口径 = 最后一次 LLM 结束(latest trace endedAt) − 用户提交时刻(roundStartMs)。
+// v2.74 用「单 trace 文件 startedAt→endedAt」，但长任务会落盘多个 trace（切分时机由客户端
+// 决定、不可预测）：实测 11:27 的任务只显示 4:22——最新文件只是最后一段；有时单文件恰好
+// 覆盖全轮又显示对——这就是「时对时错、修了还犯」的来源。WorkBuddy 显示的就是
+// 「提交→最后一次 LLM 结束」的墙钟（实测 688s vs 687s，差 1s）。
+// 返回 { durMs, source:'trace' } 或 { source:'fallback' }（条件不满足 → 调用方保留 transcript 口径）：
+//   - ltPath 缺失 / roundStartMs<=0（快照丢失）/ endedAt 缺失或解析失败或早于起点（防负数/时钟异常）
+//   - latest trace 带 sessionId 且 ≠ sid（多会话并发保护，与 v2.74 行为一致；sid 空视为不匹配）
+function traceWallDurMs(ltPath, roundStartMs, sid) {
+  try {
+    if (!ltPath || !(roundStartMs > 0)) return { source: 'fallback' };
+    const tr = ((readTrace(ltPath) || {}).trace) || {};
+    const tea = Date.parse(tr.endedAt || '');
+    if (!(tea > roundStartMs)) return { source: 'fallback' };
+    const trSid = tr.sessionId ? String(tr.sessionId) : '';
+    if (trSid && trSid !== String(sid || '')) return { source: 'fallback' };
+    return { durMs: tea - roundStartMs, source: 'trace' };
+  } catch (e) { return { source: 'fallback' }; }
 }
 
 // 有效 = 含真实 token 数据（平台先建空壳 trace、后填充 modelInfo；totalTokens/modelInfo 全空视为无效）
@@ -687,7 +719,7 @@ function aggregateTranscLines(rows, fromTs) {
     inSum += u.in; outSum += u.out; cachedSum += u.cached;
     if (firstTs === null || ts < firstTs) firstTs = ts;
     if (ts > lastTs) lastTs = ts;
-    if (!model) model = pd.model || pd.requestModelId || '';
+    if (!model) model = pd.model || pd.requestModelId || 'unknown'; // v2.82.2：模型名缺失 → 'unknown' 诚实标注（旧为 ''，弹窗显示空白且无法追查）
     count++;
   }
   if (!count) return null;
@@ -1447,23 +1479,47 @@ function stripLocalDbEntries(pricing) {
 let gLocalDbRefreshKicked = false;
 let gPythonExe = null; // 缓存已解析的 python 绝对路径
 // 解析可用的 python（绝对路径优先）：裸 `python` 若不在 PATH，cmd 会把 .py 当文档执行→
-// 弹「选择打开方式」对话框（v2.81 实测用户被弹）。顺序：CN_PYTHON env → WorkBuddy 自带 → python → python3。
-function resolvePython(cb) {
+// 弹「选择打开方式」对话框（v2.81 实测用户被弹）。
+// 顺序：CN_PYTHON env → WorkBuddy venv（有 requests） → WorkBuddy 自带解释器 → python → python3。
+// v2.82（2026-09-01）两处修复（本地官方价库自动刷新从未成功，built_at 永远停在前一天）：
+//   ① 候选表漏了 venv 路径 → 命中托管裸解释器（无 requests）→ 流水线 import requests 即崩。
+//   ② 探测命令 print(1) 只能证明"python 能跑"，不能证明"依赖齐全" → 裸解释器先命中，
+//      永远轮不到 venv。改为两轮探测：先 `import requests`，全灭才降级 `print(1)`。
+function resolvePython(cb, _pass) {
   if (gPythonExe) return cb(gPythonExe);
+  const pass = _pass || 0; // 0=校验依赖齐全；1=仅校验可运行（兜底，让脚本自己报错，好过静默熔断）
   const cands = [];
   if (process.env.CN_PYTHON) cands.push(process.env.CN_PYTHON);
   try {
-    const base = path.join(os.homedir(), '.workbuddy', 'binaries', 'python', 'versions');
+    const pyRoot = path.join(os.homedir(), '.workbuddy', 'binaries', 'python');
+    // venv 优先：第三方依赖（requests）只装在这里
+    try {
+      const envsRoot = path.join(pyRoot, 'envs');
+      const envs = fs.readdirSync(envsRoot).filter((d) => !d.startsWith('.'));
+      const ordered = envs.includes('default') ? ['default', ...envs.filter((e) => e !== 'default')] : envs;
+      for (const e of ordered) {
+        for (const rel of [['Scripts', 'python.exe'], ['bin', 'python'], ['bin', 'python3']]) {
+          const p = path.join(envsRoot, e, ...rel);
+          if (fs.existsSync(p)) cands.push(p);
+        }
+      }
+    } catch (e) {}
+    // 托管理论裸解释器兜底（通常无第三方依赖，排 venv 之后）
+    const base = path.join(pyRoot, 'versions');
     const vers = fs.readdirSync(base).filter((d) => /^3\d*\.\d+/.test(d)).sort().reverse();
     for (const v of vers) cands.push(path.join(base, v, 'python.exe'));
   } catch (e) {}
   cands.push('python', 'python3');
+  const probe = pass === 0 ? 'import requests' : 'print(1)';
   let i = 0;
   const tryNext = () => {
-    if (i >= cands.length) return cb(null);
+    if (i >= cands.length) {
+      if (pass === 0) return resolvePython(cb, 1); // 依赖级探测全灭 → 降级为可运行级
+      return cb(null);
+    }
     const exe = cands[i++];
     let c;
-    try { c = require('child_process').spawn(exe, ['-c', 'print(1)'], { windowsHide: true, stdio: 'ignore', shell: false }); }
+    try { c = require('child_process').spawn(exe, ['-c', probe], { windowsHide: true, stdio: 'ignore', shell: false }); }
     catch (e) { return tryNext(); }
     let settled = false;
     const fin = (ok) => { if (!settled) { settled = true; if (ok) { gPythonExe = exe; cb(exe); } else tryNext(); } };
@@ -1499,17 +1555,53 @@ function maybeRefreshLocalDb() {
       if (!exe) return; // 系统无 python：保留锁按退避节奏静默重试，弹窗⚠标注可见
       const q = (p) => (/\s/.test(p) ? `"${p}"` : p);
       const cmd = `${q(exe)} fetch-cn-prices.py && ${q(exe)} parse_tokenhub.py && ${q(exe)} build_index.py`;
+      // v2.82：捕获输出 + 超时保护。旧版 stdio:'ignore' 导致失败完全静默（用户只能看到
+      // ⚠价库M/D 却查不到原因）；网络 hang 时子进程永不退出 → 锁永久卡死不再重试。
+      const REFRESH_TIMEOUT_MS = 180000; // 实测约 12s，给足 3 分钟
       let c;
-      try { c = require('child_process').spawn(cmd, { cwd: CN_PRICE_PIPELINE_DIR, shell: true, windowsHide: true, stdio: 'ignore' }); }
-      catch (e) { return; }
+      let out = '';
+      try {
+        c = require('child_process').spawn(cmd, {
+          cwd: CN_PRICE_PIPELINE_DIR, shell: true, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch (e) {
+        return noteRefreshFailure(attempts + 1, 'spawn 失败: ' + String(e.message).slice(0, 200));
+      }
+      let timedOut = false;
+      const killTimer = setTimeout(() => {
+        timedOut = true;
+        try { c.kill('SIGKILL'); } catch (e) {}
+      }, REFRESH_TIMEOUT_MS);
+      try {
+        c.stdout && c.stdout.on('data', (b) => { if (out.length < 4000) out += String(b); });
+        c.stderr && c.stderr.on('data', (b) => { if (out.length < 4000) out += String(b); });
+      } catch (e) {}
       c.on('exit', (code) => {
-        if (code === 0) { try { fs.unlinkSync(CN_PRICE_REFRESH_LOCK); } catch (e) {} }
-        // 失败：保留锁文件（attempts 已递增），下次调用按退避表重试；满 MAX_ATTEMPTS 当日熔断
+        clearTimeout(killTimer);
+        if (code === 0) {
+          try { fs.unlinkSync(CN_PRICE_REFRESH_LOCK); } catch (e) {}
+          try { fs.unlinkSync(CN_PRICE_REFRESH_ERR); } catch (e) {}
+          return;
+        }
+        noteRefreshFailure(attempts + 1, (timedOut ? `超时 ${REFRESH_TIMEOUT_MS}ms 被杀` : `exit=${code}`) + ' | ' + tail(out, 400));
       });
-      c.on('error', () => {});
+      c.on('error', (e) => {
+        clearTimeout(killTimer);
+        noteRefreshFailure(attempts + 1, 'error: ' + String(e.message).slice(0, 200));
+      });
     });
   } catch (e) { /* 静默：刷新失败沿用旧库，弹窗会有 ⚠价库 标注 */ }
 }
+
+// v2.82：把失败原因落到磁盘（prices/.refresh.error），让 ⚠价库M/D 提示可被追溯，不再盲猜。
+function noteRefreshFailure(attempts, reason) {
+  try {
+    fs.writeFileSync(CN_PRICE_REFRESH_ERR, JSON.stringify({
+      at: Date.now(), atLocal: new Date().toLocaleString('zh-CN'), attempts, day: todayStr(), reason,
+    }, null, 2));
+  } catch (e) {}
+}
+function tail(s, n) { return String(s || '').replace(/\s+/g, ' ').slice(-n); }
 
 function loadPricing() {
   let p = null;
@@ -1594,6 +1686,19 @@ function findModel(pricing, modelName, mode) {
     if (normalizeModelName(key) === norm) return { key, m: models[key] };
   }
 
+  // 1.5) v2.82（2026-09-01）：去标点匹配（alnum）。本地官方价库 index.json 的 key 是
+  // 去标点归一化名（glm53 / glm53flash / deepseekv4flash），而实际模型名带标点（glm-5.3）。
+  // normalizeModelName 保留标点 → 步骤1 失配；且 'glm-5.3' 与 'glm53' 互不为子串 →
+  // 步骤3 也救不了。结果：明明本地库有准确的官方人民币价（8/28/2），却判定未收录，
+  // 每次弹窗都走一遍联网补录（慢），失败还会按 OpenRouter 美元估算价记账（不准）。
+  // 补这一级后 glm-5.3→glm53 直接命中本地官方价，不再联网、不再误报未收录。
+  const normAlnum = alnumKey(modelName);
+  if (normAlnum) {
+    for (const key of keys) {
+      if (alnumKey(key) === normAlnum) return { key, m: models[key] };
+    }
+  }
+
   // 2) 显式别名表：人工维护，当前为空表 → 不生效（见 MODEL_ALIASES 定义处说明）
   const alias = MODEL_ALIASES[norm];
   if (alias) {
@@ -1604,15 +1709,28 @@ function findModel(pricing, modelName, mode) {
     }
   }
 
-  // 3) 计费模式：双向 includes 子串匹配，取 key 长度最长的命中（v2.71）
+  // 3) 计费模式（v2.82.1 收紧）：仅「边界分隔」匹配，且**单向**——只允许具体模型名命中
+  //    家族/前缀 key（norm 较长，key 是它的边界子串）。反向（kimi→kimik25、gemini-3.7→
+  //    gemini-3.7-flash 这种家族短名）一律拒绝：撞哪个 key 取决于遍历顺序、且撞到的是
+  //    家族里最高价版本，错价风险最大 → 返回 null 走联网补价。
+  //    旧 v2.71 双向 includes 任意子串会把未收录模型撞到无关 key（glm-5.3-air→glm-5 价），
+  //    且 ensureNewModelPricing 因「宽松命中=已收录」不再联网补真价 → 错价永久化。
+  //    收紧后：hy3-x→hy3、deepseek-ai/DeepSeek-V4-Flash→deepseek-v4-flash 仍宽松命中
+  //    （边界 - 和 /）；kimi→null、gemini-3.7→null、glm-5.3-air→null（. 不是边界）。
   if (mode === 'price') {
+    const BOUND = /[-/_: \u4e00-\u9fa5]/;
+    const boundaryHit = (short, long) => { // short 是 long 的子串且两侧均为边界
+      if (!long.includes(short)) return false;
+      const i = long.indexOf(short);
+      const leftOk = i === 0 || BOUND.test(long.charAt(i - 1));
+      const rightOk = (i + short.length) === long.length || BOUND.test(long.charAt(i + short.length));
+      return leftOk && rightOk;
+    };
     let best = null; // { key, m, len }
     for (const key of keys) {
       const kn = normalizeModelName(key);
-      if (!kn) continue;
-      if (norm.includes(kn) || kn.includes(norm)) {
-        if (!best || kn.length > best.len) best = { key, m: models[key], len: kn.length };
-      }
+      if (!kn || kn.length > norm.length) continue; // 只允许「norm 较长」方向（拒绝家族短名反向撞）
+      if (boundaryHit(kn, norm) && (!best || kn.length > best.len)) best = { key, m: models[key], len: kn.length };
     }
     if (best) return { key: best.key, m: best.m };
   }
@@ -1738,8 +1856,12 @@ function isPeakHour(rules, now) {
 // cost = 未命中输入×输入价 + 命中输入×缓存价 + 输出×输出价（元），按当前时段取倍率
 function calcCost(stat, pricing) {
   if (!pricing || !stat) return null;
-  if (isLocalModel(stat.model)) return null; // 本地模型不计费（即使 pricing 误收录也不按云端价算）
-  const hit = findModel(pricing, stat.model || 'deepseek-v4-flash', 'price'); // v2.71：计费模式（精确失败后双向子串近似取价）
+  const modelName = String(stat.model || '').trim();
+  // v2.82.2：模型名缺失（空串 / unknown）不记价——「不知道模型名字还记价个毛」。
+  // 旧代码 fallback 'deepseek-v4-flash' 会把缺名 token 按 v4-flash 价入账（错价）。
+  if (!modelName || modelName === 'unknown') return null;
+  if (isLocalModel(modelName)) return null; // 本地模型不计费（即使 pricing 误收录也不按云端价算）
+  const hit = findModel(pricing, modelName, 'price'); // v2.71：计费模式（精确失败后边界匹配近似取价）
   if (!hit) return null;
   const m = hit.m;
   // 峰谷倍率：DeepSeek 系（不论后缀）统一执行峰谷规则 + 周末低峰（v2.59 用户规则）。
@@ -1924,8 +2046,13 @@ function saveLedgerWatermark(wm) {
   }
 }
 // 增量记账：累加主 transcript + 各子代理文件中"水位线之后"的新 usage 行，并推进水位线。
+// v2.82.1：整个「读水位线→算增量→记账→推进」序列放入水位线锁（.ledger-watermark.lock）——
+// watcher(--flush-delayed) 与新一轮 Stop 并发时，两进程可能读到同一旧水位线 → 同一批行
+// 各记一遍 = 账本重复计费（专家团 6s 确认窗 ∩ 新 Stop 真实可触发）。串行化后：后到者读到
+// 先到者推进的新水位线，只记增量。锁获取失败 → 本轮跳过（下轮 Stop 补记，不丢不重）。
 function incrementalRecord(tsPath, sid) {
   if (!tsPath || !fs.existsSync(tsPath)) return;
+  withFileLock(LEDGER_WATERMARK_FILE + '.lock', () => {
   // 修复1 补充：水位线损坏时跳过记账，宁可少记也不重复计费
   const lw = loadLedgerWatermarkSafe();
   if (lw.corrupt) return;
@@ -1988,6 +2115,7 @@ function incrementalRecord(tsPath, sid) {
   entry.main = nextMain;
   for (const f of Object.keys(nextSubs)) entry.subs[f] = nextSubs[f];
   saveLedgerWatermark(wm);
+  }, { ttl: 300000, retries: 30, retryDelay: 100 }); // v2.82.1：水位线锁；拿不到锁 → 本轮跳过，下轮补记
 }
 
 // ===== 每日账本报告（v2.39）：--report [all|<date>] =====
@@ -2488,21 +2616,23 @@ function addModelPrice(pricing, modelName, ref, region) {
     // 国内模型：llmabacus 人民币价直接写入
     m.input_price = Number(ref.in);
     m.output_price = Number(ref.out);
-    m.cached_price = ref.cached != null ? Number(ref.cached) : Number((ref.in * 0.1).toFixed(2));
+    // v2.82.1：缓存价缺失 → null（按 0 计），不再按输入价×10% 拍脑袋估算
+    //（各厂商实际缓存价 3%~25% 不等：DeepSeek 3.3% 会被高估 3 倍、glm 25% 被低估，失真）
+    m.cached_price = ref.cached != null ? Number(ref.cached) : null;
     m.or_id = ref.id;
     m.price_source = 'llmabacus(国内)';
-    m.note = '新模型自动补录（llmabacus 国内人民币价）';
+    m.note = '新模型自动补录（llmabacus 国内人民币价；缓存价缺失按 0 计，待人工核验补录）';
   } else {
     // 国外模型：USD×汇率换算
     m.input_price = Number((ref.usdIn * rate).toFixed(2));
-    m.cached_price = Number((ref.usdIn * rate * 0.1).toFixed(2));
+    m.cached_price = null; // v2.82.1：不再 usdIn×10% 估算，缺失按 0 计（待人工核验官方缓存价）
     m.output_price = Number((ref.usdOut * rate).toFixed(2));
     m.or_id = ref.id;
     m.usd_input_price = Number(ref.usdIn.toFixed(6));
     m.usd_output_price = Number(ref.usdOut.toFixed(6));
     m.price_source = 'usd×汇率(国外源)';
     m.auto_converted = true;
-    m.note = '新模型自动补录（USD×汇率估算，待人工核验官方价；时段策略默认无峰谷，如厂商有高峰/夜间折扣需搜索核验后补 peak_multiplier/night_discount 字段）';
+    m.note = '新模型自动补录（USD×汇率估算，待人工核验官方价；缓存价缺失按 0 计；时段策略默认无峰谷，如厂商有高峰/夜间折扣需搜索核验后补 peak_multiplier/night_discount 字段）';
   }
   pricing.models[name] = m; // 内存侧即时更新（供本进程 findModel 命中）
   // 修复6：加锁 + 锁内重新读盘合并，避免与 refresh-prices.js 并发读改写丢失更新
@@ -3085,23 +3215,14 @@ function main() {
           const estCached0 = estNames0.reduce((s, n) => s + estByModel0[n].cached, 0);
           agg.in += estIn0; agg.out += estOut0; agg.cached += estCached0; agg.total += estIn0 + estOut0;
         }
-        // v2.74：耗时统一口径——优先用 trace 墙钟(startedAt→endedAt)，与 WorkBuddy 显示一致。
-        // transcript 的 durMs 取"首条 usage 行→末条 usage 行"，而 usage 行在生成完成时落盘，
-        // 起点被右移了首轮生成耗时（常 50s+），与 WorkBuddy 不一致。trace 不可读/时间戳缺失
-        // （或归属非本会话）时回退 transcript 口径，绝不抛错。
+        // v2.82.1：耗时统一口径——改用 traceWallDurMs()（latest trace endedAt − 用户提交时刻）。
+        // v2.74 的「单 trace 文件 startedAt→endedAt」在长任务（多 trace 分段落盘）下只算到
+        // 最后一段：实测 11:27 只显示 4:22。详见 traceWallDurMs() 注释。
+        // 条件不满足 → 回退 transcript 口径，绝不抛错。
         try {
-          const lt = latestTraceFile(true);
-          if (lt) {
-            const ltj = readTrace(lt);
-            const tr = (ltj && ltj.trace) || {};
-            const tsa = Date.parse(tr.startedAt || '');
-            const tea = Date.parse(tr.endedAt || '');
-            const trSid = tr.sessionId ? String(tr.sessionId) : '';
-            if (tsa > 0 && tea >= tsa && (!trSid || trSid === String(sid))) {
-              agg.durMs = tea - tsa;
-            }
-          }
-        } catch (e) { /* trace 半写/损坏：保留 transcript 口径 */ }
+          const wd = traceWallDurMs(latestTraceFile(true), roundStart0, sid);
+          if (wd.source === 'trace') agg.durMs = wd.durMs;
+        } catch (e) { /* 保留 transcript 口径 */ }
         const modelShort = shortModelName(agg, pricing);
       const nmNote = ensureNewModelPricing(pricing, agg).note;
       // v2.64：补价完成后再记账——确保新模型首用时 pricing.json 已含该模型价格，
@@ -3348,6 +3469,7 @@ module.exports = {
   estimateInterrupted, estimateInterruptedInc,
   extractUsageFromRow, terminalErrorFromRow, terminalError, contextOverflowOmen,
   showToast,
+  traceWallDurMs, withFileLock,
   loadPricing, autoRefreshPricing, addModelPrice, savePricing, normalizeModelName, saveDailyUsageRaw,
   getTranscriptStats, sidFromPath, ledgerKey,
 };

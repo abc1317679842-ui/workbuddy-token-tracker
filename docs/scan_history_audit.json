@@ -1,0 +1,1399 @@
+{
+ "total": 98,
+ "with_compaction": 13,
+ "with_popup": 30,
+ "A_premature": [
+  "652f2909-13ff-4d40-abae-72eea0871eec"
+ ],
+ "B_missing": [
+  "agent-40d43163",
+  "agent-44752cc8",
+  "agent-5003d879",
+  "agent-67f48ca3",
+  "agent-a409ed86",
+  "agent-fd1a98ac",
+  "agent-54c832de",
+  "agent-4eac5077",
+  "agent-50881f9c",
+  "agent-9d345c8b",
+  "agent-b24a0c13",
+  "agent-c6a27196",
+  "agent-c708980c",
+  "agent-d6ca3b56",
+  "agent-4d7417c8",
+  "agent-4f7b9eb2",
+  "agent-640e61bc",
+  "agent-883315e3",
+  "agent-a6a46f46",
+  "agent-d732018a",
+  "agent-f7bbdf7f",
+  "470fb702-9a4e-4be4-88a3-8bb6001bdfdf",
+  "agent-188187b9",
+  "agent-4f7f13ca",
+  "agent-6cdf6cb6",
+  "agent-a8f2114c",
+  "agent-d227ae54",
+  "9609fc9f-7283-4d39-8825-1047ff62aa41",
+  "agent-def08849",
+  "agent-0a9f5eb3",
+  "agent-56ca54c3",
+  "agent-e0c773c1",
+  "agent-078f97e1",
+  "agent-4fc39949",
+  "6480b072-b4f1-493f-a0d3-10854c3ac831",
+  "agent-0a9731fe",
+  "agent-492cb3ab",
+  "agent-707c5789",
+  "agent-4f800f24",
+  "agent-75a01019",
+  "agent-a449d3fc",
+  "788d4930-4c0e-4671-9627-881535e7a5f9",
+  "agent-06f12c24",
+  "agent-0c72b22b",
+  "agent-1808a9e9",
+  "agent-37d0d3d2",
+  "agent-4e341b84",
+  "agent-5d7b8bae",
+  "agent-5e9db293",
+  "agent-68275ce2",
+  "agent-68a0beb1",
+  "agent-882ef83f",
+  "agent-8a29b0e1",
+  "agent-941eb3df",
+  "agent-9d53ea62",
+  "agent-a3fb7e2c",
+  "agent-ab6c362f",
+  "agent-b169b0df",
+  "agent-b19582d2",
+  "agent-d72675ef",
+  "agent-edc851ff",
+  "agent-efd6dfb2",
+  "agent-f1a410d4",
+  "agent-f9b6d2b8",
+  "b826ce9d-3e47-42b5-b11e-b29c74d4b39b",
+  "49bd6449-2f43-4dd8-b7aa-c3f9992a70b3",
+  "agent-d3664bce"
+ ],
+ "C_duplicate": [
+  "aa64e728-43e3-4a49-b107-af6406dc2bc3",
+  "7386b18a-225d-4629-aabf-95fb3df10f70"
+ ],
+ "details": [
+  {
+   "sid": "7386b18a-225d-4629-aabf-95fb3df10f70",
+   "msgs": 610,
+   "comp": 15,
+   "lastStop": 1787412025769,
+   "last_act": 1787412304668,
+   "real_users": 5,
+   "A": false,
+   "B": false,
+   "C": true,
+   "notes": [
+    "watch-debug 出现 2 个 start(watcher 重启/重复处理)"
+   ]
+  },
+  {
+   "sid": "agent-d3664bce",
+   "msgs": 59,
+   "comp": 2,
+   "lastStop": 0,
+   "last_act": 1787409882138,
+   "real_users": 0,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-22 22:44:42 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "a3fcb1dc-7d46-45ad-ab89-b87133b0a2ba",
+   "msgs": 83,
+   "comp": 0,
+   "lastStop": 1787403980024,
+   "last_act": 1787403979891,
+   "real_users": 1,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "aa64e728-43e3-4a49-b107-af6406dc2bc3",
+   "msgs": 3865,
+   "comp": 8,
+   "lastStop": 1787349332809,
+   "last_act": 1787349332222,
+   "real_users": 63,
+   "A": false,
+   "B": false,
+   "C": true,
+   "notes": [
+    "watch-debug 出现 14 个 start(watcher 重启/重复处理)"
+   ]
+  },
+  {
+   "sid": "agent-d72675ef",
+   "msgs": 135,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787347631686,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-22 05:27:11 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-a3fb7e2c",
+   "msgs": 132,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787347400489,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-22 05:23:20 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-ab6c362f",
+   "msgs": 105,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787346165353,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-22 05:02:45 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-68a0beb1",
+   "msgs": 115,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787345751716,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-22 04:55:51 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-f1a410d4",
+   "msgs": 51,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787344543617,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-22 04:35:43 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "89eb68b8-a7c3-4b29-b33d-9a1b211f622f",
+   "msgs": 13625,
+   "comp": 33,
+   "lastStop": 1787341751263,
+   "last_act": 1787341749360,
+   "real_users": 582,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "agent-efd6dfb2",
+   "msgs": 68,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787340659906,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-22 03:30:59 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-941eb3df",
+   "msgs": 36,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787328468197,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-22 00:07:48 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-882ef83f",
+   "msgs": 26,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787325465656,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-21 23:17:45 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-37d0d3d2",
+   "msgs": 43,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787325027370,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-21 23:10:27 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-5e9db293",
+   "msgs": 88,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787324651229,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-21 23:04:11 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-1808a9e9",
+   "msgs": 119,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787324314525,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-21 22:58:34 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-0c72b22b",
+   "msgs": 19,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787323699967,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-21 22:48:19 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-4e341b84",
+   "msgs": 15,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787323183354,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-21 22:39:43 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-edc851ff",
+   "msgs": 34,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787322635374,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-21 22:30:35 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-5d7b8bae",
+   "msgs": 138,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787322227369,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-21 22:23:47 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-68275ce2",
+   "msgs": 67,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787321259466,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-21 22:07:39 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-8a29b0e1",
+   "msgs": 87,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787320623209,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-21 21:57:03 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-b169b0df",
+   "msgs": 281,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787318256809,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-21 21:17:36 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-b19582d2",
+   "msgs": 217,
+   "comp": 1,
+   "lastStop": 0,
+   "last_act": 1787317458931,
+   "real_users": 2,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-21 21:04:18 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-f9b6d2b8",
+   "msgs": 178,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787316202710,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-21 20:43:22 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "49bd6449-2f43-4dd8-b7aa-c3f9992a70b3",
+   "msgs": 2,
+   "comp": 1,
+   "lastStop": 0,
+   "last_act": 1787313229754,
+   "real_users": 0,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-21 19:53:49 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-9d53ea62",
+   "msgs": 52,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787304960203,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-21 17:36:00 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "b826ce9d-3e47-42b5-b11e-b29c74d4b39b",
+   "msgs": 4,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787300288748,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-21 16:18:08 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-06f12c24",
+   "msgs": 139,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787298081515,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-21 15:41:21 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "c820abea-65fb-4f31-b49c-ce658ead9428",
+   "msgs": 645,
+   "comp": 2,
+   "lastStop": 1787210512973,
+   "last_act": 1787210512755,
+   "real_users": 26,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "788d4930-4c0e-4671-9627-881535e7a5f9",
+   "msgs": 5,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787208521256,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-20 14:48:41 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-75a01019",
+   "msgs": 89,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787206330910,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-20 14:12:10 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-4f800f24",
+   "msgs": 98,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787204556330,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-20 13:42:36 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-a449d3fc",
+   "msgs": 69,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787204091439,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-20 13:34:51 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "1fa6a50b-37e3-415c-b5fb-5731e7c97e33",
+   "msgs": 9,
+   "comp": 0,
+   "lastStop": 1787200004175,
+   "last_act": 1787200004046,
+   "real_users": 1,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "52a369b0-4d19-48f6-bfaa-cba085268b2c",
+   "msgs": 5,
+   "comp": 0,
+   "lastStop": 1787191130452,
+   "last_act": 1787191130364,
+   "real_users": 1,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "9d97d713-5902-4343-a065-638a025670a2",
+   "msgs": 1376,
+   "comp": 2,
+   "lastStop": 1787149500695,
+   "last_act": 1787149500475,
+   "real_users": 43,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "agent-492cb3ab",
+   "msgs": 162,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787126669186,
+   "real_users": 2,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-19 16:04:29 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-0a9731fe",
+   "msgs": 37,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787124324818,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-19 15:25:24 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-707c5789",
+   "msgs": 77,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787123004351,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-19 15:03:24 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "0fba51dc-6f70-416b-b786-b748427ca8e3",
+   "msgs": 5,
+   "comp": 0,
+   "lastStop": 1787093049405,
+   "last_act": 1787093049312,
+   "real_users": 1,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "9d6b417e-5163-4fb8-bda6-81b7f4b60403",
+   "msgs": 39,
+   "comp": 1,
+   "lastStop": 1787089109994,
+   "last_act": 1787089109809,
+   "real_users": 5,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "3b0701cb-b508-4b81-a1cf-c046d0381999",
+   "msgs": 46,
+   "comp": 0,
+   "lastStop": 1787082004468,
+   "last_act": 1787082004372,
+   "real_users": 3,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "a0ed96d6-e1f2-457c-8b49-b10865d9e53a",
+   "msgs": 71,
+   "comp": 3,
+   "lastStop": 1787058064306,
+   "last_act": 1787058064191,
+   "real_users": 2,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "a05fdd3e-c719-4030-90da-1f2537307a43",
+   "msgs": 141,
+   "comp": 0,
+   "lastStop": 1787042895780,
+   "last_act": 1787043547252,
+   "real_users": 11,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "6480b072-b4f1-493f-a0d3-10854c3ac831",
+   "msgs": 3,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1787036276319,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-18 14:57:56 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "7a5e7674-5c75-4951-802f-214753a60801",
+   "msgs": 17,
+   "comp": 0,
+   "lastStop": 1787035302304,
+   "last_act": 1787035302210,
+   "real_users": 1,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "e9cee34e-9cfa-47e2-a964-aa8d196b9a43",
+   "msgs": 79,
+   "comp": 0,
+   "lastStop": 1787035084318,
+   "last_act": 1787035084179,
+   "real_users": 8,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "08820ecd-6f53-436c-93d7-9825cb2d44f5",
+   "msgs": 8,
+   "comp": 0,
+   "lastStop": 1786995694833,
+   "last_act": 1786995693340,
+   "real_users": 2,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "2cc7f02a-8c52-4b74-ab03-1300d73813be",
+   "msgs": 8,
+   "comp": 0,
+   "lastStop": 1786993025517,
+   "last_act": 1786993025430,
+   "real_users": 2,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "0ce9375a-1d47-48ba-b641-b2643e1739e4",
+   "msgs": 69,
+   "comp": 0,
+   "lastStop": 1786945348679,
+   "last_act": 1786945348576,
+   "real_users": 2,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "5cce95cc-bd2d-4567-a455-9202dab3ea66",
+   "msgs": 10,
+   "comp": 0,
+   "lastStop": 1786944806510,
+   "last_act": 1786944806416,
+   "real_users": 1,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "5a6181d9-d8b7-491f-8f89-9ed9c1533f5b",
+   "msgs": 40,
+   "comp": 0,
+   "lastStop": 1786900386949,
+   "last_act": 1786900386856,
+   "real_users": 12,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "a24fe947-212d-4161-a724-9fa4cb1eaf8f",
+   "msgs": 285,
+   "comp": 1,
+   "lastStop": 1786896710328,
+   "last_act": 1786896706696,
+   "real_users": 4,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "agent-078f97e1",
+   "msgs": 76,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786893193226,
+   "real_users": 3,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-16 23:13:13 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-4fc39949",
+   "msgs": 68,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786892733514,
+   "real_users": 2,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-16 23:05:33 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "81e2087e-c3bd-47dd-8859-bf807e7dab1a",
+   "msgs": 35,
+   "comp": 0,
+   "lastStop": 1786890640217,
+   "last_act": 1786890640120,
+   "real_users": 1,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "1686e062-84cd-4107-a16c-5a08940af093",
+   "msgs": 194,
+   "comp": 1,
+   "lastStop": 1786776552394,
+   "last_act": 1786776552198,
+   "real_users": 7,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "agent-e0c773c1",
+   "msgs": 38,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786776527957,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 14:48:47 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "689004dc-79a1-46b7-9036-b147c8be6718",
+   "msgs": 24,
+   "comp": 0,
+   "lastStop": 1786776534344,
+   "last_act": 1786776527830,
+   "real_users": 1,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "3a35b538-f59a-424b-b718-daf55c029427",
+   "msgs": 53,
+   "comp": 0,
+   "lastStop": 1786774571450,
+   "last_act": 1786774564967,
+   "real_users": 2,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "agent-56ca54c3",
+   "msgs": 17,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786770959608,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 13:15:59 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-0a9f5eb3",
+   "msgs": 17,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786768241047,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 12:30:41 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "27197c0d-053c-4c24-8381-45fcdae31310",
+   "msgs": 5,
+   "comp": 0,
+   "lastStop": 1786768110378,
+   "last_act": 1786768110245,
+   "real_users": 1,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "470fb702-9a4e-4be4-88a3-8bb6001bdfdf",
+   "msgs": 114,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786767369888,
+   "real_users": 13,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 12:16:09 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-d227ae54",
+   "msgs": 69,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786767305157,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 12:15:05 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-6cdf6cb6",
+   "msgs": 124,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786766871496,
+   "real_users": 4,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 12:07:51 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-a8f2114c",
+   "msgs": 26,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786766642071,
+   "real_users": 2,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 12:04:02 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-def08849",
+   "msgs": 3,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786765971278,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 11:52:51 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "9609fc9f-7283-4d39-8825-1047ff62aa41",
+   "msgs": 25,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786765930926,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 11:52:10 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-4f7f13ca",
+   "msgs": 44,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786765696038,
+   "real_users": 2,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 11:48:16 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-188187b9",
+   "msgs": 20,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786765320106,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 11:42:00 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-4d7417c8",
+   "msgs": 4,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786764862394,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 11:34:22 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "652f2909-13ff-4d40-abae-72eea0871eec",
+   "msgs": 92,
+   "comp": 0,
+   "lastStop": 1786764668217,
+   "last_act": 1786764862391,
+   "real_users": 5,
+   "A": true,
+   "B": false,
+   "C": false,
+   "notes": [
+    "popup@2026-08-15 11:31:08 后活动持续到 2026-08-15 11:34:22 且无真实新user"
+   ]
+  },
+  {
+   "sid": "agent-a6a46f46",
+   "msgs": 4,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786764645351,
+   "real_users": 2,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 11:30:45 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-f7bbdf7f",
+   "msgs": 3,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786764532788,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 11:28:52 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-4f7b9eb2",
+   "msgs": 3,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786764356788,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 11:25:56 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-640e61bc",
+   "msgs": 3,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786764187335,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 11:23:07 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-883315e3",
+   "msgs": 4,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786763819987,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 11:16:59 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-d732018a",
+   "msgs": 13,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786763767585,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 11:16:07 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-4eac5077",
+   "msgs": 31,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786763762210,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 11:16:02 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-c6a27196",
+   "msgs": 28,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786763761721,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 11:16:01 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-50881f9c",
+   "msgs": 23,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786763723514,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 11:15:23 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-b24a0c13",
+   "msgs": 27,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786763720304,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 11:15:20 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-d6ca3b56",
+   "msgs": 29,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786763703147,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 11:15:03 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "01593e8c-617c-453e-89b2-cf5c241b559d",
+   "msgs": 65,
+   "comp": 0,
+   "lastStop": 1786763325727,
+   "last_act": 1786763557375,
+   "real_users": 7,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "agent-9d345c8b",
+   "msgs": 144,
+   "comp": 3,
+   "lastStop": 0,
+   "last_act": 1786763496567,
+   "real_users": 5,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 11:11:36 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-c708980c",
+   "msgs": 11,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786763376986,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 11:09:36 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "7d699843-0e51-42fd-ad55-4913533caf79",
+   "msgs": 54,
+   "comp": 0,
+   "lastStop": 1786762297127,
+   "last_act": 1786762379814,
+   "real_users": 2,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "agent-54c832de",
+   "msgs": 35,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786762309069,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 10:51:49 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "4ec8144b-2add-43d1-810a-979f165725db",
+   "msgs": 92,
+   "comp": 0,
+   "lastStop": 1786759908162,
+   "last_act": 1786759901659,
+   "real_users": 17,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  },
+  {
+   "sid": "agent-40d43163",
+   "msgs": 7,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786759894398,
+   "real_users": 2,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 10:11:34 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-44752cc8",
+   "msgs": 136,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786759862666,
+   "real_users": 6,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 10:11:02 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-5003d879",
+   "msgs": 12,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786759578539,
+   "real_users": 2,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 10:06:18 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-67f48ca3",
+   "msgs": 13,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786759138165,
+   "real_users": 2,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 09:58:58 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-a409ed86",
+   "msgs": 31,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786758697035,
+   "real_users": 2,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 09:51:37 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-fd1a98ac",
+   "msgs": 15,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 1786758506147,
+   "real_users": 1,
+   "A": false,
+   "B": true,
+   "C": false,
+   "notes": [
+    "末活动 2026-08-15 09:48:26 为 final-like，无后续真实user，且无 lastStopAt(可能漏弹)"
+   ]
+  },
+  {
+   "sid": "agent-ec7a7e30",
+   "msgs": 1,
+   "comp": 0,
+   "lastStop": 0,
+   "last_act": 0,
+   "real_users": 1,
+   "A": false,
+   "B": false,
+   "C": false,
+   "notes": []
+  }
+ ]
+}
