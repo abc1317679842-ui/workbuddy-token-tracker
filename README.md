@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v2.81.0-blue)
+![Version](https://img.shields.io/badge/version-v2.82.3-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -43,6 +43,9 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 | 🔄 **每日价格自动刷新** | 每天首次运行自动拉 **5 个价格源**（国内 2：llmabacus / llm-prices-cn；国外 3：OpenRouter / LiteLLM / Portkey），按模型 `region` 区分国内外定价（CN 用国内人民币价、US 用三 USD 源中位数×汇率）；**当天已刷新则不再联网**；全源失败 toast 显示「价⚠️」并保留上次价格 |
 | 🏪 **本地官方价格库优先**（v2.81） | 计费新增**本地官方库层**（各厂商官网直抓的人民币官方价），优先级：`pricing.json 的 lock` > **本地官方库** > 聚合源补录。**每天第一次对话后台强制刷新**（实测约 12s，非阻塞，刷新没跑完自动用前一天完整库）；本地没有的模型才走聚合源实时查价并永久记录 |
 | ⚠️ **刷新失败告警**（v2.81） | 本地库停留在昨天/缺失时，弹窗模型名后追加 **`⚠价库8/30`** / **`⚠价库缺失`**（正常时与原来一字不差）；失败**退避重试** 3→10→30→60 分钟、当日满 5 次熔断，次日自动恢复——不会再无限重拉，也不会让你蒙在鼓里 |
+| ⏱️ **耗时口径对齐**（v2.82.1） | 耗时 = 最后一次 LLM 结束 − 用户提交时刻，与 WorkBuddy 显示**分毫不差**（长任务多 trace 分段落盘不再只算最后一段：实测 11:27 的任务旧版只显示 4:22） |
+| 🛡️ **专家团防双记**（v2.82.2） | 增量记账整体加水位线锁，watcher 补记账与新一轮 Stop 并发时不再重复计费（集成测试两进程并发实测只记一次） |
+| 🧮 **计价精度**（v2.82.2） | 未收录模型改**边界分隔匹配**（不再 glm-5.3-air 撞 glm-5 的价）；模型名缺失/`unknown` 不记价；缓存价缺失按 0 计（不再拍脑袋 ×10%） |
 | 🔤 **可读性** | 大数自动用「万/亿」单位（287.9万 / 1.5亿），缓存占比精确到两位小数（99.12%） |
 
 ## 🏪 本地官方价格库（v2.81 起）
@@ -184,6 +187,28 @@ Windows 设置 → 系统 → 通知 → 应用通知
 本技能的 toast 使用**独立应用名「WorkBuddy Token Tracker」** 直接调用 Windows 系统通知 API 弹出，**不经过 WorkBuddy 客户端设置**——关闭 WorkBuddy 自带通知**不影响 Token 通知**。若想连 Token 通知一起关：在通知列表单独关闭「WorkBuddy Token Tracker」即可。
 
 ## 更新记录（Changelog）
+
+### v2.82.0~v2.82.3（2026-09-01）—— 价格库刷新根修 + 耗时口径 + 计费精度 + 并发加固
+
+**v2.82（2026-09-01）—— 本地价格库自动刷新根修 + 并发加固 + 逐模型沿用：**
+- **resolvePython 补 venv**：本地价格库每日自动刷新从上线起从未成功过的根因——唯一带 requests 的 venv 不在 python 解析候选表里；补入后每日刷新恢复正常（`.refresh.lock` 不再常驻）。
+- **刷新子进程治理**：180s 超时 SIGKILL（网络 hang 不再永久卡锁）+ 失败写 `.refresh.error` 留档（不再全静默）。
+- **护栏 A 修复**：`refresh-prices` 清理逻辑与注释相反、每次刷新把不在账本的模型全删（26→6）——修正后 `--force` 实测零丢失。
+- **findModel alnum 桥接**：`glm-5.3` 直接命中本地库 `glm53` 官方价（不再每次联网补录）。
+- **流水线并发加固**：fetch/parse/build 三脚本写盘改「唯一 tmp + os.replace」原子写（多会话并发不再 PermissionError / 半截 JSON）。
+- **build_index 逐模型沿用**：官网软 404（Moonshot 改版）不再静默丢模型（35→31 的 bug），缺失模型沿用旧价 + `missing_since` 7 天自动淘汰。
+
+**v2.82.1（2026-09-01）—— 弹窗耗时口径根修：**
+- 耗时 = 最新 trace `endedAt` − 用户提交时刻。旧版取「单个 trace 文件首尾」，长任务多 trace 分段落盘时只算最后一段（实测 11:27 只显示 4:22；trace 切分时机由客户端决定不可预测，所以时对时错）。新口径与 WorkBuddy 显示实测差 ≤1s。
+
+**v2.82.2（2026-09-01）—— 计费精度三修 + 缺名不记价：**
+- **findModel 单向边界匹配**：未收录模型不再撞价（glm-5.3-air→glm-5、kimi→kimik25 的错价来源），`hy3-x→hy3`、`deepseek-ai/xxx→v4-flash` 仍宽松命中。
+- **incrementalRecord 水位线锁**：watcher 与 Stop 并发不再重复记账（专家团场景实测双记 bug，集成测试两进程并发只记一次）。
+- **缓存价不估算**：自动补录的缓存价缺失置 `null`（按 0 计），不再按输入价 ×10% 拍脑袋（DeepSeek 实际 3.3% 会被高估 3 倍）。
+- **缺名不记价**：模型名缺失 / `unknown` 只记 token 不记钱（旧版按 deepseek-v4-flash 默认价入账）。
+
+**v2.82.3（2026-09-01）—— 锁等待去忙等：**
+- `withFileLock` / `withPricingLock` 重试等待改 `Atomics.wait` 真睡眠（不再 50×100ms 空转烧 CPU）。全套 108 项测试 0 失败 + 全天账本对账 0 差异。
 
 ### v2.76~v2.81（2026-08-31）—— 本地官方价格库优先 + 每日强刷 + 失败治理
 
