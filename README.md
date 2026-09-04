@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v2.82.3-blue)
+![Version](https://img.shields.io/badge/version-v2.84-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -45,6 +45,7 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 | ⚠️ **刷新失败告警**（v2.81） | 本地库停留在昨天/缺失时，弹窗模型名后追加 **`⚠价库8/30`** / **`⚠价库缺失`**（正常时与原来一字不差）；失败**退避重试** 3→10→30→60 分钟、当日满 5 次熔断，次日自动恢复——不会再无限重拉，也不会让你蒙在鼓里 |
 | ⏱️ **耗时口径对齐**（v2.82.1） | 耗时 = 最后一次 LLM 结束 − 用户提交时刻，与 WorkBuddy 显示**分毫不差**（长任务多 trace 分段落盘不再只算最后一段：实测 11:27 的任务旧版只显示 4:22） |
 | 🛡️ **专家团防双记**（v2.82.2） | 增量记账整体加水位线锁，watcher 补记账与新一轮 Stop 并发时不再重复计费（集成测试两进程并发实测只记一次） |
+| 🛑 **手动取消补弹**（v2.83/v2.84） | 用户手动取消任务时 WorkBuddy **不触发 Stop hook**（取消被挂起直到下一条消息），被取消轮的 token 会被并进下一轮弹窗、无法辨认。v2.83 起在 hook 端识别 transcript 的 `Interrupted by user` 取消标记并**立即补弹**（文案带 **（手动取消）**，日志 `reason=cancelled-round-flush`）；**v2.84** 修正续跑判定——取消后先有用户新消息 = 新轮次（补弹），取消后直接跟模型回复 = 续跑（不补弹）。5 项回放测试全通过 |
 | 🧮 **计价精度**（v2.82.2） | 未收录模型改**边界分隔匹配**（不再 glm-5.3-air 撞 glm-5 的价）；模型名缺失/`unknown` 不记价；缓存价缺失按 0 计（不再拍脑袋 ×10%） |
 | 🔤 **可读性** | 大数自动用「万/亿」单位（287.9万 / 1.5亿），缓存占比精确到两位小数（99.12%） |
 
@@ -187,6 +188,23 @@ Windows 设置 → 系统 → 通知 → 应用通知
 本技能的 toast 使用**独立应用名「WorkBuddy Token Tracker」** 直接调用 Windows 系统通知 API 弹出，**不经过 WorkBuddy 客户端设置**——关闭 WorkBuddy 自带通知**不影响 Token 通知**。若想连 Token 通知一起关：在通知列表单独关闭「WorkBuddy Token Tracker」即可。
 
 ## 更新记录（Changelog）
+
+### v2.83~v2.84（2026-09-04）—— 手动取消漏弹修复（v2.84 续跑判定修正）
+
+**背景（真实事故，2026-09-02 00:33）**：用户手动取消一轮长任务（实测消耗 108.7万 tokens），**没有弹出任何通知**。排查确认：WorkBuddy 手动取消**不触发 Stop hook**（取消被 `SessionAbortMiddleware` 挂起，直到下一条用户消息才吸收，全程无 `executeStopHooks`）——该轮没有结算入口，其 token 在下一条消息时被静默合并进下一轮弹窗（显示 25m3s，用户完全无法辨认）。
+
+**v2.83 —— hook 端补弹路径：**
+- 新增判据函数 `interruptedRowsAfter(rows, roundStartMs)`：从 transcript 提取「取消标记」（`role=assistant` + `status=incomplete` + `providerData.error.message` 精确为 `Interrupted by user`），区别于既有的 `interruptedByUser`（只看末尾行、服务于 watcher 即时信号）。
+- 三个安全条件全部满足才补弹，防重复弹：① `inProgress` 为真（上一轮无完成的 Stop/watcher 结算）；② 存在未被后续消息跟进的取消标记（该轮确实终止）；③ 取消标记 ts > `roundStart`（属于本轮，不是更早的旧标记）。
+- 补弹后推进 `lastStopAt` 并 return；**不走 coalesce/watcher**——取消是终态，不存在"是否续跑"的不确定性。
+
+**v2.84 —— 续跑判定修正（关键）：**
+- v2.83 初版判定「取消标记后出现 assistant 消息 → 续跑、不补弹」，把真实流程 **取消 → 用户发新问题 → 模型回答新问题** 误判为续跑，导致真实取消场景仍然全部漏弹（实测 transcript `ab3c8bf6`：line1262 取消 / 1263 用户新消息 / 1266 新回复）。
+- 改为**看中间隔没隔用户消息**：取消后先出现 `role=user` → `break`（新轮次，补弹）；取消后直接跟 assistant（无 user 分隔）→ 才算续跑，不补弹。
+
+**验证**：5 项离线回放测试全通过 —— T1 真实 transcript（00:33:53 取消 → 00:35:07 user → 00:35:49 assistant）PASS；T2 续跑拦截 / T3 无取消标记 / T4 取消早于轮起点 / T5 连续两次取消（取最后一个）均 PASS。
+
+**边界说明**：供应商侧或应用侧自行中断（非用户点击停止）也会写入同样的 `Interrupted by user` 标记，但此时 Stop hook **正常触发** → 走既有 watcher `interrupted` 路径弹窗，**不走**本补弹路径（实测 2026-09-02 01:35 即如此，日志 `reason=interrupted`）。补弹路径只兜「Stop hook 压根没触发」的情况。
 
 ### v2.82.0~v2.82.3（2026-09-01）—— 价格库刷新根修 + 耗时口径 + 计费精度 + 并发加固
 

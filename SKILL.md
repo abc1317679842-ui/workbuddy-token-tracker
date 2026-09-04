@@ -11,11 +11,20 @@ type: skill
 - **Windows 10/11**：系统通知（toast）仅 Windows 支持；macOS/Linux 可正常手动使用（方式 A），但不弹通知。
 - **Node.js ≥ 20**：脚本零依赖单文件，无需 npm install。
 
-## 当前功能总览（v2.82.3 · 2026-09-01）
+## 当前功能总览（v2.84 · 2026-09-04）
+
+> **v2.83~v2.84 要点（2026-09-04）：** 手动取消漏弹修复——WorkBuddy 手动取消不触发 Stop hook（实测 00:33 取消被 SessionAbortMiddleware 挂起，全程无 executeStopHooks），被取消轮的 token 会被静默并进下一轮弹窗（实测 108.7万并入下轮、显示 25m3s 无法辨认）。v2.83 在 hook 端新增「取消轮补弹」路径（文案带 **（手动取消）**）；**v2.84 修正续跑判定**——取消后【先 user 新消息再 assistant 回复】= 新轮次应补弹，取消后【直接 assistant 回复】= 续跑不补弹（v2.83 初版把正常取消流程误判为续跑，导致全部漏弹）。5 项离线回放测试（含真实 transcript ab3c8bf6）全部通过。
 
 > **v2.82 系列要点（详见文末更新记录）：** 本地价格库每日自动刷新根修（resolvePython 补 venv）+ 刷新子进程 180s 超时治理 + 护栏 A 修复（价格库不再被清空）+ 流水线原子写并发加固 + build_index 逐模型沿用（官网软 404 不丢模型）；**v2.82.1** 弹窗耗时口径根修（= 最新 trace endedAt − 用户提交时刻，与 WorkBuddy 显示差 ≤1s）；**v2.82.2** findModel 单向边界匹配（未收录不再撞价）+ incrementalRecord 水位线锁（专家团 watcher/Stop 并发不双记）+ 缓存价缺失置 null（不拍脑袋 ×10%）+ 缺名不记价；**v2.82.3** 锁等待 Atomics.wait 去忙等。全套 108 项测试 + 全天账本对账 0 差异。
 
 > **⚠️ 强制（查询触发总纲）：所有统计查询必须调用 `--report` 命令并原样贴出脚本输出，禁止自行解析 JSON。** 无论用户问「今日消耗」「今天用了多少」「账本」「报告」「统计」「花费」还是历史某天，一律先跑 `node token-tracker.js --report`（或 `--report <日期>`），再把脚本打印的 Markdown 表格原文贴给用户；不得自行读取 `daily-usage.json`、不得自行汇总、不得转成列表/纯文本/代码块。详细规则见下方「查询触发规则（强制）」与「展示格式约束（强制）」。
+
+> **v2.83~v2.84（2026-09-04，手动取消漏弹修复）：**
+> - **根因（v2.83 定位）**：用户手动取消任务时，WorkBuddy **不触发 Stop hook**（实测 2026-09-02 00:33 汉化轮：取消被 SessionAbortMiddleware 挂起，直到下一条用户消息才吸收，全程无 `executeStopHooks`）。watcher 也已被吸收 → 该轮无任何结算入口，其 token 在下一条消息时被静默合并进下一轮弹窗（实测被取消轮 108.7万 tokens 并入下轮，弹窗显示 25m3s，用户完全无法辨认）。
+> - **修复（v2.83）**：hook 端（`--hook` 的 asHook 分支）新增补弹路径。新增判据函数 `interruptedRowsAfter(rows, roundStartMs)`——从 transcript 提取「取消标记」（`role=assistant` + `status=incomplete` + `providerData.error.message` 精确为 `Interrupted by user`，区别于 `interruptedByUser` 只看末尾行）。三个安全条件全部满足才补弹：① `inProgress` 为真（上一轮无完成的 Stop/watcher 结算）；② 存在未被后续消息跟进的取消标记（该轮确实终止）；③ 取消标记 ts > `roundStart`（属于本轮，不是旧标记）。补弹后推进 `lastStopAt` 并 return，不走 coalesce/watcher（取消是终态，无续跑不确定性）。弹窗文案追加 **（手动取消）**，诊断日志 `reason` = `cancelled-round-flush`。
+> - **v2.84 续跑判定修正**：v2.83 初版判定「取消标记后出现 assistant 消息 → 续跑不补弹」，把真实流程「取消 → 用户发新问题 → 模型回答新问题」误判为续跑，导致真实取消场景仍全部漏弹（实测 transcript ab3c8bf6 line1262 取消 / 1263 用户新消息 / 1266 新回复）。改为**看中间隔没隔用户消息**：取消后先出现 `role=user` → `break`（新轮次，补弹）；取消后直接跟 assistant（无 user 分隔）→ 才算续跑，不补弹。
+> - **验证**：5 项离线回放测试全通过 —— T1 真实 transcript 场景（00:33:53 取消→00:35:07 user→00:35:49 assistant）PASS；T2 续跑拦截 / T3 无取消标记 / T4 取消早于轮起点 / T5 连续两次取消（取最后一个）均 PASS。
+> - **边界（重要）**：供应商侧/应用侧自行中断的场景（非用户点击停止）也会在 transcript 写入同样的 `Interrupted by user` 标记，此时 Stop hook **正常触发** → 走既有 watcher `interrupted` 路径弹窗，**不走**本补弹路径（实测 2026-09-02 01:35 即如此，reason=interrupted）。补弹路径只兜「Stop hook 压根没触发」的情况。
 
 > **v2.82.2（2026-09-01，全方位审查三修）：** 备份含于 `*.bak-before-fix-20260901`。
 > - **findModel 计费匹配收紧（中一）**：v2.71 双向 includes 任意子串会把未收录模型撞到无关 key（glm-5.3-air→glm-5 价、kimi→kimik25 价），且因「宽松命中=已收录」不再联网补真价 → 错价永久化。改为**单向边界分隔匹配**：仅允许 norm 较长、key 是 norm 的边界子串（`-/_:空格/中文` 为边界，`.` 不算——glm-5.3 与 glm-5 是不同模型）。hy3-x→hy3、deepseek-ai/DeepSeek-V4-Flash→deepseek-v4-flash 仍命中；kimi/gemini-3.7/glm-5.3-air → null 走补价。
@@ -325,6 +334,7 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 | 弹窗提示「⚠价库8/31」/ 价库不刷新 | `WorkBuddy\2026-08-30-22-25-15\prices\.refresh.lock`（失败会常驻）+ `.refresh.error`（v2.82 起失败留档）+ `binaries/python/envs/default`（venv 是否有 requests） | 刷新失败首查 `.refresh.error` 内容；「python 环境」问题查 resolvePython 是否命中 venv（v2.82 根修：候选表必须含 venv 路径） |
 | 弹窗耗时与 WorkBuddy 显示差很多 | 本轮 trace 文件数量（`~/.workbuddy/traces/<pid>/` 同窗口几个 trace） | 长任务会分多个 trace 文件，v2.74 单文件口径只算最后一段（11:27 显示 4:22）；v2.82.1 起 = 最新 trace endedAt − 用户提交时刻（roundStart0），差 ≤1s |
 | 新模型计费明显不对 / 显示 unknown | `pricing.json` 对应条目 + `daily-usage.json` 模型名 | v2.82.2 起 findModel 为单向边界匹配：`glm-5.3-air` 不会撞 `glm-5` 的价；模型名缺失（`unknown`）只记 token 不记钱——若出现 unknown 条目，说明 transcript 的 `providerData.model` 缺失 |
+| 手动取消后不弹窗（v2.83+） | `token-tracker-toast.log`（搜 `cancelled-round-flush`）+ transcript 取消标记（`role=assistant`/`status=incomplete`/`error.message` = `Interrupted by user`） | v2.83 起 hook 端补弹，文案带 **（手动取消）**、日志 `reason=cancelled-round-flush`。若仍不弹：① 该轮 Stop hook 是否触发过（触发过则走既有 watcher `interrupted` 路径，属正常）；② 取消标记后是否直接跟了 assistant 回复（判定为续跑，设计内不补弹）；③ `inProgress` 是否为真（`lastStopAt < lastUserMsgAt`，已结算过则不补弹防重复） |
 | 专家团金额疑似翻倍（双记） | `.ledger-watermark.json` 各会话水位线 + 账本模型 token | v2.82.2 起 incrementalRecord 整体加 `.ledger-watermark.json.lock` 水位线锁，watcher 与 Stop 并发只记一次；仍翻倍则查是否锁被异常跳过（stderr 有「水位线保持不推进」则下轮会补记） |
 
 > ⚠️ **hooks 命令铁律**：所有 hook 命令必须保持**纯净的 `node` 调用**（如 `node C:/.../token-tracker.js --stop`），**禁止使用 `cmd /c` 包装或环境变量前缀**（如 `cmd /c "set X=1 && node ..."`）。此类包装会被 WorkBuddy 判为无效 hook 配置（`Invalid hook config`），导致整个事件组（Stop / UserPromptSubmit）跳过、进程瞬间失败且无任何日志产物。调试日志已改为弹窗时自动记录，无需通过环境变量或命令前缀开启。
