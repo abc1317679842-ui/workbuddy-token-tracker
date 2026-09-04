@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v2.75 (2026-08-29)
+// token-usage-tracker v2.84 (2026-09-04)
 // v2.63：调试日志机制重构——废弃 TOKEN_TRACKER_DEBUG 环境变量开关 + poll 全量记录，改为「弹窗时自动记录」：
 //   每次 showToast 无条件向 ~/.workbuddy/token-tracker-toast.log 追加一行 JSON 诊断（原因/sessionId/行数/稳定计数/compaction 状态等）。
 // v2.62：compaction 检测由"行数减少>5"改为"扫描 transcript 末尾 30 行识别压缩标记（compactionMode 方案）"。
@@ -1211,6 +1211,38 @@ function hasSubagentsRecentlyActive(tsPath, windowMs) {
 // 主 transcript 无 Interrupted，但子代理文件最后一行是 Interrupted by user）。
 // 之前的实现只查主 transcript 最后一行 → 误判"子代理还在运行"，其实子代理已停止（和用户界面一致）。
 // 现在同时检查主 transcript 与所有子代理文件的最后一行。
+// v2.83：手动取消漏弹修复的判据函数——从 transcript 行中提取「取消标记」（role=assistant +
+// status=incomplete + providerData.error.message 精确为 "Interrupted by user"）。
+// v2.84 续跑判定修正：取消后【先 user 新消息再 assistant 回复】= 新轮次（正常取消流程，补弹）；
+// 取消后【直接 assistant 回复】（中间无 user 消息）= 续跑（不补弹）。
+// v2.83 初版误把"取消→用户新消息→模型回复"判成续跑，导致真实取消场景全部漏弹（实测 ab3c8bf6）。
+// 返回 [{ts}] 列表。
+// 与 interruptedByUser（watcher 即时信号）不同：这里只看主 transcript（hook 端无子代理上下文）。
+function interruptedRowsAfter(rows, roundStartMs) {
+  const out = [];
+  let lastIdx = -1;
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r || r.type !== 'message') continue;
+    const isCancel = r.role === 'assistant' && r.status === 'incomplete'
+      && r.providerData && r.providerData.error
+      && /^Interrupted by user$/i.test(String(r.providerData.error.message || '').trim());
+    if (isCancel && (Number(r.timestamp) || 0) > (roundStartMs || 0)) { out.push({ ts: Number(r.timestamp), idx: i }); lastIdx = i; }
+  }
+  if (lastIdx >= 0) {
+    // v2.84 续跑判定：取消标记之后必须【先出现新的 user 消息再出现 assistant 回复】才算新轮次
+    //（正常流程：取消 → 用户发新问题 → 模型回答新问题 → 这不是续跑，取消轮应补弹）。
+    // 只有取消标记之后【直接】出现 assistant 回复（中间没有 user 消息分隔）→ 才是续跑，不补弹。
+    for (let j = lastIdx + 1; j < rows.length; j++) {
+      const r2 = rows[j];
+      if (!r2 || r2.type !== 'message') continue;
+      if (r2.role === 'user') break; // 新提问出现 → 后续 assistant 属于新轮次，取消轮确已终止
+      if (r2.role === 'assistant') return []; // 取消后直接跟 assistant 回复（无新提问）→ 续跑，不补弹
+    }
+  }
+  return out;
+}
+
 function interruptedByUser(tsPath) {
   if (!tsPath) return false;
   const intrIn = (r) => {
@@ -3432,6 +3464,59 @@ function main() {
       const psnap = loadSnapshot(sid) || {};
       saveSnapshot({ file: psnap.file || hookFile, stat: psnap.stat || stat, lastUserMsgAt: psnap.lastUserMsgAt || 0, lastStopAt: Date.now() }, sid);
     }
+    // v2.83：手动取消漏弹修复——上一轮未结算（inProgress）且 transcript 有「Interrupted by user」
+    // 标记（role=assistant + status=incomplete + providerData.error.message 精确为 Interrupted by user）
+    // → 用户手动取消后 WorkBuddy 未触发 Stop hook（实测 2026-09-02 00:33：取消被 SessionAbortMiddleware
+    // 挂起，直到下一条用户消息才吸收，全程无 executeStopHooks）。此场景下立即把被取消轮聚合补弹，
+    // 防止其 token 被静默合并进下一轮弹窗（实测被取消轮 108.7万 tokens 并入下轮，弹窗显示 25m3s 用户无法辨认）。
+    // 安全条件（全部满足才补弹）：
+    //   ① inProgress 为真（上一轮无完成的 Stop/watcher 弹窗 → 确实未结算）；
+    //   ② transcript 存在"未被后续 assistant 消息跟进"的取消标记（= 取消后没有新回复 → 该轮确实终止）；
+    //   ③ roundStart > 0 且取消标记 timestamp > roundStart（属于被取消的那一轮，不是更早的旧标记）。
+    // 补弹后：推进 lastStopAt，随后起点刷新守卫按"已结束"路径刷新起点（下一轮从本次提交开始聚合）。
+    // 不走 coalesce/watcher：取消轮是终态，无"是否续跑"的不确定性，直接弹即可。
+    if (tsPathH) {
+      const snapPre = loadSnapshot(sid) || {};
+      const roundStartH = snapPre.lastUserMsgAt || 0;
+      const inProgressH = roundStartH > 0 && (snapPre.lastStopAt || 0) < roundStartH;
+      if (inProgressH) {
+        const intrRows = interruptedRowsAfter(readTranscLines(tsPathH), roundStartH);
+        const intrInfo = intrRows.length ? intrRows[intrRows.length - 1] : null;
+        if (intrInfo && intrInfo.ts > roundStartH) {
+          // 聚合起点 = 旧 roundStartH（含被取消轮全部调用）；终点天然为 transcript 当前末尾
+          let aggC = aggregateTranscript(tsPathH, roundStartH);
+          if (aggC) {
+            const estByModelC = estimateInterrupted(readTranscLines(tsPathH), 0, roundStartH);
+            const estNamesC = Object.keys(estByModelC);
+            if (estNamesC.length) {
+              const estInC = estNamesC.reduce((s, n) => s + estByModelC[n].in, 0);
+              const estOutC = estNamesC.reduce((s, n) => s + estByModelC[n].out, 0);
+              const estCachedC = estNamesC.reduce((s, n) => s + estByModelC[n].cached, 0);
+              aggC.in += estInC; aggC.out += estOutC; aggC.cached += estCachedC; aggC.total += estInC + estOutC;
+            }
+            const durC = Math.max(0, intrInfo.ts - roundStartH); // 取消时刻 - 轮起点 = 被取消轮墙钟时长
+            aggC.durMs = aggC.durMs || durC;
+            const modelC = shortModelName(aggC, pricing);
+            ensureNewModelPricing(pricing, aggC);
+            incrementalRecord(tsPathH, sid);
+            writeProbe({ time: new Date().toISOString(), event: 'Hook', ok: true, sid, sameRound: false,
+              note: 'cancelled-round-flush', transcriptPath: tsPathH, stat: aggC,
+              line: lineFor(aggC, false, modelC), source: 'transcript-cancelled-round', intrAt: new Date(intrInfo.ts).toISOString() });
+            const balC = balanceText();
+            showToast(
+              toastLine1(aggC, modelC, '（手动取消）', balC, todayUsageTxt()),
+              toastLine2(aggC, pricing),
+              'cancelled-round-flush'
+            );
+            // 该轮已彻底结束：推进 lastStopAt，并让下方起点刷新守卫按"已结束"路径刷新起点
+            const psnapC = loadSnapshot(sid) || {};
+            saveSnapshot({ file: psnapC.file || hookFile, stat: psnapC.stat || null, lastUserMsgAt: psnapC.lastUserMsgAt || 0, lastStopAt: Date.now() }, sid);
+            out({ hookSpecificOutput: {} });
+            return;
+          }
+        }
+      }
+    }
     // v2.27（2026-08-12，起点刷新守卫）：专家团运行中途用户真实提交（system-reminder 触发 hook）
     // 会把 lastUserMsgAt 刷晚 → Stop 聚合起点变晚 → 漏掉之前的调用（实测 legal 409.3万漏成 159.8万）。
     // 修复：仅当上一轮已结束（lastStopAt >= lastUserMsgAt，即有过完成的 Stop/watcher 弹窗）才刷新起点；
@@ -3465,6 +3550,7 @@ module.exports = {
   readTranscLines, parseTranscChunk, readTranscLinesFrom, extractUsage, perModelFromRows, aggregatePerModel,
   todayDisplay, reportTxt, reportSummaryTxt, normalizeDailyUsage,
   mainModelState, lastTranscLine, coalescePath, hasActiveSubagentsSince, subagentsDirFromTranscript, subagentPending, subagentsAllStagnant, interruptedByUser, hasSubagentsRecentlyActive,
+  interruptedRowsAfter,
   incrementalRecord, loadLedgerWatermark, saveLedgerWatermark,
   estimateInterrupted, estimateInterruptedInc,
   extractUsageFromRow, terminalErrorFromRow, terminalError, contextOverflowOmen,
