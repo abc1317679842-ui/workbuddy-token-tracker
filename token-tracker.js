@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v2.84 (2026-09-04)
+// token-usage-tracker v2.91 (2026-09-05)
 // v2.63：调试日志机制重构——废弃 TOKEN_TRACKER_DEBUG 环境变量开关 + poll 全量记录，改为「弹窗时自动记录」：
 //   每次 showToast 无条件向 ~/.workbuddy/token-tracker-toast.log 追加一行 JSON 诊断（原因/sessionId/行数/稳定计数/compaction 状态等）。
 // v2.62：compaction 检测由"行数减少>5"改为"扫描 transcript 末尾 30 行识别压缩标记（compactionMode 方案）"。
@@ -75,7 +75,12 @@ const PROBE = path.join(WB, 'skills', 'token-usage-tracker', '.stop-probe.json')
 const DELAY_TOAST_MS = 6 * 1000; // debounce 窗口：最后一个子回合结束后延迟几秒弹汇总（技能要求"可延迟几秒"）
 // v2.63：弹窗诊断日志——取代旧的 TOKEN_TRACKER_DEBUG 环境变量调试机制。
 // 每次弹窗无条件向 ~/.workbuddy/token-tracker-toast.log 追加一行 JSON 诊断，便于事后排查弹窗原因/compaction 判定。
-const TOAST_LOG_PATH = path.join(os.homedir(), '.workbuddy', 'token-tracker-toast.log');
+// v2.99（2026-09-10，测试发现的隔离泄漏修复）：以下两个诊断日志原先硬编码 `os.homedir()`，
+//   绕过了 WB_ROOT 隔离——导致测试时即使设了 WB_ROOT，日志仍写进真实 ~/.workbuddy，
+//   污染真实日志文件（实测：一次隔离测试在真实 compaction 日志留下 11 行、toast 日志 5 行痕迹）。
+//   改为与 daily-usage / ledger-watermark 一致地基于 WB 变量。
+//   **注意：默认 WB === ~/.workbuddy，故正式使用时路径与行为完全不变（零影响）。**
+const TOAST_LOG_PATH = path.join(WB, 'token-tracker-toast.log');
 const MAX_TOAST_LOG_SIZE = 5 * 1024 * 1024; // 5MB 轮清：超过即清空后重新追加，避免无限增长
 // 最近一次 watcher 轮询状态快照；showToast 内部据此补全诊断字段。
 // 循环外调用（估算/无记录/挂起聚合补弹）时可能为 null，writeToastLog 须容忍缺失字段。
@@ -87,6 +92,48 @@ let gLastTraceFile = null;
 let gLastToastText = null;
 let gLastToastTs = 0;
 const TOAST_DEDUP_MS = 10 * 60 * 1000;
+// v2.97（2026-09-10 用户反馈"子代理结束 1 分钟后才弹窗，太久"）：
+//   子代理「静默多久即视为停写」的判定窗口。原为硬编码 60s，造成 ~7 倍冗余。
+//   实测依据（Explore-3 真实子代理转录）：事件间**最大间隔 8.8s**（模型思考空档）、平均 1.6s；
+//   且子代理最后一笔写入时间 == 文件 mtime（无落盘延迟）。故 20s 已覆盖实测最大间隔的 2.3 倍。
+//   收口延迟预期：60s+9s(稳定帧) ≈ 69s → 20s+9s ≈ 29s（缩短约 58%）。
+//   **误判的代价可控**：即使子代理思考超 20s 被误判停写而提前弹窗，也**不影响账本准确性**——
+//   记账走 transcript 行数水位线增量，后续落盘的部分会在下一轮被补记（v2.50 机制）。
+//   可用 SUBAGENT_IDLE_MS 环境变量覆盖。
+const SUBAGENT_IDLE_MS = Number(process.env.SUBAGENT_IDLE_MS) || 20 * 1000;
+// v2.87：compaction 专项事件日志——压缩对 hook 侧是纯黑盒（触发时机/Stop 次数/重写方式无契约），
+// 历史 8 次压缩相关弹窗异常（08-25~09-05）每次只能从弹窗反推机制。本日志在关键决策点落盘
+// transcript 形态快照（行数/mtime/末行类型/压缩标记/聚合起点决策），出问题先看数据再修，不再猜。
+const COMPACTION_LOG_PATH = path.join(WB, 'token-tracker-compaction.log');
+// v2.90：跨进程弹窗指纹文件（token-tracker-toast-fp.json）随抑制机制一并撤除。
+// v2.87：transcript 形态快照（只读，绝不抛错）——行数/mtime/大小/末行类型/末 30 行压缩标记 id。
+function captureTranscShape(tsPath) {
+  try {
+    if (!tsPath || !fs.existsSync(tsPath)) return { exists: false };
+    const st = fs.statSync(tsPath);
+    const shape = { exists: true, mtimeMs: Math.round(st.mtimeMs), size: st.size };
+    try { shape.lineCount = getTranscriptStats(tsPath).lineCount; } catch (e) {}
+    try {
+      const tl = lastTranscLine(tsPath);
+      shape.tail = tl ? { type: tl.type, role: tl.role || null, status: tl.status || null } : null;
+    } catch (e) {}
+    try {
+      let mid = null;
+      for (const ln of readTailRawLines(tsPath, 30)) { const m = compactionMarkerId(ln); if (m !== null) mid = m; }
+      shape.markerId = mid;
+    } catch (e) {}
+    return shape;
+  } catch (e) { return { exists: false, err: String(e && e.message || e) }; }
+}
+// v2.87：compaction 事件日志追加（诊断通道，绝不影响主流程）。
+function appendCompactionLog(event, data) {
+  try {
+    const rec = Object.assign({ ts: new Date().toISOString(), pid: process.pid, event }, data || {});
+    fs.appendFileSync(COMPACTION_LOG_PATH, JSON.stringify(rec) + '\n');
+  } catch (e) { /* 诊断日志写失败忽略 */ }
+}
+// v2.90：跨进程弹窗抑制已整体撤除（误杀真弹窗，见 showToast 内 v2.90 注释）。
+// 保留 captureTranscShape / appendCompactionLog（事件观测，v2.87-① 继续有效）。
 function writeToastLog(reason, state) {
   try {
     try {
@@ -156,6 +203,38 @@ function spawnFlushWatcher(sid) {
     });
     child.unref();
   } catch (e) { process.stderr.write(`[token-tracker] 延迟弹窗 watcher 启动失败: ${e.message}\n`); }
+}
+
+// v2.85：轮级临时 watcher——UserPromptSubmit（--hook）为每个新轮 spawn 的自限时观察进程（非兜底、
+// 非常驻）。职责：盯住「本轮被手动取消且未触发 Stop hook」的场景——取消标记收尾 + 8 秒无新行 →
+// 立即补弹，不再等下一轮用户提交触发 v2.83 兜底（0-usage 取消时兜底还会静默丢失，15:33 型漏弹）。
+// 退出条件（任一，见 roundWatchMain）：轮已结算 / 新轮接管起点 / coalesce 出现 / transcript 消失 / 生命上限。
+// v2.91：工作区日志定位——logs/<today>/<工作区目录名>__*.log 中 mtime 最新者。
+// 取消信号源（客户端源码实证：[ACP Agent] cancel: received cancel request 每次取消必写）。
+function resolveWorkspaceLogFile(cwd) {
+  try {
+    const ws = path.basename(String(cwd || '').replace(/[\\/]+$/, ''));
+    if (!ws) return '';
+    const dir = path.join(os.homedir(), '.workbuddy', 'logs', todayStr());
+    if (!fs.existsSync(dir)) return '';
+    let best = '', bestM = 0;
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.startsWith(ws + '__') || !f.endsWith('.log')) continue;
+      const m = fs.statSync(path.join(dir, f)).mtimeMs;
+      if (m > bestM) { bestM = m; best = path.join(dir, f); }
+    }
+    return best;
+  } catch (e) { return ''; }
+}
+function spawnRoundWatcher(sid, tsPath, roundStart, logFile) {
+  try {
+    if (!tsPath || !(roundStart > 0)) return;
+    const cp = require('child_process');
+    const child = cp.spawn(process.execPath, [__filename, '--round-watch', sid || '', tsPath, String(roundStart), logFile || ''], {
+      detached: true, stdio: 'ignore', windowsHide: true, env: process.env,
+    });
+    child.unref();
+  } catch (e) { process.stderr.write(`[token-tracker] 轮级取消 watcher 启动失败: ${e.message}\n`); }
 }
 const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
 // ===== 本地官方价格库（v2.80, 2026-08-31）=====
@@ -382,11 +461,22 @@ function latestTraceFile(skipInvalid) {
 // 返回 { durMs, source:'trace' } 或 { source:'fallback' }（条件不满足 → 调用方保留 transcript 口径）：
 //   - ltPath 缺失 / roundStartMs<=0（快照丢失）/ endedAt 缺失或解析失败或早于起点（防负数/时钟异常）
 //   - latest trace 带 sessionId 且 ≠ sid（多会话并发保护，与 v2.74 行为一致；sid 空视为不匹配）
-function traceWallDurMs(ltPath, roundStartMs, sid) {
+function traceWallDurMs(ltPath, roundStartMs, sid, tsPath) {
   try {
     if (!ltPath || !(roundStartMs > 0)) return { source: 'fallback' };
     const tr = ((readTrace(ltPath) || {}).trace) || {};
-    const tea = Date.parse(tr.endedAt || '');
+    let tea = Date.parse(tr.endedAt || '');
+    // v2.88：轮尾压缩盲区——压缩（contextSummary）不写 trace 文件，最新 trace 的 endedAt 停在
+    // 模型回复结束，压缩段耗时被整个漏掉（实测 09-05：弹窗显示 4m6s、客户端实际 12m49s）。
+    // 修复：endedAt 取 max(trace.endedAt, transcript 末行 timestamp)——压缩 marker/调用行的 ts
+    // 覆盖压缩段。cap 在 Date.now() 防未来时间戳（测试数据）。
+    try {
+      if (tsPath && fs.existsSync(tsPath)) {
+        const tl = lastTranscLine(tsPath);
+        const tlTs = tl ? Number(tl.timestamp || 0) : 0;
+        if (tlTs > tea) tea = Math.min(tlTs, Date.now());
+      }
+    } catch (e) {}
     if (!(tea > roundStartMs)) return { source: 'fallback' };
     const trSid = tr.sessionId ? String(tr.sessionId) : '';
     if (trSid && trSid !== String(sid || '')) return { source: 'fallback' };
@@ -527,14 +617,32 @@ function aggregateRound(roundStartMs, sessionId, anchorFile) {
 // usage 字段为 camelCase：{requests, inputTokens, outputTokens, totalTokens, inputTokensDetails:[{cached_tokens}]}
 function extractUsage(u) {
   if (!u || typeof u !== 'object') return null;
-  const inT = u.inputTokens || u.input_tokens || u.prompt_tokens || 0;
-  const outT = u.outputTokens || u.output_tokens || u.completion_tokens || 0;
+  // v2.99（2026-09-10，测试发现的防御性加固）：token 数值统一做「数值化 + 非负钳制 + 取整」。
+  //   原实现 `u.inputTokens || 0` 直接采信原值——若客户端把 token 数改成**字符串**（如 "100"），
+  //   JS 隐式转换会让下游 `inSum += u.in` 变成**字符串拼接**（"100200"），账本彻底脏掉且难以察觉；
+  //   负数/浮点同样会污染累加与计费。
+  //   真实数据实测（9574 个样本）当前全为 int 且无负值，故本条为**防御性**改动、正常路径行为不变。
+  const num = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.round(n) : 0; };
+  const inT = num(u.inputTokens != null ? u.inputTokens : (u.input_tokens != null ? u.input_tokens : u.prompt_tokens));
+  const outT = num(u.outputTokens != null ? u.outputTokens : (u.output_tokens != null ? u.output_tokens : u.completion_tokens));
   if (!inT && !outT) return null;
   let cached = 0;
   const det = u.inputTokensDetails || u.prompt_tokens_details || null;
-  if (Array.isArray(det)) { for (const d of det) { if (d && d.cached_tokens) cached += d.cached_tokens; } }
-  else if (det && typeof det === 'object') cached = det.cached_tokens || 0;
-  return { in: inT, out: outT, cached };
+  if (Array.isArray(det)) { for (const d of det) { if (d && d.cached_tokens) cached += num(d.cached_tokens); } }
+  else if (det && typeof det === 'object') cached = num(det.cached_tokens);
+  cached = num(cached);
+  // v2.96：额外提取「思考 token」(reasoning)。实测本会话占输出 **63.8%**，此前完全未统计。
+  //   仅**新增字段**，不改动 in/out/cached 语义；账本写入 addModelUsage() 显式只取
+  //   in/out/cached/total，因此该字段**不会污染 daily-usage.json**。
+  //   两个可能位点：usage.outputTokensDetails[] 与 rawUsage.completion_tokens_details。
+  let reasoning = 0;
+  const od = u.outputTokensDetails || u.completion_tokens_details || null;
+  if (Array.isArray(od)) {
+    for (const d of od) { if (d && typeof d.reasoning_tokens === 'number') reasoning += d.reasoning_tokens; }
+  } else if (od && typeof od === 'object' && typeof od.reasoning_tokens === 'number') {
+    reasoning = od.reasoning_tokens;
+  }
+  return { in: inT, out: outT, cached, reasoning };
 }
 
 // v2.57（第一阶段修复）：从 transcript 整行提取 usage，兼容三个实际存在的数据位点：
@@ -705,6 +813,7 @@ function readTranscLinesFrom(tsPath, fromLine) {
 function aggregateTranscLines(rows, fromTs) {
   const seen = new Set();
   let inSum = 0, outSum = 0, cachedSum = 0;
+  let reasoningSum = 0; // v2.96：思考 token 累计（仅用于弹窗展示，不写入账本）
   let firstTs = null, lastTs = 0, model = '', count = 0;
   for (const r of rows) {
     const ts = r.timestamp;
@@ -717,13 +826,14 @@ function aggregateTranscLines(rows, fromTs) {
     if (seen.has(key)) continue;
     seen.add(key);
     inSum += u.in; outSum += u.out; cachedSum += u.cached;
+    reasoningSum += u.reasoning || 0; // v2.96：思考 token（仅展示）
     if (firstTs === null || ts < firstTs) firstTs = ts;
     if (ts > lastTs) lastTs = ts;
     if (!model) model = pd.model || pd.requestModelId || 'unknown'; // v2.82.2：模型名缺失 → 'unknown' 诚实标注（旧为 ''，弹窗显示空白且无法追查）
     count++;
   }
   if (!count) return null;
-  return { in: inSum, out: outSum, cached: cachedSum, total: inSum + outSum, durMs: Math.max(0, lastTs - (firstTs || lastTs)), model, firstTs, lastTs, count };
+  return { in: inSum, out: outSum, cached: cachedSum, total: inSum + outSum, durMs: Math.max(0, lastTs - (firstTs || lastTs)), model, firstTs, lastTs, count, reasoning: reasoningSum };
 }
 
 // v2.69：estimateInterrupted 的增量版包装（只改解析范围，不改统计口径）。
@@ -758,6 +868,67 @@ function estimateInterruptedInc(tsPath, rows, watermark) {
 function subagentsDirFromTranscript(tsPath) {
   const base = path.basename(tsPath).replace(/\.jsonl?$/, '');
   return path.join(path.dirname(tsPath), base, 'subagents');
+}
+
+// v2.98（2026-09-10）：升级为「返回带形态信息的子代理模型表」，以支持区分两种协作形态。
+// 背景：WorkBuddy 有两类多代理形态（官方文档 workbuddy.cn/docs/cli/agent-teams 明确区分）——
+//   ① **Sub-agents（子代理）**：单会话内运行、只向主代理汇报；内置类型 Explore / Plan / general-purpose。
+//   ② **Agent Teams（专家团）**：成员完全独立、可互相通信、有共享任务列表；成员有**分配的颜色**。
+// 实测可区分特征（本项目 86 个子代理转录）：
+//   · 两者转录内均有 `providerData.isSubAgent === true`（最硬的"是子代理"证据）；
+//   · 普通子代理 `providerData.agent` = 内置类型名（如 "Explore"），**无** agentColor；
+//   · 专家团成员 `providerData.agent` = 专家角色名（topic-researcher / prototype-builder 等），**有** agentColor。
+// 返回：Map<normalizedModel, { isTeam: boolean, names: Set<string> }>
+// 设计原则不变：纯读取、不改任何现有数据结构；异常一律返回空 Map → 调用方退化为不标注。
+function subagentModelSet(tsPath, roundStartMs) {
+  const map = new Map();
+  if (!tsPath) return map;
+  const since = Number(roundStartMs) || 0;
+  const add = (model, isTeam, name) => {
+    const k = normalizeModelName(model);
+    if (!k) return;
+    let e = map.get(k);
+    if (!e) { e = { isTeam: false, names: new Set() }; map.set(k, e); }
+    if (isTeam) e.isTeam = true;              // 任一成员带颜色 → 视为专家团
+    if (name) e.names.add(String(name));
+  };
+  try {
+    // 1) 收集本轮子代理转录中的模型与形态
+    const subDir = subagentsDirFromTranscript(tsPath);
+    if (!fs.existsSync(subDir)) return map;
+    for (const f of fs.readdirSync(subDir)) {
+      if (!/\.jsonl?$/i.test(f)) continue;
+      const fp = path.join(subDir, f);
+      try { if (since && fs.statSync(fp).mtimeMs < since) continue; } catch (e) { continue; }
+      for (const r of readTranscLines(fp)) {
+        const pd = (r && r.providerData) || {};
+        const nm = pd.model;
+        if (!nm) continue;
+        // isSubAgent 为最硬证据；缺失时靠"来自 subagents/ 目录"这个事实兜底（等价旧行为）
+        const isSub = pd.isSubAgent === true || pd.isSubAgent === undefined;
+        if (!isSub) continue;
+        add(nm, !!pd.agentColor, pd.agent); // 有 agentColor ⇒ 专家团成员
+      }
+    }
+    if (!map.size) return map;
+    // 2) 减去本轮主转录出现过的模型（主模型同名的场景不该被标注）——读取失败必须清空，宁可漏标不可误标
+    for (const r of readTranscLines(tsPath)) {
+      const ts = r && r.timestamp;
+      if (since && !(typeof ts === 'number' && ts > since)) continue;
+      const nm = (r && r.providerData || {}).model;
+      if (nm) map.delete(normalizeModelName(nm));
+    }
+  } catch (e) {
+    map.clear(); // 任何异常 → 不标注，退化为原行为
+  }
+  return map;
+}
+
+// v2.98：把形态信息格式化为弹窗标注后缀。
+//   专家团 → 「（专家团使用）」；普通子代理 → 「（子代理使用）」；未知 → 「（子代理使用）」保守兜底。
+function subagentTagOf(entry) {
+  if (!entry) return '';
+  return entry.isTeam ? '（专家团使用）' : '（子代理使用）';
 }
 
 // v2.39：按模型分桶聚合 transcript 行（与 aggregateTranscLines 完全一致的去重口径），
@@ -1193,7 +1364,7 @@ function hasSubagentsRecentlyActive(tsPath, windowMs) {
   const dir = subagentsDirFromTranscript(tsPath);
   let entries;
   try { entries = fs.readdirSync(dir); } catch (e) { return false; } // 无目录 → 无子代理 → 不活跃
-  const cutoff = Date.now() - (windowMs || 60 * 1000);
+  const cutoff = Date.now() - (windowMs || SUBAGENT_IDLE_MS);
   for (const f of entries) {
     if (!/^agent-.+\.jsonl$/i.test(f)) continue;
     try {
@@ -1446,7 +1617,23 @@ function mergeLocalPriceDb(pricing) {
     try { db = JSON.parse(fs.readFileSync(CN_PRICE_DB, 'utf-8')); break; }
     catch (e) { if (attempt === 0) { require('child_process').execSync('ping -n 1 -w 60 127.0.0.1 >NUL', { stdio: 'ignore' }); } }
   }
-  if (!db) return pricing; // 库缺失/损坏 → 沿用 pricing.json
+  if (!db) {
+    // v2.96：价库缺失不再静默。原先直接 return pricing，会让国内模型价格悄悄退化为聚合源/估算价，
+    //   全程无任何提示（与 Exa 断链同类"静默失效"病）。此处仅**增加告警**，不改路径解析逻辑，
+    //   避免牵动 CN_PRICE_REFRESH_LOCK / _ERR 等同目录文件带来的联动风险。
+    //   仅当文件确实不存在时告警，避开原子替换的正常窗口。
+    try {
+      if (!fs.existsSync(CN_PRICE_DB)) {
+        process.stderr.write('[token-tracker] ⚠️ 本地官方价库缺失: ' + CN_PRICE_DB + '（国内模型价格将退化为聚合源/估算价，请检查该目录是否被移动/删除）\n');
+      } else {
+        // v2.99（测试发现的漏洞修复）：文件**存在但解析失败**（JSON 损坏 / 半写 / 被截断）——
+        //   这比"缺失"更危险：用户看到文件还在，不会怀疑价库有问题，而国内模型其实已静默无价。
+        //   原实现只在"不存在"时告警，此处补齐"存在但损坏"分支。
+        process.stderr.write('[token-tracker] ⚠️ 本地官方价库已损坏（JSON 解析失败）: ' + CN_PRICE_DB + '（国内模型将无价可用、费用显示为空，请检查该文件）\n');
+      }
+    } catch (e) { /* 忽略：告警本身不得影响主流程 */ }
+    return pricing;
+  }
   const byAlnum = {};
   for (const key of Object.keys(pricing.models)) {
     const ak = alnumKey(key);
@@ -1861,8 +2048,13 @@ function parsePeakSchedule(sched) {
 }
 function isPeakHour(rules, now) {
   const t = now || new Date();
-  const day = t.getDay();
-  const h = t.getHours() + t.getMinutes() / 60;
+  // v2.95：统一按**北京时间**判定峰谷，与 recalc-day.js 的 isPeakBeijing 口径一致。
+  //   原实现用机器本地时区（t.getDay()/getHours()），非 GMT+8 机器会与回填工具判定相悖。
+  //   换算：UTC = local + getTimezoneOffset()分钟；北京时间 = UTC + 8h。
+  //   GMT+8 机器下两者恒等 → **零行为变化**（已验算：offset=-480 时 bj 时刻 === t 时刻）。
+  const bj = new Date(t.getTime() + t.getTimezoneOffset() * 60000 + 8 * 3600 * 1000);
+  const day = bj.getDay();
+  const h = bj.getHours() + bj.getMinutes() / 60;
   // 有官方规则 → 完全按官方来（通用跟随：官方改任何时段/周末规则都自动生效）
   if (rules && typeof rules === 'object') {
     const weekendOff = rules.weekend_off_peak === true || rules.weekend_off_peak === 'true';
@@ -1903,11 +2095,17 @@ function calcCost(stat, pricing) {
   const peakMult = isDeepSeek ? (typeof m.peak_multiplier === 'number' ? m.peak_multiplier : 2) : (typeof m.peak_multiplier === 'number' ? m.peak_multiplier : 1);
   // 时段判定跟随官方 deepseek_rules（通用：官方调时段/周末规则自动生效）
   const mult = isPeakHour(pricing.deepseek_rules) ? peakMult : 1;
-  const cached = stat.cached || 0;
-  const uncached = Math.max(0, (stat.in || 0) - cached);
+  // v2.99（测试发现的防御性加固）：cached / out 补非负钳制。
+  //   原实现 in 侧已有 Math.max(0,...)，但 cached 与 out 仅用 (v || 0)——负数会直接参与计算：
+  //   · 负 out → 总价变负，污染当日账本合计；
+  //   · 负 cached → uncached = max(0, in-cached) 反向变大，账单被静默放大。
+  //   真实数据（9574 样本）当前无负值，属防御性改动；正数路径结果完全不变。
+  const cached = Math.max(0, Number(stat.cached) || 0);
+  const outTok = Math.max(0, Number(stat.out) || 0);
+  const uncached = Math.max(0, Math.max(0, Number(stat.in) || 0) - cached);
   const cost = (uncached / 1e6) * (m.input_price || 0) * mult
              + (cached / 1e6) * (m.cached_price || 0) * mult
-             + ((stat.out || 0) / 1e6) * (m.output_price || 0) * mult;
+             + (outTok / 1e6) * (m.output_price || 0) * mult;
   return cost;
 }
 
@@ -1957,12 +2155,17 @@ function normalizeDailyUsage(d) {
 }
 function loadDailyUsage() {
   try {
-    gDailyCorrupt = false;
-    return normalizeDailyUsage(JSON.parse(fs.readFileSync(DAILY_USAGE_FILE, 'utf-8')));
+    const parsed = normalizeDailyUsage(JSON.parse(fs.readFileSync(DAILY_USAGE_FILE, 'utf-8')));
+    gDailyCorrupt = false; // v2.99：只在**成功解析**后清除标志
+    return parsed;
   } catch (e) {
     if (e.code === 'ENOENT') {
-      // 文件尚不存在（首次运行）→ 视为空账本，非损坏，不禁止后续写入
-      gDailyCorrupt = false;
+      // 文件尚不存在 → 视为空账本（首次运行），**不在此处臆断地清除 gDailyCorrupt**。
+      // v2.99（测试发现的"日志与行为不符 + 历史丢失"修复）：
+      //   原实现把 `gDailyCorrupt = false` 放在函数**开头**，导致同一进程内第二次调用时，
+      //   因文件已被本轮重命名为 .corrupt-<ts> 而走 ENOENT 分支 → 标志被清 → recordUsage 不再跳过
+      //   → 用空账本写回，历史累计丢失（而日志仍声称"本轮不写回覆盖"，与实际行为矛盾）。
+      //   现在标志只由"成功解析"来清除，损坏状态在本进程内保持，确保跳过写入生效。
       return {};
     }
     // 损坏文件：重命名为 .corrupt-<时间戳> 备份（保留历史数据），本轮禁止写回空对象以免覆盖
@@ -2048,16 +2251,18 @@ function loadLedgerWatermarkSafe() {
     const j = JSON.parse(fs.readFileSync(LEDGER_WATERMARK_FILE, 'utf-8'));
     if (j && typeof j === 'object') return { wm: j, corrupt: false };
   } catch (e) { /* 主文件缺失或损坏 → 继续降级 */ }
+  // v2.99（测试发现的重复计费修复）：**不再自动回退 .bak**。
+  //   原实现：主文件损坏 → 回退 .bak。但 .bak 是 saveLedgerWatermark 在写入**前**复制的旧主文件，
+  //   恒落后一个保存周期 → 回退它等于把「上次保存 → 本次保存」之间**已记账的增量重放一遍** = 重复计费。
+  //   这与下方注释确立的原则（宁可少记也不重复计费）直接冲突。
+  //   （实测复现：主文件损坏回退 .bak 后，账本多出 5500 in / 1600 out，恰为两行已记增量被重放。）
+  //   改为：主文件损坏 → 直接跳过本轮记账；.bak 仍留在磁盘上，**仅供人工恢复**。
   const bak = LEDGER_WATERMARK_FILE + '.bak';
-  try {
-    const j = JSON.parse(fs.readFileSync(bak, 'utf-8'));
-    if (j && typeof j === 'object') {
-      process.stderr.write(`[token-tracker] 水位线主文件不可用，已回退 .bak 备份\n`);
-      return { wm: j, corrupt: false };
-    }
-  } catch (e) { /* .bak 也不可用 */ }
+  const hasBak = (() => { try { return fs.existsSync(bak); } catch (e) { return false; } })();
   if (fs.existsSync(LEDGER_WATERMARK_FILE)) {
-    process.stderr.write(`[token-tracker] 水位线已损坏且无可用备份，本轮跳过记账以避免重复计费（确认后请手动删除 ${path.basename(LEDGER_WATERMARK_FILE)} 再重记）\n`);
+    process.stderr.write(`[token-tracker] 水位线已损坏，本轮跳过记账以避免重复计费（确认后请手动删除 ${path.basename(LEDGER_WATERMARK_FILE)} 再重记）`
+      + (hasBak ? `；.bak 备份仍在（${path.basename(bak)}），但它恒落后一个保存周期，**直接覆盖会导致重复计费**，仅在人工核对进度一致后方可使用` : '')
+      + '\n');
     return { wm: null, corrupt: true };
   }
   return { wm: {}, corrupt: false }; // 首次运行文件不存在 → 正常空水位线
@@ -2229,12 +2434,20 @@ function reportSummaryTxt(arg) {
 // PowerShell 子进程会被一起带走（宿主 job object 管理 hook 进程树，detached 不一定能脱离），toast 还没弹出就丢失。
 // 同步 execFileSync 阻塞几百毫秒保证 toast 弹出后父进程才退出，与本函数调用位置（循环收口后）完全契合，不存在阻塞副作用。
 // 失败不阻断主流程（stderr 记录）。
-function showToast(line1, line2, reason) {
+function showToast(line1, line2, reason, tsPath) {
   // v2.63.1：把实际文案拼进诊断日志；合并最近 watcher 轮询快照字段（gLastWatchState），
   // 字段缺失时 writeToastLog 内部以 null 兜底，绝不因诊断而影响弹窗。
   const toastState = Object.assign({}, gLastWatchState || {});
   toastState.toastText = String(line1 || '') + ' | ' + String(line2 || '');
   writeToastLog(reason, toastState);
+  // v2.90：测试静默开关——TOKEN_TRACKER_NO_TOAST=1 时只写诊断日志、不调系统通知。
+  // 【硬规矩（用户 2026-09-05 两次强调，已记 ~/.workbuddy/MEMORY.md）：一切测试/回放必须设此开关，
+  // 禁止真弹窗与控制台闪烁骚扰前台】。诊断日志先行（上方 writeToastLog），断言照旧基于 toast 日志。
+  if (process.env.TOKEN_TRACKER_NO_TOAST === '1') return;
+  // v2.90：撤销 v2.87 的跨进程弹窗抑制（toastSuppressCheck）——实测误杀真弹窗：短轮（纯问答）
+  // 每轮只往 transcript 加 2~4 行，"行数差<10=同轮重复"的假设不成立（实测 18:48 吞掉全新轮弹窗，
+  // compaction log toast-suppressed 铁证）。它防的"同轮双弹"已被 v2.86 聚合起点根修覆盖，
+  // 残余场景（watcher 被杀时重复弹）概率低且后果轻——误杀代价 >> 防重复收益，整体撤除。
   // v2.70：弹窗去重——本次文案与上次完全相同且间隔 <10 分钟 → 跳过本次弹窗（诊断日志已写，
   // 去重状态仅内存不落盘）。防同一会话 Stop 弹窗与 watcher 兜底弹窗同文案重复弹出。
   const now = Date.now();
@@ -2348,8 +2561,12 @@ function periodPeakNote(stat, pricing) {
 }
 
 // 夜间时段判断（默认 00:00-08:00，UTC+8；模型可声明 night_hours=[start,end] 覆盖）
-function isNightHour(m) {
-  const h = new Date().getHours();
+function isNightHour(m, now) {
+  // v2.95：与 isPeakHour 同步——统一按北京时间判定（原先用机器本地时区）。
+  //   now 为可选参数（向后兼容，现有调用不传 → 等价于旧行为）；换算方式与 isPeakHour 相同。
+  const t = now || new Date();
+  const bj = new Date(t.getTime() + t.getTimezoneOffset() * 60000 + 8 * 3600 * 1000);
+  const h = bj.getHours();
   if (m && Array.isArray(m.night_hours) && m.night_hours.length === 2) {
     const [s, e] = m.night_hours;
     return s < e ? (h >= s && h < e) : (h >= s || h < e); // 跨天区间
@@ -2639,9 +2856,16 @@ function savePricingAtomic(pricing) {
 function addModelPrice(pricing, modelName, ref, region) {
   const name = String(modelName).toLowerCase();
   const rate = Number(pricing.usd_cny_rate) > 0 ? pricing.usd_cny_rate : 7.2;
+  // v2.94：按模型族写「正确的」峰谷倍率，而不是一律写 1。
+  //   原实现一律写 1（number），会绕过 calcCost(:1979) 对 DeepSeek 的"缺省按 2"逻辑
+  //   （typeof === 'number' 成立 → 不取缺省）→ 新收录的 DeepSeek 模型高峰不翻倍、长期低估。
+  //   这里直接写正确值而非删字段，是为了让显示层 periodPeakNote(:2421) 也拿到 number：
+  //   显示层没有 DeepSeek 缺省分支（缺省一律 1），若删字段会导致「计费×2 但弹窗不显示高峰双倍」
+  //   的新不一致。判定正则与 calcCost 保持一致；非 DeepSeek 仍写 1，与原行为完全相同。
+  const isDSModel = /(^|[\/\-_])deepseek/i.test(String(modelName));
   const m = {
     name: String(modelName),
-    peak_multiplier: 1,
+    peak_multiplier: isDSModel ? 2 : 1,
     region: region || 'CN',
   };
   if (region === 'CN') {
@@ -2738,6 +2962,158 @@ function ensureNewModelPricing(pricing, stat) {
   return { status: ok ? 'added' : 'error', note: ok ? `ℹ️ 新模型 ${stat.model} 已自动补录估算价（OpenRouter·国外定价，待核验）；时段折扣策略（高峰/夜间）请用搜索技能核验补录` : `⚠️ 新模型 ${stat.model} 价格写入失败` };
 }
 
+// v2.85：--round-watch <sid> <tsPath> <roundStart> 主循环（detached 自限时进程，非兜底非驻留）。
+// 每 2s 轮询 transcript + snapshot：
+//   退出（静默）：该轮已被 Stop/watcher 结算（lastStopAt>=roundStart）/ 新轮接管起点（lastUserMsgAt>
+//   roundStart）/ coalesce 出现（正常 Stop 链路接管）/ transcript 消失 / 生命上限（默认 3h，防僵尸）。
+//   补弹：出现「终止态取消标记（interruptedRowsAfter 非空 = 标记后无 assistant 续跑）+ 静默满 8s」→
+//   聚合弹（手动取消）；聚合为空（0-usage 取消，usage 未落盘）→ estimateInterrupted 估算弹
+//   （手动取消）（估算）（v2.52 Stop 端同款）。弹后推进 lastStopAt → 下一轮 hook 的兜底因"已结算"
+//   自动跳过，不会双弹（注意 showToast 去重是进程内存态，跨进程无效——防双弹必须靠结算推进）。
+//   静默判定同时看行数与 mtime（压缩重写不改行数但改 mtime）。
+//   与下一轮 hook 兜底的竞态：弹前最后一刻复核 snapshot（结算即退出）；残余窗口毫秒级。
+function roundWatchMain(sid, tsPath, roundStart, logFile) {
+  const POLL_MS = Number(process.env.ROUND_WATCH_POLL_MS) || (2 * 1000);
+  const QUIET_MS = Number(process.env.ROUND_WATCH_QUIET_MS) || (8 * 1000);
+  // v2.91：自适应静默——取消确认后一旦发现新 usage 行落盘且稳定 ADAPT_QUIET_MS → 提前弹（典型 3~5s）；
+  // 无新 usage（0-usage/空闲取消）→ QUIET_MS 兜底。ROUND_WATCH_ADAPT_QUIET_MS 可 env 覆盖。
+  const ADAPT_QUIET_MS = Number(process.env.ROUND_WATCH_ADAPT_QUIET_MS) || (2 * 1000);
+  const MAX_LIFE_MS = Number(process.env.ROUND_WATCH_MAX_MS) || (3 * 60 * 60 * 1000);
+  if (!tsPath || !(roundStart > 0)) return;
+  // v2.87：compaction 事件观测（方案①）——轮级取消 watcher 启动点落盘形态快照
+  appendCompactionLog('round-watch-start', { sid, roundStart, shape: captureTranscShape(tsPath) });
+  // v2.91：工作区日志信号（取消确认第二源，100% 可靠——客户端源码实证每次取消必写
+  // "[ACP Agent] cancel: received cancel request for session <sid>"，含 Aborting 与 Ignoring idle 两个分支）。
+  // 增量读：offset 起点为启动时文件大小（只认启动后的行，防历史取消误报）。
+  const t0 = Date.now();
+  let lastLines = -1, lastMtime = -1, lastChangeAt = t0;
+  let logOffset = 0, logCancelTs = 0;
+  try { if (logFile && fs.existsSync(logFile)) logOffset = fs.statSync(logFile).size; } catch (e) {}
+  while (true) {
+    sleep(POLL_MS);
+    try {
+      // --- 退出判定（先于弹窗判定，防与正常链路双弹）---
+      const snap = loadSnapshot(sid) || {};
+      if ((snap.lastStopAt || 0) >= roundStart) return;   // 该轮已由 Stop/兜底/watcher 结算
+      if ((snap.lastUserMsgAt || 0) > roundStart) return; // 更新的轮次已接管起点
+      if (readCoalesce(sid)) return;                      // Stop 端已写合并文件，正常链路接管
+      let st;
+      try { st = fs.statSync(tsPath); } catch (e) { return; } // transcript 消失（会话被删）
+      const rows = readTranscLines(tsPath);
+      if (rows.length !== lastLines || st.mtimeMs !== lastMtime) {
+        lastLines = rows.length; lastMtime = st.mtimeMs; lastChangeAt = Date.now();
+      }
+      // --- v2.91：扫工作区日志增量，匹配本会话取消请求 ---
+      if (logFile && fs.existsSync(logFile)) {
+        try {
+          const lst = fs.statSync(logFile);
+          if (lst.size > logOffset) {
+            const fd = fs.openSync(logFile, 'r');
+            const buf = Buffer.alloc(lst.size - logOffset);
+            fs.readSync(fd, buf, 0, buf.length, logOffset);
+            fs.closeSync(fd);
+            logOffset = lst.size;
+            const needle = 'cancel: received cancel request for session ' + sid;
+            const txt = buf.toString('utf8');
+            if (txt.includes(needle) && !logCancelTs) {
+              const lines = txt.split('\n').filter(l => l.includes(needle));
+              const lastLn = lines[lines.length - 1] || '';
+              const mm = /\[(\d{4})\/(\d{1,2})\/(\d{1,2}) (\d{1,2}):(\d{1,2}):(\d{1,2})(?:\.(\d{1,3}))?\]/.exec(lastLn);
+              logCancelTs = mm ? new Date(+mm[1], +mm[2] - 1, +mm[3], +mm[4], +mm[5], +mm[6], +(mm[7] || 0)).getTime() : Date.now();
+              appendCompactionLog('round-watch-cancel-confirmed', { sid, via: 'client-log', logCancelTs });
+            }
+          }
+        } catch (e) { /* 日志读取失败：退化纯 transcript 模式 */ }
+      }
+      // --- 弹窗判定：取消确认（transcript 标记行 ∨ 工作区日志信号）+ 静默满 ---
+      const intr = interruptedRowsAfter(rows, roundStart);
+      const intrInfo = intr.length ? intr[intr.length - 1] : null;
+      // v2.91：取消确认双源——标记行 ts 或 日志信号 ts（取先到者，且必须晚于本轮起点）
+      const cancelTs = intrInfo ? intrInfo.ts : (logCancelTs > roundStart ? logCancelTs : 0);
+      if (cancelTs) {
+        // v2.91 自适应：追踪确认之后新落盘的 usage 行——落盘且稳定 ADAPT_QUIET_MS → 提前弹
+        let lastUsageTs = 0;
+        for (const r of rows) {
+          const ts = Number(r.timestamp || 0);
+          if (ts > cancelTs && ts > lastUsageTs && extractUsage((r.providerData || {}).usage)) lastUsageTs = ts;
+        }
+        const anchor = Math.max(cancelTs, lastUsageTs, lastChangeAt);
+        const needed = lastUsageTs > 0 ? ADAPT_QUIET_MS : QUIET_MS;
+        if ((Date.now() - anchor) >= needed) {
+        // 弹前最后一刻复核（防与下一轮 hook 的兜底路径竞态双弹）
+        const snap2 = loadSnapshot(sid) || {};
+        if ((snap2.lastStopAt || 0) >= roundStart || (snap2.lastUserMsgAt || 0) > roundStart) return;
+        const pricing = loadPricing();
+        const aggC = aggregateTranscript(tsPath, roundStart);
+        if (aggC) {
+          // 与 v2.83 兜底同构：合并被中断调用估算 + 补记账 + 弹窗
+          const estByModelC = estimateInterrupted(rows, 0, roundStart);
+          const estNamesC = Object.keys(estByModelC);
+          if (estNamesC.length) {
+            const estInC = estNamesC.reduce((s, n) => s + estByModelC[n].in, 0);
+            const estOutC = estNamesC.reduce((s, n) => s + estByModelC[n].out, 0);
+            const estCachedC = estNamesC.reduce((s, n) => s + estByModelC[n].cached, 0);
+            aggC.in += estInC; aggC.out += estOutC; aggC.cached += estCachedC; aggC.total += estInC + estOutC;
+          }
+          const durC = Math.max(0, cancelTs - roundStart);
+          aggC.durMs = aggC.durMs || durC;
+          const modelC = shortModelName(aggC, pricing);
+          ensureNewModelPricing(pricing, aggC);
+          incrementalRecord(tsPath, sid);
+          writeProbe({ time: new Date().toISOString(), event: 'RoundWatch', ok: true, sid, sameRound: false,
+            note: 'cancelled-round-watch', transcriptPath: tsPath, stat: aggC,
+            line: lineFor(aggC, false, modelC), source: 'transcript-cancelled-round-watch',
+            intrAt: new Date(cancelTs).toISOString() });
+          showToast(
+            toastLine1(aggC, modelC, '（手动取消）', balanceText(), todayUsageTxt()),
+            toastLine2(aggC, pricing),
+            'cancelled-round-watch'
+          );
+        } else {
+          // 0-usage 取消（取消时 usage 未落盘）→ 估算弹窗（v2.52 Stop 端同款）
+          const estByModel = estimateInterrupted(rows, 0, roundStart);
+          const estNames = Object.keys(estByModel);
+          if (estNames.length) {
+            const estTotal = estNames.reduce((s, n) => s + estByModel[n].total, 0);
+            const estIn = estNames.reduce((s, n) => s + estByModel[n].in, 0);
+            const estOut = estNames.reduce((s, n) => s + estByModel[n].out, 0);
+            const estStat = { in: estIn, out: estOut, cached: 0, total: estTotal, durMs: Math.max(0, cancelTs - roundStart), model: estNames[0], count: estNames.length };
+            const estModelShort = shortModelName(estStat, pricing);
+            incrementalRecord(tsPath, sid); // 水位线幂等；估算依据如可记则按 Stop 端同款入账本
+            writeProbe({ time: new Date().toISOString(), event: 'RoundWatch', ok: true, sid, sameRound: false,
+              note: 'cancelled-round-watch-est', transcriptPath: tsPath, stat: estStat,
+              line: '本轮被手动取消，估算 token（usage 未落盘）', source: 'transcript-cancelled-round-watch-est',
+              intrAt: new Date(cancelTs).toISOString() });
+            showToast(toastLine1(estStat, estModelShort, '（手动取消）（估算）', balanceText(), todayUsageTxt()), toastLine2(estStat, pricing), 'cancelled-round-watch-est');
+          } else {
+            // 取消早于首字节落盘（连 incomplete reasoning 行都没有，2026-09-05 15:33 实测型）→ 无估算依据。
+            // 对齐 Stop 端 v2.51：弹「无记录」提示而非静默退出，让用户知道该轮已取消、无本地数据可计
+            //（输入侧云端可能已计费，但本地无凭据，不编造数字）。
+            incrementalRecord(tsPath, sid);
+            writeProbe({ time: new Date().toISOString(), event: 'RoundWatch', ok: true, sid, sameRound: false,
+              note: 'cancelled-round-watch-no-token', transcriptPath: tsPath, stat: null,
+              line: '本轮无 token 消耗记录（手动取消）', source: 'transcript-cancelled-round-watch-no-token',
+              intrAt: new Date(cancelTs).toISOString() });
+            showToast('本轮无 token 消耗记录（手动取消）', '取消早于模型输出落盘，本地无该轮数据（输入侧云端或已计费，无法估算）', 'cancelled-round-watch-no-token');
+          }
+        }
+        // 该轮已结算：推进 lastStopAt（lastUserMsgAt 取 max，防回写覆盖 hook 刚刷新的新起点）
+        const psnapW = loadSnapshot(sid) || {};
+        saveSnapshot({ file: psnapW.file || tsPath, stat: psnapW.stat || null,
+          lastUserMsgAt: Math.max(psnapW.lastUserMsgAt || 0, roundStart), lastStopAt: Date.now() }, sid);
+        return;
+        } // v2.91：自适应静默判定（anchor/needed）闭合
+      } // v2.91：取消确认（cancelTs）闭合
+      if (Date.now() - t0 > MAX_LIFE_MS) return; // 生命上限：静默退出，绝不僵尸
+    } catch (e) {
+      // 轮询内异常（半写/瞬态 IO）：记诊断继续轮询；持续异常由生命上限兜底
+      try {
+        writeProbe({ time: new Date().toISOString(), event: 'RoundWatch', ok: false, sid, note: 'poll-error', error: String((e && e.message) || e) });
+      } catch (e2) { /* 诊断失败不影响轮询 */ }
+    }
+  }
+}
+
 function main() {
   const asHook = process.argv.includes('--hook');
   const asStop = process.argv.includes('--stop');
@@ -2752,6 +3128,13 @@ function main() {
     } else {
       process.stdout.write(reportTxt(rArg) + '\n');
     }
+    return;
+  }
+  // v2.85：--round-watch <sid> <tsPath> <roundStart> —— 轮级临时 watcher 入口（--hook 为新轮 spawn 的
+  // detached 自限时观察进程）：盯「本轮被手动取消且无 Stop hook」，见 roundWatchMain。
+  if (process.argv.includes('--round-watch')) {
+    const rwi = process.argv.indexOf('--round-watch');
+    roundWatchMain(process.argv[rwi + 1] || '', process.argv[rwi + 2] || '', Number(process.argv[rwi + 3]) || 0, process.argv[rwi + 4] || '');
     return;
   }
   // v2.40：--flush-delayed <sid> —— Stop 端 spawn 的 detached 后台 watcher 入口。
@@ -2914,6 +3297,8 @@ function main() {
     };
     // 记录本 watcher 启动（含 sid / 起点 / 合并文件是否存在）
     appendWatchDebug({ type: 'start', ts: Date.now(), sid: fSid, tsPath, roundStart: info0.roundStart || 0, hasCoalesce: !!(info0 && info0.agg) });
+    // v2.87：compaction 事件观测（方案①）——flush watcher 启动点落盘形态快照
+    appendCompactionLog('flush-watch-start', { sid: fSid, roundStart: info0.roundStart || 0, hasCoalesce: !!(info0 && info0.agg), shape: captureTranscShape(tsPath) });
 
     // v2.57（第一阶段修复）：unknown 计数日志——unknown 语义是"无法确定当前状态"，
     // 本阶段【不】用 unknown 超时当自动弹窗依据（误弹风险），但连续 unknown 需要可观测。
@@ -3129,7 +3514,10 @@ function main() {
         } else if (pendingSub.length === 0) {
           // 名字匹配判据说"无未完成子代理"。但中文团队 spawn 名提取失败会 pending 假空，
           // 子代理可能还在跑 → 需再确认子代理文件确实停更（v2.47 修复）。
-          if (hasSubagentsRecentlyActive(tsPath, 60 * 1000)) {
+          // v2.97：窗口由硬编码 60s 改为 SUBAGENT_IDLE_MS（默认 20s）——实测事件间最大间隔仅 8.8s，
+          //   60s 造成用户体感"子代理结束后 1 分钟才弹窗"。此处只收紧正常路径；
+          //   异常死寂兜底（subagentsAllStagnant）仍保持 60s 保守值。
+          if (hasSubagentsRecentlyActive(tsPath, SUBAGENT_IDLE_MS)) {
             // 子代理文件还在写 → 假空，继续等（不收口）
             lastActiveAt = Date.now();
             busySince = 0;
@@ -3161,7 +3549,13 @@ function main() {
       // v2.50：弹窗前补一次增量记账（子代理收尾可能在 Stop 之后才落盘，水位线保证不重复）
       if (info.tsPath) incrementalRecord(info.tsPath, fSid);
       const bal = balanceText();
-      showToast(toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), bal, todayUsageTxt()), toastLine2(agg, pricing), toastReason);
+      // v2.98：子代理/专家团弹窗标注——区分两种形态（专家团=带 agentColor 的成员；普通子代理=内置类型）。
+      // 与主模型同名的子代理会被并入同一模型桶（按模型分桶已天然实现），此处仅做标注，不改计费与数据结构。
+      const subModels = subagentModelSet(info.tsPath, info.roundStart || 0);
+      const modelShort = shortModelName(agg, pricing);
+      const subEntry = subModels.get(normalizeModelName(agg.model || ''));
+      const modelLabel = subEntry ? modelShort + subagentTagOf(subEntry) : modelShort;
+      showToast(toastLine1(agg, modelLabel, periodNote(agg, pricing), bal, todayUsageTxt()), toastLine2(agg, pricing), toastReason, info.tsPath);
       clearCoalesce(fSid);
       // v2.27：watcher 弹窗完成 = 专家团本轮真正结束 → 推进 lastStopAt（供 hook 端起点刷新守卫）
       const ws = loadSnapshot(fSid) || {};
@@ -3175,7 +3569,8 @@ function main() {
   // 手动运行无 payload → sid='' → 全局快照（行为不变）。stdin 只读一次，后面全部复用 payloadRaw。
   const payloadRaw = (asHook || asStop) ? readStdin() : '';
   let sid = '';
-  try { sid = String((JSON.parse(payloadRaw).session_id) || ''); } catch (e) { /* payload 非 JSON 或无 session 字段 */ }
+  let hookCwd = '';
+  try { const hp = JSON.parse(payloadRaw); sid = String(hp.session_id || ''); hookCwd = String(hp.cwd || ''); } catch (e) { /* payload 非 JSON 或无 session 字段 */ }
 
   // 输出统一走 stdout；hook 场景输出 Claude-Code 风格 JSON
   const out = (hookOut) => {
@@ -3232,14 +3627,24 @@ function main() {
 
     const prevSnap0 = loadSnapshot(sid) || {};
     const roundStart0 = prevSnap0.lastUserMsgAt || 0;
+    // v2.86：同轮二次 Stop 守卫——上次弹窗结算（lastStopAt）晚于本轮起点 → 聚合起点改从 lastStopAt 起，
+    // 只算新增段。场景实证（2026-09-05 16:50/16:51 双弹）：压缩（compaction）完成会触发第二次 Stop hook，
+    // 原逻辑无条件从 lastUserMsgAt 重聚整轮 → 弹窗2 = 弹窗1 已弹数据 + 压缩调用新增（实测 20.6万/146 +
+    // 4.7万/385 = 25.3万/531，耗时同显 17.4s）→ 用户观感"重复弹窗"。账本因水位线幂等不受影响（实测弹窗2
+    // 仅新增记账 ¥0.02），纯弹窗层重复。从未结算过（lastStopAt <= roundStart0）时 aggStart == roundStart0，
+    // 单次 Stop 行为完全不变。
+    const settledAt0 = prevSnap0.lastStopAt || 0;
+    const aggStart0 = settledAt0 > roundStart0 ? settledAt0 : roundStart0;
+    // v2.87：compaction 事件观测（方案①）——Stop 决策点落盘形态快照 + 聚合起点决策，事后可完整还原事件序列
+    appendCompactionLog('stop-transcript', { sid, roundStart0, lastStopAt: settledAt0, aggStart: aggStart0, shape: captureTranscShape(tsPath) });
         if (tsPath && roundStart0 > 0) {
-      let agg = aggregateTranscript(tsPath, roundStart0);
+      let agg = aggregateTranscript(tsPath, aggStart0);
       if (!agg) { sleep(500); agg = aggregateTranscript(tsPath, roundStart0); } // transcript 尾部可能未 flush
       if (!agg) { sleep(1500); agg = aggregateTranscript(tsPath, roundStart0); }
       if (agg) {
         // v2.53：本轮可能"完整调用（有 usage）+ 被中断思考（无 usage）"混合——合并被中断估算，
         // 让弹窗显示两边汇总（之前只显示完整调用部分，被中断思考漏了）。
-        const estByModel0 = estimateInterrupted(readTranscLines(tsPath), 0, roundStart0);
+        const estByModel0 = estimateInterrupted(readTranscLines(tsPath), 0, aggStart0);
         const estNames0 = Object.keys(estByModel0);
         if (estNames0.length) {
           const estIn0 = estNames0.reduce((s, n) => s + estByModel0[n].in, 0);
@@ -3250,9 +3655,12 @@ function main() {
         // v2.82.1：耗时统一口径——改用 traceWallDurMs()（latest trace endedAt − 用户提交时刻）。
         // v2.74 的「单 trace 文件 startedAt→endedAt」在长任务（多 trace 分段落盘）下只算到
         // 最后一段：实测 11:27 只显示 4:22。详见 traceWallDurMs() 注释。
+        // v2.88：起点恢复 roundStart0（v2.86 曾误用 aggStart0——同轮二次 Stop 时只算到上次结算点），
+        // 并传 tsPath 让 endedAt 取 max(trace.endedAt, transcript 末行 ts)——压缩不写 trace，
+        // 轮尾压缩段耗时靠 transcript 末行补全（实测 4m6s → 12m47s，与客户端一致）。
         // 条件不满足 → 回退 transcript 口径，绝不抛错。
         try {
-          const wd = traceWallDurMs(latestTraceFile(true), roundStart0, sid);
+          const wd = traceWallDurMs(latestTraceFile(true), roundStart0, sid, tsPath);
           if (wd.source === 'trace') agg.durMs = wd.durMs;
         } catch (e) { /* 保留 transcript 口径 */ }
         const modelShort = shortModelName(agg, pricing);
@@ -3271,7 +3679,7 @@ function main() {
         // v2.28：判定专家团 = subCount>0 或 teamActive（子代理异步落盘，中途 Stop 时 subCount 可能
         // 为 0，但主 transcript 本轮已有 Agent/TeamCreate 调用 → 仍按专家团合并，避免误弹多次）。
         // v2.39：本轮按模型分桶明细（每日账本"分模型"用，与 aggregateTranscript 同口径）
-        const byModel = aggregatePerModel(tsPath, roundStart0);
+        const byModel = aggregatePerModel(tsPath, aggStart0);
         // R2 修复（2026-08-23）：plain 路径结构性零确认问题——原逻辑在 Stop 端 0ms 确认窗直接弹窗并
         // 立即推进 lastStopAt，导致"Stop 但主模型同轮续跑/恢复"被误判为轮次结束（A 类 Premature，
         // repro_r2.js 35/35 全 PREMATURE，历史实证 652f2909）。
@@ -3286,13 +3694,23 @@ function main() {
         // 修复3：与 incrementalRecord 的记账键统一走 ledgerKey（原先这里用 basename 回退，
         // 而记账用的是原始 sid —— 两者不一致，且 basename 跨项目会撞）。
         const effSid = ledgerKey(sid, tsPath);
-        writeCoalesce(effSid, agg, { tsPath, roundStart: roundStart0, byModel, terminalError: teAtStop || undefined, traceFile });
+        writeCoalesce(effSid, agg, { tsPath, roundStart: aggStart0, byModel, terminalError: teAtStop || undefined, traceFile });
         spawnFlushWatcher(effSid);
         // v2.37：systemMessage 通道 WorkBuddy UI 实测不显示（无法注入到对话回复），删除该无效注入；
         // toast 已在上面弹出。保留空 hook 返回保证进程行为不变。
         out({ hookSpecificOutput: {} });
         return;
       } else {
+        // v2.86：同轮二次 Stop 且已结算过 → 聚合窗口内无新增 usage 行 → 静默跳过（绝不弹"无记录"
+        // 误导——数据其实早已结算过）；记账照跑保底残余行，水位线幂等不重复。
+        if (settledAt0 > roundStart0) {
+          incrementalRecord(tsPath, sid);
+          writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sid, sameRound: false,
+            transcriptPath: tsPath, stat: null, note: 'same-round-settled-no-new-usage-skip',
+            payload: summarizePayload(payloadRaw) });
+          out({ hookSpecificOutput: {} });
+          return;
+        }
         // v2.52：本轮无 usage 行（停止过快 / 思考途中停止，模型输出未落盘 usage）。
         // 先尝试中断补偿：若本轮有被中断的调用（incomplete reasoning），估算其 token 弹窗显示估算值；
         // 否则才走"无记录"提示（不 fall through trace 兜底，避免读错并发会话数据）。
@@ -3456,7 +3874,11 @@ function main() {
     const pendInfo = readCoalesceInfo(sid);
     if (pendAgg) {
       if (pendInfo && pendInfo.traceFile) gLastTraceFile = pendInfo.traceFile; // v2.63.1：诊断记录 trace 文件名
-      const pendModel = shortModelName(pendAgg, pricing);
+      // v2.98：子代理/专家团弹窗标注（与主路径同规则；失败时 Map 为空 → 退化为原行为）
+      const pendSubModels = subagentModelSet(pendInfo && pendInfo.tsPath, (pendInfo && pendInfo.roundStart) || 0);
+      const pendModelBase = shortModelName(pendAgg, pricing);
+      const pendEntry = pendSubModels.get(normalizeModelName(pendAgg.model || ''));
+      const pendModel = pendEntry ? pendModelBase + subagentTagOf(pendEntry) : pendModelBase;
       const bal = balanceText();
       showToast(toastLine1(pendAgg, pendModel, periodNote(pendAgg, pricing), bal, todayDisplay(pendAgg, pricing)), toastLine2(pendAgg, pricing), 'hook-fallback');
       clearCoalesce(sid);
@@ -3478,15 +3900,22 @@ function main() {
     if (tsPathH) {
       const snapPre = loadSnapshot(sid) || {};
       const roundStartH = snapPre.lastUserMsgAt || 0;
-      const inProgressH = roundStartH > 0 && (snapPre.lastStopAt || 0) < roundStartH;
-      if (inProgressH) {
-        const intrRows = interruptedRowsAfter(readTranscLines(tsPathH), roundStartH);
+      // v2.85：结算门槛从「轮未结束」（inProgress）放宽为「取消标记晚于最近一次结算」——
+      // 轮级 watcher 补弹推进 lastStopAt 后，连环取消（取消→新轮→又取消）场景下一轮 hook
+      // 仍能识别新的待结算标记；intrInfo.ts > lastStopAt 天然排除已结算的旧标记，不会重复补弹。
+      if (roundStartH > 0) {
+        // v2.96：原先此处对同一 transcript 全量读 2 次（本行 + estimateInterrupted），
+        //   叠加 aggregateTranscript 内部的一次共 3 次；大会话（实测最大 49MB）下每次用户提交都重复解析。
+        //   改为读取一次复用。**仅合并外围两处**——aggregateTranscript 内部还聚合子代理目录，
+        //   不能简单替换为 aggregateTranscLines，否则会丢失子代理数据。
+        const transcRowsH = readTranscLines(tsPathH);
+        const intrRows = interruptedRowsAfter(transcRowsH, roundStartH);
         const intrInfo = intrRows.length ? intrRows[intrRows.length - 1] : null;
-        if (intrInfo && intrInfo.ts > roundStartH) {
+        if (intrInfo && intrInfo.ts > roundStartH && intrInfo.ts > (snapPre.lastStopAt || 0)) {
           // 聚合起点 = 旧 roundStartH（含被取消轮全部调用）；终点天然为 transcript 当前末尾
           let aggC = aggregateTranscript(tsPathH, roundStartH);
           if (aggC) {
-            const estByModelC = estimateInterrupted(readTranscLines(tsPathH), 0, roundStartH);
+            const estByModelC = estimateInterrupted(transcRowsH, 0, roundStartH);
             const estNamesC = Object.keys(estByModelC);
             if (estNamesC.length) {
               const estInC = estNamesC.reduce((s, n) => s + estByModelC[n].in, 0);
@@ -3509,8 +3938,12 @@ function main() {
               'cancelled-round-flush'
             );
             // 该轮已彻底结束：推进 lastStopAt，并让下方起点刷新守卫按"已结束"路径刷新起点
+            // v2.85/v2.89：就地刷新 lastUserMsgAt（旧起点残留会让下一轮 Stop 聚合窗错位重算被取消轮）
+            // + 为新轮 spawn 轮级取消 watcher（v2.89 补回丢失的调用点，同守卫尾部）。
+            const nowC = Date.now();
             const psnapC = loadSnapshot(sid) || {};
-            saveSnapshot({ file: psnapC.file || hookFile, stat: psnapC.stat || null, lastUserMsgAt: psnapC.lastUserMsgAt || 0, lastStopAt: Date.now() }, sid);
+            saveSnapshot({ file: psnapC.file || hookFile, stat: psnapC.stat || null, lastUserMsgAt: nowC, lastStopAt: nowC }, sid);
+            spawnRoundWatcher(sid, tsPathH, nowC, resolveWorkspaceLogFile(hookCwd));
             out({ hookSpecificOutput: {} });
             return;
           }
@@ -3525,7 +3958,23 @@ function main() {
     const prevStart = psnap2.lastUserMsgAt || 0;
     const prevStop = psnap2.lastStopAt || 0;
     const inProgress = prevStart > 0 && prevStop < prevStart; // 上一轮未结束（专家团进行中）
-    saveSnapshot({ file: hookFile, stat, lastUserMsgAt: inProgress ? prevStart : Date.now(), lastStopAt: psnap2.lastStopAt || 0 }, sid);
+    const nowH = Date.now();
+    saveSnapshot({ file: hookFile, stat, lastUserMsgAt: inProgress ? prevStart : nowH, lastStopAt: psnap2.lastStopAt || 0 }, sid);
+    // v2.85/v2.89：全新轮（上一轮已结算）→ 为本轮 spawn 轮级取消 watcher。
+    // v2.89 补记：v2.85 的这个调用点在后续编辑中丢失（测试直接调 --round-watch 入口、未覆盖
+    // spawn 链路 → 6 项回放全 PASS 仍漏检），真实取消自 09-03 起全部退化为下一轮 hook 兜底。
+    if (!inProgress && tsPathH) spawnRoundWatcher(sid, tsPathH, nowH, resolveWorkspaceLogFile(hookCwd));
+    // v2.88：hook 注入行的耗时同源修复（asHook 路径内，tsPathH/prevStart 作用域正确）——
+    // 单 trace 口径同样不含轮尾压缩段（trace endedAt 停在模型回复结束，实测 4m5s vs 实际 12m49s）。
+    // 轮起点 prevStart（守卫前的上一轮起点）→ transcript 末行 ts 覆盖压缩段；取不到时保持 trace 口径。
+    // 放在 saveSnapshot 之后：快照保留 trace 原口径，本次注入行用整轮口径。
+    try {
+      if (!sameRound && stat && stat.durMs != null && tsPathH && fs.existsSync(tsPathH) && prevStart > 0) {
+        const tl = lastTranscLine(tsPathH);
+        const tlTs = tl ? Number(tl.timestamp || 0) : 0;
+        if (tlTs > prevStart) stat.durMs = Math.min(tlTs, Date.now()) - prevStart;
+      }
+    } catch (e) { /* 保持 trace 口径 */ }
   } else if (!sameRound) {
     // 手动模式：新轮次展示该轮统计并记录快照（供后续轮次去重）
     saveSnapshot({ file: f, stat }, sid);
