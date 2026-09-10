@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v2.84-blue)
+![Version](https://img.shields.io/badge/version-v2.99-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -188,6 +188,122 @@ Windows 设置 → 系统 → 通知 → 应用通知
 本技能的 toast 使用**独立应用名「WorkBuddy Token Tracker」** 直接调用 Windows 系统通知 API 弹出，**不经过 WorkBuddy 客户端设置**——关闭 WorkBuddy 自带通知**不影响 Token 通知**。若想连 Token 通知一起关：在通知列表单独关闭「WorkBuddy Token Tracker」即可。
 
 ## 更新记录（Changelog）
+
+### v2.99（2026-09-10）—— 全方位测试后修复 6 项：消灭「账本静默失真」
+
+由 4 个测试子代理并行扫描 4 个维度（解析健壮性 / 入口流程 / 计费定价 / 状态并发），报告 11 项经逐条复核**全部确证**。
+
+- **a. token 数值类型加固**：`extractUsage` 原不校验类型 → 字符串触发 JS **字符串拼接**（`"100"+200="100200"`），账本脏掉且难察觉。统一数值化+非负+取整（真实 9574 样本全为 int，属防御性）。
+- **b. 隔离泄漏修复**：`TOAST_LOG_PATH` / `COMPACTION_LOG_PATH` 原硬编码 `os.homedir()`，绕过 `WB_ROOT` → 测试污染真实日志（实测 16 行）。改用 `WB` 变量，默认路径不变。
+- **c. 价库「存在但损坏」告警**：原仅「缺失」告警；文件在但 JSON 损坏时**完全静默**（比缺失更危险，用户不会怀疑）。补齐该分支。
+- **d. `calcCost` 负数钳制**：负 out 产生**负总价**污染账本；负 cached 令账单**失真放大**。加非负钳制。
+- **e. 水位线 `.bak` 不再自动回退（高）**：`.bak` 恒落后一个保存周期，回退它 = 重放已记增量 = **重复计费**（实测多记 5500 in / 1600 out），违反本函数自身「宁可少记不重复」原则。改为 skip + 提示人工核对。
+- **f. 账本损坏标志不再被误清（高）**：`loadDailyUsage` 开头无条件清 `gDailyCorrupt`，同进程第二次调用走 ENOENT 会清标志 → **用空账本写回、历史丢失**（日志却称「不写回覆盖」）。标志改为只由「成功解析」清除。
+
+**安全性**：解析 8/8、计费 5/5 等价性零差异 + 真实账本健康度检查（无负数、无 cached>in、无金额异常）+ `--report` 冒烟正常 —— **计数/计消耗零误报**。
+
+**未采纳（设计取舍）**：`findModel` 边界匹配使未收录变体按家族基价计费（v2.82.1 有意设计，改会破坏正常变体匹配）；跨零点峰谷窗口（s>e）被跳过（官方无此档）。
+
+### v2.98（2026-09-10）—— 弹窗区分「子代理」与「专家团」+ 判定依据升级
+
+依据官方文档（workbuddy.cn/docs/cli/agent-teams）与 86 份真实子代理转录实测：普通子代理 `agent`=内置类型名（Explore / Plan / general-purpose）且**无** `agentColor`；专家团成员 `agent`=专家角色名（topic-researcher / prototype-builder 等）且**有** `agentColor`（官方：成员以分配颜色渲染）。
+- 判定由「仅靠 subagents/ 目录位置」升级为优先读转录内 `isSubAgent === true`。
+- 标注：专家团 →`（专家团使用）`；普通子代理 →`（子代理使用）`；**与主模型同模型** → 并入主弹窗不标注。
+- 更正旧结论：`providerData.agent` 恒为 `cli` **只在主转录成立**；子代理转录里它是角色类型名，正是关键判据。
+
+### v2.97（2026-09-10）—— 子代理弹窗提速（延迟 61s → 26s）
+
+根因：`hasSubagentsRecentlyActive(tsPath, 60*1000)` 窗口过度保守。实测子代理事件间**最大间隔仅 8.8s**（模型思考空档），且最后写入时间 == 文件 mtime（无落盘延迟）。新增 `SUBAGENT_IDLE_MS`（默认 20s，可用环境变量覆盖）；**异常死寂兜底仍保持 60s 不动**。真机实测：**61 秒 → 26 秒（缩短 57%）**。
+
+### v2.96（2026-09-10）—— 价库失效告警 + 热路径缓存 + reasoning 数据提取
+
+- 价库缺失不再静默（stderr 告警；仅加告警、不改路径解析，避开刷新锁联动）。
+- 取消路径重复全量读 3 次 → 1 次（大会话 49MB 下省约 2/3 解析）。
+- `extractUsage` 新增 `reasoning` 字段（实测占输出 **63.8%**），账本不受影响（`addModelUsage` 只取 in/out/cached/total）。
+
+### v2.95（2026-09-10）—— 子代理弹窗标注 + 时区统一
+
+- 新增 `subagentModelSet()`：子代理与主模型不同模型 → 独立弹窗并标注「子代理使用」；同模型 → 并入主弹窗不标注。
+
+### v2.94（2026-09-10）—— 自动补录峰谷倍率修正
+
+`addModelPrice` 原把 `peak_multiplier` 一律写死 `1`，绕过 `calcCost` 对 DeepSeek 的「缺省按 2」→ 新收录的 DeepSeek 模型高峰不翻倍（长期低估）。改为按模型族写（**DeepSeek=2，其余=1**）。
+
+### v2.93（2026-09-10）—— 官方模型名正则放宽 + 账本回溯重算
+
+**① 官方页自动新增修复（根因级）**：旧正则 `/^deepseek-v4-/` 匹配不到带点版本号的新模型名（如 `deepseek-v4.1-flash`），会**静默漏掉**该模型，并导致**其余模型价格整体错位**（`grab()` 按模型数截取价格数组），且不报错。放宽为 `/^deepseek-/` 后，官方上架新模型可被自动收录（隔离测试 T1 验证）。
+
+**② 新增 `recalc-day.js` 回溯工具**：补录只能让之后的消耗计上价，当天此前记成 ¥0 的历史数据需回溯重算。工具按现价 + 峰谷（读 toast 日志轮次时间判定高峰占比）重算指定日期，独立进程不侵入主链路。实测 09-10：¥0.5012 → ¥1.8643（4 轮全在高峰时段）。
+
+### v2.92（2026-09-10）—— 新模型手动补录 + 官方价自动对账
+
+**背景**：DeepSeek-V4.1 Flash 已在客户端上线，但官方定价页未上架、聚合源未收录 → 自动补录链路必然失败，账本持续记 ¥0.00（本日实测 263 万输入记 0 元）。
+
+**修复**：① `pricing.json` 新增手动补录条目（`manual:true` + `lock:true`），价格取自官方公告（空闲 1 / 0.02 / 4，高峰 ×2）；② `deepseek-official.js` 的 retired 扫描豁免 `manual` 条目（原先手动新增模型次日会被打成 retired = 不再计费）；③ 新增对账机制：官方源收录后自动写入「手动值 vs 官方值 vs 差异%」到 `_manual_audit` 并交接到官方价。
+
+**影响**：新模型从「等官方 / 等聚合源（时间不可控）」变为「立刻可补录，官方上线后自动纠偏并留痕」。
+
+### v2.91（2026-09-05）—— 取消检测双信号 + 自适应静默
+
+**信号升级**：round watcher 新增工作区日志信号源（`cancel: received cancel request for session <sid>`，客户端源码实证每次取消必写、含精确时间戳与会话 id），与 transcript 取消标记行互为冗余——标记行缺失/延迟也能确认取消。自适应静默：取消确认后新 usage 落盘且稳定 2s → 提前弹（典型 3~5s，原固定 8s）；无 usage → 8s 兜底。测试基建：`TOKEN_TRACKER_NO_TOAST=1` 静默开关，测试零弹窗零闪烁（硬规矩入 MEMORY.md）。
+
+**验证**：S1 日志信号确认（标记行缺失）→ 聚合弹「4万/2000」精确；S2 自适应 4.8s 弹（固定静默需 6s+）。
+
+### v2.89（2026-09-05）—— 实时取消补弹失效根修：spawn 调用点丢失
+
+**现象**：手动取消后弹的是兜底（cancelled-round-flush，下一轮提交才弹），而非 v2.85 的实时补弹（8 秒内）。
+
+**取证（toast log 全史 + git diff）**：① 客户端层：08-25~09-02 的取消全部即时弹（interrupted，Stop hook 触发），09-03 起取消不再稳定触发 Stop hook（挂起行为），出现兜底——客户端行为不稳定；② **技能层（主因）**：v2.85 的弹窗三分支/watcher 主体/--round-watch 入口全部完好，唯独两处 spawnRoundWatcher 调用点在后续编辑中丢失——round watcher 从未被启动，真实取消 0 次实时弹。旧测试直接调 --round-watch 入口测 watcher 主体、未覆盖 spawn 链路，全 PASS 仍漏检。
+
+**修复**：补回两处调用点 + 新增端到端测试（--hook → spawn → 取消标记 → 实时弹）。验证：spawn 链路通、取消标记写入后 2.5s 实时弹（probe 记 RoundWatch）。
+
+### v2.88（2026-09-05）—— 耗时显示压缩盲区根修：换数据源，不再依赖 trace
+
+**现象**：弹窗显示耗时 4m6s、客户端实际 12m49s（差 3 倍）；hook 注入行同款（4m5s）。取证确认这轮 `aggStart == roundStart`，与 v2.86 无关——是耗时口径的老盲区被"轮尾压缩"形态触发。
+
+**根因**：压缩（contextSummary）**不写 trace 文件**——最新 trace 的 endedAt 停在模型回复结束（17:27:47），压缩的 8m44s 只写 transcript。`traceWallDurMs = trace.endedAt − 轮起点` 无论怎么调，都补不回 trace 里根本不存在的压缩段。历次修（v2.74 分段 / v2.82.1 口径）都在 trace 里打转。
+
+**修复**：结束时刻改取 **max(trace.endedAt, transcript 末行 timestamp)**——transcript 是唯一覆盖全轮（含压缩）的数据源；起点恢复整轮起点（v2.86 曾误用上次结算点）；hook 注入行同源修复（asHook 路径内增强 stat.durMs，快照保留 trace 原口径）。修复后该弹窗应显示 ≈12m47s（与客户端 12m49s 差 2s，UI 计时开销）。
+
+**验证**：函数级单测 3/3——旧口径（无 tsPath）246s 不回归 / 新口径 767s 覆盖压缩段 / 起点晚于 endedAt 走 fallback。
+
+### v2.87（2026-09-05）—— compaction 事件日志 + 跨进程弹窗兜底去重
+
+**背景**：压缩相关弹窗异常 8 次（08-25~09-05）反复修反复出。取证结论：不是客户端某次更新改坏（09-01 旧客户端就有同款双弹痕迹），而是 **compaction 对 hook 侧完全黑盒、形态组合爆炸**——每次只能修当时观察到的那个形态。用户拍板：只做"观测先行 + 弹窗兜底"，不再打地鼠。
+
+**① compaction 专项事件日志**（`~/.workbuddy/token-tracker-compaction.log`）：三个关键决策点落盘事件 + transcript 形态快照（`stop-transcript` 含聚合起点决策 / `flush-watch-start` / `round-watch-start`，shape 含 lineCount、mtime、size、末行 type+role+status、末 30 行压缩标记 id）。以后再出怪弹窗，直接有完整事件序列可查，不再猜机制。
+
+**③ 跨进程弹窗兜底去重**（指纹文件 `token-tracker-toast-fp.json`）：四条件全满足才抑制第二窗——同 transcript、行数差 <10、间隔 <240s、同模型。行数差 <10 是关键信号：连续小轮每轮新增 10+ 行不会误伤；同轮数据被两个进程重复聚合时行数几乎不变（实测双弹 930→934 只差 4 行）。抑制只影响展示（账本按水位线已记完）；被抑制内容仍写入 toast 诊断日志；cancelled/估算/无记录文案不参与（取消补弹必须可见）。
+
+**验证**：one-shot 全链路（stop → watcher → 弹窗「1万/550」精确 + compaction log 完整）；抑制实测（两连弹第二窗 `toast-suppressed` 记录、系统通知未弹）；实战验证 17:23 用户取消轮 `interrupted` 弹窗 29s 内及时弹出。
+
+**失效边界**：指纹只记最后一条（三连弹的第三窗若行数差 >10 不拦，宁漏拦不误拦）；非 watcher 收口路径不参与抑制；行数差 <10 的小额新增段也会被拦（账本已记，仅少展示一个 ¥0.0x 小窗）。
+
+### v2.86（2026-09-05）—— 同轮二次 Stop 守卫：压缩触发双弹根修
+
+**现象**：16:50:35 与 16:51:13 连出两个几乎一样的弹窗（同模型 glm-5.3-flash、同"耗时 17.4s"，仅金额差 2 分钱），观感"重复弹窗"。
+
+**根因链**（`token-tracker-toast.log` 取证）：「今天消耗」轮 16:48:34 Stop → coalesce + flush watcher → 上下文压缩随即开始（transcript 末行持续 busy）→ watcher 等 120s 后 busy-timeout 弹窗1（20.6万/146/¥0.08）并推进 lastStopAt。16:50:50 **压缩完成触发第二次 Stop hook** → Stop 端聚合起点只认 `lastUserMsgAt`（仍为 16:48）→ 无条件重聚整轮（已弹的 20.6万/146 + 压缩调用新增 4.7万/385 = 25.3万/531）→ spawn 新 watcher → 16:51:13 弹窗2。**账本从未重复**（incrementalRecord 水位线幂等，弹窗2 仅新增记 ¥0.02，16:48 时 ¥28.19 → 双弹后 ¥28.29 精确吻合），纯弹窗层重复。
+
+**修复**：Stop 端 transcript 路径聚合起点改用 `aggStart = max(lastUserMsgAt, lastStopAt)`——已结算过（lastStopAt > 轮起点）只聚合新增段（`aggregateTranscript`/`estimateInterrupted`/`traceWallDurMs`/`aggregatePerModel`/`writeCoalesce` 五处同步）；聚合窗口无新增 usage 且已结算过 → **静默跳过**（记账照跑保底 + probe 记 `same-round-settled-no-new-usage-skip`），绝不弹"无记录"误导。未结算过时行为完全不变。
+
+**验证**：3 项回放全 PASS——T-A 同轮二次 Stop 有新增 → 只弹新增段（2100/150，不再含已弹的 1万）；T-B 无新增 → 静默；T-C 单次 Stop 回归 → 弹整轮（1.2万/650）。账本自备份自恢复零污染。
+
+**失效边界**：① watcher 从未弹成（进程被杀/应用关闭）→ lastStopAt 不推进，同轮二次 Stop 退回旧行为（重聚整轮）；② 同轮多段续跑（R2 场景）现在也只弹新增段——整轮汇总看弹窗"今日累计"；③ v2.85 取消补弹同样推进 lastStopAt，语义共享不冲突。
+
+### v2.85（2026-09-05）—— 轮级临时 watcher：手动取消实时补弹（方案 A）
+
+**动机**：v2.83/v2.84 的 hook 端兜底依赖「用户下次提交」触发，且 0-usage 取消（取消时 usage 尚未落盘）会静默跳过——实测 2026-09-05 15:33：15:31 发起 → 15:33:03 手动取消，窗口内 0 条 usage 行、0 条 reasoning 行，兜底全程无感知，该轮 2 分钟还被并入下一轮弹窗（16m49s 无法辨认）。用户拍板方案 A：**hook 时 spawn 轮级 watcher，取消后 8 秒即补弹**，非常驻、非兜底。
+
+**实现**：
+- 新增 `--round-watch <sid> <tsPath> <roundStart>` 入口 + `spawnRoundWatcher()`（detached/stdio ignore/windowsHide/unref，照 `spawnFlushWatcher` 模板）+ `roundWatchMain()` 2s 轮询主循环。spawn 点两处：① 每个全新轮的 hook（起点刷新守卫后）；② v2.83 兜底补弹 return 前（新轮同样需要 watcher）。
+- **弹窗三分支**（终止态取消标记 + 静默满 8s，行数与 mtime 双跟踪防压缩误判）：有 usage → 聚合实数弹（`cancelled-round-watch`）；0-usage 有 incomplete reasoning → 估算弹（`cancelled-round-watch-est`，v2.52 Stop 端同款）；两者皆无 → 「本轮无 token 消耗记录（手动取消）」（`cancelled-round-watch-no-token`）——不静默、不编数字。
+- **退出条件（防双弹，先于弹窗判定）**：轮已结算（`lastStopAt ≥ roundStart`）/ 新轮接管起点 / coalesce 出现（正常 Stop 链路接管）/ transcript 消失 / 生命上限 3h。注：showToast 的 10 分钟文案去重是进程内存态、跨进程无效，防双弹全靠结算推进 + 弹前复核。
+- **兜底路径配套修复**：结算门槛放宽为「取消标记晚于最近一次结算」（连环取消不漏、已结算旧标记不重弹）；兜底补弹后就地刷新 `lastUserMsgAt`（原实现 `return` 跳过了起点刷新守卫，旧起点残留会让下一轮 Stop 聚合窗错位）。
+
+**验证**：6 项回放全 PASS——T1 有 usage 聚合弹（20万/4000/缓存90% 精确）；T2 0-usage 估算弹（estIn=前轮 15万）；T3 已结算静默退出（445ms 零弹）；T4 续跑（标记后直接 assistant）不弹；T5 取消后 user 跟进仍补弹；T6 **真实 15:33 数据**回放 → 弹「无 token 消耗记录（手动取消）」。测试自备份自恢复账本，跑完与备份逐字段一致（零污染）。
+
+**失效边界**：① 应用完全关闭时 watcher 可能被 Job Object 连带收割（与 `--flush-delayed` 同局限）→ 退回 hook 兜底；② 取消后 8s 内就发新消息（快于静默窗）→ 让位下一轮 hook 兜底；③ 上一轮未结算时不重复 spawn，旧 watcher 已死则退回兜底；④「无 token」场景输入侧云端或已计费但本地无凭据，只提示不估算。
 
 ### v2.83~v2.84（2026-09-04）—— 手动取消漏弹修复（v2.84 续跑判定修正）
 
