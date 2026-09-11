@@ -37,7 +37,20 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const WB = process.env.WB_ROOT || path.join(os.homedir(), '.workbuddy');
+// 数据根探测：优先 .workbuddy-ai，回退 .workbuddy。
+// 旧实现写死 .workbuddy，但在较新 WorkBuddy 版本中真实数据根已迁移到 .workbuddy-ai
+// （.workbuddy 仅剩 device-id/logs），导致未设置 WB_ROOT 时读不到任何 trace/settings（见 PR）。
+function detectWorkBuddyRoot() {
+  const h = os.homedir();
+  const cands = [path.join(h, '.workbuddy-ai'), path.join(h, '.workbuddy')];
+  for (const c of cands) {
+    try {
+      if (fs.existsSync(path.join(c, 'traces')) || fs.existsSync(path.join(c, 'settings.json'))) return c;
+    } catch (e) { /* 忽略，继续下一个候选 */ }
+  }
+  return path.join(h, '.workbuddy');
+}
+const WB = process.env.WB_ROOT || detectWorkBuddyRoot();
 const TRACE_DIR = path.join(WB, 'traces');
 
 // ===== 联网功能开关（v2.30）=====
@@ -240,10 +253,11 @@ const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
 // ===== 本地官方价格库（v2.80, 2026-08-31）=====
 // 各厂商官网直抓（人民币官方价），由 python 流水线每日重建：
 //   fetch-cn-prices.py && parse_tokenhub.py && build_index.py → prices/index.json（原子写，含 built_at 闸门）
-// 可用环境变量覆盖路径；默认指向价格库项目目录。
-const CN_PRICE_DIR = process.env.CN_PRICE_DB_DIR || 'C:\\Users\\14779\\WorkBuddy\\2026-08-30-22-25-15\\prices';
+// 可用环境变量覆盖路径；默认落到技能目录内（不再写死作者本机绝对路径，
+// 否则其他用户机器上目录不存在 → 每日刷新必然失败 → 长期弹 ⚠价库 告警，见 PR）。
+const CN_PRICE_DIR = process.env.CN_PRICE_DB_DIR || path.join(WB, 'skills', 'token-usage-tracker', 'prices');
 const CN_PRICE_DB = path.join(CN_PRICE_DIR, 'index.json');
-const CN_PRICE_PIPELINE_DIR = process.env.CN_PRICE_PIPELINE_DIR || 'C:\\Users\\14779\\WorkBuddy\\2026-08-30-22-25-15';
+const CN_PRICE_PIPELINE_DIR = process.env.CN_PRICE_PIPELINE_DIR || path.join(WB, 'skills', 'token-usage-tracker');
 const CN_PRICE_REFRESH_LOCK = path.join(CN_PRICE_DIR, '.refresh.lock');
 const CN_PRICE_REFRESH_ERR = path.join(CN_PRICE_DIR, '.refresh.error'); // v2.82：刷新失败原因留档
 const PRICING_LOCK_FILE = path.join(WB, 'skills', 'token-usage-tracker', '.pricing.lock'); // 修复6：pricing 并发写锁
