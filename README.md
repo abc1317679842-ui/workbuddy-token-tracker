@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v2.99-blue)
+![Version](https://img.shields.io/badge/version-v3.06-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -188,6 +188,22 @@ Windows 设置 → 系统 → 通知 → 应用通知
 本技能的 toast 使用**独立应用名「WorkBuddy Token Tracker」** 直接调用 Windows 系统通知 API 弹出，**不经过 WorkBuddy 客户端设置**——关闭 WorkBuddy 自带通知**不影响 Token 通知**。若想连 Token 通知一起关：在通知列表单独关闭「WorkBuddy Token Tracker」即可。
 
 ## 更新记录（Changelog）
+
+### v3.06（2026-09-12）—— 弹窗系统性失效根修 + 解耦 + 全面测试加固
+
+**弹窗彻底不弹（根因）**：WorkBuddy 新版在 hook 进程结束后会**连带终止其派生的 detached 子进程**；原后台 watcher 刚启动即被杀，而 `cp.spawn` 的失败是**异步 `'error'` 事件**（原代码无监听）→ 完全静默（无日志、无降级）。
+- 修复：`spawn` 补 `'error'` 监听留痕；新增 `startWatcherVerified()` 校验是否真接管；**普通轮改为同步立即弹窗**（不再依赖后台子进程），专家团仍走 watcher；普通轮自行推进 `lastStopAt`（原由 watcher 推进）。
+
+**解耦（抗客户端更新）**
+- 价库路径由硬编码工作区改为 `autoDiscoverCnPriceDir()` 四级自适应（环境变量 → 自动扫描 `~/WorkBuddy/*/prices` 取最新 → 技能自身目录副本 → 旧值）；已建兜底副本（31 模型），**工作区消失仍可用**。
+- 新增 schema 漂移留痕（`schema-drift-suspect`，正常轮次 0 误报）。
+
+**全面测试发现并修复**
+- watcher 抢锁失败 → **TDZ 崩溃**（`appendWatchDebug` 的 `const` 定义在使用之后）→ 定义前移。
+- 已结算轮**重复弹窗**（重试用 `roundStart0` 回退到已结算区间）→ 统一用 `aggStart0`。
+- 取消轮"零已完成用量"漏补弹 → 估算前置 + 构造基底 agg（两处取消路径均已修）。
+- 水位线 **UTF-8 BOM** 导致记账被跳过 → 已去 BOM（教训：勿用 `Out-File -Encoding utf8` 写会被 JSON 解析的文件）。
+- `recordUsage` 损坏守卫：**审查后保持原顺序**（改为"先 load 再判断"反而丢本轮用量），补注释说明。
 
 ### v2.99（2026-09-10）—— 全方位测试后修复 6 项：消灭「账本静默失真」
 
