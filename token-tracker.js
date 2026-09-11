@@ -195,14 +195,57 @@ function clearCoalesce(sid) {
 // 多子回合时起一个 detached 后台 watcher：延迟 DELAY_TOAST_MS 后复查，无新 trace 则弹汇总。
 // 父进程是 Stop hook（同步短生命周期），必须 unref 让 watcher 独立存活；Windows 下 detached
 // + stdio:'ignore' + windowsHide 避免闪黑窗。
+// v3.00：记录最近一次 watcher spawn 的异步错误（供调用方决定是否降级同步弹窗）
+let lastWatcherSpawnError = null;
 function spawnFlushWatcher(sid) {
   try {
     const cp = require('child_process');
     const child = cp.spawn(process.execPath, [__filename, '--flush-delayed', sid || ''], {
       detached: true, stdio: 'ignore', windowsHide: true, env: process.env,
     });
+    // v3.00（2026-09-11 故障修复）：**spawn 的失败是异步 'error' 事件，不是同步异常**。
+    //   原实现只有 try/catch，且没有 'error' 监听 → 找不到可执行文件时错误被**静默丢弃**：
+    //   无日志、无降级、调用方也以为已启动 → 表现为"弹窗彻底不弹、只有下次 hook 兜底"。
+    //   这正是 2026-09-11 22:38 起（WorkBuddy 重部署 node 后）watcher 全部失效的根因。
+    //   现补上监听：留痕供诊断 + 置位标记供调用方降级。
+    lastWatcherSpawnError = null;
+    child.on('error', (e) => {
+      lastWatcherSpawnError = (e && (e.code || e.message)) || 'unknown';
+      try {
+        appendCompactionLog('watcher-spawn-error', {
+          sid, execPath: String(process.execPath || ''), err: (e && e.message) || '', code: (e && e.code) || '',
+        });
+      } catch (e2) { /* 留痕失败不阻塞 */ }
+      process.stderr.write(`[token-tracker] watcher 启动失败(异步): ${(e && e.message) || e}\n`);
+    });
     child.unref();
-  } catch (e) { process.stderr.write(`[token-tracker] 延迟弹窗 watcher 启动失败: ${e.message}\n`); }
+    return child;
+  } catch (e) {
+    lastWatcherSpawnError = `sync:${e && e.message}`;
+    process.stderr.write(`[token-tracker] 延迟弹窗 watcher 启动失败: ${e.message}\n`);
+    return null;
+  }
+}
+
+// v3.00（2026-09-11 故障修复）：启动 watcher 并**校验其是否真的接管**。
+//   判据：watcher 启动后第一件事就是抢锁（coalescePath(sid) + '.lock'），锁文件 mtime 会新于启动时刻。
+//   原实现 spawn 后**不校验**，spawn 异步失败时调用方毫不知情 → 弹窗静默消失（本次故障根因）。
+//   返回 true = watcher 已接管（弹窗由它负责）；false = 未起来，**调用方必须降级为同步弹窗**。
+function startWatcherVerified(sid) {
+  let cp = null;
+  try { cp = require('child_process'); } catch (e) { return false; }
+  const lockF = coalescePath(sid) + '.lock';
+  let lockBefore = 0;
+  try { if (fs.existsSync(lockF)) lockBefore = fs.statSync(lockF).mtimeMs; } catch (e) { lockBefore = 0; }
+  spawnFlushWatcher(sid);
+  for (let i = 0; i < 10; i++) {                 // 最多约 1.5s（10 × 150ms）
+    if (lastWatcherSpawnError) return false;     // 已收到异步 error → 立即判定失败，不空等
+    try {
+      if (fs.existsSync(lockF) && fs.statSync(lockF).mtimeMs > lockBefore) return true; // 锁被新建/更新 → watcher 已接管
+    } catch (e) { /* 读取瞬时失败：下一轮重试 */ }
+    try { cp.execSync('ping -n 1 -w 100 127.0.0.1 >NUL', { stdio: 'ignore' }); } catch (e) { /* sleep 150ms */ }
+  }
+  return false;
 }
 
 // v2.85：轮级临时 watcher——UserPromptSubmit（--hook）为每个新轮 spawn 的自限时观察进程（非兜底、
@@ -241,9 +284,47 @@ const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
 // 各厂商官网直抓（人民币官方价），由 python 流水线每日重建：
 //   fetch-cn-prices.py && parse_tokenhub.py && build_index.py → prices/index.json（原子写，含 built_at 闸门）
 // 可用环境变量覆盖路径；默认指向价格库项目目录。
-const CN_PRICE_DIR = process.env.CN_PRICE_DB_DIR || 'C:\\Users\\14779\\WorkBuddy\\2026-08-30-22-25-15\\prices';
+// v3.02（2026-09-11 解耦·自适应）：价库路径**自动发现**，不再写死某个具体工作区。
+//   背景：原实现硬编码 `C:\Users\14779\WorkBuddy\2026-08-30-22-25-15\prices`，
+//   该工作区一旦改名/迁移/删除，价库即**静默失效**（国内模型失去官方价、费用显示为空）。
+//   WorkBuddy 更新频繁且会重建工作区，这类"写死路径"是最典型的易碎点。
+//   自适应策略（按优先级，命中即用）：
+//     ① 环境变量 `CN_PRICE_DB_DIR`（显式覆盖，最高优先）
+//     ② **自动扫描** `~/WorkBuddy/*/prices/index.json`，取 mtime **最新**者
+//        —— 抗工作区改名/新建/多份并存，无需人工维护路径
+//     ③ 技能自身目录 `prices/`（随技能走的兜底副本，完全不依赖任何工作区）
+//     ④ 旧硬编码路径（向后兼容，最后兜底）
+//   全部未命中 → 返回空串，走既有降级（stderr 告警 + 回退聚合价），绝不崩溃。
+function autoDiscoverCnPriceDir() {
+  const cands = [];
+  if (process.env.CN_PRICE_DB_DIR) cands.push(String(process.env.CN_PRICE_DB_DIR));
+  try {
+    const wsRoot = path.join(os.homedir(), 'WorkBuddy');
+    let best = null, bestM = -1;
+    for (const d of fs.readdirSync(wsRoot)) {
+      const dir = path.join(wsRoot, d, 'prices');
+      const idx = path.join(dir, 'index.json');
+      try {
+        if (!fs.existsSync(idx)) continue;
+        const m = fs.statSync(idx).mtimeMs;
+        if (m > bestM) { bestM = m; best = dir; }
+      } catch (e) { /* 单个目录失败不影响其它候选 */ }
+    }
+    if (best) cands.push(best);
+  } catch (e) { /* ~/WorkBuddy 不存在 → 跳过该级 */ }
+  cands.push(path.join(__dirname, 'prices'));
+  cands.push('C:\\Users\\14779\\WorkBuddy\\2026-08-30-22-25-15\\prices');
+  for (const c of cands) {
+    if (!c) continue;
+    try { if (fs.existsSync(path.join(c, 'index.json'))) return c; } catch (e) { /* 继续下一候选 */ }
+  }
+  return cands[0] || ''; // 均未命中 → 返回首个候选（触发既有告警与降级路径）
+}
+const CN_PRICE_DIR = autoDiscoverCnPriceDir();
 const CN_PRICE_DB = path.join(CN_PRICE_DIR, 'index.json');
-const CN_PRICE_PIPELINE_DIR = process.env.CN_PRICE_PIPELINE_DIR || 'C:\\Users\\14779\\WorkBuddy\\2026-08-30-22-25-15';
+// 抓价流水线目录：同样自适应——优先环境变量，其次价库所在目录，最后旧硬编码。
+const CN_PRICE_PIPELINE_DIR = process.env.CN_PRICE_PIPELINE_DIR
+  || (CN_PRICE_DIR ? path.dirname(CN_PRICE_DIR) : 'C:\\Users\\14779\\WorkBuddy\\2026-08-30-22-25-15');
 const CN_PRICE_REFRESH_LOCK = path.join(CN_PRICE_DIR, '.refresh.lock');
 const CN_PRICE_REFRESH_ERR = path.join(CN_PRICE_DIR, '.refresh.error'); // v2.82：刷新失败原因留档
 const PRICING_LOCK_FILE = path.join(WB, 'skills', 'token-usage-tracker', '.pricing.lock'); // 修复6：pricing 并发写锁
@@ -814,6 +895,11 @@ function aggregateTranscLines(rows, fromTs) {
   const seen = new Set();
   let inSum = 0, outSum = 0, cachedSum = 0;
   let reasoningSum = 0; // v2.96：思考 token 累计（仅用于弹窗展示，不写入账本）
+  // v3.04（自适应·schema 漂移留痕）：统计「有 providerData 结构、却提取不出 usage」的行数。
+  //   动机：上游若改了 usage 字段名，原实现会**静默 fallback**（读不到就当 0），
+  //   技能安静地算错而你无从察觉 —— 这正是本轮反复出现的"静默失败"同类病。
+  //   现改为：疑似漂移时**主动留痕**（仅在下面严格条件下触发），让"算错"变成"有据可查"。
+  let missWithPd = 0;
   let firstTs = null, lastTs = 0, model = '', count = 0;
   for (const r of rows) {
     const ts = r.timestamp;
@@ -821,7 +907,11 @@ function aggregateTranscLines(rows, fromTs) {
     const pd = r.providerData || {};
     // v2.66：统一用 extractUsageFromRow，兼容 pd.usage / pd.rawUsage / message.usage
     const u = extractUsageFromRow(r);
-    if (!u) continue;
+    if (!u) {
+      // v3.04：行内有 providerData 结构却提取不出 usage → 计入"疑似漂移"（无 providerData 的行不算，属正常）
+      if (pd && typeof pd === 'object' && Object.keys(pd).length > 0) missWithPd++;
+      continue;
+    }
     const key = pd.messageId || pd.conversationRequestId || r.id || (r.type + ':' + ts);
     if (seen.has(key)) continue;
     seen.add(key);
@@ -832,7 +922,17 @@ function aggregateTranscLines(rows, fromTs) {
     if (!model) model = pd.model || pd.requestModelId || 'unknown'; // v2.82.2：模型名缺失 → 'unknown' 诚实标注（旧为 ''，弹窗显示空白且无法追查）
     count++;
   }
-  if (!count) return null;
+  if (!count) {
+    // v3.04（自适应）：仅在**严格条件**下留痕，避免正常轮次刷日志——
+    //   ① 本窗口内一条 usage 都没解析出来（count === 0，确实异常）
+    //   ② 且有 ≥3 行带 providerData（排除"本就是纯消息轮/空轮次"的正常情况）
+    //   触发即说明：上游可能改了 usage 字段结构。留痕后可在 compaction log 中检索
+    //   `schema-drift-suspect` 定位，而不再是无从察觉地算错。
+    if (missWithPd >= 3) {
+      try { appendCompactionLog('schema-drift-suspect', { missWithPd, totalRows: rows.length, fromTs }); } catch (e) { /* 留痕失败不阻塞 */ }
+    }
+    return null;
+  }
   return { in: inSum, out: outSum, cached: cachedSum, total: inSum + outSum, durMs: Math.max(0, lastTs - (firstTs || lastTs)), model, firstTs, lastTs, count, reasoning: reasoningSum };
 }
 
@@ -2200,6 +2300,15 @@ function addModelUsage(day, model, stat, pricing) {
 // 决定是否推进水位线——记账失败却推进水位线 = 这部分用量永久丢失。
 // 返回 false 的三种情形：账本此前损坏 / 锁获取失败 / 无用量可记；写盘失败也返回 false。
 function recordUsage(stat, pricing, byModel) {
+  // v3.06（审查结论·**刻意保持当前顺序，不要"修正"它**）：
+  //   表面看这个守卫像是"死代码"——`gDailyCorrupt` 初始为 false，而真正置位它的 `loadDailyUsage()`
+  //   在下面（锁内）才执行，于是首次遇损坏时本守卫不会命中。
+  //   但实测确认：**这是良性的、且优于"修正"后的行为**——
+  //     当前顺序：损坏 → 备份为 `.corrupt-<ts>` → 用本轮用量**新建**账本 → **本轮用量不丢**，历史亦在备份中 ✓
+  //     若改为"先 loadDailyUsage() 再判断"（看似更严谨）：损坏 → 备份 → 守卫命中 → **跳过写入 → 本轮用量丢失** ✗
+  //   另外该守卫并非完全无效：同一进程内**第二次**调用 recordUsage 时，`gDailyCorrupt` 已被置为 true，
+  //   此时会正确跳过（避免二次覆盖）。每轮通常只调用一次，故该分支很少触发。
+  //   结论：**保持现状**。此处仅补充注释，避免后人误"修正"。
   if (gDailyCorrupt) {
     // 账本此前损坏：跳过写入，避免用空对象覆盖历史（历史已备份为 .corrupt 文件）
     process.stderr.write(`[token-tracker] 账本此前损坏，本轮跳过写入以免覆盖历史（备份在 .corrupt 文件）\n`);
@@ -3044,11 +3153,17 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
         const snap2 = loadSnapshot(sid) || {};
         if ((snap2.lastStopAt || 0) >= roundStart || (snap2.lastUserMsgAt || 0) > roundStart) return;
         const pricing = loadPricing();
-        const aggC = aggregateTranscript(tsPath, roundStart);
+        const aggC0 = aggregateTranscript(tsPath, roundStart);
+        // v3.06：同 hook 路径的修复 —— 零"已完成用量"但有"被中断估算"时构造零值基底，避免静默丢弃。
+        const estByModelC0 = estimateInterrupted(rows, 0, roundStart);
+        const estNamesC0 = Object.keys(estByModelC0);
+        const aggC = aggC0 || (estNamesC0.length
+          ? { in: 0, out: 0, cached: 0, total: 0, model: estNamesC0[0], durMs: 0, count: 0 }
+          : null);
         if (aggC) {
           // 与 v2.83 兜底同构：合并被中断调用估算 + 补记账 + 弹窗
-          const estByModelC = estimateInterrupted(rows, 0, roundStart);
-          const estNamesC = Object.keys(estByModelC);
+          const estByModelC = estByModelC0;
+          const estNamesC = estNamesC0;
           if (estNamesC.length) {
             const estInC = estNamesC.reduce((s, n) => s + estByModelC[n].in, 0);
             const estOutC = estNamesC.reduce((s, n) => s + estByModelC[n].out, 0);
@@ -3221,6 +3336,27 @@ function main() {
         return true;
       } catch (e) { return false; }
     };
+    // v3.05（2026-09-11 修复·TDZ 崩溃）：**把 watcher 调试日志函数提前到抢锁之前定义**。
+    //   原实现里 `appendWatchDebug` 定义在下方（抢锁成功之后），而"未拿到锁"分支会先调用它 ——
+    //   const 存在暂时性死区（TDZ），导致任何抢锁失败（并发 watcher / 陈旧锁 pid 被存活进程复用）
+    //   都抛出 `ReferenceError: Cannot access 'appendWatchDebug' before initialization`，
+    //   watcher **未捕获异常崩溃**（退出码 1），既不弹窗也不留痕。实测已复现。
+    //   修复：定义前移，使失败分支可安全调用。
+    const watchDebugPath = coalescePath(fSid) + '.watch-debug';
+    const maxDebugRows = 2000;
+    const watchDebugOn = process.env.WATCH_DEBUG === '1';
+    const appendWatchDebug = (o) => {
+      if (!watchDebugOn) return;
+      try {
+        const line = JSON.stringify(o) + '\n';
+        fs.appendFileSync(watchDebugPath, line);
+        const buf = fs.readFileSync(watchDebugPath, 'utf-8');
+        const ls = buf.split('\n');
+        if (ls.length > maxDebugRows + 20) {
+          fs.writeFileSync(watchDebugPath, ls.slice(ls.length - maxDebugRows).filter((x) => x !== '').join('\n') + '\n');
+        }
+      } catch (e) { /* 日志写入失败：不阻塞主逻辑 */ }
+    };
     gotLock = acquireWatchLock();
     if (!gotLock) {
       // 未获取锁（锁有效/无法确认/原子竞争失败）→ 退出，避免并发重复弹
@@ -3280,21 +3416,6 @@ function main() {
     // 清理策略：只保留最近 2000 行（约 100 分钟轮询），超出的旧行截断，避免无限增长。
     // v2.59：改为环境变量开关（WATCH_DEBUG=1 才落盘），默认关闭——生产不产生残留文件、无 I/O 开销；
     // 排查 watcher 状态时设 WATCH_DEBUG=1 运行即复现调试日志（watch-debug 曾实证定位 compaction 回归）。
-    const watchDebugPath = coalescePath(fSid) + '.watch-debug';
-    const maxDebugRows = 2000;
-    const watchDebugOn = process.env.WATCH_DEBUG === '1';
-    const appendWatchDebug = (o) => {
-      if (!watchDebugOn) return;
-      try {
-        const line = JSON.stringify(o) + '\n';
-        fs.appendFileSync(watchDebugPath, line);
-        const buf = fs.readFileSync(watchDebugPath, 'utf-8');
-        const ls = buf.split('\n');
-        if (ls.length > maxDebugRows + 20) {
-          fs.writeFileSync(watchDebugPath, ls.slice(ls.length - maxDebugRows).filter((x) => x !== '').join('\n') + '\n');
-        }
-      } catch (e) { /* 日志写入失败：不阻塞主逻辑 */ }
-    };
     // 记录本 watcher 启动（含 sid / 起点 / 合并文件是否存在）
     appendWatchDebug({ type: 'start', ts: Date.now(), sid: fSid, tsPath, roundStart: info0.roundStart || 0, hasCoalesce: !!(info0 && info0.agg) });
     // v2.87：compaction 事件观测（方案①）——flush watcher 启动点落盘形态快照
@@ -3639,8 +3760,15 @@ function main() {
     appendCompactionLog('stop-transcript', { sid, roundStart0, lastStopAt: settledAt0, aggStart: aggStart0, shape: captureTranscShape(tsPath) });
         if (tsPath && roundStart0 > 0) {
       let agg = aggregateTranscript(tsPath, aggStart0);
-      if (!agg) { sleep(500); agg = aggregateTranscript(tsPath, roundStart0); } // transcript 尾部可能未 flush
-      if (!agg) { sleep(1500); agg = aggregateTranscript(tsPath, roundStart0); }
+      // v3.05（2026-09-11 修复·重复弹窗）：两次重试**必须沿用 aggStart0，不能回退到 roundStart0**。
+      //   aggStart0 = max(lastStopAt, roundStart0) 是"上次已结算点"；roundStart0 是本轮起点（更早）。
+      //   原实现重试时改用 roundStart0 → 窗口回退到**已结算区间**，一旦首次聚合因数据未落盘失败，
+      //   重试就会命中上一轮的旧用量并**重新弹一次窗**（实测复现：probe 显示 source=transcript、
+      //   stat 为旧轮的 in:100/out:50）。这与 v2.86「已结算轮静默跳过」的设计意图相悖。
+      //   改为沿用 aggStart0：数据延迟落盘时重试依然能捕到（文件在这 500ms/1500ms 内已更新），
+      //   且窗口不回退 —— **既不漏新数据，也不会重弹旧数据**。
+      if (!agg) { sleep(500); agg = aggregateTranscript(tsPath, aggStart0); } // transcript 尾部可能未 flush
+      if (!agg) { sleep(1500); agg = aggregateTranscript(tsPath, aggStart0); }
       if (agg) {
         // v2.53：本轮可能"完整调用（有 usage）+ 被中断思考（无 usage）"混合——合并被中断估算，
         // 让弹窗显示两边汇总（之前只显示完整调用部分，被中断思考漏了）。
@@ -3694,10 +3822,66 @@ function main() {
         // 修复3：与 incrementalRecord 的记账键统一走 ledgerKey（原先这里用 basename 回退，
         // 而记账用的是原始 sid —— 两者不一致，且 basename 跨项目会撞）。
         const effSid = ledgerKey(sid, tsPath);
+        // v3.01（2026-09-11 修复·第二版）：**普通轮直接同步弹窗，不再依赖 detached 后台 watcher**。
+        //   根因（实测证据链）：WorkBuddy 新版在 hook 进程结束后会**连带终止其派生的 detached 子进程**
+        //   —— watcher 刚 spawn 就被杀，表现为「无 watcher-spawn-error（spawn 成功）、无 flush-watch-start
+        //   （没活到写日志）、锁未创建」，弹窗彻底失效，只能等下次 hook 兜底。
+        //   对照实验：PowerShell 手动跑 --stop 时 watcher 正常（15:01:57 有 flush-watch-start）→ 证实是
+        //   宿主进程管理行为差异，而非代码问题。该行为随客户端更新才出现，故"更新后开始坏"。
+        //   本改动同时**回归代码原设计意图**（见上方 v2.27/v2.28 注释：普通轮立即弹，仅专家团走合并延迟）。
+        //   判断依据 agg.subCount / agg.teamActive —— 二者均为 0/false 即普通轮。
+        const isPlainRound = !(agg && (Number(agg.subCount) > 0 || agg.teamActive === true));
+        if (isPlainRound) {
+          // 普通轮：同步立即弹（不 spawn、不等确认窗），并清掉 coalesce 以免被兜底二次补弹
+          try {
+            showToast(
+              toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), balanceText(), todayUsageTxt()),
+              toastLine2(agg, pricing),
+              (typeof toastReason === 'string' && toastReason) ? toastReason + '+plain-immediate' : 'plain-immediate',
+              tsPath
+            );
+            clearCoalesce(effSid);
+            // v3.03（蝴蝶效应修复）：**普通轮必须自己推进 lastStopAt**。
+            //   原设计里 lastStopAt 由 watcher 弹窗完成后推进（见 --flush-delayed 内注释）。
+            //   本分支改为同步弹窗、不启动 watcher 后，若此处不推进，则：
+            //   下轮 --hook 计算 `inProgress = lastUserMsgAt > lastStopAt` 会**误判"上轮未结束"**
+            //   → 起点刷新守卫不刷新 roundStart → 下轮聚合范围从上轮起点算起 → **弹窗数值偏大**。
+            //   （账本不受影响：incrementalRecord 走行数水位线去重；受损的是"弹窗显示"。）
+            //   写法对齐 watcher 内 :3184 —— lastUserMsgAt 取 max 防回写覆盖 hook 刚刷新的新起点。
+            try {
+              const psnapP = loadSnapshot(sid) || {};
+              saveSnapshot({
+                file: psnapP.file || tsPath,
+                stat: psnapP.stat || null,
+                lastUserMsgAt: Math.max(psnapP.lastUserMsgAt || 0, aggStart0),
+                lastStopAt: Date.now(),
+              }, sid);
+            } catch (e) { /* 快照写失败不影响弹窗 */ }
+            appendCompactionLog('stop-plain-immediate', { sid: effSid, subCount: agg && agg.subCount, teamActive: !!(agg && agg.teamActive) });
+          } catch (e) { process.stderr.write(`[token-tracker] 普通轮同步弹窗失败: ${e.message}\n`); }
+          out({ hookSpecificOutput: {} });
+          return;
+        }
         writeCoalesce(effSid, agg, { tsPath, roundStart: aggStart0, byModel, terminalError: teAtStop || undefined, traceFile });
-        spawnFlushWatcher(effSid);
-        // v2.37：systemMessage 通道 WorkBuddy UI 实测不显示（无法注入到对话回复），删除该无效注入；
-        // toast 已在上面弹出。保留空 hook 返回保证进程行为不变。
+        // 专家团/多子回合：仍需 watcher（要等子代理落盘后才汇总），启动并校验是否接管；
+        // 未接管 → 立即降级为同步弹窗，保证**任何情况下至少弹一次**。
+        if (!startWatcherVerified(effSid)) {
+          // 二次确认：coalesce 仍在（未被其它 watcher 清掉）才补弹，避免与在跑的 watcher 双弹
+          let stillPending = false;
+          try { stillPending = fs.existsSync(coalescePath(effSid)); } catch (e) { stillPending = false; }
+          if (stillPending) {
+            try {
+              showToast(
+                toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), balanceText(), todayUsageTxt()),
+                toastLine2(agg, pricing),
+                (typeof toastReason === 'string' && toastReason) ? toastReason + '+no-watcher' : 'no-watcher-fallback',
+                tsPath
+              );
+              clearCoalesce(effSid);
+              appendCompactionLog('stop-sync-fallback', { sid: effSid, why: lastWatcherSpawnError || 'watcher-not-up' });
+            } catch (e) { process.stderr.write(`[token-tracker] 降级同步弹窗失败: ${e.message}\n`); }
+          }
+        }
         out({ hookSpecificOutput: {} });
         return;
       } else {
@@ -3914,9 +4098,18 @@ function main() {
         if (intrInfo && intrInfo.ts > roundStartH && intrInfo.ts > (snapPre.lastStopAt || 0)) {
           // 聚合起点 = 旧 roundStartH（含被取消轮全部调用）；终点天然为 transcript 当前末尾
           let aggC = aggregateTranscript(tsPathH, roundStartH);
+          // v3.06（修复·取消轮零用量漏补弹）：把"被中断估算"提到判断之前，
+          //   原实现是 `if (aggC) { ...估算... }` —— 一旦本轮没有任何**已完成**的 usage 落盘
+          //   （典型：用户刚提交就手动取消，模型还在思考），aggregateTranscript 返回 null，
+          //   整个块被跳过 → 即使 estimateInterrupted() 估到了被中断的思考消耗，
+          //   也**既不弹窗也不记账，静默丢弃**。
+          //   现在：估算非空时先构造一个零值基底 agg，让下面的合并/弹窗/记账照常执行。
+          const estByModelC = estimateInterrupted(transcRowsH, 0, roundStartH);
+          const estNamesC = Object.keys(estByModelC);
+          if (!aggC && estNamesC.length) {
+            aggC = { in: 0, out: 0, cached: 0, total: 0, model: estNamesC[0], durMs: 0, count: 0 };
+          }
           if (aggC) {
-            const estByModelC = estimateInterrupted(transcRowsH, 0, roundStartH);
-            const estNamesC = Object.keys(estByModelC);
             if (estNamesC.length) {
               const estInC = estNamesC.reduce((s, n) => s + estByModelC[n].in, 0);
               const estOutC = estNamesC.reduce((s, n) => s + estByModelC[n].out, 0);
