@@ -522,6 +522,7 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 - [ ] **版本号一改，本地端 + 云端介绍必须一起同步（最易漏）**：
   - 本地端（本 SKILL.md）：① 顶部「当前功能总览」版本号 + 新版本要点 ② 核心功能介绍（如需）③ 维护与排查速查表（新问题排查点）——不只改 changelog，总览头版本号常漏
   - 云端（README.md）：① Version 徽章 ② 核心功能表新条目 ③ 版本历史 changelog
+- [ ] **推送脚本的文件清单必须与仓库实际跟踪文件对齐**（2026-09-16 踩坑）：`gh-push-api.py` 的 `FILES` 最初只有 5 个（token-tracker.js / SKILL.md / README.md / manifest.yaml / recalc-day.js），但仓库实际跟踪 12 项（含 `deepseek-official.js` / `refresh-prices.js` / `pricing.json`）。改动这两个脚本后若不加进 `FILES`，会**只推文档不推代码**——仓库版本号变了、修复却没上去。推送前先 `list contents` 对一遍仓库文件。
 - [ ] 对 master 与 main **各推送一次**（gh-push-api.py 按分支跑）
 - [ ] **推送后必须核验**：contents API 对比两分支各文件的 `size`/`sha` 一致——大文件 blob 曾单独返回空 `{}` 而脚本照样报"成功"（263KB 主文件实测踩过），核验只取 size/sha、不读 content
 - [ ] 两分支 `git diff <a> <b> --stat` 为空 = 一致
