@@ -517,7 +517,8 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 
 ### 推送自检清单（2026-09-12 从全局记忆迁入；推送本技能到 GitHub 前逐项勾）
 > 仓库：`abc1317679842-ui/workbuddy-token-tracker`，默认分支 `main`（另有本地 master 线，两条线无共同祖先）。
-> 当前环境推送通道：**GitHub REST API 脚本 `<工作区>/.workbuddy/gh-push-api.py`**（PortableGit 缺 remote-https，git 推送不可用）。
+> 当前环境推送通道：**① git 原生推送（2026-09-16 实测已通，推荐）**：`GIT_EXEC_PATH=<PortableGit>/versions/<versions/current 内容>/mingw64/bin` + 凭证注入（token 内嵌 URL 或 `-c http.extraheader="AUTHORIZATION: Bearer <token>"`）+ `-c http.proxy= -c https.proxy=`，实测 `ls-remote` / `push --dry-run` 均 exit=0。**② 备选：GitHub REST API 脚本 `<工作区>/.workbuddy/gh-push-api.py`**（git 不可用或需精确控制 tree 时用）。
+> ⚠️ **误区纠正（2026-09-16）**：此前记录的「PortableGit 缺 remote-https，git 推送不可用」是**误判**——helper 实际存在于 `mingw64/bin`（`git-remote-http(s).exe`），而默认 exec-path 指向的 `mingw64/libexec/git-core` **是空目录**，不设 `GIT_EXEC_PATH` 就会报假象 `git: 'remote-https' is not a git command`。exit=128 的另一半原因是**凭证**（wincred 中 `git:https://<user>@github.com` 条目取不出 → `could not read Username`），属可修问题，**不等于通道故障**。
 - [ ] 先 `git ls-remote --heads origin`：确认分支与默认分支（HEAD 指向），两条分支内容都要最新
 - [ ] **版本号一改，本地端 + 云端介绍必须一起同步（最易漏）**：
   - 本地端（本 SKILL.md）：① 顶部「当前功能总览」版本号 + 新版本要点 ② 核心功能介绍（如需）③ 维护与排查速查表（新问题排查点）——不只改 changelog，总览头版本号常漏
