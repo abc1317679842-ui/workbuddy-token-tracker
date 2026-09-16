@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.06-blue)
+![Version](https://img.shields.io/badge/version-v3.07-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -41,6 +41,7 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 | ⏰ **时段价格标注** | 行1 显示时段策略：DeepSeek 原厂系高峰 → **`高峰双倍`**；声明了 `night_discount` 的模型夜间 → **`夜间X折`**。⚠️ **时段策略无公开 API 数据源，需手动维护**（厂商时段政策变动时，请在 `pricing.json` 中提示模型更新 `peak_multiplier`/`night_discount`/`peak_hours`/`night_hours` 字段，代码自动读取） |
 | 🆕 **新模型自动补录** | 检测到未收录模型**立即联网**补录：先查国内源 llmabacus（人民币价，`region=CN`），再回退 OpenRouter（USD×汇率，`region=US`）；查不到则提示用搜索技能人工核验官方定价页 |
 | 🔄 **每日价格自动刷新** | 每天首次运行自动拉 **5 个价格源**（国内 2：llmabacus / llm-prices-cn；国外 3：OpenRouter / LiteLLM / Portkey），按模型 `region` 区分国内外定价（CN 用国内人民币价、US 用三 USD 源中位数×汇率）；**当天已刷新则不再联网**；全源失败 toast 显示「价⚠️」并保留上次价格 |
+| 🔗 **官方价跨 key 接管**（v3.07） | 官方现行 API ID 与本地 key 不同名时（如本地 `deepseek-v4.1-flash` ↔ 官方 `deepseek-flash`），按官方页「模型版本」行自动对齐识别为同一模型：**官方价强制覆盖手动补录价**、解除 `manual`/`lock` 冻结、绑定 `alias_of` 并写 `_manual_audit` 留痕；聚合源刷新也不会再覆盖官方价 |
 | 🏪 **本地官方价格库优先**（v2.81） | 计费新增**本地官方库层**（各厂商官网直抓的人民币官方价），优先级：`pricing.json 的 lock` > **本地官方库** > 聚合源补录。**每天第一次对话后台强制刷新**（实测约 12s，非阻塞，刷新没跑完自动用前一天完整库）；本地没有的模型才走聚合源实时查价并永久记录 |
 | ⚠️ **刷新失败告警**（v2.81） | 本地库停留在昨天/缺失时，弹窗模型名后追加 **`⚠价库8/30`** / **`⚠价库缺失`**（正常时与原来一字不差）；失败**退避重试** 3→10→30→60 分钟、当日满 5 次熔断，次日自动恢复——不会再无限重拉，也不会让你蒙在鼓里 |
 | ⏱️ **耗时口径对齐**（v2.82.1） | 耗时 = 最后一次 LLM 结束 − 用户提交时刻，与 WorkBuddy 显示**分毫不差**（长任务多 trace 分段落盘不再只算最后一段：实测 11:27 的任务旧版只显示 4:22） |
@@ -188,6 +189,16 @@ Windows 设置 → 系统 → 通知 → 应用通知
 本技能的 toast 使用**独立应用名「WorkBuddy Token Tracker」** 直接调用 Windows 系统通知 API 弹出，**不经过 WorkBuddy 客户端设置**——关闭 WorkBuddy 自带通知**不影响 Token 通知**。若想连 Token 通知一起关：在通知列表单独关闭「WorkBuddy Token Tracker」即可。
 
 ## 更新记录（Changelog）
+
+### v3.07（2026-09-16）—— DeepSeek 官方价「跨 key 接管」：手动补录价不再永久锁死
+
+**问题**：手动补录的模型 key（`deepseek-v4.1-flash`）与官方现行 API ID（`deepseek-flash`）不同名，旧逻辑只按官方 ID 精确匹配 → 永远匹配不上 → 手动条目停在 `pending-official`，且 `manual`+`lock` 双标记使其被彻底冻结，官方调价也不更新（静默用过期价）。
+
+**修复**：
+- `deepseek-official.js`：解析官方页「模型版本」行，用去标点归一化与本地 key/name 对齐，命中即判定同一模型 → 官方价强制覆盖手动价、解除 `manual`/`lock` 冻结、打 `alias_of=<官方ID>`（保留本地 key 供运行时匹配 + 豁免 retired）、写 `_manual_audit`（`official-adopted` + diff）。
+- `refresh-prices.js`：官方价解析加别名回退 `official.official[m.alias_of]`（防止被聚合源 llmabacus 价覆盖）；14 天清理豁免别名条目。
+
+**验证**：隔离 `WB_ROOT` 端到端（含 `--force` 五源全成功）——别名条目在聚合源刷新下保持官方价；真实价库零误写；`--report` 计费回归正常。
 
 ### v3.06（2026-09-12）—— 弹窗系统性失效根修 + 解耦 + 全面测试加固
 
