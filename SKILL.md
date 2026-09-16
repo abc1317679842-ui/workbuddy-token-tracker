@@ -517,7 +517,11 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 
 ### 推送自检清单（2026-09-12 从全局记忆迁入；推送本技能到 GitHub 前逐项勾）
 > 仓库：`abc1317679842-ui/workbuddy-token-tracker`，默认分支 `main`（另有本地 master 线，两条线无共同祖先）。
-> 当前环境推送通道：**① git 原生推送（2026-09-16 实测已通，推荐）**：`GIT_EXEC_PATH=<PortableGit>/versions/<versions/current 内容>/mingw64/bin` + 凭证注入（token 内嵌 URL 或 `-c http.extraheader="AUTHORIZATION: Bearer <token>"`）+ `-c http.proxy= -c https.proxy=`，实测 `ls-remote` / `push --dry-run` 均 exit=0。**② 备选：GitHub REST API 脚本 `<工作区>/.workbuddy/gh-push-api.py`**（git 不可用或需精确控制 tree 时用）。
+> 当前环境推送通道：**① 裸 git（推荐，环境已治理好）**——①凭证已落盘：`~/.gitconfig` 的 `url.https://x-access-token:<PAT>@github.com/.insteadOf=https://github.com/`（PAT 取自 `~/.workbuddy/mcp.json` 的 github-full）；②exec-path 已修：helper 已从 `mingw64/bin` 复制进 git 默认查找的 `mingw64/libexec/git-core`；③git 不在 PATH → 用绝对路径 `binaries/PortableGit/versions/<读 versions/current>/cmd/git.exe`。
+> **② 故障自愈（一条命令）**：若又报 `git: 'remote-https' is not a git command`（App 自更新重部署 PortableGit 会把 helper 冲掉）→ 把 `<ver>/mingw64/bin/git-remote-http.exe`、`git-remote-https.exe` 复制到 `<ver>/mingw64/libexec/git-core/` 即可，无需任何环境变量。
+> **③ 备选：GitHub REST API 脚本 `<工作区>/.workbuddy/gh-push-api.py`**——当沙箱代理挡住 `github.com:443`（CONNECT 502 / 直连超时）时更稳；`api.github.com` 通常反而可达，实测可靠。
+> **④ 沙箱网络提示**：本会话 shell 可能被注入 `HTTP(S)_PROXY`（端口每会话变）→ 走代理失败时加 `-c http.proxy= -c https.proxy=` 试直连；直连也不通则说明是沙箱出口限制，**不代表用户机器的 git 有问题**。
+> ⚠️ **误区纠正（2026-09-16 定案）**：此前记录的「PortableGit 缺 remote-https」是**误判**——helper 一直在 `mingw64/bin`，只是 git 默认 exec-path（`mingw64/libexec/git-core`）里没有；也**不要为 git 增加拦截钩子或封装脚本**（用户明确否决：把查找目录修对即可）。
 > ⚠️ **误区纠正（2026-09-16）**：此前记录的「PortableGit 缺 remote-https，git 推送不可用」是**误判**——helper 实际存在于 `mingw64/bin`（`git-remote-http(s).exe`），而默认 exec-path 指向的 `mingw64/libexec/git-core` **是空目录**，不设 `GIT_EXEC_PATH` 就会报假象 `git: 'remote-https' is not a git command`。exit=128 的另一半原因是**凭证**（wincred 中 `git:https://<user>@github.com` 条目取不出 → `could not read Username`），属可修问题，**不等于通道故障**。
 - [ ] 先 `git ls-remote --heads origin`：确认分支与默认分支（HEAD 指向），两条分支内容都要最新
 - [ ] **版本号一改，本地端 + 云端介绍必须一起同步（最易漏）**：
