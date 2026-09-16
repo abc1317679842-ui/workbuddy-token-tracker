@@ -11,7 +11,13 @@ type: skill
 - **Windows 10/11**：系统通知（toast）仅 Windows 支持；macOS/Linux 可正常手动使用（方式 A），但不弹通知。
 - **Node.js ≥ 20**：脚本零依赖单文件，无需 npm install。
 
-## 当前功能总览（v3.06 · 2026-09-12）
+## 当前功能总览（v3.07 · 2026-09-16）
+
+> **v3.07 要点（2026-09-16）：DeepSeek 官方价「跨 key 接管」——手动补录价不再永久锁死。**
+> - **背景**：用户手动补录 `deepseek-v4.1-flash`（1/0.02/4），而官方现行 API ID 是 `deepseek-flash`（页内「模型版本」= DeepSeek-V4.1-Flash）。旧逻辑只按官方 ID 精确匹配本地 key → **永远匹配不上** → 手动条目停在 `_manual_audit.status=pending-official`、`official:null`，且带 `manual`+`lock` 双标记被彻底冻结（`refresh-prices.js:468` 直接跳过覆盖）→ 官方再调价也不更新（静默用过期价）。
+> - **修复（deepseek-official.js）**：解析官方页「模型版本」行，用去标点归一化（`DeepSeek-V4.1-Flash` → `deepseekv41flash`）与本地 key/name 对齐；命中即判定同一模型 → ① 官方价**强制覆盖**手动价 ② 删除 `manual`/`manual_at`/`lock`（解冻）③ 打 `alias_of=<官方ID>`（保留本地 key 供运行时匹配，并豁免 retired 扫描）④ 写 `_manual_audit`（manual vs official + diff + `official-adopted`）。只接管「手动条目」或「已绑定别名的条目」，不做无差别改名。
+> - **配套（refresh-prices.js）**：官方价解析加别名回退 `official.official[m.alias_of]`——否则别名条目会落进聚合源分支、被 llmabacus 价覆盖掉刚写入的官方价；14 天清理同样豁免别名条目。
+> - **测试**：隔离 `WB_ROOT` 端到端（官方抓取 + `--force` 五源全成功）——接管后别名条目在聚合源刷新下**保持官方价不被劫持**；真实价库零误写；`--report` 计费回归正常。
 
 > **v3.06 要点（2026-09-11 深夜 ~ 09-12 凌晨）：弹窗系统性失效根修 + 解耦 + 全面测试加固。**
 >
@@ -315,6 +321,7 @@ type: skill
 - 如果用户只问某一天的消耗，也使用 `--report <日期>` 并原样贴出。
 - 如果用户问的是 summary（只要总合计，不要模型明细），才允许使用 `--report summary`，但同样必须贴出脚本输出，不得自行加工。
 - 任何情况下，禁止绕过脚本直接解析账本 JSON 后手工格式化输出。
+- **⚠️ 本条已有物理拦截（2026-09-12 起）**：`~/.workbuddy/hooks/pre-tool-guard.js` 会在 PreToolUse 层 deny 手工解析 `daily-usage.json` 的命令（Read/Write/Edit 直碰账本同样 deny）；技能维护调试需直读账本时，在命令中加 `WB_LEDGER_MAINT=1` 自证放行。
 
 ## 安装与启用（新用户必读：装完必须配 hooks 才自动弹通知）
 从技能市场安装 = 文件拷入 skills 目录，**不会自动挂 hook**。请让 WorkBuddy 助手帮你把下面配置合并进 `settings.json`（或手动添加）：
@@ -502,7 +509,34 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 | 弹窗提示「⚠价库8/31」/ 价库不刷新 | `WorkBuddy\2026-08-30-22-25-15\prices\.refresh.lock`（失败会常驻）+ `.refresh.error`（v2.82 起失败留档）+ `binaries/python/envs/default`（venv 是否有 requests） | 刷新失败首查 `.refresh.error` 内容；「python 环境」问题查 resolvePython 是否命中 venv（v2.82 根修：候选表必须含 venv 路径） |
 | 弹窗耗时与 WorkBuddy 显示差很多 | 本轮 trace 文件数量（`~/.workbuddy/traces/<pid>/` 同窗口几个 trace） | 长任务会分多个 trace 文件，v2.74 单文件口径只算最后一段（11:27 显示 4:22）；v2.82.1 起 = 最新 trace endedAt − 用户提交时刻（roundStart0），差 ≤1s |
 | 新模型计费明显不对 / 显示 unknown | `pricing.json` 对应条目 + `daily-usage.json` 模型名 | v2.82.2 起 findModel 为单向边界匹配：`glm-5.3-air` 不会撞 `glm-5` 的价；模型名缺失（`unknown`）只记 token 不记钱——若出现 unknown 条目，说明 transcript 的 `providerData.model` 缺失 |
+| 官方调价后本地价一直不更新 / 手动条目长期 `pending-official` | `pricing.json` 该条目（`manual`/`lock`/`alias_of`）+ `_manual_audit` | v3.07 起官方页「模型版本」行与本地 key/name 对齐后**跨 key 接管**（官方价覆盖手动价 + 解绑 `manual`/`lock` + 打 `alias_of`）。若仍 pending：① 「模型版本」列数与模型列数不一致 → 安全降级为纯 key 匹配（不猜测对齐）；② 官方现行 ID 与本地 key 同名时走常规精确匹配；③ `alias_of` 条目在聚合源刷新时靠 `official.official[m.alias_of]` 回退取官方价，若被 llmabacus 价覆盖说明该回退失效 |
 | 手动取消后不弹窗（v2.83+，v2.85 起实时补弹） | `token-tracker-toast.log`（搜 `cancelled-round-watch` / `cancelled-round-flush`）+ transcript 取消标记（`role=assistant`/`status=incomplete`/`error.message` = `Interrupted by user`） | v2.85 起每个新轮 hook spawn 轮级 watcher（`--round-watch`），取消标记收尾 + 8s 无新行即补弹，reason=`cancelled-round-watch`（有 usage）/`-est`（估算）/`-no-token`（无凭据）。若仍不弹：① 取消标记后直接跟 assistant 回复（续跑，设计内不弹）；② 轮已被结算（`lastStopAt ≥ roundStart`，防双弹退出）；③ 应用关闭时 watcher 被 Job Object 连带收割（失效边界，退回下一轮 hook 兜底 `cancelled-round-flush`） |
 | 专家团金额疑似翻倍（双记） | `.ledger-watermark.json` 各会话水位线 + 账本模型 token | v2.82.2 起 incrementalRecord 整体加 `.ledger-watermark.json.lock` 水位线锁，watcher 与 Stop 并发只记一次；仍翻倍则查是否锁被异常跳过（stderr 有「水位线保持不推进」则下轮会补记） |
 
 > ⚠️ **hooks 命令铁律**：所有 hook 命令必须保持**纯净的 `node` 调用**（如 `node C:/.../token-tracker.js --stop`），**禁止使用 `cmd /c` 包装或环境变量前缀**（如 `cmd /c "set X=1 && node ..."`）。此类包装会被 WorkBuddy 判为无效 hook 配置（`Invalid hook config`），导致整个事件组（Stop / UserPromptSubmit）跳过、进程瞬间失败且无任何日志产物。调试日志已改为弹窗时自动记录，无需通过环境变量或命令前缀开启。
+
+### 推送自检清单（2026-09-12 从全局记忆迁入；推送本技能到 GitHub 前逐项勾）
+> 仓库：`abc1317679842-ui/workbuddy-token-tracker`，默认分支 `main`（另有本地 master 线，两条线无共同祖先）。
+> 当前环境推送通道：**GitHub REST API 脚本 `<工作区>/.workbuddy/gh-push-api.py`**（PortableGit 缺 remote-https，git 推送不可用）。
+- [ ] 先 `git ls-remote --heads origin`：确认分支与默认分支（HEAD 指向），两条分支内容都要最新
+- [ ] **版本号一改，本地端 + 云端介绍必须一起同步（最易漏）**：
+  - 本地端（本 SKILL.md）：① 顶部「当前功能总览」版本号 + 新版本要点 ② 核心功能介绍（如需）③ 维护与排查速查表（新问题排查点）——不只改 changelog，总览头版本号常漏
+  - 云端（README.md）：① Version 徽章 ② 核心功能表新条目 ③ 版本历史 changelog
+- [ ] 对 master 与 main **各推送一次**（gh-push-api.py 按分支跑）
+- [ ] **推送后必须核验**：contents API 对比两分支各文件的 `size`/`sha` 一致——大文件 blob 曾单独返回空 `{}` 而脚本照样报"成功"（263KB 主文件实测踩过），核验只取 size/sha、不读 content
+- [ ] 两分支 `git diff <a> <b> --stat` 为空 = 一致
+- [ ] 临时分支用完清理（守卫拦删除就向用户说明）
+
+
+## 反借口表（2026-09-14 补）
+
+| 我会这么想 | 现实 |
+|---|---|
+| 数字差不多就行 | 账本只许技能自带入口读，禁手撸脚本解析 `daily-usage.json` |
+| 自己写个脚本解析更快 | PreToolUse 有物理拦截，绕过会被 deny |
+| 报个总消耗就够了 | 问账本必须跑 `--report` 并**原样贴出** 7 列 Markdown 表格 |
+| 金额估算随便填 | 走 `pricing.json` 口径，不自造单价 |
+| 这条没记上，算了 | 有行数水位线机制；缺记要查根因，不能放过 |
+| 表格列太多，精简一下 | 7 列一列都不能少，格式不许改 |
+
+**红旗（出现即停）**：手算费用；拿别处的数字代替账本；改了表格列或格式；绕过 `--report` 直接读原始文件。

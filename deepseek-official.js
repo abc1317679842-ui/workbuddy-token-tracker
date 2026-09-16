@@ -86,9 +86,26 @@ function parseOfficial(html) {
     if (c[0] === '模型' || c.includes('模型')) { header = c; break; }
   }
   if (!header) throw new Error('官方页未找到模型表头');
-  out.models = header.filter((s) => /^deepseek-v4-/.test(s));
-  if (!out.models.length) throw new Error('官方页未解析到 deepseek-v4 模型');
+  // v2.93：模型名过滤从 /^deepseek-v4-/ 放宽为 /^deepseek-/。
+  // 旧正则在官方上架 "deepseek-v4.1-flash" 这类**带点版本号**的模型时会静默漏掉它
+  // （第 12 个字符是 '.' 不是 '-'），而价格行的数字个数仍是全部模型的 → grab() 取前 n 个
+  // 会导致**其余模型价格整体错位**（v4-pro 拿到 v4.1 的价、vision-exp 拿到 v4-pro 的价），
+  // 且不报错。放宽后新模型名（v4.1 / v4-1 / 未来任意 deepseek-*）都能被自动收录。
+  out.models = header.filter((s) => /^deepseek-/.test(s));
+  if (!out.models.length) throw new Error('官方页未解析到 deepseek 模型');
   const n = out.models.length;
+
+  // v3.07（2026-09-16）：解析「模型版本」行（如 DeepSeek-V4.1-Flash）。
+  // 用途：官方现行 API ID 可能与本地 key 不同名（本地 deepseek-v4.1-flash ↔ 官方 deepseek-flash），
+  // 「模型版本」是这两者同属一个模型的权威依据 → 供 main() 做跨 key 接管。
+  // 列数与模型列不一致 → 视为不可用（返回空数组），退回纯 key 精确匹配，绝不猜测对齐。
+  let versions = [];
+  for (const t of trs) {
+    const c = cellText(t);
+    if (c[0] === '模型版本') { versions = c.slice(1).filter(Boolean); break; }
+  }
+  if (versions.length !== n) versions = [];
+  out.versions = versions;
 
   const grab = (tr, baseIdx) => {
     const c = cellText(tr);
@@ -157,6 +174,18 @@ function toModelBlock(prices, models, i) {
   };
 }
 
+// 去标点归一化（与 token-tracker.js 的 alnumKey 同口径）：DeepSeek-V4.1-Flash → deepseekv41flash
+function alnumOf(s) {
+  return String(s == null ? '' : s).toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+// 相对差异百分比（官方 vs 手动）：(official - manual) / manual × 100
+function pctDiff(manual, official) {
+  return (typeof manual === 'number' && manual !== 0 && typeof official === 'number')
+    ? Number((((official - manual) / manual) * 100).toFixed(2))
+    : null;
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const RAW = args.includes('--raw');
@@ -180,6 +209,21 @@ async function main() {
         parsed.models.forEach((mkey, i) => {
           const blk = toModelBlock(parsed.prices, parsed.models, i);
           const existing = pricing.models[mkey] || {};
+          // v2.92：官方源收录了先前手动补录的模型 → 先落一条对账记录（手动值 vs 官方值），
+          // 再由下方重建逻辑采信官方价（重建时不带 manual → 标记自然消失 = 交接到官方价）。
+          // 这样「手动补录」与「官方拉取」不需要人工比对，差异自动留痕可回查。
+          if (existing.manual === true) {
+            const official = { input_price: blk.input_price, cached_price: blk.cached_price, output_price: blk.output_price };
+            const manual = { input_price: existing.input_price, cached_price: existing.cached_price, output_price: existing.output_price };
+            const pct = (a, b) => (typeof a === 'number' && a !== 0 && typeof b === 'number') ? Number((((b - a) / a) * 100).toFixed(2)) : null;
+            const diff = { input_pct: pct(manual.input_price, official.input_price), cached_pct: pct(manual.cached_price, official.cached_price), output_pct: pct(manual.output_price, official.output_price) };
+            if (!Array.isArray(pricing._manual_audit)) pricing._manual_audit = [];
+            const rec = pricing._manual_audit.find((r) => r && r.model === mkey);
+            const patch = { manual, official, diff, status: 'official-adopted', adopted_at: new Date().toISOString() };
+            if (rec) Object.assign(rec, patch);
+            else pricing._manual_audit.push({ model: mkey, manual_at: existing.manual_at || null, source: existing.price_source || null, ...patch });
+            process.stderr.write(`[deepseek-official] ${mkey} 官方价已收录，手动补录价交接到官方价：${manual.input_price}/${manual.cached_price}/${manual.output_price} → ${official.input_price}/${official.cached_price}/${official.output_price}\n`);
+          }
           pricing.models[mkey] = {
             name: existing.name || mkey,
             input_price: blk.input_price,
@@ -195,9 +239,79 @@ async function main() {
           };
           delete pricing.models[mkey].retired; // 官方回归 → 解除 retired
         });
+        // 1.5) v3.07（2026-09-16）跨 key 接管：官方现行 API ID ≠ 本地 key 时，靠「模型版本」对齐。
+        // 场景：运行时上报 deepseek-v4.1-flash，官方现行 ID 是 deepseek-flash（版本 DeepSeek-V4.1-Flash）。
+        // 旧逻辑只按官方 ID 精确匹配本地 key → 永远匹配不上 → 手动条目永久 pending、lock 冻结永不更新。
+        // 现按去标点归一化的版本名与本地 key/name 对齐，命中即判定同一模型并：
+        //   ① 官方价覆盖手动价（用户要求：官方为准，手动设定不再生效）
+        //   ② 解除 manual / manual_at / lock（去掉冻结，此后每次刷新持续同步）
+        //   ③ 打 alias_of=<官方ID>（保留本地 key 供运行时匹配；并豁免 retired 扫描）
+        //   ④ 写 _manual_audit 留痕（manual vs official + diff + official-adopted）
+        // 只接管「手动补录条目」或「已绑定别名的条目」，不做无差别改名——避免误伤其他模型。
+        const versions = Array.isArray(parsed.versions) ? parsed.versions : [];
+        let aliasAdopted = 0;
+        parsed.models.forEach((mkey, i) => {
+          const vkey = alnumOf(versions[i]);
+          if (!vkey) return;
+          const blk = toModelBlock(parsed.prices, parsed.models, i);
+          for (const key of Object.keys(pricing.models)) {
+            if (key === mkey) continue;
+            const m = pricing.models[key];
+            if (!m || typeof m !== 'object') continue;
+            if (!(m.manual === true || m.alias_of === mkey)) continue;      // 只动手动/已绑定别名的条目
+            const byKey = alnumOf(key) === vkey;
+            const byName = alnumOf(m.name) === vkey;
+            if (!byKey && !byName) continue;
+            const manual = { input_price: m.input_price, cached_price: m.cached_price, output_price: m.output_price };
+            const official = { input_price: blk.input_price, cached_price: blk.cached_price, output_price: blk.output_price };
+            // ① 覆盖
+            m.input_price = official.input_price;
+            m.cached_price = official.cached_price;
+            m.output_price = official.output_price;
+            m.peak_multiplier = blk.peak_multiplier || 2;
+            m.price_source = 'deepseek官方';
+            m.region = 'CN';
+            // ② 解冻
+            delete m.manual;
+            delete m.manual_at;
+            delete m.lock;
+            delete m.retired;
+            // ③ 绑定官方 ID
+            m.alias_of = mkey;
+            // ④ 留痕
+            if (!Array.isArray(pricing._manual_audit)) pricing._manual_audit = [];
+            const rec = pricing._manual_audit.find((r) => r && r.model === key);
+            const patch = {
+              manual,
+              official,
+              diff: {
+                input_pct: pctDiff(manual.input_price, official.input_price),
+                cached_pct: pctDiff(manual.cached_price, official.cached_price),
+                output_pct: pctDiff(manual.output_price, official.output_price),
+              },
+              status: 'official-adopted',
+              adopted_at: new Date().toISOString(),
+              official_id: mkey,
+              official_version: versions[i],
+              matched_by: byKey ? 'key-version' : 'name-version',
+            };
+            if (rec) Object.assign(rec, patch);
+            else pricing._manual_audit.push({ model: key, manual_at: null, source: m.price_source || null, ...patch });
+            aliasAdopted++;
+            process.stderr.write(
+              `[deepseek-official] 跨 key 接管：本地 ${key} ≡ 官方 ${mkey}（版本 ${versions[i]}，按${byKey ? 'key' : 'name'}匹配）→ ` +
+              `官方价 ${manual.input_price}/${manual.cached_price}/${manual.output_price} → ${official.input_price}/${official.cached_price}/${official.output_price}，已解除手动+冻结标记\n`
+            );
+          }
+        });
         // 2) 本地 DeepSeek 系、官方清单没有的 → 标记 retired（保留历史账本，不再计费匹配）
         for (const key of Object.keys(pricing.models)) {
           const isDS = /(^|[\/\-_])deepseek/i.test(key);
+          // v2.92：手动补录条目豁免 retired——「官方暂未收录」不等于「官方已下线」。
+          // 否则新模型刚手工补价，次日刷新就被打成 retired（=不再计费），补录等于白做。
+          // v3.07：alias_of 条目同样豁免——它绑定了官方在售模型（只是本地 key 不同名），
+          // 若被打成 retired 会导致运行时该名查不到价（回退联网估算），故必须保留可计费。
+          if (pricing.models[key].manual === true || pricing.models[key].alias_of) continue;
           if (isDS && !officialSet.has(key)) {
             pricing.models[key].retired = true;
             if (!pricing.models[key].price_source) pricing.models[key].price_source = '聚合源(官方已下线)';
@@ -237,7 +351,7 @@ async function main() {
         delete pricing.last_refresh_error_at;
         savePricing(pricing);
       }
-      const out = { ok: true, official: {}, peak_schedule: rules.peak_schedule, weekend_off_peak: rules.weekend_off_peak, effective_at: rules.effective_at, fetched_at: new Date().toISOString() };
+      const out = { ok: true, official: {}, versions: parsed.versions || [], peak_schedule: rules.peak_schedule, weekend_off_peak: rules.weekend_off_peak, effective_at: rules.effective_at, fetched_at: new Date().toISOString() };
       parsed.models.forEach((mkey, i) => {
         out.official[mkey] = toModelBlock(parsed.prices, parsed.models, i);
       });

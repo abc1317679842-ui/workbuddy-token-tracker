@@ -404,7 +404,7 @@ async function main() {
     for (const key of Object.keys(models)) {
       const m = models[key];
       if (!m || typeof m !== 'object') continue;
-      if (m.lock === true) continue; // 冻结模型故意保留，不删
+      if (m.lock === true || m.alias_of) continue; // 冻结模型 / 官方别名条目 故意保留，不删
       const lu = lastUsed[key] || normUsed[norm(key)];
       // 护栏 A：仅删除「曾出现在 daily-usage 且最后使用超过 14 天」的模型；
       // 从未出现在 daily-usage（lastUsed=none，如新加/手动/未记账模型）一律保留。
@@ -455,7 +455,9 @@ async function main() {
       // v2.59（2026-08-23）：官方优先——DeepSeek 系模型若官方清单里有，直接用官方价
       //（官方页含空闲/高峰价 + 时段 + 周末低峰规则，聚合源只有高峰价且无周末规则）。
       // 官方没有的 DeepSeek 系（如已下线 V3 系列）→ 回落聚合源。
-      const officialBlk = officialOk && official.official[key];
+      // v3.07（2026-09-16）：别名条目（本地 key 与官方 ID 不同名，如 deepseek-v4.1-flash ↔ deepseek-flash）
+      // 也必须走官方价——否则会落进下面的聚合源分支，用 llmabacus 价覆盖掉 deepseek-official.js 刚写入的官方价。
+      const officialBlk = officialOk && (official.official[key] || (m.alias_of ? official.official[m.alias_of] : null));
       if (officialBlk) {
         m.input_price = officialBlk.input_price;
         m.cached_price = officialBlk.cached_price;
