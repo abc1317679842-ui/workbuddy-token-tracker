@@ -1150,7 +1150,13 @@ function aggregateTranscript(tsPath, roundStartMs) {
       }
     } catch (e) { /* subagents 读取失败：忽略子代理部分 */ }
   }
-  const sub = aggregateTranscLines(subRows, 0); // 子代理文件本身只属于本次专家团
+  // v3.13（2026-09-23）：子代理行**必须做行级时间戳过滤**（原先传 0 = 不过滤）。
+  //   根因实测：子代理文件被"唤醒/复用"时（如给旧成员发消息），文件 mtime 变新 → 被算作"本轮"，
+  //   但文件里**含更早轮次的行** → 不过滤会把旧行也算进本轮 → **弹窗数字偏大**
+  //   （真实数据实测：唤醒 agent-51c238cc 后，连续 5 轮各多算 82.0 万 token）。
+  //   ⚠️ 账本不受影响：账本走 `.ledger-watermark.json` 行数水位线，同一行只记一次；
+  //   本处只修"每次全量重算"的弹窗路径，使其与 `aggregateSubsOnly`（拆分路径）口径一致。
+  const sub = aggregateTranscLines(subRows, roundStartMs); // 子代理文件本身只属于本次专家团
   if (!main && !sub) return null;
   // v3.11：区分「主模型」与「子代理模型」（**仅供显示**）。历史根因：下面的 model 字段是
   //   `sub.model || main.model`（子代理优先）→ 团队轮标题显示成子代理模型（如 hy3），用户误以为自己的模型变了。
@@ -1458,6 +1464,38 @@ function hasActiveSubagentsSince(tsPath, sinceTs) {
 // pending 非空 = 还有子代理未完成/未回传 → 任务未结束，绝不能判 final。
 // 这比 hasActiveSubagentsSince（mtime 判据）可靠得多：子代理可能长思考停顿不写文件（实测停顿超 100 秒），
 // 但只要它还没发 completed/failed 通知，就绝不能判结束——mtime 判据在此场景会漏（v2.42 被用户实测击穿）。
+// v3.13（2026-09-23）：本轮子代理文件是否**全部已终止**（末行是 assistant 且非 incomplete）。
+//   用途：Stop 时若子代理"刚写过"（mtime 落在 20s 活跃窗内），但文件其实已写完（末行终止态），
+//   说明只差毫秒级写入时差（实测 01:45：文件 01:45:05.904 写完，Stop 在 01:45:05.2，差 0.7 秒）
+//   → 可走单条完整弹窗（含子代理 token），避免白拆两条。
+//   ⚠️ 严格要求"非 incomplete"：被取消/中断的子代理末行是 incomplete → **不放行**（宁拆不错，保证不漏 token）。
+//   ⚠️ 仅用于"微重判"配合：调用方还会复查 `subagentPending()`，双重确认后才走单条。
+function allInRoundSubFilesTerminal(tsPath, roundStartMs) {
+  try {
+    const dir = subagentsDirFromTranscript(tsPath);
+    const files = fs.readdirSync(dir).filter((f) => /^agent-.*\.jsonl$/i.test(f));
+    let any = false;
+    for (const f of files) {
+      const p = path.join(dir, f);
+      let mt = 0;
+      try { mt = fs.statSync(p).mtimeMs; } catch (e) { continue; }
+      if (mt <= roundStartMs) continue; // 非本轮的子代理文件 → 不参与判定
+      any = true;
+      const last = lastTranscLine(p);
+      if (!(last && last.type === 'message' && last.role === 'assistant' && last.status !== 'incomplete')) return false;
+    }
+    return any; // 本轮没有子代理文件 → 不算"已终止"，交给原有 mtime 判据
+  } catch (e) { return false; }
+}
+
+// 同步等待（不 spawn 子进程）：用 Atomics.wait 睡 ms 毫秒
+function sleepSync(ms) {
+  try {
+    const sab = new SharedArrayBuffer(4);
+    Atomics.wait(new Int32Array(sab), 0, 0, ms);
+  } catch (e) { /* 环境不支持则忽略（退化为不等待） */ }
+}
+
 function subagentPending(tsPath) {
   const spawned = new Set();
   const ended = new Set();
@@ -3975,8 +4013,25 @@ function main() {
         //   会导致本快速路径永不触发（真实会话实测 21 个子代理中 3 个 incomplete）。
         let teamDataReady = false;
         try {
-          teamDataReady = subagentPending(tsPath).length === 0
-            && !hasSubagentsRecentlyActive(tsPath, SUBAGENT_IDLE_MS);
+          // v3.13（2026-09-23）：原判据只看 mtime 活跃窗（20s）→ 子代理"刚写完但差 <20s"会被误判"仍在跑"，
+          //   白拆两条（实测 01:45：文件 01:45:05.904 写完，Stop 在 01:45:05.2，只差 0.7 秒）。
+          //   新增**有界微重判**：pending=0 且文件"刚活跃"时，最多重判 3 次（每次等 700ms，共 ~2.1s），
+          //   其间只要 `subagentPending()` 仍为 0 且**本轮子代理文件全部为终止态**（allInRoundSubFilesTerminal）
+          //   就放行**单条完整弹窗**（含子代理 token）。
+          //   ⚠️ 准确性优先：只有**全部**文件确认终止才放行；超预算仍未终止 → 走拆分兜底（绝不漏 token）。
+          //   关闭开关：环境变量 WB_NO_SUB_WAIT=1（用于测试或异常时快速回退）。
+          const pend0 = subagentPending(tsPath).length === 0;
+          const active0 = hasSubagentsRecentlyActive(tsPath, SUBAGENT_IDLE_MS);
+          teamDataReady = pend0 && !active0;
+          if (pend0 && active0 && process.env.WB_NO_SUB_WAIT !== '1') {
+            for (let i = 0; i < 3 && !teamDataReady; i++) {
+              sleepSync(700);
+              try {
+                teamDataReady = subagentPending(tsPath).length === 0 && allInRoundSubFilesTerminal(tsPath, aggStart0);
+              } catch (e) { teamDataReady = false; }
+              if (teamDataReady) appendCompactionLog('stop-sub-wait-resolved', { sid: effSid, tries: i + 1 });
+            }
+          }
         } catch (e) { teamDataReady = false; }
         if (isPlainRound || teamDataReady) {
           // 普通轮：同步立即弹（不 spawn、不等确认窗），并清掉 coalesce 以免被兜底二次补弹
