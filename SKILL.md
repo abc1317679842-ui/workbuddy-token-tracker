@@ -11,7 +11,44 @@ type: skill
 - **Windows 10/11**：系统通知（toast）仅 Windows 支持；macOS/Linux 可正常手动使用（方式 A），但不弹通知。
 - **Node.js ≥ 20**：脚本零依赖单文件，无需 npm install。
 
-## 当前功能总览（v3.07 · 2026-09-16）
+## 当前功能总览（v3.12 · 2026-09-23）
+
+> **v3.12 要点（2026-09-23）：异常轮拆分弹窗兜底——子代理仍在跑时先弹主模型，结束后补弹子代理。**
+> - **动机**：团队轮若在 Stop 那一刻子代理**仍在运行/卡死**，旧逻辑走 watcher → 弹窗延迟到"下一个事件"才出（实测延迟 1~10 分钟），若一直无事件则**永远不弹**。
+> - **实现**：Stop 新增第三分支（条件 `teamActive === true && !teamDataReady`）→ ① **立刻**弹【主模型】条（标注「子代理运行中」，**不 sleep/不轮询**：实测子代理落盘滞后 0.0 秒，等待无收益且 hook 超时预算未知）② 把 `mainToastedAt` 写进 coalesce ③ 仍启动 watcher。补弹路径（watcher 出口 + `--hook` 兜底）见到 `mainToastedAt` → **只弹【子代理】条**（reason `team-sub-only`）并清理 coalesce，**不重复计主模型**。
+> - **新增函数**：`aggregateMainOnly`（只聚合主转录）/ `aggregateSubsOnly`（只聚合子代理文件）/ `toastLineTagged`（第一行插标注，超宽放弃标注）。
+> - **实测（隔离 `WB_ROOT` + 真 CLI + 真实 transcript 复制件 + 真实 trace，`TOKEN_TRACKER_NO_TOAST=1`）**：
+>   - 普通轮 → 1 条无标注 ✓；团队轮·子代理已结束 → 1 条完整（v3.11 的「（子代理 X）」标注）✓
+>   - **异常轮 → Stop 弹主模型条 + 子代理结束后补弹【子代理】条** ✓；重复触发**不重复弹** ✓；coalesce 正确清理 ✓
+>   - 真实文件零改动（toast 日志行数/md5 前后一致）✓
+>   - 「子代理刚结束未满 20 秒」被误拆的频率：**真实数据 0/23**（子代理末行比主转录末行早 25~3974 秒）→ 误伤风险极低。
+> - **⚠️ 排查备忘（花了很久，记此）**：**补弹路径依赖 trace 文件存在**——在"沙箱未造 trace"的夹具里会测出"补弹不触发"，那是**夹具缺失的假象**，非代码缺陷。下次排查同类问题先确认 trace 是否齐备。
+> - **紧急开关**：`WB_TEAM_SPLIT=0` → 回到 v3.11 行为（异常轮仍走 watcher，延迟但最终弹一条完整的）。
+> - **已知依赖**：`aggregateSubsOnly` 仅按**文件 mtime** 过滤"本轮"子代理；若 mtime 被外部改动（备份还原/复制），可能把旧轮用量算进来（建议后续加内部 timestamp 二次过滤）。
+
+> **v3.11 要点（2026-09-23）：弹窗第一行改为「主模型（子代理 X）」。**
+> - **根因**：聚合出口 `aggregateTranscript`（约 :1158）的 `model: (sub && sub.model) || (main && main.model) || ''` —— **子代理模型优先于主模型**，团队轮标题因此显示成 `hy3`（子代理用的混元3），用户误以为"我用的模型变了/计费错了"。**同时**该 `model` 字段还被 `calcCost`（:2197）用来取价目表算全轮费用。
+> - **修法（只动显示，不碰计费）**：新增 `modelMain`（主转录主导模型）与 `subModels`（子代理模型，按 token 降序去重）两个字段；`shortModelName` 显示时优先取 `modelMain`；`toastLine1` 在第一行模型名后追加 `（子代理 X）`。
+> - **显示规则（用户 2026-09-23 定稿）**：① 第一个**必须是主模型**；② 第一行**最多两个模型名**（主 + 1 个子代理，多余只标「等」）；③ **子代理模型与主模型相同时不标注**；④ 超宽**先截断子代理段**，预算不足则整段丢弃（主模型完整保留）；⑤ 仅动第一行，耗时/今日/余额/输入输出那两行不变。
+> - **⚠️ 绝不能改的**：`stat.model` 保持原样（`sub.model` 优先）——`calcCost` 用它取价目表，改了会让费用静默换价目表。
+> - **实测（真 CLI + 隔离 WB_ROOT + `TOKEN_TRACKER_NO_TOAST=1`，读真实生成的弹窗日志）**：真实团队轮 → `deepseek-v4.1-flash（子代理 hy3）`（宽 33 ≤45）；合成 5 用例全过（无子代理不标注 / 同模型不标注 / 子代理超长名截断至 43 / 主模型超长截断至 45）；真实文件零改动。
+> - **附带发现（未修，待定）**：团队轮的弹窗**费用**仍按 `stat.model`（=子代理模型）单一价目表计算全轮 token —— 主模型与子代理价差大时会偏。账本按模型分桶记账，**不受影响**；仅弹窗那个 ¥ 是近似值。
+
+> **v3.10 要点（2026-09-22，经两名独立验证员复核后定稿）：两处「改这里引出那里」的修正。**
+> - **① 取消否决条件改为「精确编辑重发匹配」（推翻 v3.08 的"完成行否决"）**：独立验证员全库分类 247 处取消标记 → **E=12**（有精确 `resend-fork-notice` 匹配 = 真编辑重发）／**C=208**（**无** resend、标记后先出现普通用户提问再出现完成行 = **真取消 + 用户随后又提问**）／U=27。按 v3.08 的"其后有完成行即否决"计算，**误杀率 = 208/220 = 94.5%** —— 后果正是 v2.83 治过的病（取消轮不补弹 → token 静默并入下一轮；第三方证据：日志里 42 条 `cancelled-*` 弹窗、23 个 C 类样本在取消后 7~31 秒确曾正常补弹）。**现改为**：取标记之前最近一条 `role==='user'` 消息的 `id`，全文找 `type==='resend-fork-notice'` 且 `editedUserItemId === 该 id` 才否决。实测：事故（E 类）仍被正确否决，C 类真取消（1686e062=6 个 / a24fe947=3 个 / 9d97d713=5 个）恢复识别。
+> - **② 修复D 加"子代理活跃"兜底（修 BUG-1，独立验证员发现）**：修复D 原判据只看 `subagentPending().length===0`，但该函数在 **Agent 调用取不到可解析 name 时（中文团队/无 name 字段）会假空返回 []**（本文件 v2.47 注释早已记录同源问题）→ 会导致 ①本轮弹窗少算仍在跑的子代理用量 ②推进 `lastStopAt` 后子代理后续输出再无 watcher 接管（弹窗丢失；账本不受影响）。**现复用本文件既有的 `hasSubagentsRecentlyActive(tsPath, SUBAGENT_IDLE_MS=20s)`**（:1462，原本就用于 pending 假空兜底）作为第二道判据。⚠️ 不要改用"子代理末行是否都已收尾"——被取消/中断的子代理文件末行永远是 `incomplete`（真实会话实测 21 个子代理中 3 个如此），那样会让本快速路径永不触发。
+> - **验证实证**：真实团队轮 `pending=0 && recentlyActive=false` → `teamDataReady=true`（快速路径生效）；反向对照（30 天窗口）返回 true，证明该函数确按 mtime 判定。另经复核：**轮次边界无偏差、不会同轮双弹、no-token 推进 `lastStopAt` 端到端通过、`interruptedByUser` 不漏检**。
+
+> **v3.09 要点（2026-09-22 深夜，已被 v3.10 修正）：撤回 v3.08 的 `skipRun` 判据（前提被实证推翻）；修团队轮弹窗延迟（修复D）。**
+> - **撤回 `skipRun` 判据（重要，勿再犯）**：v3.08 曾用「标记行 `skipRun===true` → 非取消」，其前提（skipRun = 编辑重发特征）**已被全库实证推翻**——扫描 207 个 transcript（274 MB），命中正规取消标记 **183 处，183/183 全部带 `providerData.skipRun=true`**。它是应用中止在飞请求的**通用字段**（用户点停止 / 编辑重发 / 分叉 都会写），**据此排除会 100% 灭掉真实取消检测**。现已删除该判据并就地注释固化证据。⚠️ 注意字段实际位于 **`providerData.skipRun`**（非顶层 `r.skipRun`）——v3.08 的实现因路径写错恰好空转未酿祸，但属**地雷**。保留有效的「后续完成行即否决」。
+> - **修复D：团队轮弹窗时效（可能延迟 1~10 分钟、甚至不弹）**。根因：Stop 时若判为团队轮（`subCount>0 || teamActive`）→ 写 coalesce + `startWatcherVerified` spawn watcher；而 watcher 的降级兜底**只在「spawn 未接管」时触发**，覆盖不了「**spawn 成功但随后被宿主进程收割**」（现场遗留 `.coalesce-*.json.lock`、无 toast）→ 只能等下一轮 `--hook` 补弹。实测 2026-09-22 三连：23:21:33 / 23:33:42 / 23:47:34 三条团队轮弹窗**全部**靠 `hook-fallback` 补出，延迟 1~10 分钟。修法：Stop 时若 `subagentPending(tsPath).length === 0`（子代理已全部收尾 = 数据已齐）→ **直接走同步立即弹窗**，不再 spawn watcher。实测该团队轮 transcript 的 pending = 0 → 三连延迟全部消除；账本不受影响（走行数水位线），受损的只是弹窗时效。
+
+> **v3.08 要点（2026-09-22）：修复「未取消却弹（手动取消）」的取消误判。**（⚠️ 本段所述 `skipRun` 判据已被 v3.09 撤回，见上条；实际生效的是「后续完成行即否决」+「no-token 分支推进 lastStopAt」）
+> - **根因（实测会话 b017080d-78d5-441a-9e33-fa89a0902c6d，2026-09-22 23:10~23:22）**：用户编辑后重发/分叉消息时，应用会**中止在飞请求并写一个通用中断标记**（`role=assistant`/`status=incomplete`/`error.message="Interrupted by user"`/`skipRun=true`），主轮之后继续正常跑到完成——**主轮从未被用户取消**。但兜底判定把这条标记当成「用户手动取消」：
+>   ① 该标记带 `skipRun=true`，旧逻辑未排除；② 标记之后主轮**正常完成**，旧逻辑却在遇到注入型 `user`（task-notification）行时 `break` 直接采信标记、根本没检查到后续的完成行；③ 23:10:09 的 Stop 走 no-token 分支**不推进 `lastStopAt`**（停在 23:06:05），导致 23:21 注入行唤起兜底时 `intrInfo.ts > lastStopAt` 仍成立 → 误弹「（手动取消）」，整轮 10m31s 被错标。
+> - **修复 1（治本·收窄取消判据，`interruptedRowsAfter` / `interruptedByUser`）**：(a) 命中标记行若 `skipRun===true` 一律不认定为取消；(b) 命中后**扫完全部后续行**，只要存在任意「正常完成」的 `assistant`（`status!=='incomplete'`）行即判非取消、返回空——不再中途 break 采信标记；(c) 注入型 `user` 行不参与 break/续跑判断。真实取消（标记无 `skipRun` 且其后无完成行）仍必识别。
+> - **修复 2（堵触发链·no-token 分支推进 `lastStopAt`）**：no-token Stop 返回前同样 `saveSnapshot` 写入 `lastStopAt: Date.now()`，使后续注入行唤起兜底时 `intrInfo.ts > lastStopAt` 不再成立，从根上断掉「旧标记被注入行复活」的链条。两处修复独立即可挡住本次事故。
+> - **验证**：`WB_ROOT` 隔离回放真实事故 transcript → 不再误判；合成「标记无 skipRun、其后无完成行」→ 仍识别为取消；普通轮/重复弹回归正常；真实账本与价库 md5 零改动。
 
 > **v3.07 要点（2026-09-16）：DeepSeek 官方价「跨 key 接管」——手动补录价不再永久锁死。**
 > - **背景**：用户手动补录 `deepseek-v4.1-flash`（1/0.02/4），而官方现行 API ID 是 `deepseek-flash`（页内「模型版本」= DeepSeek-V4.1-Flash）。旧逻辑只按官方 ID 精确匹配本地 key → **永远匹配不上** → 手动条目停在 `_manual_audit.status=pending-official`、`official:null`，且带 `manual`+`lock` 双标记被彻底冻结（`refresh-prices.js:468` 直接跳过覆盖）→ 官方再调价也不更新（静默用过期价）。
@@ -511,6 +548,7 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 | 新模型计费明显不对 / 显示 unknown | `pricing.json` 对应条目 + `daily-usage.json` 模型名 | v2.82.2 起 findModel 为单向边界匹配：`glm-5.3-air` 不会撞 `glm-5` 的价；模型名缺失（`unknown`）只记 token 不记钱——若出现 unknown 条目，说明 transcript 的 `providerData.model` 缺失 |
 | 官方调价后本地价一直不更新 / 手动条目长期 `pending-official` | `pricing.json` 该条目（`manual`/`lock`/`alias_of`）+ `_manual_audit` | v3.07 起官方页「模型版本」行与本地 key/name 对齐后**跨 key 接管**（官方价覆盖手动价 + 解绑 `manual`/`lock` + 打 `alias_of`）。若仍 pending：① 「模型版本」列数与模型列数不一致 → 安全降级为纯 key 匹配（不猜测对齐）；② 官方现行 ID 与本地 key 同名时走常规精确匹配；③ `alias_of` 条目在聚合源刷新时靠 `official.official[m.alias_of]` 回退取官方价，若被 llmabacus 价覆盖说明该回退失效 |
 | 手动取消后不弹窗（v2.83+，v2.85 起实时补弹） | `token-tracker-toast.log`（搜 `cancelled-round-watch` / `cancelled-round-flush`）+ transcript 取消标记（`role=assistant`/`status=incomplete`/`error.message` = `Interrupted by user`） | v2.85 起每个新轮 hook spawn 轮级 watcher（`--round-watch`），取消标记收尾 + 8s 无新行即补弹，reason=`cancelled-round-watch`（有 usage）/`-est`（估算）/`-no-token`（无凭据）。若仍不弹：① 取消标记后直接跟 assistant 回复（续跑，设计内不弹）；② 轮已被结算（`lastStopAt ≥ roundStart`，防双弹退出）；③ 应用关闭时 watcher 被 Job Object 连带收割（失效边界，退回下一轮 hook 兜底 `cancelled-round-flush`） |
+| 未取消却弹「（手动取消）」（v3.08 修复的误判） | 该轮 transcript（搜 `Interrupted by user`）+ 取消标记那一行是否带 `skipRun=true` + 标记之后是否存在「正常完成」的 assistant 行 + `~/.workbuddy/<proj>/token-tracker/<sid>/snapshot.json` 的 `lastStopAt` | v3.08 起：① 标记行 `skipRun===true`（应用中止在飞请求/编辑重发分叉，非用户取消）→ 不算取消；② 标记之后任意位置存在 `role=assistant` 且 `status!=='incomplete'` 的完成行 → 该轮已继续完成，不算取消；③ no-token Stop 已推进 `lastStopAt`，`intrInfo.ts > lastStopAt` 不成立则兜底不触发。若仍误弹：核查标记行是否确为 `skipRun=true` 且其后有完成行——若是而仍误判，说明兜底 `intrInfo.ts > lastStopAt` 校验没挡住（lastStopAt 陈旧），检查 no-token 分支是否真的写了快照 |
 | 专家团金额疑似翻倍（双记） | `.ledger-watermark.json` 各会话水位线 + 账本模型 token | v2.82.2 起 incrementalRecord 整体加 `.ledger-watermark.json.lock` 水位线锁，watcher 与 Stop 并发只记一次；仍翻倍则查是否锁被异常跳过（stderr 有「水位线保持不推进」则下轮会补记） |
 
 > ⚠️ **hooks 命令铁律**：所有 hook 命令必须保持**纯净的 `node` 调用**（如 `node C:/.../token-tracker.js --stop`），**禁止使用 `cmd /c` 包装或环境变量前缀**（如 `cmd /c "set X=1 && node ..."`）。此类包装会被 WorkBuddy 判为无效 hook 配置（`Invalid hook config`），导致整个事件组（Stop / UserPromptSubmit）跳过、进程瞬间失败且无任何日志产物。调试日志已改为弹窗时自动记录，无需通过环境变量或命令前缀开启。

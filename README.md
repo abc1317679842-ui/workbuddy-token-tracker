@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.07-blue)
+![Version](https://img.shields.io/badge/version-v3.12-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -189,6 +189,51 @@ Windows 设置 → 系统 → 通知 → 应用通知
 本技能的 toast 使用**独立应用名「WorkBuddy Token Tracker」** 直接调用 Windows 系统通知 API 弹出，**不经过 WorkBuddy 客户端设置**——关闭 WorkBuddy 自带通知**不影响 Token 通知**。若想连 Token 通知一起关：在通知列表单独关闭「WorkBuddy Token Tracker」即可。
 
 ## 更新记录（Changelog）
+
+### v3.12（2026-09-23）—— 异常轮拆分弹窗兜底（先主模型、后补子代理）
+
+**问题**：团队轮若在 Stop 时子代理**仍在运行/卡死**，旧逻辑会把弹窗推迟到"下一个事件"（实测延迟 1~10 分钟），若无后续事件则**永远不弹**。
+
+**实现**：Stop 新增第三分支 —— 判定"子代理仍在跑"时 **立刻弹【主模型】条**（第一行标注「子代理运行中」），并把 `mainToastedAt` 写入 coalesce；等子代理结束后由 watcher / `--hook` 兜底**补弹【子代理】条**（`team-sub-only`），不重复计主模型。**不引入任何阻塞等待**（实测子代理落盘滞后 0.0 秒，等待无收益）。新增 `aggregateMainOnly` / `aggregateSubsOnly` / `toastLineTagged`。
+
+**实测**（隔离 `WB_ROOT` + 真 CLI + 真实 transcript/trace 复制件）：普通轮 1 条无标注 ✓；团队轮子代理已结束 1 条完整 ✓；**异常轮 = 主模型条 + 补弹子代理条** ✓；重复触发不重复弹 ✓；真实文件零改动 ✓；"子代理刚结束未满 20 秒"误拆频率 0/23。
+
+**紧急开关**：`WB_TEAM_SPLIT=0` 回到 v3.11 行为。**排查备忘**：补弹依赖 trace 文件存在，缺 trace 的沙箱会误报"补弹不触发"。
+
+### v3.11（2026-09-23）—— 弹窗第一行改为「主模型（子代理 X）」
+
+**问题**：团队轮（专家团/子代理）的弹窗标题显示成**子代理用的模型**（如 `hy3`），用户误以为自己的模型变了或计费错了。根因：聚合出口 `aggregateTranscript` 的 `model: (sub && sub.model) || (main && main.model)` —— **子代理模型优先**。
+
+**修法（只动显示，不碰计费）**：新增 `modelMain` / `subModels` 两个字段；`shortModelName` 优先取 `modelMain`；`toastLine1` 在第一行追加 `（子代理 X）`。规则：主模型永远在前；第一行最多两个模型名（多余标「等」）；子代理与主模型相同则不标注；超宽先截子代理段，预算不足整段丢弃。`stat.model` **保持原样**（`calcCost` 用它取价目表，不可改）。
+
+**实测**（真 CLI + 隔离 `WB_ROOT` + 静默开关）：真实团队轮 → `deepseek-v4.1-flash（子代理 hy3）`；合成 5 用例全过（含超长名截断至 ≤45 宽）；真实文件零改动。
+
+**已知近似（未修）**：团队轮弹窗的 ¥ 仍按单一价目表算全轮 token；账本按模型分桶记账不受影响。
+
+### v3.10（2026-09-22）—— 两名独立验证员复核后的两处修正
+
+**① 取消否决改为「精确编辑重发匹配」**（推翻 v3.09/v3.08 的"完成行否决"）：全库分类 247 处取消标记 → E=12（精确 `resend-fork-notice` 匹配＝真编辑重发）／C=208（无 resend、标记后先有普通用户提问再有完成行＝**真取消 + 用户随后又提问**）／U=27。按"完成行否决"计算**误杀率 94.5%（208/220）**，后果是取消轮不补弹 → token 静默并入下一轮（v2.83 治过的病；第三方证据：日志 42 条 `cancelled-*`、23 个 C 类样本取消后 7~31 秒确曾正常补弹）。现改为：标记前最近一条 user 消息的 `id` 与某条 `resend-fork-notice.editedUserItemId` 精确相等才否决。实测事故（E）仍被挡住、C 类真取消恢复识别。
+
+**② 修复D 增「子代理活跃」兜底**（修 BUG-1）：原判据只看 `subagentPending().length===0`，而该函数在 **Agent 调用取不到可解析 name（中文团队/无 name）时假空返回 []** → 会提前弹窗、少算子代理用量，且推进边界后子代理后续输出再无人接管（弹窗丢失；账本不受影响）。现复用本文件既有的 `hasSubagentsRecentlyActive(tsPath, SUBAGENT_IDLE_MS=20s)` 作为第二道判据。⚠️ 勿改用"子代理末行都已收尾"——被取消的子代理末行永远是 `incomplete`，会让快速路径永不触发。
+
+**复核结论**：轮次边界无偏差、不会同轮双弹、no-token 推进 `lastStopAt` 端到端通过、`interruptedByUser` 不漏检。
+
+### v3.09（2026-09-22）—— 撤回 skipRun 判据 + 修复团队轮弹窗延迟/不弹（已被 v3.10 修正，见上）
+
+**① 撤回 v3.08 的 `skipRun` 判据（前提被实证推翻）**：v3.08 曾按「标记行 `skipRun===true` → 非取消」排除，依据是"skipRun = 编辑重发特征"。全库实测推翻了它——扫描 207 个 transcript（274 MB），命中正规取消标记 **183 处，183/183 全部带 `providerData.skipRun=true`**。该字段是应用中止在飞请求的**通用字段**（点停止/编辑重发/分叉都会写），据此排除会 **100% 灭掉真实取消检测**。已删除该判据并就地注释固化证据。（另注意：字段位于 `providerData.skipRun`，v3.08 误写成顶层 `r.skipRun`，恰好空转未酿祸。）
+
+**② 修复团队轮弹窗时效（此前可能延迟 1~10 分钟甚至不弹）**：Stop 判定为团队轮时走 coalesce + watcher；而 watcher 的降级兜底只在「spawn 未接管」时触发，**覆盖不了「spawn 成功但随后被宿主进程收割」**（现场遗留 `.coalesce-*.json.lock`、无 toast）→ 只能等下一轮 `--hook` 补弹。实测三条团队轮弹窗全部靠 `hook-fallback` 补出（延迟 1~10 分钟）。修法：Stop 时若 `subagentPending(tsPath).length === 0`（子代理已全部收尾 = 数据已齐）→ **直接同步立即弹窗**，不再 spawn watcher。实测该场景 pending=0，延迟全部消除；账本不受影响。
+
+### v3.08（2026-09-22）—— 修复「未取消却弹（手动取消）」的取消误判 ⚠️（其中 `skipRun` 判据已被 v3.09 撤回；实际生效的是「后续完成行即否决」+「no-token 分支推进 lastStopAt」）
+
+**问题**：2026-09-22 实测会话 b017080d-…：用户编辑后重发/分叉消息时，应用中止在飞请求并写一个通用中断标记（`role=assistant`/`status=incomplete`/`error.message="Interrupted by user"`/`skipRun=true`），主轮之后继续正常跑到完成——主轮从未被取消。但兜底判定把这条标记误判为「用户手动取消」，整轮 10m31s 被错标「（手动取消）」。根因三重叠加：① 命中标记行带 `skipRun=true`，旧逻辑未排除；② 标记之后主轮正常完成，旧逻辑遇到注入型 `user`（task-notification）行就 `break` 直接采信标记、没检查到后续完成行；③ 23:10:09 的 Stop 走 no-token 分支不推进 `lastStopAt`，导致 23:21 注入行唤起兜底时 `intrInfo.ts > lastStopAt` 仍成立。
+
+**修复**：
+- `interruptedRowsAfter` / `interruptedByUser`：命中标记行若 `skipRun===true` 一律不认定取消；命中后扫完全部后续行，只要存在任意「正常完成」的 `assistant`（`status!=='incomplete'`）行即判非取消、返回空；注入型 `user` 行不参与 break/续跑判断（治本）。
+- no-token Stop 分支返回前同样 `saveSnapshot` 写入 `lastStopAt: Date.now()`，使后续注入行唤起兜底时 `intrInfo.ts > lastStopAt` 不再成立（堵触发链）。
+- 真实取消（标记无 `skipRun` 且其后无完成行）仍必识别，不漏。
+
+**验证**：`WB_ROOT` 隔离回放真实事故 transcript → 不再误判；合成「标记无 skipRun、其后无完成行」→ 仍识别为取消；普通轮/重复弹回归正常；真实账本与价库 md5 零改动。
 
 ### v3.07（2026-09-16）—— DeepSeek 官方价「跨 key 接管」：手动补录价不再永久锁死
 

@@ -185,6 +185,7 @@ function writeCoalesce(sid, agg, meta) {
     if (meta.roundStart) payload.roundStart = meta.roundStart;
     if (meta.byModel) payload.byModel = meta.byModel;       // v2.39：专家团按模型分桶明细（watcher 记账用）
     if (meta.terminalError) payload.terminalError = meta.terminalError; // v2.57：主模型终态错误标记（429/5xx/timeout），供 watcher 首查感知
+    if (typeof meta.mainToastedAt === 'number') payload.mainToastedAt = meta.mainToastedAt; // v3.12：异常轮主模型已先弹标记（供补弹判断不重复）
   }
   try { fs.writeFileSync(coalescePath(sid), JSON.stringify(payload)); }
   catch (e) { process.stderr.write(`[token-tracker] 合并文件写入失败: ${e.message}\n`); }
@@ -1151,11 +1152,26 @@ function aggregateTranscript(tsPath, roundStartMs) {
   }
   const sub = aggregateTranscLines(subRows, 0); // 子代理文件本身只属于本次专家团
   if (!main && !sub) return null;
+  // v3.11：区分「主模型」与「子代理模型」（**仅供显示**）。历史根因：下面的 model 字段是
+  //   `sub.model || main.model`（子代理优先）→ 团队轮标题显示成子代理模型（如 hy3），用户误以为自己的模型变了。
+  //   ⚠️ 但 `model` 字段**不能改**——`calcCost`（:2197）用它取价目表算全轮费用，改了会让费用静默换价目表。
+  //   因此新增 modelMain（主转录主导模型）与 subModels（子代理模型，按 token 降序去重）专供弹窗显示。
+  const subModels = (() => {
+    try {
+      const m = perModelFromRows(subRows, 0);
+      return Object.entries(m)
+        .filter(([n, b]) => n && b && b.total > 0)
+        .sort((a, b) => b[1].total - a[1].total)
+        .map(([n]) => n);
+    } catch (e) { return []; }
+  })();
   const res = {
     in: (main ? main.in : 0) + (sub ? sub.in : 0),
     out: (main ? main.out : 0) + (sub ? sub.out : 0),
     cached: (main ? main.cached : 0) + (sub ? sub.cached : 0),
     model: (sub && sub.model) || (main && main.model) || '',
+    modelMain: (main && main.model) || (sub && sub.model) || '',
+    subModels,
     count: (main ? main.count : 0) + (sub ? sub.count : 0),
     subCount: sub ? sub.count : 0,
     // v2.28：本轮主 transcript 是否有专家团活动（子代理文件未落盘也能识别）
@@ -1166,6 +1182,51 @@ function aggregateTranscript(tsPath, roundStartMs) {
   const lastTs = Math.max(main ? main.lastTs : 0, sub ? sub.lastTs : 0);
   res.durMs = Math.max(0, lastTs - (firstTs || lastTs));
   return res;
+}
+
+// v3.12（异常轮拆分弹窗兜底）：只聚合【主转录】——异常轮 Stop 时子代理仍在跑，先弹主模型条用。
+//   复用 aggregateTranscLines(readTranscLines(tsPath), roundStartMs)，返回形状与 aggregateTranscript 一致
+//   （model/in/out/cached/total/durMs/count…）；不带 subModels（避免 toastLine1 显示成"子代理标注"）。
+function aggregateMainOnly(tsPath, roundStartMs) {
+  try { return aggregateTranscLines(readTranscLines(tsPath), roundStartMs); }
+  catch (e) { return null; }
+}
+
+// v3.12：只聚合【子代理文件】（subagents/agent-*.jsonl 中 mtime > roundStartMs 的），用于异常轮补弹"子代理部分"。
+//   返回形状同 aggregateTranscript：model 用子代理主导模型（按 token 最多），subModels 填子代理模型列表；
+//   不含主模型用量（否则与主模型条重复）。
+function aggregateSubsOnly(tsPath, roundStartMs) {
+  const subDir = subagentsDirFromTranscript(tsPath);
+  if (!fs.existsSync(subDir)) return null;
+  let subRows = [];
+  try {
+    for (const f of fs.readdirSync(subDir)) {
+      if (!/^agent-.*\.jsonl$/i.test(f)) continue;
+      const fp = path.join(subDir, f);
+      let mt = 0;
+      try { mt = fs.statSync(fp).mtimeMs; } catch (e2) { continue; }
+      if (mt <= roundStartMs) continue; // 本轮之前创建的子代理（上一轮专家团）→ 排除
+      subRows = subRows.concat(readTranscLines(fp));
+    }
+  } catch (e) { return null; }
+  if (!subRows.length) return null;
+  // v3.12.1 加固（2026-09-23）：原先两处都传 0（=不做内部时间戳过滤），仅靠文件 mtime 归属本轮——
+  //   若 mtime 被外部改动（备份还原 / 复制文件），会把**旧轮**的行也算进来（实测：夹具出现"耗时 301 小时"、
+  //   金额被放大）。改为传 roundStartMs 做**行级 timestamp 二次过滤**，与主聚合口径一致。
+  const sub = aggregateTranscLines(subRows, roundStartMs);
+  if (!sub) return null;
+  // 主导模型：按 token 最多；subModels 列表（同样按行级 timestamp 过滤）
+  const byModel = perModelFromRows(subRows, roundStartMs);
+  const subModels = Object.entries(byModel)
+    .filter(([n, b]) => n && b && b.total > 0)
+    .sort((a, b) => b[1].total - a[1].total)
+    .map(([n]) => n);
+  const dominant = subModels.length ? subModels[0] : sub.model;
+  return {
+    in: sub.in, out: sub.out, cached: sub.cached, total: sub.total,
+    model: dominant, modelMain: dominant, subModels,
+    count: sub.count, durMs: sub.durMs, firstTs: sub.firstTs, lastTs: sub.lastTs, reasoning: sub.reasoning,
+  };
 }
 
 // watcher 用：roundStart 后是否有 timestamp > sinceMs 的新调用（主 transcript）或子代理文件 mtime > sinceMs
@@ -1498,17 +1559,32 @@ function interruptedRowsAfter(rows, roundStartMs) {
     const isCancel = r.role === 'assistant' && r.status === 'incomplete'
       && r.providerData && r.providerData.error
       && /^Interrupted by user$/i.test(String(r.providerData.error.message || '').trim());
-    if (isCancel && (Number(r.timestamp) || 0) > (roundStartMs || 0)) { out.push({ ts: Number(r.timestamp), idx: i }); lastIdx = i; }
+    // ⚠️ 勿用 providerData.skipRun 作取消判据（2026-09-22 全库实证）：207 个 transcript 中
+    //    183/183 条真实取消标记**全部**带 providerData.skipRun=true —— 它是应用中止在飞请求时的
+    //    通用字段（用户点停止 / 编辑重发 / 分叉 都会写），**不是"编辑重发"的特征**。
+    //    据此排除会 100% 灭掉真实取消检测。真正有效的是下方"后续完成行即否决"（修复1b）。
+    if (isCancel && (Number(r.timestamp) || 0) > (roundStartMs || 0)) {
+      out.push({ ts: Number(r.timestamp), idx: i }); lastIdx = i;
+    }
   }
   if (lastIdx >= 0) {
-    // v2.84 续跑判定：取消标记之后必须【先出现新的 user 消息再出现 assistant 回复】才算新轮次
-    //（正常流程：取消 → 用户发新问题 → 模型回答新问题 → 这不是续跑，取消轮应补弹）。
-    // 只有取消标记之后【直接】出现 assistant 回复（中间没有 user 消息分隔）→ 才是续跑，不补弹。
-    for (let j = lastIdx + 1; j < rows.length; j++) {
-      const r2 = rows[j];
-      if (!r2 || r2.type !== 'message') continue;
-      if (r2.role === 'user') break; // 新提问出现 → 后续 assistant 属于新轮次，取消轮确已终止
-      if (r2.role === 'assistant') return []; // 取消后直接跟 assistant 回复（无新提问）→ 续跑，不补弹
+    // v3.10 关键修正（2026-09-22 全库实证）：否决条件**只能**是"该轮被编辑重发/分叉"，不能是"其后有完成行"。
+    //   证据：247 处取消标记分类 → E=12（有精确 resend-fork 匹配 = 真编辑重发）、
+    //   C=208（**无** resend、标记后先出现普通用户提问、再出现完成行 = 真取消 + 用户随后又提问）、U=27。
+    //   若按"后续有完成行"否决，误杀率 = 208/220 = **94.5%**，后果正是 v2.83 治过的病：
+    //   取消轮不补弹 → 其 token 静默并入下一轮（历史实证 108.7 万并入下轮、显示 25m3s）。
+    //   现改为精确匹配：取标记之前最近一条 role==='user' 消息的 id，全文找 type==='resend-fork-notice'
+    //   且 editedUserItemId 等于该 id 的行 → 命中才否决（2026-09-22 事故正是此形态，仍被挡住）。
+    let prevUserId = null;
+    for (let j = lastIdx - 1; j >= 0; j--) {
+      const rj = rows[j];
+      if (rj && rj.type === 'message' && rj.role === 'user' && rj.id) { prevUserId = rj.id; break; }
+    }
+    if (prevUserId) {
+      for (let j = 0; j < rows.length; j++) {
+        const rj = rows[j];
+        if (rj && rj.type === 'resend-fork-notice' && String(rj.editedUserItemId) === String(prevUserId)) return [];
+      }
     }
   }
   return out;
@@ -1519,6 +1595,7 @@ function interruptedByUser(tsPath) {
   const intrIn = (r) => {
     if (!r || r.type !== 'message') return false;
     if (r.role !== 'assistant') return false; // v2.49：真正的中断标记是 assistant（主模型输出被中断），排除 role=user 的摘要
+    // ⚠️ 此处禁止加 skipRun 判据：183/183 真实取消均带 providerData.skipRun=true（见 interruptedRowsAfter 顶部注释）。
     const c = Array.isArray(r.content) ? r.content.map((x) => (x && x.text) || '').join('') : (typeof r.content === 'string' ? r.content : '');
     return /^\s*Interrupted by user\s*$/i.test(c); // 精确匹配，排除长摘要里顺带提到 "Interrupted by user"（1686e062 上下文压缩误弹）
   };
@@ -2590,7 +2667,9 @@ function showToast(line1, line2, reason, tsPath) {
 // 完整显示不截断（用户要求：toast 两行空间足够放全名），仅去掉括号里的补充说明便于紧凑。
 function shortModelName(stat, pricing) {
   let name = '';
-  const raw = String((stat && stat.model) || '');
+  // v3.11：**显示**优先用主转录模型 `modelMain`（团队轮时 `stat.model` 会被子代理模型占据，见 :1158 注释）。
+  //   与计费解耦：calcCost 仍用 stat.model，本函数只负责显示名。
+  const raw = String((stat && (stat.modelMain || stat.model)) || '');
   if (isLocalModel(raw)) {
     name = cleanModelName(raw); // 本地模型：去 provider/组织前缀显示干净名
   } else {
@@ -2720,7 +2799,25 @@ function shrinkTitle(s, maxW) {
 }
 
 function toastLine1(stat, modelShort, period, balTxt, todayTxt) {
-  const head = modelShort || '';
+  let head = modelShort || '';
+  // v3.11：团队轮在第一行补「（子代理 X）」——只补与主模型**不同**的子代理模型；最多列 1 个 + 「等」。
+  //   需求（用户 2026-09-23 明确）：① 第一个必须是主模型；② 第一行最多两个模型名；③ 超宽就截断，先截子代理段。
+  //   实现：主模型完整保留；给子代理段按剩余预算截断（shrinkTitle），预算不足则整段丢弃。
+  try {
+    const subs = Array.isArray(stat && stat.subModels)
+      ? stat.subModels.filter((m) => m && m !== (modelShort || ''))
+      : [];
+    if (subs.length) {
+      const periodW = period ? dispWidthTitle(` ${period}`) : 0;
+      // 6 = 「（子代理 」+「）」的近似显示宽度
+      const budget = TOAST_ROW1_MAX_W - dispWidthTitle(head) - periodW - 6;
+      if (budget >= 6) {
+        const one = String(subs[0]);
+        const shown = dispWidthTitle(one) <= budget ? one : shrinkTitle(one, budget);
+        head = `${head}（子代理 ${shown}${subs.length > 1 ? '等' : ''}）`;
+      }
+    }
+  } catch (e) { /* 标注失败不影响主流程 */ }
   // 行1：模型名 + 时段标注（空格分隔，不占用时间位置）
   const periodTxt = period ? ` ${period}` : '';
   const line1 = `${head}${periodTxt}`;
@@ -2773,6 +2870,20 @@ function toastLine2(stat, pricing) {
     line = line.replace(ratioTxt, '');
   }
   return line;
+}
+
+// v3.12：在 toast 第一行模型名后插入状态标注（异常轮用"子代理运行中"、补弹用"子代理"），
+//   不改动 toastLine1 本体（保证正常轮/团队轮一字不变）。超宽时放弃标注，绝不超出 TOAST_ROW1_MAX_W。
+function toastLineTagged(agg, pricing, tag) {
+  if (!tag) return toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), balanceText(), todayUsageTxt());
+  const mShort = shortModelName(agg, pricing);
+  const base = toastLine1(agg, mShort, periodNote(agg, pricing), balanceText(), todayUsageTxt());
+  const nl = base.indexOf('\n');
+  const line1 = nl >= 0 ? base.slice(0, nl) : base;
+  const tail = nl >= 0 ? base.slice(nl) : '';
+  const tagged = mShort ? line1.replace(mShort, mShort + tag) : (tag + line1);
+  if (dispWidthTitle(tagged) > TOAST_ROW1_MAX_W) return base; // 超宽保护：放弃标注
+  return tagged + tail;
 }
 
 // ===== DeepSeek 账户余额查询（NIX 客户端同款原理，仅自定义 API 模式） =====
@@ -3670,17 +3781,30 @@ function main() {
       // v2.50：弹窗前补一次增量记账（子代理收尾可能在 Stop 之后才落盘，水位线保证不重复）
       if (info.tsPath) incrementalRecord(info.tsPath, fSid);
       const bal = balanceText();
-      // v2.98：子代理/专家团弹窗标注——区分两种形态（专家团=带 agentColor 的成员；普通子代理=内置类型）。
-      // 与主模型同名的子代理会被并入同一模型桶（按模型分桶已天然实现），此处仅做标注，不改计费与数据结构。
-      const subModels = subagentModelSet(info.tsPath, info.roundStart || 0);
-      const modelShort = shortModelName(agg, pricing);
-      const subEntry = subModels.get(normalizeModelName(agg.model || ''));
-      const modelLabel = subEntry ? modelShort + subagentTagOf(subEntry) : modelShort;
-      showToast(toastLine1(agg, modelLabel, periodNote(agg, pricing), bal, todayUsageTxt()), toastLine2(agg, pricing), toastReason, info.tsPath);
-      clearCoalesce(fSid);
-      // v2.27：watcher 弹窗完成 = 专家团本轮真正结束 → 推进 lastStopAt（供 hook 端起点刷新守卫）
-      const ws = loadSnapshot(fSid) || {};
-      saveSnapshot({ file: ws.file || '', stat: ws.stat || null, lastUserMsgAt: ws.lastUserMsgAt || 0, lastStopAt: Date.now() }, fSid);
+      if (info.mainToastedAt) {
+        // v3.12：异常轮——主模型已在 Stop 先弹，此处只补弹【子代理】部分（不含主模型用量，否则重复）
+        const subAgg = aggregateSubsOnly(info.tsPath, info.roundStart || 0);
+        if (subAgg && subAgg.total > 0) {
+          const subToastAgg = Object.assign({}, subAgg, { subModels: undefined });
+          showToast(toastLineTagged(subToastAgg, pricing, '（子代理）'), toastLine2(subToastAgg, pricing), 'team-sub-only', info.tsPath);
+        }
+        appendCompactionLog('flush-team-sub-only', { sid: fSid, subTotal: subAgg ? subAgg.total : 0 });
+        clearCoalesce(fSid);
+        const ws = loadSnapshot(fSid) || {};
+        saveSnapshot({ file: ws.file || '', stat: ws.stat || null, lastUserMsgAt: ws.lastUserMsgAt || 0, lastStopAt: Date.now() }, fSid);
+      } else {
+        // v2.98：子代理/专家团弹窗标注——区分两种形态（专家团=带 agentColor 的成员；普通子代理=内置类型）。
+        // 与主模型同名的子代理会被并入同一模型桶（按模型分桶已天然实现），此处仅做标注，不改计费与数据结构。
+        const subModels = subagentModelSet(info.tsPath, info.roundStart || 0);
+        const modelShort = shortModelName(agg, pricing);
+        const subEntry = subModels.get(normalizeModelName(agg.model || ''));
+        const modelLabel = subEntry ? modelShort + subagentTagOf(subEntry) : modelShort;
+        showToast(toastLine1(agg, modelLabel, periodNote(agg, pricing), bal, todayUsageTxt()), toastLine2(agg, pricing), toastReason, info.tsPath);
+        clearCoalesce(fSid);
+        // v2.27：watcher 弹窗完成 = 专家团本轮真正结束 → 推进 lastStopAt（供 hook 端起点刷新守卫）
+        const ws = loadSnapshot(fSid) || {};
+        saveSnapshot({ file: ws.file || '', stat: ws.stat || null, lastUserMsgAt: ws.lastUserMsgAt || 0, lastStopAt: Date.now() }, fSid);
+      }
     }
     // R4（2026-08-23）：释放只删自己持有的锁（校验 pid===自己），避免异常路径误删新 owner 的锁
     if (gotLock) { try { const o = JSON.parse(fs.readFileSync(lockPath, 'utf-8')); if (o && o.pid === myPid) fs.unlinkSync(lockPath); } catch (e) {} }
@@ -3831,7 +3955,30 @@ function main() {
         //   本改动同时**回归代码原设计意图**（见上方 v2.27/v2.28 注释：普通轮立即弹，仅专家团走合并延迟）。
         //   判断依据 agg.subCount / agg.teamActive —— 二者均为 0/false 即普通轮。
         const isPlainRound = !(agg && (Number(agg.subCount) > 0 || agg.teamActive === true));
-        if (isPlainRound) {
+        // v3.09 修复D（2026-09-22 实证·弹窗时效）：团队轮若在 Stop 时刻**子代理已全部收尾**，说明数据已齐
+        //   → 直接走同步立即弹窗，不再 spawn watcher。
+        //   证据：当晚三次团队轮弹窗全靠下一轮 --hook 兜底（reason=hook-fallback），延迟 1~10 分钟；
+        //   而 watcher 的降级分支只在"spawn 未接管"时触发，**覆盖不了"spawn 成功但随后被宿主收割"**
+        //   （现场遗留 .coalesce-*.json.lock、无 toast）。账本不受影响（走行数水位线），受损的只是弹窗时效。
+        // v3.09.1（BUG-1 修复，独立验证员发现）：**不能只看 subagentPending().length===0**。
+        //   实测：当 Agent 调用的参数里取不到可解析 name（中文名/无 name 字段）时，subagentPending 会**假空**返回 []
+        //   → 若据此走快速路径，会 ①本轮弹窗少算仍在跑的子代理用量 ②推进 lastStopAt 后子代理后续输出再无 watcher 接管
+        //   → 该轮后续用量弹窗丢失。故加第二道判据：**每个子代理文件末行必须已是"已收尾"**（与时间无关，
+        //   不用 stagnant 时间窗，避免把要修的延迟又带回来）。二者同时成立才走快速路径。
+        // v3.09.1（BUG-1 修复，独立验证员发现）：**不能只看 subagentPending().length===0**。
+        //   实测：Agent 调用参数取不到可解析 name 时（中文团队/无 name 字段），subagentPending 会**假空**返回 []
+        //   → 若据此走快速路径，会 ①本轮弹窗少算仍在跑的子代理用量 ②推进 lastStopAt 后子代理后续输出
+        //   再无 watcher 接管 → 该轮后续用量弹窗丢失（账本走水位线不受影响）。
+        //   **正解是复用本文件既有的 v2.47 机制** `hasSubagentsRecentlyActive`（同源问题，见 :1458 注释）：
+        //   靠子代理文件 mtime 判断是否仍有子代理在活跃写入（窗口 SUBAGENT_IDLE_MS = 20s，与 :3657 调用一致）。
+        //   ⚠️ 不要改用"子代理末行是否都已收尾"——被取消/中断的子代理文件末行永远是 incomplete，
+        //   会导致本快速路径永不触发（真实会话实测 21 个子代理中 3 个 incomplete）。
+        let teamDataReady = false;
+        try {
+          teamDataReady = subagentPending(tsPath).length === 0
+            && !hasSubagentsRecentlyActive(tsPath, SUBAGENT_IDLE_MS);
+        } catch (e) { teamDataReady = false; }
+        if (isPlainRound || teamDataReady) {
           // 普通轮：同步立即弹（不 spawn、不等确认窗），并清掉 coalesce 以免被兜底二次补弹
           try {
             showToast(
@@ -3857,8 +4004,49 @@ function main() {
                 lastStopAt: Date.now(),
               }, sid);
             } catch (e) { /* 快照写失败不影响弹窗 */ }
-            appendCompactionLog('stop-plain-immediate', { sid: effSid, subCount: agg && agg.subCount, teamActive: !!(agg && agg.teamActive) });
+            appendCompactionLog('stop-plain-immediate', { sid: effSid, subCount: agg && agg.subCount, teamActive: !!(agg && agg.teamActive), teamDataReady });
           } catch (e) { process.stderr.write(`[token-tracker] 普通轮同步弹窗失败: ${e.message}\n`); }
+          out({ hookSpecificOutput: {} });
+          return;
+        }
+        // v3.12「异常轮拆分弹窗兜底」——**已实测通过（2026-09-23，带 trace 夹具）**，默认开启：
+        //   实测：① 异常轮 Stop → 立刻 1 条【主模型】条（标"子代理运行中"）；
+        //        ② 子代理结束后 `--hook` → 补弹 1 条【子代理】条（reason `team-sub-only`），coalesce 清理；
+        //        ③ 再次触发 → 不重复；④ 真实 toast 日志 md5 前后一致（零污染）。
+        //   ⚠️ 排查提示：**补弹路径依赖 trace 文件存在**——早前在"沙箱未造 trace"的夹具里测出"补弹不触发"，
+        //      是夹具缺失导致的假象，非代码缺陷（排查花了很久，记此备忘）。
+        //   紧急关闭：设环境变量 WB_TEAM_SPLIT=0（回到 v3.11 行为：异常轮仍走 watcher，延迟但最终弹一条完整的）。
+        const TEAM_SPLIT_ENABLED = process.env.WB_TEAM_SPLIT !== '0';
+        const existingCoal = readCoalesceInfo(effSid);
+        const mainAlreadyToasted = !!(existingCoal && existingCoal.mainToastedAt);
+        if (TEAM_SPLIT_ENABLED && agg && agg.teamActive === true && !teamDataReady) {
+          if (!mainAlreadyToasted) {
+            // ① 立刻弹主模型条（标注子代理运行中），不等子代理
+            const mainAgg = aggregateMainOnly(tsPath, aggStart0);
+            if (mainAgg && mainAgg.total > 0) {
+              showToast(
+                toastLineTagged(mainAgg, pricing, '（子代理运行中）'),
+                toastLine2(mainAgg, pricing),
+                'team-main-first',
+                tsPath
+              );
+            }
+            appendCompactionLog('stop-team-main-first', { sid: effSid, subCount: agg && agg.subCount, teamActive: true, mainTotal: mainAgg ? mainAgg.total : 0 });
+            // ② 写 coalesce 带 mainToastedAt（供补弹判断"主模型已弹过"）
+            writeCoalesce(effSid, agg, { tsPath, roundStart: aggStart0, byModel, mainToastedAt: Date.now(), traceFile });
+          } else {
+            // 同一轮已弹过主模型（如异常轮内重复 Stop/hook 事件）→ 绝不重复弹，续跑 watcher 即可；
+            // roundStart 沿用首次弹主模型时的值，避免后续 Stop 把聚合起点推进导致漏算子代理。
+            writeCoalesce(effSid, agg, { tsPath, roundStart: (existingCoal && existingCoal.roundStart) || aggStart0, byModel, mainToastedAt: existingCoal.mainToastedAt, traceFile });
+          }
+          // ③ ⚠️ 这里**绝不推进 lastStopAt**（v3.12.1 实测修复，2026-09-23）：
+          //    watcher 与 hook 兜底都用 `lastStopAt` 判断"本轮是否已结算"，一旦在此推进，
+          //    两条补弹路径都会认为本轮已结束而**直接跳过** → 子代理那条永远不弹。
+          //    （实测：推进后 Stop 后等 40 秒、再触发 --hook 均无补弹，且 coalesce 残留不清理。）
+          //    轮次边界推进交给补弹路径自己完成——watcher 出口与 hook 兜底在弹完【子代理】条后
+          //    都会 `saveSnapshot({lastStopAt: Date.now()})`；重复弹主模型由 coalesce 的 mainToastedAt 拦。
+          // ④ 仍启动 watcher，子代理结束后补弹【子代理】部分
+          startWatcherVerified(effSid);
           out({ hookSpecificOutput: {} });
           return;
         }
@@ -3922,6 +4110,14 @@ function main() {
         const aux0 = (today0 ? '今日累计 ' + today0 + ' ｜ ' : '') + (bal0 ? bal0 + ' ｜ ' : '');
         // 宽度保护：原因优先，今日累计/余额超宽时丢弃（v2.53.1 原因提示是用户最想看的，保它）
         const body0 = dispWidth(aux0 + reason0) > TOAST_LINE_MAX_W ? reason0 : (aux0 + reason0);
+        // v3.08 修复2：no-token 分支同样推进 lastStopAt，与正常结算路径一致写快照。
+        // 目的：避免"应用中止在飞请求"（skipRun/fork）触发 no-token Stop 后，轮次边界 lastStopAt
+        // 停滞在更早时刻，导致后续注入型 user 行（task-notification）唤起兜底判定时，旧取消标记
+        // 因 intrInfo.ts > lastStopAt 仍成立而被"复活"误判为手动取消（实测 2026-09-22 b017080d…）。
+        try {
+          const snap0 = loadSnapshot(sid) || {};
+          saveSnapshot({ file: snap0.file || tsPath, stat: snap0.stat || null, lastUserMsgAt: snap0.lastUserMsgAt || 0, lastStopAt: Date.now() }, sid);
+        } catch (e) { /* 快照写失败不影响弹窗 */ }
         showToast('本轮无 token 消耗记录', body0, 'no-token');
         out({ hookSpecificOutput: {} });
         return;
@@ -4058,17 +4254,31 @@ function main() {
     const pendInfo = readCoalesceInfo(sid);
     if (pendAgg) {
       if (pendInfo && pendInfo.traceFile) gLastTraceFile = pendInfo.traceFile; // v2.63.1：诊断记录 trace 文件名
-      // v2.98：子代理/专家团弹窗标注（与主路径同规则；失败时 Map 为空 → 退化为原行为）
-      const pendSubModels = subagentModelSet(pendInfo && pendInfo.tsPath, (pendInfo && pendInfo.roundStart) || 0);
-      const pendModelBase = shortModelName(pendAgg, pricing);
-      const pendEntry = pendSubModels.get(normalizeModelName(pendAgg.model || ''));
-      const pendModel = pendEntry ? pendModelBase + subagentTagOf(pendEntry) : pendModelBase;
       const bal = balanceText();
-      showToast(toastLine1(pendAgg, pendModel, periodNote(pendAgg, pricing), bal, todayDisplay(pendAgg, pricing)), toastLine2(pendAgg, pricing), 'hook-fallback');
-      clearCoalesce(sid);
-      // v2.27：兜底补弹完成 → 该轮已结束，标记 lastStopAt（供下轮起点刷新判断）
-      const psnap = loadSnapshot(sid) || {};
-      saveSnapshot({ file: psnap.file || hookFile, stat: psnap.stat || stat, lastUserMsgAt: psnap.lastUserMsgAt || 0, lastStopAt: Date.now() }, sid);
+      if (pendInfo && pendInfo.mainToastedAt) {
+        // v3.12：异常轮——主模型已在 Stop 先弹，hook 兜底只补弹【子代理】部分（不含主模型用量，否则重复）
+        const subAgg = aggregateSubsOnly(pendInfo.tsPath, (pendInfo && pendInfo.roundStart) || 0);
+        if (subAgg && subAgg.total > 0) {
+          const subToastAgg = Object.assign({}, subAgg, { subModels: undefined });
+          showToast(toastLineTagged(subToastAgg, pricing, '（子代理）'), toastLine2(subToastAgg, pricing), 'team-sub-only', pendInfo.tsPath);
+        }
+        appendCompactionLog('hook-team-sub-only', { sid, subTotal: subAgg ? subAgg.total : 0 });
+        clearCoalesce(sid);
+        // v2.27：兜底补弹完成 → 该轮已结束，标记 lastStopAt（供下轮起点刷新判断）
+        const psnap = loadSnapshot(sid) || {};
+        saveSnapshot({ file: psnap.file || hookFile, stat: psnap.stat || stat, lastUserMsgAt: psnap.lastUserMsgAt || 0, lastStopAt: Date.now() }, sid);
+      } else {
+        // v2.98：子代理/专家团弹窗标注（与主路径同规则；失败时 Map 为空 → 退化为原行为）
+        const pendSubModels = subagentModelSet(pendInfo && pendInfo.tsPath, (pendInfo && pendInfo.roundStart) || 0);
+        const pendModelBase = shortModelName(pendAgg, pricing);
+        const pendEntry = pendSubModels.get(normalizeModelName(pendAgg.model || ''));
+        const pendModel = pendEntry ? pendModelBase + subagentTagOf(pendEntry) : pendModelBase;
+        showToast(toastLine1(pendAgg, pendModel, periodNote(pendAgg, pricing), bal, todayDisplay(pendAgg, pricing)), toastLine2(pendAgg, pricing), 'hook-fallback');
+        clearCoalesce(sid);
+        // v2.27：兜底补弹完成 → 该轮已结束，标记 lastStopAt（供下轮起点刷新判断）
+        const psnap = loadSnapshot(sid) || {};
+        saveSnapshot({ file: psnap.file || hookFile, stat: psnap.stat || stat, lastUserMsgAt: psnap.lastUserMsgAt || 0, lastStopAt: Date.now() }, sid);
+      }
     }
     // v2.83：手动取消漏弹修复——上一轮未结算（inProgress）且 transcript 有「Interrupted by user」
     // 标记（role=assistant + status=incomplete + providerData.error.message 精确为 Interrupted by user）
@@ -4190,13 +4400,14 @@ module.exports = {
   todayStr, loadDailyUsage, saveDailyUsage, recordUsage, dayTotalOf, hitRate,
   calcCost, findModel, isLocalModel, fmtCost, cleanModelName,
   readTranscLines, parseTranscChunk, readTranscLinesFrom, extractUsage, perModelFromRows, aggregatePerModel,
+  aggregateMainOnly, aggregateSubsOnly,
   todayDisplay, reportTxt, reportSummaryTxt, normalizeDailyUsage,
   mainModelState, lastTranscLine, coalescePath, hasActiveSubagentsSince, subagentsDirFromTranscript, subagentPending, subagentsAllStagnant, interruptedByUser, hasSubagentsRecentlyActive,
   interruptedRowsAfter,
   incrementalRecord, loadLedgerWatermark, saveLedgerWatermark,
   estimateInterrupted, estimateInterruptedInc,
   extractUsageFromRow, terminalErrorFromRow, terminalError, contextOverflowOmen,
-  showToast,
+  showToast, toastLineTagged,
   traceWallDurMs, withFileLock,
   loadPricing, autoRefreshPricing, addModelPrice, savePricing, normalizeModelName, saveDailyUsageRaw,
   getTranscriptStats, sidFromPath, ledgerKey,

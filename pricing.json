@@ -1,5 +1,5 @@
 {
-  "date": "2026-09-16",
+  "date": "2026-09-23",
   "currency": "CNY",
   "unit": "元/百万 tokens",
   "usd_cny_rate": 7.2,
@@ -21,8 +21,8 @@
       "output_price": 4.5,
       "peak_multiplier": 2,
       "or_id": "deepseek/deepseek-v4-flash",
-      "usd_input_price": 0.11354,
-      "usd_output_price": 0.22708,
+      "usd_input_price": 0.14,
+      "usd_output_price": 0.28,
       "price_source": "deepseek官方",
       "region": "CN",
       "lock": true,
@@ -35,8 +35,8 @@
       "output_price": 4,
       "peak_multiplier": 2,
       "or_id": "deepseek/deepseek-v4.1-flash",
-      "usd_input_price": 0.15,
-      "usd_output_price": 0.6,
+      "usd_input_price": 0.225,
+      "usd_output_price": 0.9,
       "price_source": "deepseek官方",
       "region": "CN",
       "alias_of": "deepseek-flash"
@@ -48,8 +48,8 @@
       "output_price": 4.5,
       "peak_multiplier": 2,
       "or_id": "deepseek/deepseek-v4-flash-vision-exp",
-      "usd_input_price": 0.18,
-      "usd_output_price": 0.47,
+      "usd_input_price": 0.22,
+      "usd_output_price": 0.66,
       "price_source": "deepseek官方",
       "region": "CN",
       "lock": true,
@@ -62,8 +62,8 @@
       "output_price": 13.5,
       "peak_multiplier": 2,
       "or_id": "deepseek/deepseek-v4-pro",
-      "usd_input_price": 1.0175,
-      "usd_output_price": 2.035,
+      "usd_input_price": 0.927768,
+      "usd_output_price": 1.855536,
       "price_source": "deepseek官方",
       "region": "CN",
       "lock": true
@@ -79,8 +79,8 @@
       "tier_note": "Hy4 目前仅 preview 版，无正式版；2周免费活动仅限 WorkBuddy/CodeBuddy 产品使用，不影响 API 计费",
       "note": "已修正：原值 out=18.01/cache=0.6 来自 usd×汇率(国外源)，cache 翻倍错误；改为官方人民币价 6/18/0.3",
       "lock": true,
-      "usd_input_price": 0.834,
-      "usd_output_price": 2.501
+      "usd_input_price": 0.8395,
+      "usd_output_price": 2.518
     },
     "kimi-k3": {
       "name": "Kimi K3",
@@ -91,8 +91,8 @@
       "output_price": 100,
       "price_source": "腾讯云TokenPlan官方(本地价库)",
       "lock": true,
-      "usd_input_price": 2.648138,
-      "usd_output_price": 13.282724
+      "usd_input_price": 3,
+      "usd_output_price": 15
     },
     "glm-4.7-flash": {
       "name": "GLM-4.7-Flash",
@@ -114,8 +114,8 @@
       "output_price": 100,
       "peak_multiplier": 1,
       "or_id": "moonshotai/kimi-k3",
-      "usd_input_price": 2.648138,
-      "usd_output_price": 13.282724,
+      "usd_input_price": 3,
+      "usd_output_price": 15,
       "price_source": "llmabacus(国内)",
       "region": "CN",
       "tier_note": "8-23 备份价兜底（本地库无此模型）",
@@ -128,8 +128,8 @@
       "output_price": 21,
       "peak_multiplier": 1,
       "or_id": "moonshotai/kimi-k2.5",
-      "usd_input_price": 0.45,
-      "usd_output_price": 2.25,
+      "usd_input_price": 0.555,
+      "usd_output_price": 2.775,
       "region": "CN",
       "price_source": "本地价格库 2026-09-01 抓取：Kimi 官方文档 chat-k25.md",
       "backfilled": "2026-09-01 from 8-23 backup"
@@ -142,8 +142,8 @@
       "peak_multiplier": 1,
       "note": "官方标准价；>512k 档翻倍 8.4/1.68/33.6；促销五折 2.1/0.42/8.4；OpenRouter 显示为五折价",
       "or_id": "minimax/minimax-m3",
-      "usd_input_price": 0.3,
-      "usd_output_price": 1.2,
+      "usd_input_price": 0.315,
+      "usd_output_price": 1.26,
       "price_source": "llmabacus(国内)",
       "region": "CN",
       "tier_note": "8-23 备份价兜底（本地库无此模型）",
@@ -157,8 +157,8 @@
       "peak_multiplier": 1,
       "or_id": "minimax/MiniMax-M2.7",
       "price_source": "llmabacus(国内)",
-      "usd_input_price": 0.3,
-      "usd_output_price": 1.2,
+      "usd_input_price": 0.45,
+      "usd_output_price": 1.8,
       "region": "CN",
       "tier_note": "8-23 备份价兜底（本地库无此模型）",
       "backfilled": "2026-09-01 from 8-23 backup"
@@ -196,14 +196,14 @@
       "output_price": 4,
       "peak_multiplier": 2,
       "or_id": "deepseek/deepseek-flash",
-      "usd_input_price": 0.15,
-      "usd_output_price": 0.6,
+      "usd_input_price": 0.21,
+      "usd_output_price": 0.84,
       "price_source": "deepseek官方",
       "region": "CN"
     }
   },
   "last_source": "multi-source",
-  "last_refresh_note": "2026-09-15T16:13:31.907Z 多源刷新：llmabacus(国内·人民币·主)✓ | llm-prices-cn(国内·人民币·备)✗(This operation was aborted) | openrouter(USD)✓ | litellm(USD)✗(This operation was aborted) | portkey(USD)✓；人民币主价更新 7 个，USD参考 13 个，region 设定 0 个（汇率 7.2）；DeepSeek官方价✓",
+  "last_refresh_note": "2026-09-22T16:17:28.277Z 多源刷新：llmabacus(国内·人民币·主)✓ | llm-prices-cn(国内·人民币·备)✓ | openrouter(USD)✓ | litellm(USD)✓ | portkey(USD)✓；人民币主价更新 8 个，USD参考 14 个，region 设定 0 个（汇率 7.2）；DeepSeek官方价✓",
   "_lookedup_models": [
     "google/gemma-4-12b-qat",
     "qwen3.6-35b-a3b-instruct-revised",
@@ -216,10 +216,10 @@
     "deep-model"
   ],
   "deepseek_rules": {
-    "peak_schedule": "9:00 - 12:00、14:00 - 18:00",
+    "peak_schedule": "",
     "weekend_off_peak": true,
     "effective_at": null,
-    "updated_at": "2026-09-16T05:43:17.504Z"
+    "updated_at": "2026-09-22T16:17:25.390Z"
   },
   "_manual_audit": [
     {
@@ -242,7 +242,7 @@
         "cached_pct": 0,
         "output_pct": 0
       },
-      "adopted_at": "2026-09-16T05:43:17.503Z",
+      "adopted_at": "2026-09-22T16:17:25.389Z",
       "official_id": "deepseek-flash",
       "official_version": "DeepSeek-V4.1-Flash",
       "matched_by": "key-version"
