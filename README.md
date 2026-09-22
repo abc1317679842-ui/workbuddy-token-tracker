@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.12-blue)
+![Version](https://img.shields.io/badge/version-v3.13-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -189,6 +189,12 @@ Windows 设置 → 系统 → 通知 → 应用通知
 本技能的 toast 使用**独立应用名「WorkBuddy Token Tracker」** 直接调用 Windows 系统通知 API 弹出，**不经过 WorkBuddy 客户端设置**——关闭 WorkBuddy 自带通知**不影响 Token 通知**。若想连 Token 通知一起关：在通知列表单独关闭「WorkBuddy Token Tracker」即可。
 
 ## 更新记录（Changelog）
+
+### v3.13（2026-09-23）—— 子代理口径统一 + 有界微重判
+
+**① 口径统一（准确性修复）**：`aggregateTranscript` 合并子代理时原先不做**行级时间戳过滤**（只靠文件 mtime 归属本轮）→ 子代理文件被**唤醒/复用**时（文件 mtime 变新但含更早轮次的行）会把旧行算进来，**弹窗数字偏大**。真实数据实测：唤醒 `agent-51c238cc` 后连续 5 轮各多算 **82.0 万** token。现改为传 `roundStartMs` 过滤，与拆分路径口径一致。**守恒验证**：改前单条 1108.7万 vs 拆分 1028.6万（差 80.1万）；改后 **1417.9万 vs 1417.9万（差 0.00万）**。账本走行数水位线，不受影响。
+
+**② 有界微重判**：原 mtime 活跃窗（20s）会把"刚写完只差不到 20 秒"的子代理误判为仍在跑，白拆两条（实测只差 0.7 秒）。现新增最多 3×700ms 的重判：期间若**本轮子代理文件全部为终止态**则放行单条完整弹窗，否则回退拆分。**仅当全部文件确认终止才放行，绝不漏 token**；开关 `WB_NO_SUB_WAIT=1`。
 
 ### v3.12（2026-09-23）—— 异常轮拆分弹窗兜底（先主模型、后补子代理）
 
