@@ -219,7 +219,7 @@
     "peak_schedule": "",
     "weekend_off_peak": true,
     "effective_at": null,
-    "updated_at": "2026-09-27T16:00:03.773Z"
+    "updated_at": "2026-09-27T23:21:55.963Z"
   },
   "_manual_audit": [
     {
@@ -242,7 +242,7 @@
         "cached_pct": 0,
         "output_pct": 0
       },
-      "adopted_at": "2026-09-27T16:00:03.772Z",
+      "adopted_at": "2026-09-27T23:21:55.961Z",
       "official_id": "deepseek-flash",
       "official_version": "DeepSeek-V4.1-Flash",
       "matched_by": "key-version"

@@ -25,10 +25,27 @@ const TOAST_LOG = path.join(WB, 'token-tracker-toast.log');
 
 const PEAK_RANGES = [[9 * 60, 12 * 60], [14 * 60, 18 * 60]]; // 北京时间（分钟）
 
+// v3.15（2026-09-28）：中国法定假日表（与 token-tracker.js 的 isChineseHolidayBeijing 同源同口径）
+//   官方口径：峰时段「不含中国法定假日」→ 假日全天低峰。数据缺失时降级（不判假），不报错。
+const HOLIDAYS = path.join(SKILL_DIR, 'holidays.json');
+let _holidays = null;
+function isChineseHoliday(bjDate) {
+  try {
+    if (_holidays === null) {
+      try { _holidays = JSON.parse(fs.readFileSync(HOLIDAYS, 'utf-8')); } catch (e) { _holidays = { years: {} }; }
+    }
+    const y = bjDate.getUTCFullYear();
+    const key = `${y}-${String(bjDate.getUTCMonth() + 1).padStart(2, '0')}-${String(bjDate.getUTCDate()).padStart(2, '0')}`;
+    const arr = (_holidays.years || {})[String(y)] || [];
+    return arr.indexOf(key) >= 0;
+  } catch (e) { return false; }
+}
+
 function isPeakBeijing(iso) {
   const beijing = new Date(new Date(iso).getTime() + 8 * 3600 * 1000);
   const dow = beijing.getUTCDay();
   if (dow === 0 || dow === 6) return false;
+  if (isChineseHoliday(beijing)) return false; // v3.15：法定假日全天低峰（官方口径）
   const mins = beijing.getUTCHours() * 60 + beijing.getUTCMinutes();
   return PEAK_RANGES.some(([a, b]) => mins >= a && mins < b);
 }

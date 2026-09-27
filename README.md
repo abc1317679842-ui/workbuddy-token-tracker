@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.14-blue)
+![Version](https://img.shields.io/badge/version-v3.15-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -189,6 +189,21 @@ Windows 设置 → 系统 → 通知 → 应用通知
 本技能的 toast 使用**独立应用名「WorkBuddy Token Tracker」** 直接调用 Windows 系统通知 API 弹出，**不经过 WorkBuddy 客户端设置**——关闭 WorkBuddy 自带通知**不影响 Token 通知**。若想连 Token 通知一起关：在通知列表单独关闭「WorkBuddy Token Tracker」即可。
 
 ## 更新记录（Changelog）
+
+### v3.15（2026-09-28）—— 法定节假日感知的峰谷判定
+
+**修正的问题**：DeepSeek 官方口径规定峰时段（北京 **09:00-12:00 / 14:00-18:00** 工作日）**不含中国法定假日**，但技能此前**只判周末、不判假日** → **法定假日里的峰时段被按高峰 ×2 计费，金额高估一倍**。
+
+**改动**：
+- 新增 `holidays.json`（放假日列表）+ `refresh-holidays.js`（抓取脚本，**双源交叉验证**）：
+  - 主源 `NateScarlet/holiday-cn`；校验源 `HankAviator/china-holiday-calendar`（source 直指 **gov.cn 国务院公告原文**）
+  - 两源一致 → 采用；**不一致 → 取交集（保守）**，差异写入 `cross_check` 供核查
+  - 实测：2025 = 28 天（两源一致 ✓）、2026 = 33 天（两源一致 ✓）、2027 = 公告未出
+- `token-tracker.js:isPeakHour()` 与 `recalc-day.js:isPeakBeijing()` **同步**加入假日判定（口径必须一致）；**数据缺失自动降级**为原行为，不报错。
+
+**测试**：单测 **22/22 通过**（假日→低峰、工作日峰时段→高峰、周末→低峰、无数据→降级旧行为）。
+
+**更新方式**：每年公告发布后跑一次 `node refresh-holidays.js`。
 
 ### v3.14（2026-09-28）—— 余额查询开启 + 「通知不弹横幅」排查文档
 

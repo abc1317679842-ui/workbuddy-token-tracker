@@ -2264,6 +2264,25 @@ function parsePeakSchedule(sched) {
   }
   return ranges;
 }
+// v3.15（2026-09-28）：中国法定假日表（holidays.json，由 refresh-holidays.js 双源交叉验证生成）
+//   官方口径（api-docs.deepseek.com/quick_start/pricing）：峰时段「不含中国法定假日」→
+//   假日的 9:00-12:00 / 14:00-18:00（北京）同样算低峰。此前只判周末、不判假日 → 假日的工作日被多算一倍（高估）。
+//   ⚠️ 数据缺失/解析失败 → 降级为"不判假"（= 原行为），绝不抛错。
+const HOLIDAYS_FILE = path.join(WB, 'skills', 'token-usage-tracker', 'holidays.json');
+let _holidaysCache = null;
+function isChineseHolidayBeijing(bjDate) {
+  try {
+    if (_holidaysCache === null) {
+      try { _holidaysCache = JSON.parse(fs.readFileSync(HOLIDAYS_FILE, 'utf-8')); }
+      catch (e) { _holidaysCache = { years: {} }; }
+    }
+    const y = bjDate.getFullYear();
+    const key = `${y}-${String(bjDate.getMonth() + 1).padStart(2, '0')}-${String(bjDate.getDate()).padStart(2, '0')}`;
+    const arr = (_holidaysCache.years || {})[String(y)] || [];
+    return arr.indexOf(key) >= 0;
+  } catch (e) { return false; }
+}
+
 function isPeakHour(rules, now) {
   const t = now || new Date();
   // v2.95：统一按**北京时间**判定峰谷，与 recalc-day.js 的 isPeakBeijing 口径一致。
@@ -2273,6 +2292,8 @@ function isPeakHour(rules, now) {
   const bj = new Date(t.getTime() + t.getTimezoneOffset() * 60000 + 8 * 3600 * 1000);
   const day = bj.getDay();
   const h = bj.getHours() + bj.getMinutes() / 60;
+  // v3.15：法定假日 → 全天低峰（DeepSeek 官方口径：峰时段不含中国法定假日）
+  if (isChineseHolidayBeijing(bj)) return false;
   // 有官方规则 → 完全按官方来（通用跟随：官方改任何时段/周末规则都自动生效）
   if (rules && typeof rules === 'object') {
     const weekendOff = rules.weekend_off_peak === true || rules.weekend_off_peak === 'true';
