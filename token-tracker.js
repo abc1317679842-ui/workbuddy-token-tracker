@@ -45,7 +45,10 @@ const TRACE_DIR = path.join(WB, 'traces');
 // 公开价表（OpenRouter）每日自动刷新/新模型补录默认开启，均无需密钥，失败自动降级为本地价。
 // 三个分开关各自独立；ENABLE_NETWORK=false 时所有联网请求一律跳过（一键零联网）。
 const ENABLE_NETWORK = true;        // 总开关：false = 全部联网功能关闭（含分开关）
-const ENABLE_BALANCE_QUERY = false; // 分开关1：余额查询（携带 DeepSeek API key 请求官方接口，最敏感）
+const ENABLE_BALANCE_QUERY = true; // 分开关1：余额查询（携带 DeepSeek API key 请求官方接口，最敏感）
+// 2026-09-28 用户明确指令开启（原为 false）：弹窗第二行恢复显示「余额¥X」，数据来自官方
+//   https://api.deepseek.com/user/balance（key 从 models.json 读取，仅本机使用、不外传，15s 缓存）。
+//   要临时关闭：把本行改回 false。
 const ENABLE_PRICE_REFRESH = true;  // 分开关2：每日价格自动刷新（OpenRouter 公开价表，无需密钥）
 const ENABLE_MODEL_LOOKUP = true;   // 分开关3：新模型价格自动补录（OpenRouter 公开价表，无需密钥）
 // 余额查询安全性：开启后仅向官方 https://api.deepseek.com/user/balance 发送请求，密钥只通过
@@ -3020,6 +3023,9 @@ function balanceText() {
   // 余额与上次不同（toFixed(2) 字符串比较，避免浮点相等判断）→ 账户在消耗 → 显示
   // v2.18: 恢复「¥」符号（实测行1 上限 47u，峰值场景 45u+1u=46u 仍有富余）
   return total.toFixed(2) !== last.toFixed(2) ? `余额¥${total.toFixed(2)}` : '';
+  // ⚠️ 2026-09-28 曾一度改为"每轮都显示"，用户当天明确要求**保留变化检测**并说明理由：
+  //   「变化还是留着，因为它无法判断你用的是 API 还是 WorkBuddy 自带的，**只有余额变动了才知道用的是 API**」
+  //   → 故本逻辑维持原样：仅余额变化时显示。已回滚"恒定显示"。
 }
 
 // ===== 新模型价格自动补录（检测到未收录模型 → 立即联网查 OpenRouter） =====

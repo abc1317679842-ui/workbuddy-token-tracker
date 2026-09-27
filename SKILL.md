@@ -11,7 +11,56 @@ type: skill
 - **Windows 10/11**：系统通知（toast）仅 Windows 支持；macOS/Linux 可正常手动使用（方式 A），但不弹通知。
 - **Node.js ≥ 20**：脚本零依赖单文件，无需 npm install。
 
-## 当前功能总览（v3.13 · 2026-09-23）
+## ⚠️ 常见故障：通知「不弹横幅」（Windows 会静默"长期没点开"的应用通知）
+
+> 2026-09 实机遇到并已定位修复，**放在最前面**，因为现象诡异、极易误判成"技能坏了"。
+
+**症状**：技能本身正常（账本、日志都在更新），但通知**还有提示音、在「通知中心」（Win+N）里也能翻到**，**唯独右下角不再弹出横幅**了。
+
+**根因**：Windows 有个「**通知建议**」机制（内部名 `SmartOptOut`）—— 系统发现你对某应用的通知**长期不点开**，就会弹一条建议问你"要不要关掉这个应用的通知"；**无论你点了确认，还是系统按习惯自动降级**，它都会在注册表里给该应用写下：
+
+```
+HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\Settings\<AppId>
+    ShowBanner     = 0            ← ★横幅被关（"不弹"的直接原因）
+    LastOptOutTime = <时间戳>      ← 那次"关闭"操作的记录
+```
+
+实机证据（2026-09-26 本机）：`ShowBanner=0`、`LastOptOutTime=1790248477`、`PeriodicNotificationCount=52`；同机 `Windows.ActionCenter.SmartOptOut` 项也已存在（说明建议机制确实触发过）。
+
+**为什么在「设置 → 系统 → 通知」里找不到这个应用**：本技能的 toast 用**自定义 AppId「WorkBuddy Token Tracker」**直接调 Windows API ——
+`[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('WorkBuddy Token Tracker').Show($t)`
+它**不是已安装应用**，因此**不出现在设置的应用列表里**（这是刻意设计：不经过 WorkBuddy 客户端通知开关，两者互不影响）→ **只能用注册表改**。
+
+**解决方法（普通权限，无需管理员）**：
+
+```powershell
+# ① 重新打开横幅（必做）
+Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\Settings\WorkBuddy Token Tracker" -Name ShowBanner -Value 1
+
+# ② 关掉"通知建议"，免得以后又被问"要不要关掉该应用通知"（可选但推荐）
+$k = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.ActionCenter.SmartOptOut"
+New-Item -Path $k -Force | Out-Null
+New-ItemProperty -Path $k -Name Enabled -Value 0 -PropertyType DWord -Force | Out-Null
+```
+
+**验证**（回显 `ShowBanner : 1` 即已恢复）：
+
+```powershell
+Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\Settings\WorkBuddy Token Tracker" | Select-Object ShowBanner
+```
+
+**实测结果**：2026-09-26 执行 ① 后**当场恢复**（`ShowBanner 0 → 1`，后续弹窗正常）。
+
+**其他会让横幅消失的原因**（若上面无效，按此顺序排查）：专注助手/免打扰（含自动规则：全屏、游戏、投影时段）→ 该应用通知总开关 → 电量节能限制后台活动 → 全屏应用抑制横幅 → 系统时间/时区异常。这些都在「设置 → 系统 → 通知」里可核对；**只有"自定义 AppId"这一类（本技能）必须走上面的注册表法**。
+
+## 当前功能总览（v3.14 · 2026-09-28）
+
+> **v3.14 要点（2026-09-28）：① 余额查询已开启（弹窗第二行恢复「余额¥X」）；② 新增「Windows 不弹横幅」排查说明。**
+> - **① 余额显示已开启**：`ENABLE_BALANCE_QUERY` 由默认 `false` 改为 **`true`**（用户指令）。数据来自官方 `https://api.deepseek.com/user/balance`，key 从 `models.json` 读取、**仅本机使用、不外传**，15 秒缓存。显示位置＝弹窗**第二行**：`耗时 X 今日¥Y 余额¥Z`。
+>   - **显示规则保留「变化检测」（用户 2026-09-28 明确要求保留）**：首次观测只记基线不显示；**余额与上次观测不同才显示**。理由（用户原话）：*"它无法判断你用的是 API 还是 WorkBuddy 自带的，**只有余额变动了才知道用的是 API**"*。→ 余额稳定不动时不显示余额段，这是**设计行为，不是故障**。
+>   - 兜底：查不到且有旧缓存 → 用旧值；连缓存都没有 → 不显示（绝不显示错数字）。
+>   - **宽度实测（第二行上限 `TOAST_ROW2_MAX_W = 42`）**：典型场景 31 宽；今日/余额各 4 位 38 宽；**极端各 5 位数（¥12345.67）40 宽** → 均不超宽，余额不会因宽度被丢弃。
+> - **② 「通知不弹横幅」的排查与修复**：详细说明与命令见**本文最前面的《常见故障：通知「不弹横幅」》一节**（Windows 的「通知建议」会把长期未点开的应用通知静默为"只进通知中心"，并写入 `ShowBanner=0`；本技能用自定义 AppId，设置界面里找不到，只能改注册表）。
 
 > **v3.13 要点（2026-09-23）：两处准确性修复 —— ① 子代理行级时间戳过滤统一口径；② 团队轮"差几毫秒就白拆两条"的有界微重判。**
 > - **① 口径统一（准确性修复·重要）**：`aggregateTranscript` 合并子代理时原先传 `0`（**不做行级时间戳过滤**），只靠文件 mtime 归属本轮 → 当子代理文件被**唤醒/复用**（如给旧成员发消息）时，文件 mtime 变新但**含更早轮次的行** → **弹窗数字偏大**。真实数据实测：唤醒 `agent-51c238cc` 后，**连续 5 轮各多算 82.0 万 token**。现改为传 `roundStartMs` 做行级过滤，与拆分路径 `aggregateSubsOnly` 口径一致。

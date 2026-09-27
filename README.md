@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.13-blue)
+![Version](https://img.shields.io/badge/version-v3.14-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -189,6 +189,18 @@ Windows 设置 → 系统 → 通知 → 应用通知
 本技能的 toast 使用**独立应用名「WorkBuddy Token Tracker」** 直接调用 Windows 系统通知 API 弹出，**不经过 WorkBuddy 客户端设置**——关闭 WorkBuddy 自带通知**不影响 Token 通知**。若想连 Token 通知一起关：在通知列表单独关闭「WorkBuddy Token Tracker」即可。
 
 ## 更新记录（Changelog）
+
+### v3.14（2026-09-28）—— 余额查询开启 + 「通知不弹横幅」排查文档
+
+**① 余额查询已开启**：`ENABLE_BALANCE_QUERY` 由默认 `false` 改为 `true`。弹窗**第二行**恢复显示 `余额¥X`，数据来自官方 `https://api.deepseek.com/user/balance`（key 从 `models.json` 读，仅本机使用、不外传，15 秒缓存）。**显示规则保留「变化检测」**：首次只记基线不显示，**余额与上次不同才显示** —— 因为无法判断用的是官方 API 还是产品内置额度，**只有余额变动才说明在用 API**；余额稳定不动时不显示属**设计行为**。宽度实测：第二行上限 42，极端场景（今日/余额各 5 位数）40 宽，不会超宽丢余额。
+
+**② 「通知不弹横幅」排查（⚠️ 重要，详见 SKILL.md 最前面一节）**：Windows 的「**通知建议**」（`SmartOptOut`）会把**长期未点开**的应用通知静默成「只进通知中心、不弹横幅」，并在 `HKCU\...\Notifications\Settings\<AppId>` 写入 **`ShowBanner = 0`**。本技能用**自定义 AppId「WorkBuddy Token Tracker」**（直调 Windows API），**不出现在「设置 → 系统 → 通知」的应用列表里，只能改注册表**：
+
+```powershell
+Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\Settings\WorkBuddy Token Tracker" -Name ShowBanner -Value 1
+```
+
+（建议同时关掉"通知建议"：`...\Windows.ActionCenter.SmartOptOut` 新建 DWORD `Enabled=0`。）**实测 2026-09-26 当场恢复。**
 
 ### v3.13（2026-09-23）—— 子代理口径统一 + 有界微重判
 
