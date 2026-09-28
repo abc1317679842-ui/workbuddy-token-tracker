@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.15-blue)
+![Version](https://img.shields.io/badge/version-v3.16-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -189,6 +189,17 @@ Windows 设置 → 系统 → 通知 → 应用通知
 本技能的 toast 使用**独立应用名「WorkBuddy Token Tracker」** 直接调用 Windows 系统通知 API 弹出，**不经过 WorkBuddy 客户端设置**——关闭 WorkBuddy 自带通知**不影响 Token 通知**。若想连 Token 通知一起关：在通知列表单独关闭「WorkBuddy Token Tracker」即可。
 
 ## 更新记录（Changelog）
+
+### v3.16（2026-09-28）—— 吸收社区 PR/Issue：数据根探测 + 截断兜底（外部用户贡献致谢）
+
+**背景**：仓库收到两份高质量社区反馈（[PR #1](../../pull/1) @liyangbing、[PR #2 + Issue #3](../../pull/2) @kyo-zzz），逐条核实后本版吸收其要点：
+
+- **数据根智能探测**（PR #2 要点）：`WB` 根目录不再写死 `~/.workbuddy`，改为探测 `~/.workbuddy-ai`（新版客户端可能迁移的数据根）→ `~/.workbuddy` 兜底；`WB_ROOT` 环境变量仍最高优先。4 个脚本（token-tracker / recalc-day / refresh-prices / deepseek-official）同步修改。
+- **transcript_path 截断兜底**（Issue #3-①，已实测复现）：客户端偶尔把 `transcript_path` 末尾截断 2 字符 → 账本永远记不上（toast 走 traces 兜底仍显示，极具迷惑性）。现路径失效时用 `session_id` 在 `projects/` 下精确匹配兜底。**沙箱双组实测**：截断路径修复前账本 0 记录 → 修复后与完整路径记账完全一致。
+- **SKILL.md 措辞修正**（PR #1，其指出完全正确）：陈旧模型清理条件描述与 v2.82 代码行为相反，已改正（实际行为：仅删除「曾出现在账本且超 14 天未使用」的模型，从未出现的保留）。
+- **版本号统一**（Issue #3-④）：文件头注释此前仍停在 v2.91，现三处（manifest/README/文件头）统一 v3.16。
+
+**未采纳/待定**：Issue #3-②（流水线 .py 脚本开源）、#3-③（内置 `--backfill` 回填）——后续评估。
 
 ### v3.15（2026-09-28）—— 法定节假日感知的峰谷判定
 

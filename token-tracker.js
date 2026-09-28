@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v2.91 (2026-09-05)
+// token-usage-tracker v3.16 (2026-09-28)
 // v2.63：调试日志机制重构——废弃 TOKEN_TRACKER_DEBUG 环境变量开关 + poll 全量记录，改为「弹窗时自动记录」：
 //   每次 showToast 无条件向 ~/.workbuddy/token-tracker-toast.log 追加一行 JSON 诊断（原因/sessionId/行数/稳定计数/compaction 状态等）。
 // v2.62：compaction 检测由"行数减少>5"改为"扫描 transcript 末尾 30 行识别压缩标记（compactionMode 方案）"。
@@ -37,7 +37,21 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const WB = process.env.WB_ROOT || path.join(os.homedir(), '.workbuddy');
+// v3.16（2026-09-28，外部用户 PR#2 要点采纳）：数据根智能探测。
+// 背景：较新版本 WorkBuddy 客户端可能把数据根迁移到 ~/.workbuddy-ai（~/.workbuddy 仅剩
+// device-id/logs），此时写死 ~/.workbuddy 会读不到任何 trace → 记账全 0、弹窗空。
+// 探测顺序：WB_ROOT 环境变量（测试/隔离用，最高优先）> ~/.workbuddy-ai > ~/.workbuddy（兜底）。
+function detectWorkBuddyRoot() {
+  const h = os.homedir();
+  const cands = [path.join(h, '.workbuddy-ai'), path.join(h, '.workbuddy')];
+  for (const c of cands) {
+    try {
+      if (fs.existsSync(path.join(c, 'traces')) || fs.existsSync(path.join(c, 'settings.json'))) return c;
+    } catch (e) { /* 单个候选探测失败不影响下一个 */ }
+  }
+  return path.join(h, '.workbuddy'); // 两个都判不出 → 旧默认，行为向后兼容
+}
+const WB = process.env.WB_ROOT || detectWorkBuddyRoot();
 const TRACE_DIR = path.join(WB, 'traces');
 
 // ===== 联网功能开关（v2.30）=====
@@ -821,6 +835,32 @@ function terminalError(tsPath) {
 }
 
 // 从 Stop payload 拿主 transcript 路径（payload.transcript_path；兼容 .json / 实际落盘 .jsonl）
+// v3.16（2026-09-28，外部用户 Issue#3-① 采纳）：transcript_path 截断兜底。
+// 背景（外部用户实测）：客户端偶尔把 transcript_path 末尾截断 2 字符（bcf...e5618 → bcf...e5），
+// existsSync=false → 返回 null → transcript 记账整条被跳过 → toast 有显示（traces 兜底）但
+// daily-usage 永远为空。防御：路径找不到文件时，用 session_id 在 projects/ 下按文件名精确匹配
+// 兜底（projects/<会话目录>/<sid>.jsonl，兼容旧布局 projects/<sid>.jsonl）。慢路径仅在
+// 常规路径失效时触发，不影响正常会话性能。
+function findTranscriptBySessionId(sid) {
+  const safe = String(sid || '').replace(/[^a-zA-Z0-9_-]/g, ''); // 防路径注入（同 snapPath C6）
+  if (!safe) return null;
+  const root = path.join(WB, 'projects');
+  const names = [safe + '.jsonl', safe + '.json'];
+  try {
+    for (const d of fs.readdirSync(root)) {
+      for (const nm of names) {
+        const fp = path.join(root, d, nm);
+        try { if (fs.existsSync(fp)) return fp; } catch (e) {}
+      }
+    }
+    for (const nm of names) {
+      const fp = path.join(root, nm);
+      try { if (fs.existsSync(fp)) return fp; } catch (e) {}
+    }
+  } catch (e) { /* projects/ 不存在等 → 放弃兜底 */ }
+  return null;
+}
+
 function transcriptPathFromPayload(payloadRaw) {
   try {
     const p = JSON.parse(payloadRaw);
@@ -829,7 +869,9 @@ function transcriptPathFromPayload(payloadRaw) {
     if (/\.jsonl?$/.test(tp)) { /* 已是 json/jsonl */ }
     else if (tp.endsWith('.json')) tp = tp + 'l';
     if (!fs.existsSync(tp) && tp.endsWith('l')) tp = tp.slice(0, -1); // .jsonl 不存在回退 .json
-    return fs.existsSync(tp) ? tp : null;
+    if (fs.existsSync(tp)) return tp;
+    // v3.16 截断兜底：常规路径失效 → 按 session_id 精确匹配
+    return findTranscriptBySessionId(p && p.session_id);
   } catch (e) { return null; }
 }
 

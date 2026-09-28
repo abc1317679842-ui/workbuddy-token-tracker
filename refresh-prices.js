@@ -36,7 +36,18 @@ const path = require('path');
 const os = require('os');
 const { spawnSync } = require('child_process');
 
-const WB = process.env.WB_ROOT || path.join(os.homedir(), '.workbuddy');
+// v3.16：数据根智能探测（与 token-tracker.js 同口径）：WB_ROOT > ~/.workbuddy-ai（新版客户端）> ~/.workbuddy
+function detectWorkBuddyRoot() {
+  const h = os.homedir();
+  const cands = [path.join(h, '.workbuddy-ai'), path.join(h, '.workbuddy')];
+  for (const c of cands) {
+    try {
+      if (fs.existsSync(path.join(c, 'traces')) || fs.existsSync(path.join(c, 'settings.json'))) return c;
+    } catch (e) { /* 单个候选探测失败不影响下一个 */ }
+  }
+  return path.join(h, '.workbuddy');
+}
+const WB = process.env.WB_ROOT || detectWorkBuddyRoot();
 const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
 const PRICING_LOCK_FILE = path.join(WB, 'skills', 'token-usage-tracker', '.pricing.lock'); // 修复6：pricing 并发写锁（与 token-tracker.js 共用）
 const DS_OFFICIAL = process.env.DS_OFFICIAL || path.join(__dirname, 'deepseek-official.js'); // 可覆盖（测试/镜像）

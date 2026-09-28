@@ -32,7 +32,18 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const WB = process.env.WB_ROOT || path.join(os.homedir(), '.workbuddy');
+// v3.16：数据根智能探测（与 token-tracker.js 同口径）：WB_ROOT > ~/.workbuddy-ai（新版客户端）> ~/.workbuddy
+function detectWorkBuddyRoot() {
+  const h = os.homedir();
+  const cands = [path.join(h, '.workbuddy-ai'), path.join(h, '.workbuddy')];
+  for (const c of cands) {
+    try {
+      if (fs.existsSync(path.join(c, 'traces')) || fs.existsSync(path.join(c, 'settings.json'))) return c;
+    } catch (e) { /* 单个候选探测失败不影响下一个 */ }
+  }
+  return path.join(h, '.workbuddy');
+}
+const WB = process.env.WB_ROOT || detectWorkBuddyRoot();
 const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
 const OFFICIAL_URL = process.env.DS_OFFICIAL_URL || 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing'; // 可覆盖（代理/镜像/测试）
 const TIMEOUT_MS = 15000;
