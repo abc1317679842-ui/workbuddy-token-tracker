@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-国内厂商官方人民币价抓取器（v0.1，2026-08-31）
+国内厂商官方人民币价抓取器（v0.3，2026-09-28）
+- v0.3：阶跃列序修正(输入未命中/输入命中/输出)；step-5-preview 白名单；MiniMax 专用解析
+  (改版页补齐 M3/M2.x 共 9 模型)；Kimi 域名迁移 platform.kimi.com + k3 多列行取末 3 位
+- v0.2：智谱切官方文档站 docs.bigmodel.cn（弃控制台 SPA bundle 通道）
 
 用法：
     python fetch-cn-prices.py
@@ -54,9 +57,10 @@ VENDORS = {
     'minimax': {
         'name': 'MiniMax',
         'url': 'https://platform.minimaxi.com/docs/guides/pricing-paygo',
-        'mode': 'tr',
-        # 该页混有视频生成模型(按秒计费，非 token 计价)——只保留"元/百万 tokens"文本计价行
-        'require_re': re.compile(r'百万\s*tokens?', re.I),
+        # v0.3(2026-09-28)：页面改版——数据行不再含'元'（单位挪进表头），M3 价为「刊例/永久五折」
+        # 成对出现，另有优先 service tier 表（标准×1.5）。旧 tr 模式只能抓到 H3-Context-IR 一个
+        # 模型（M3/M2.7/M2.5/M2.1/M2 共 9 个全被 '元' in text 过滤误杀），改专用解析器。
+        'mode': 'minimax',
     },
     'stepfun': {
         'name': '阶跃星辰',
@@ -64,6 +68,11 @@ VENDORS = {
         'mode': 'tr',
         # 剔除语音/图像类与坏行(stepaudio·step-tts按万字符/step-asr按小时/audio列序不可靠/仅单价行)；保留 step-1o-audio(按token计价)
         'drop_re': re.compile(r'step-?tts|step-?asr|step-?audio|step-image|step-2x-large', re.I),
+        # v0.3(2026-09-28)：列序修正——表头实为「输入(缓存未命中)/输入(缓存命中)/输出」，
+        # 旧版按 [in,out,cache] 映射导致 out/cache 整体错位（step-3.7-flash 输出 ¥8.1 被记成 ¥0.27）
+        'order': ('in', 'cache', 'out'),
+        # step-5-preview 是真实产品名（非快照别名），SNAP_RE 的 -preview$ 会误杀，白名单放行
+        'keep_over_re': re.compile(r'^step-5-preview$', re.I),
     },
     'deepseek': {
         'name': 'DeepSeek',
@@ -120,12 +129,16 @@ def looks_like_model(name):
     return True
 
 
-def parse_tr(html, keep=None, keep_re=None, drop_re=None, require_re=None):
-    """通用表格解析：逐 <tr> 提取含'元'的行。
+def parse_tr(html, keep=None, keep_re=None, drop_re=None, require_re=None,
+             order=('in', 'out', 'cache'), keep_over_re=None):
+    """通用表格解析：逐 <tr> 提取含'元'的行（v0.3 起输出结构化 in/out/cache）。
     keep:      可选前缀元组，仅保留自家模型名（如 ('qwen',) 过滤掉转售的第三方）。
     keep_re:   可选正则，仅保留匹配的主流档位名。
     drop_re:   可选正则，命中模型名则丢弃（如阶跃剔除语音类）。
-    require_re:可选正则，行文本必须命中才保留（如 MiniMax 只留"百万 tokens"计价行）。"""
+    require_re:可选正则，行文本必须命中才保留（如 MiniMax 只留"百万 tokens"计价行）。
+    order:     行内价格出现顺序对应的语义（默认 ('in','out','cache')）。
+               阶跃表头为「输入(未命中)/输入(命中)/输出」→ order=('in','cache','out')。
+    keep_over_re: 白名单正则——命中则无视 SNAP_RE（如 step-5-preview 是真模型名非快照）。"""
     out = []
     for row in re.findall(r'<tr[^>]*>[\s\S]{0,900}?</tr>', html):
         text = strip_tags(row)
@@ -140,18 +153,29 @@ def parse_tr(html, keep=None, keep_re=None, drop_re=None, require_re=None):
         name = tokens[0] if tokens else ''
         if not looks_like_model(name):
             continue
-        if SNAP_RE.search(name):
+        if keep_over_re and keep_over_re.search(name):
+            pass  # 白名单：真模型名含 -preview 等快照样式，放行
+        elif SNAP_RE.search(name):
             continue
         if drop_re and drop_re.search(name):
             continue
         if keep_re and not keep_re.match(name):
             continue
-        out.append({
+
+        def _at(pos):
+            return prices[pos] if len(prices) > pos else None
+        slot = {'in': _at(0), 'out': _at(1), 'cache': _at(2)}
+        in_v, out_v, cache_v = slot[order[0]], slot[order[1]], slot[order[2]]
+        rec = {
             'name': name,
             'raw_text': text[:300],
-            'prices_cny': prices,
+            'in_price': ['%s元' % in_v] if in_v is not None else [],
+            'out_price': ['%s元' % out_v] if out_v is not None else [],
             'context': next((t for t in tokens if re.match(r'^\d+[KkMm]$', t)), ''),
-        })
+        }
+        if cache_v is not None:
+            rec['cache_hit'] = ['%s元' % cache_v]
+        out.append(rec)
     if keep:
         out = [m for m in out if m['name'].lower().startswith(keep)]
     # 去重（保留首次出现）
@@ -212,18 +236,102 @@ def parse_zhipu_docs(html):
     return out
 
 
-KIMI_PAGES = ['chat-k3', 'chat-k27-code', 'chat-k26', 'chat-k25', 'chat-v1']
+def parse_minimax(html):
+    """MiniMax 官方定价页（v0.3，2026-09-28）——页面已改版：数据行不含'元'（单位在表头）。
+    实测结构（urllib 直抓 577KB，76 行）：
+      - 语言模型区有「标准 / 优先」两个 service tier 表，优先 = 标准价 ×1.5（页脚注明）；
+        两表行名完全相同 → 同名同档只取首次出现（标准表在前）。
+      - M3 行：模型名后带档位与「永久五折」，6 个数字两两成对 = 刊例/五折：
+          MiniMax-M3 ≤512k 永久五折 4.20 2.10 16.80 8.40 0.84 0.42
+          → 输入 刊例4.20/五折2.10；输出 刊例16.80/五折8.40；缓存读 刊例0.84/五折0.42
+        >512k 档整体 ×2。计费价取「永久五折」价（官方标注永久折扣 = 实际扣费口径），
+        主档取 ≤512k，>512k 与优先 tier 写入 tier_note。
+      - M2.x 行：数字 = 输入, 输出, 缓存读, (缓存写)。
+      - H3-Context-IR 行：仍含'元'内联（2 个数字 = 输入/输出）。
+    """
+    out, seen = [], set()
+
+    def emit(name, api, in_v, out_v, cache_v, note):
+        if name in seen:
+            return
+        seen.add(name)
+        rec = {
+            'name': name,
+            'brand': 'minimax',
+            'api_name': api,
+            'source_type': 'first_party',
+            'in_price': ['%s元' % in_v] if in_v is not None else [],
+            'out_price': ['%s元' % out_v] if out_v is not None else [],
+            'cache_hit': ['%s元' % cache_v] if cache_v is not None else [],
+            'tier_note': note,
+            'source': 'MiniMax 官方定价页(platform.minimaxi.com/docs/guides/pricing-paygo)',
+        }
+        out.append(rec)
+
+    for tb in re.findall(r'<table[\s\S]*?</table>', html):
+        rows = re.findall(r'<tr[^>]*>([\s\S]*?)</tr>', tb)
+        if not rows:
+            continue
+        header = strip_tags(rows[0])
+        if '输入价格' not in header or '元/百万' not in header:
+            continue  # 只处理 token 计价表（跳过 TTS/视频等按秒/万字符计费表）
+        for row in rows[1:]:
+            text = strip_tags(row)
+            mname = re.match(r'^(MiniMax-[A-Za-z0-9.\-]+)\s*(.*)$', text)
+            if not mname:
+                continue
+            name, rest = mname.group(1), mname.group(2)
+            nums = re.findall(r'(\d+(?:\.\d+)?)', rest)
+            if not nums:
+                continue
+            api = name.lower()
+            if name == 'MiniMax-H3-Context-IR':
+                # 内联'元'行：[输入, 输出]
+                in_v = float(nums[0]) if len(nums) > 0 else None
+                out_v = float(nums[1]) if len(nums) > 1 else None
+                emit(name, api, in_v, out_v, None, '上下文改写模型（官方现行价）')
+            elif '永久五折' in text:
+                # M3 行：档位文本含 '512k' 会被抓进数字 → 取末 6 位；
+                # 6 数字成对 = [刊例in, 五折in, 刊例out, 五折out, 刊例cache, 五折cache]
+                if len(nums) < 6:
+                    continue
+                six = nums[-6:]
+                tier = '≤512k' if ('≤' in rest or '<=' in rest) else '>512k'
+                if tier != '≤512k':
+                    continue  # 主档只存 ≤512k，>512k 记入档位说明
+                list_in, in_v = float(six[0]), float(six[1])
+                list_out, out_v = float(six[2]), float(six[3])
+                list_ca, ca_v = float(six[4]), float(six[5])
+                emit(name, api, in_v, out_v, ca_v,
+                     '官方标注永久五折(实际扣费价)；刊例 输入%s/输出%s/缓存%s；'
+                     '>512k档×2(刊例8.4/33.6/1.68,五折4.2/16.8/0.84)；'
+                     '优先service tier按标准×1.5' % (list_in, list_out, list_ca))
+            else:
+                # M2.x 行：[输入, 输出, 缓存读, (缓存写)]
+                in_v = float(nums[0])
+                out_v = float(nums[1])
+                ca_v = float(nums[2]) if len(nums) > 2 else None
+                extra = '%s档' % ('highspeed' if 'highspeed' in name else '标准')
+                emit(name, api, in_v, out_v, ca_v, extra)
+    return out
+
+
+KIMI_PAGES = ['chat-k3']
 
 
 def parse_kimi():
     """Kimi(Moonshot) 官方价：各模型单独的 mintlify 文档页(.md 源，比 HTML 干净)。
+    v0.3(2026-09-28)：moonshot.cn 文档已 301 迁至 platform.kimi.com（requests 自动跟随，
+    但直接用新域免去一跳）；chat-k25 / chat-v1 实测已是死页（0 行），剔除；
+    3 个有效页返回同一张表（k3/k2.7-code/k2.7-code-highspeed/k2.6），留 1 页即可。
     表格行形如：
-      ["kimi-k3","1M tokens","¥2.00","¥20.00","¥100.00","1,048,576 tokens"]
-      → 缓存命中/输入(未命中)/输出 = 2.00 / 20.00 / 100.00（¥/1M）
-    旧版(如 moonshot-v1)无缓存列：["moonshot-v1-8k","1M tokens","¥2.00","¥10.00","8,192 tokens"]
+      ["kimi-k3","1M tokens","¥20.00","¥40.00","¥2.00","¥20.00","¥100.00","1,048,576 tokens"]
+      ["kimi-k2.7-code","1M tokens","¥1.30","¥6.50","¥27.00","262,144 tokens"]
+    价格语义 = [缓存命中, 输入(未命中), 输出]；k3 行多出历史列（共 5 个价）→ 统一取末 3 位，
+    实测 k3 末 3 位 = 2.00/20.00/100.00，与 pricing.json 用户已校对 lock 价完全一致。
     """
     out = []
-    base = 'https://platform.moonshot.cn/docs/pricing/'
+    base = 'https://platform.kimi.com/docs/pricing/'
     for pg in KIMI_PAGES:
         try:
             t = requests.get(base + pg + '.md', headers={'User-Agent': UA}, timeout=20).text
@@ -240,8 +348,8 @@ def parse_kimi():
             if SNAP_RE.search(name):
                 continue
             prices = re.findall(r'"¥([\d.]+)"', m.group(2))
-            if len(prices) == 3:
-                cache, inp, outp = prices
+            if len(prices) >= 3:
+                cache, inp, outp = prices[-3:]  # k3 行多历史列 → 取末 3 位
             elif len(prices) == 2:
                 cache, inp, outp = None, prices[0], prices[1]
             else:
@@ -325,7 +433,10 @@ def main():
             else:
                 html = fetch(cfg['url'])
                 if cfg['mode'] == 'tr':
-                    entry['models'] = parse_tr(html, cfg.get('keep'), cfg.get('keep_re'), cfg.get('drop_re'), cfg.get('require_re'))
+                    entry['models'] = parse_tr(html, cfg.get('keep'), cfg.get('keep_re'), cfg.get('drop_re'), cfg.get('require_re'),
+                                               cfg.get('order', ('in', 'out', 'cache')), cfg.get('keep_over_re'))
+                elif cfg['mode'] == 'minimax':
+                    entry['models'] = parse_minimax(html)
                 elif cfg['mode'] == 'zhipu_docs':
                     entry['models'] = parse_zhipu_docs(html)
                 elif cfg['mode'] == 'kimi':

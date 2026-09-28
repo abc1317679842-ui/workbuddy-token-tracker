@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.17.1-blue)
+![Version](https://img.shields.io/badge/version-v3.17.2-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -190,6 +190,20 @@ Windows 设置 → 系统 → 通知 → 应用通知
 本技能的 toast 使用**独立应用名「WorkBuddy Token Tracker」** 直接调用 Windows 系统通知 API 弹出，**不经过 WorkBuddy 客户端设置**——关闭 WorkBuddy 自带通知**不影响 Token 通知**。若想连 Token 通知一起关：在通知列表单独关闭「WorkBuddy Token Tracker」即可。
 
 ## 更新记录（Changelog）
+
+### v3.17.2（2026-09-28）—— 拉取器全量实测：阶跃列序修正 + MiniMax 改版补齐 + Kimi 迁域
+
+- **阶跃列序修正（价格误差实锤）**：官方表头实为「输入(缓存未命中)/输入(缓存命中)/输出」，
+  旧版按 [输入,输出,缓存] 映射导致 out/cache 整体错位——step-3.7-flash 输出 ¥8.1 被记成 ¥0.27（差 30 倍）。
+  parse_tr 新增 `order` 参数，step 全系 5 模型 in/out/cache 已按官方表头重排
+- **step-5-preview 补录**：真实产品名被 SNAP_RE 的 `-preview$` 快照规则误杀，新增 keep_over_re 白名单放行（7/20/0.35）
+- **MiniMax 改版补齐（漏抓 9 个模型）**：官方页改版后数据行不再含"元"（单位挪进表头），
+  旧 tr 模式只抓到 H3-Context-IR。新增专用解析器：M3「刊例/永久五折」成对价取五折实际扣费价
+  （经 2026-06 官方公告交叉验证：≤512k 输入2.1/输出8.4），M2.7/M2.5/M2.1/M2 全系补录，
+  优先 service tier(×1.5) 去重跳过，>512k 档写入 tier_note
+- **Kimi 域名迁移适配**：moonshot.cn 文档已 301 迁 platform.kimi.com，直用新域；
+  chat-k25/chat-v1 实测死页剔除；k3 行多历史列（5 价）改取末 3 位=缓存/输入/输出（与 lock 价核对一致）
+- 全量实测：5 家拉取器 47 模型 ✓；index.json 43→52 模型；对账本历史零影响（账本无 step/minimax 用量）
 
 ### v3.17.1（2026-09-28）—— 智谱价源切换：控制台页 → 官方文档站
 
