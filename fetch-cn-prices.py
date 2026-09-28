@@ -72,9 +72,8 @@ VENDORS = {
     },
     'zhipu': {
         'name': '智谱 GLM',
-        'url': 'https://open.bigmodel.cn/pricing',
-        'mode': 'bundle',
-        'asset_base': 'https://static.bigmodel.cn/wd-paas-front',
+        'url': 'https://docs.bigmodel.cn/cn/guide/start/pricing',
+        'mode': 'zhipu_docs',
     },
     'kimi': {
         'name': 'Kimi(Moonshot)',
@@ -165,45 +164,52 @@ def parse_tr(html, keep=None, keep_re=None, drop_re=None, require_re=None):
     return uniq
 
 
-def parse_bundle(html, cfg):
-    """SPA 三步解析：骨架 -> bundle 路径 -> 结构化价格"""
-    m = re.search(r'/js/app\.[a-f0-9]+\.js', html)
-    if not m:
-        return []
-    js = fetch(cfg['asset_base'] + m.group(0))
+def _znum(s):
+    """表格单元格 → 数字；'免费'/'不支持'/'限时免费' 等非数字返回 None"""
+    s = (s or '').strip()
+    m = re.match(r'^(\d+(?:\.\d+)?)$', s)
+    return float(m.group(1)) if m else None
+
+
+def parse_zhipu_docs(html):
+    """智谱官方文档站定价页（v0.2，2026-09-28）——服务端渲染语义表格，无需 bundle 解析。
+    列：模型名称 | 上下文 | 输入单价 | 输出单价 | 缓存存储 | 缓存命中 | 输入模态。
+
+    v0.1 曾抓控制台页(open.bigmodel.cn/pricing 的 SPA bundle)：2026-09-28 实测该页
+    「5折限时两周至09-09」活动过期 19 天仍未恢复原价(0.4/1.4)，而文档站现行价已是
+    原价(0.8/2.8/0.23) → 两官方页矛盾，以文档站为准，弃用 bundle 通道。"""
     out = []
-    idx = 0
-    while True:
-        k = js.find('name:"', idx)
-        if k < 0:
-            break
-        seg = js[k:k + 700]
-        nm = seg[6:seg.find('"', 6)]
-        # 只收 GLM 系（该 bundle 里还有其他文案段落）
-        if nm.startswith('GLM') and not SNAP_RE.search(nm):
-            def grab(field):
-                mm = re.search(field + r':\[([^\]]*)\]', seg)
-                if not mm:
-                    return []
-                return re.findall(r'"([^"]*)"', mm.group(1))
-            out.append({
-                'name': nm,
-                'in_price': grab('inPrice'),
-                'out_price': grab('outPrice'),
-                'cache_hit': grab('hit'),
-                'cache_storage': (re.search(r'storage:"([^"]*)"', seg) or [None, ''])[1],
-                'context': (grab('upDownText') or [''])[0],
-                'tier_note': (re.search(r'intro:"([^"]*)"', seg) or [None, ''])[1],
-                'source': '智谱 GLM 官方定价页(open.bigmodel.cn/pricing)',
-            })
-        idx = k + 10
-    seen, uniq = set(), []
-    for m in out:
-        if m['name'] in seen:
+    seen = set()
+    for table in re.findall(r'<table[\s\S]*?</table>', html):
+        if '输入单价' not in table:
             continue
-        seen.add(m['name'])
-        uniq.append(m)
-    return uniq
+        for row in re.findall(r'<tr[^>]*>([\s\S]*?)</tr>', table):
+            cells = [strip_tags(c) for c in re.findall(r'<td[^>]*>([\s\S]*?)</td>', row)]
+            if len(cells) < 6:
+                continue
+            name = cells[0].strip()
+            if not re.match(r'^GLM[-A-Za-z0-9.]*$', name):
+                continue
+            inp = _znum(cells[2])
+            outp = _znum(cells[3])
+            cache = _znum(cells[5]) if len(cells) > 5 else None
+            if inp is None and outp is None:
+                continue  # 免费/无法解析的行不进价库（build_index 同样拒收无价条目）
+            if name in seen:
+                continue  # 同名模型多表出现（如 5V-Turbo）只取首次
+            seen.add(name)
+            out.append({
+                'name': name,
+                'brand': 'zhipu',
+                'api_name': None,
+                'source_type': 'first_party',
+                'in_price': ['%s元' % inp] if inp is not None else [],
+                'out_price': ['%s元' % outp] if outp is not None else [],
+                'cache_hit': ['%s元' % cache] if cache is not None else [],
+                'tier_note': '智谱官方文档站现行价',
+                'source': '智谱官方文档站(docs.bigmodel.cn/cn/guide/start/pricing)',
+            })
+    return out
 
 
 KIMI_PAGES = ['chat-k3', 'chat-k27-code', 'chat-k26', 'chat-k25', 'chat-v1']
@@ -320,8 +326,8 @@ def main():
                 html = fetch(cfg['url'])
                 if cfg['mode'] == 'tr':
                     entry['models'] = parse_tr(html, cfg.get('keep'), cfg.get('keep_re'), cfg.get('drop_re'), cfg.get('require_re'))
-                elif cfg['mode'] == 'bundle':
-                    entry['models'] = parse_bundle(html, cfg)
+                elif cfg['mode'] == 'zhipu_docs':
+                    entry['models'] = parse_zhipu_docs(html)
                 elif cfg['mode'] == 'kimi':
                     entry['models'] = parse_kimi()
             # 补全 source 标注（解析器未设时回退到厂商名）

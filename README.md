@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.17-blue)
+![Version](https://img.shields.io/badge/version-v3.17.1-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -190,6 +190,12 @@ Windows 设置 → 系统 → 通知 → 应用通知
 本技能的 toast 使用**独立应用名「WorkBuddy Token Tracker」** 直接调用 Windows 系统通知 API 弹出，**不经过 WorkBuddy 客户端设置**——关闭 WorkBuddy 自带通知**不影响 Token 通知**。若想连 Token 通知一起关：在通知列表单独关闭「WorkBuddy Token Tracker」即可。
 
 ## 更新记录（Changelog）
+
+### v3.17.1（2026-09-28）—— 智谱价源切换：控制台页 → 官方文档站
+
+- **弃用** `open.bigmodel.cn/pricing`（SPA bundle 解析）：实测该页「5折限时两周至09-09」活动**过期 19 天仍未恢复原价**（0.4/1.4），导致 GLM-5.3-Flash 计费低估一半
+- **改用** `docs.bigmodel.cn/cn/guide/start/pricing`（服务端渲染语义表格，无需 bundle 三步解析），现行价 **0.8/2.8/0.23**；全部 26 个 GLM 模型与文档站逐条核对一致，另新增 GLM-5.3-FlashX
+- `pricing.json` 对 glm-5.3-flash 加 `lock`（人工核对 2026-09-28），双保险防控制台页旧价回流
 
 ### v3.17（2026-09-28）—— 新增 backfill.js 历史回填工具（Issue #3-③ 落地，致谢 @kyo-zzz）
 

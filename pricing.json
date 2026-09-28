@@ -200,6 +200,16 @@
       "usd_output_price": 0.29,
       "price_source": "deepseek官方",
       "region": "CN"
+    },
+    "glm-5.3-flash": {
+      "name": "GLM-5.3-Flash",
+      "input_price": 0.8,
+      "cached_price": 0.23,
+      "output_price": 2.8,
+      "price_source": "智谱官方文档站 docs.bigmodel.cn/cn/guide/start/pricing(2026-09-28 人工核对现行价)",
+      "region": "CN",
+      "lock": true,
+      "tier_note": "控制台页 5折活动(至09-09)已过期但页面未恢复原价；按官方文档站现行原价 0.8/2.8/0.23 lock"
     }
   },
   "last_source": "multi-source",
