@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.16-blue)
+![Version](https://img.shields.io/badge/version-v3.16.1-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -65,6 +65,7 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 - **峰谷**：DeepSeek 高峰×2（9:00–12:00 / 14:00–18:00 工作日、周末全天空闲）；其他模型峰谷按官方页比例换算，非整数倍时自动标注「需人工核验」。
 - **环境要求**：需要 **Python 3**（自动探测：`CN_PYTHON` 环境变量 → WorkBuddy 自带 python → 系统 `python`/`python3`）+ 网络。无 python 时静默跳过刷新，弹窗会亮 `⚠价库` 提示，不影响计费。
 - **可配置**：`CN_PRICE_DB_DIR`（本地库目录，默认价格库项目 `prices/`）、`CN_PRICE_PIPELINE_DIR`（流水线脚本目录）、`CN_PYTHON`（python 可执行文件路径）。流水线脚本：`fetch-cn-prices.py` + `parse_tokenhub.py` + `build_index.py`（每日手动跑一次即等价于自动刷新）。
+- **流水线脚本已随仓库开源（v3.16.1）**：`fetch-cn-prices.py`（MiniMax/阶跃/智谱/Kimi 官方页直抓 + DeepSeek 读 lock 价）、`parse_tokenhub.py`（腾讯云 TokenHub 文档页解析，混元峰谷/分档）、`build_index.py`（合并去重 + lock 权威覆盖 + 单厂商失败沿用防僵尸）。依赖：`requests`（`pip install requests`），Python 3。三个脚本与本技能同目录放置即可被自动发现；抓到的 `prices/index.json` 放在 `CN_PRICE_DB_DIR` 指向的目录。
 
 ## 🔌 联网功能与开关（v2.30 起）
 
@@ -190,6 +191,16 @@ Windows 设置 → 系统 → 通知 → 应用通知
 
 ## 更新记录（Changelog）
 
+### v3.16.1（2026-09-28）—— 流水线脚本开源（Issue #3-② 落地）
+
+应外部用户 @kyo-zzz 的反馈（[#3-②](../../issues/3)），把此前缺失的三个国内价库流水线脚本随仓库发布：
+
+- `fetch-cn-prices.py` —— 厂商官方定价页直抓（MiniMax / 阶跃 / 智谱 GLM / Kimi），DeepSeek 直接读 `pricing.json` 的 lock 权威价
+- `parse_tokenhub.py` —— 腾讯云 TokenHub 官方文档页解析（混元峰谷时段 / 输入长度分档 / 原厂直供标记）
+- `build_index.py` —— 合并去重索引：first_party 优先、`pricing.json` lock 覆盖、单厂商当日抓取失败逐模型沿用（7 天防僵尸淘汰）
+
+依赖：Python 3 + `requests`。放置在本技能目录（或 `CN_PRICE_PIPELINE_DIR` 指向目录）即可被每日自动刷新调用，从此不再出现「每天白跑 + 长期 ⚠价库」。
+
 ### v3.16（2026-09-28）—— 吸收社区 PR/Issue：数据根探测 + 截断兜底（外部用户贡献致谢）
 
 **背景**：仓库收到两份高质量社区反馈（[PR #1](../../pull/1) @liyangbing、[PR #2 + Issue #3](../../pull/2) @kyo-zzz），逐条核实后本版吸收其要点：
@@ -199,7 +210,7 @@ Windows 设置 → 系统 → 通知 → 应用通知
 - **SKILL.md 措辞修正**（PR #1，其指出完全正确）：陈旧模型清理条件描述与 v2.82 代码行为相反，已改正（实际行为：仅删除「曾出现在账本且超 14 天未使用」的模型，从未出现的保留）。
 - **版本号统一**（Issue #3-④）：文件头注释此前仍停在 v2.91，现三处（manifest/README/文件头）统一 v3.16。
 
-**未采纳/待定**：Issue #3-②（流水线 .py 脚本开源）、#3-③（内置 `--backfill` 回填）——后续评估。
+**未采纳/待定**：Issue #3-③（内置 `--backfill` 回填）——后续评估；#3-②（流水线脚本开源）已在 **v3.16.1** 落地。
 
 ### v3.15（2026-09-28）—— 法定节假日感知的峰谷判定
 
