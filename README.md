@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.16.1-blue)
+![Version](https://img.shields.io/badge/version-v3.17-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -190,6 +190,16 @@ Windows 设置 → 系统 → 通知 → 应用通知
 本技能的 toast 使用**独立应用名「WorkBuddy Token Tracker」** 直接调用 Windows 系统通知 API 弹出，**不经过 WorkBuddy 客户端设置**——关闭 WorkBuddy 自带通知**不影响 Token 通知**。若想连 Token 通知一起关：在通知列表单独关闭「WorkBuddy Token Tracker」即可。
 
 ## 更新记录（Changelog）
+
+### v3.17（2026-09-28）—— 新增 backfill.js 历史回填工具（Issue #3-③ 落地，致谢 @kyo-zzz）
+
+`node backfill.js`（**默认 dry-run 不落盘**）/ `node backfill.js --write`（写入前自动备份账本与水位线）。
+
+- 递归扫描全部 transcript（主会话 + `subagents/agent-*.jsonl`），按**行 timestamp 的北京日期**重建整个账本
+- 与增量记账严格同口径：usage 提取/去重/费用（findModel 边界匹配 + 本地官方价库合并镜像 + 峰谷按行时间判定，含法定假日 v3.15 口径）
+- **中断补偿**（v2.52 镜像）：被中断的思考也按行时间戳归属日期补入
+- 写入后把所有会话水位线**推满并逐键取 max**——回填后的 Stop 增量记账零重复（沙箱实测：回填后 --stop 账本字节级不变）
+- ⚠️ **老账本机器慎用 --write**：被删除/被 compaction 重写的会话 transcript 已不存在，回填读不到 → 用 dry-run 先对比，凡「现账本金额 > 回填金额」的日子，现账本才是更完整的数据源（增量记账对 compaction 截断免疫）。本工具最佳场景：**新用户安装后回填全部历史 / 账本丢失或损坏后重建**。
 
 ### v3.16.1（2026-09-28）—— 流水线脚本开源（Issue #3-② 落地）
 
