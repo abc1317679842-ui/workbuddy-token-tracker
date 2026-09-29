@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.18.0 (2026-09-30)
+// token-usage-tracker v3.18.1 (2026-09-30)
 // v2.63：调试日志机制重构——废弃 TOKEN_TRACKER_DEBUG 环境变量开关 + poll 全量记录，改为「弹窗时自动记录」：
 //   每次 showToast 无条件向 ~/.workbuddy/token-tracker-toast.log 追加一行 JSON 诊断（原因/sessionId/行数/稳定计数/compaction 状态等）。
 // v2.62：compaction 检测由"行数减少>5"改为"扫描 transcript 末尾 30 行识别压缩标记（compactionMode 方案）"。
@@ -1966,6 +1966,7 @@ function stripLocalDbEntries(pricing) {
   }
   delete out.local_db;
   delete out.peak_rules;
+  delete out._lookedup_models; // v3.18.1（N6）：已查列表已迁至 .lookedup-models.json，防御性剥离旧字段
   return out;
 }
 
@@ -2110,6 +2111,27 @@ function loadPricing() {
   return p;
 }
 
+// v3.18.1（N6）：模型"已查未收录"列表——本地 sidecar 文件（.lookedup-models.json，.gitignore 排除），
+// 不再写进 pricing.json（旧实现把本机自定义模型名随公开仓库分发）。上限 200 条防无界增长。
+const LOOKEDUP_FILE = path.join(path.dirname(PRICING), '.lookedup-models.json');
+let _lookedupCache = null;
+function loadLookedup() {
+  if (_lookedupCache) return _lookedupCache;
+  try {
+    const a = JSON.parse(fs.readFileSync(LOOKEDUP_FILE, 'utf-8'));
+    _lookedupCache = Array.isArray(a) ? a.filter((x) => typeof x === 'string').slice(-200) : [];
+  } catch (e) { _lookedupCache = []; }
+  return _lookedupCache;
+}
+function rememberLookedup(name) {
+  const a = loadLookedup();
+  if (a.indexOf(name) < 0) {
+    a.push(name);
+    if (a.length > 200) a.splice(0, a.length - 200);
+    try { fs.writeFileSync(LOOKEDUP_FILE, JSON.stringify(a)); } catch (e) { /* 写失败仅影响下次去重，不致命 */ }
+  }
+}
+
 // v2.39（2026-08-15）：日界改用「本地时间」——旧版用 UTC（toISOString），用户在 UTC+8，
 // 凌晨 0–8 点会把当天算成前一天，导致每日账本/定价刷新错位。本地日期才是用户的"每天"。
 function todayStr() {
@@ -2123,11 +2145,26 @@ function todayStr() {
 // 联网拉 OpenRouter 更新（execFileSync 保证刷新完成才继续；失败保留本地价并 stderr 暴露，不静默）。
 function autoRefreshPricing(pricing) {
   if (!pricing || typeof pricing !== 'object') {
-    // v2.66：pricing 缺失/损坏 → 尝试重建（联网拉取）。成功返回新 pricing；失败返回 null（不崩）。
-    if (!(ENABLE_NETWORK && ENABLE_PRICE_REFRESH)) return null;
+    // v3.18.1（N3）：区分「文件缺失」与「文件损坏」。损坏时先改名备份为 .corrupt-<ts> 再重建（自愈，
+    // 与账本的 .corrupt 处理一致）；重建失败时提示可用备份人工恢复，不再用误导性的「沿用本地价」文案。
+    const missing = !fs.existsSync(PRICING);
+    if (!(ENABLE_NETWORK && ENABLE_PRICE_REFRESH)) {
+      process.stderr.write(`[token-tracker] pricing.json ${missing ? '缺失' : '损坏'}且联网开关关闭，无法重建（所有模型费用将无法计算）；请手动修复文件或开启联网刷新\n`);
+      return null;
+    }
+    if (!missing) {
+      try {
+        const bak = `${PRICING}.corrupt-${new Date().toISOString().replace(/[:.]/g, '').slice(0, 17)}`;
+        fs.renameSync(PRICING, bak);
+        process.stderr.write(`[token-tracker] pricing.json 损坏，已备份为 ${path.basename(bak)}，尝试重建\n`);
+      } catch (e) {
+        process.stderr.write(`[token-tracker] pricing.json 损坏且备份失败，拒绝覆盖（所有模型费用将无法计算）: ${String(e.message).slice(0, 120)}\n`);
+        return null;
+      }
+    }
     const script = path.join(path.dirname(PRICING), 'refresh-prices.js');
     if (!fs.existsSync(script)) {
-      process.stderr.write(`[token-tracker] refresh-prices.js 不存在，pricing 重建失败\n`);
+      process.stderr.write(`[token-tracker] refresh-prices.js 不存在，pricing 重建失败（所有模型费用将无法计算）\n`);
       return null;
     }
     try {
@@ -2135,7 +2172,7 @@ function autoRefreshPricing(pricing) {
         timeout: 60000, stdio: 'pipe', windowsHide: true, env: Object.assign({}, process.env, { WB_ROOT: WB }),
       });
     } catch (e) {
-      process.stderr.write(`[token-tracker] pricing 重建失败（沿用本地价）: ${String(e.message).slice(0, 200)}\n`);
+      process.stderr.write(`[token-tracker] pricing 重建失败（所有模型费用将无法计算；可把 .corrupt 备份改名回 pricing.json 人工恢复）: ${String(e.message).slice(0, 200)}\n`);
       return null;
     }
     const rebuilt = loadPricing();
@@ -3285,7 +3322,7 @@ function ensureNewModelPricing(pricing, stat) {
   const hit = findModel(pricing, stat.model, 'price'); // v2.71：计费模式——宽松命中（如 hy3-x→hy3）即视为已收录，避免无谓联网补录
   if (hit && typeof hit.m.input_price === 'number') return { status: 'none', note: '' };
   const name = lookupKeyOf(stat.model); // v3.18：路径型模型名（本地 .gguf 等）取末段做键，避免把本机绝对路径写进价格库
-  const looked = (pricing._lookedup_models || []).indexOf(name) >= 0;
+  const looked = loadLookedup().indexOf(name) >= 0;
   if (looked) {
     return { status: 'skipped', note: `⚠️ 新模型 ${stat.model} 价格已查过未收录，可搜官方定价页人工补录` };
   }
@@ -3311,12 +3348,9 @@ function ensureNewModelPricing(pricing, stat) {
   const ref = lookupOrPrice(stat.model);
   if (ref === null) {
     // 国内外源均确认没有 → 记入已查列表，避免每次运行都联网
-    pricing._lookedup_models = pricing._lookedup_models || [];
-    if (pricing._lookedup_models.indexOf(name) < 0) {
-      pricing._lookedup_models.push(name);
-      // v3.18（M1）：上限 200 条，防止无界追加把价格库越写越大
-      if (pricing._lookedup_models.length > 200) pricing._lookedup_models.splice(0, pricing._lookedup_models.length - 200);
-    }
+    // v3.18.1（N6）：已查列表改存本地 sidecar 文件（.lookedup-models.json，不入库）——
+    // 旧实现写进 pricing.json，本机自定义模型名（fast-model 等）会随公开仓库分发
+    rememberLookedup(name);
     // 修复6：加锁写，避免与 refresh-prices.js 并发覆盖。
     // v2.80：内存 pricing 含本地官方库合并条目（只属于 index.json），写盘前剥离，防止两源互相覆盖/膨胀
     const persist = stripLocalDbEntries(pricing);

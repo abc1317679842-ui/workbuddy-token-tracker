@@ -3,6 +3,19 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.18.1（2026-09-30）—— 复审报告落地：分发正确性 + 价格库自愈 + 文档收尾
+
+- **N1**：`.gitignore` 补 `local-config.json`/`.env`（v3.18.0 声明过但推送清单漏了该文件，仓库里仍是旧版——本次补推）+ 新增排除 `docs/`、`.lookedup-models.json`
+- **N2**：`refresh-holidays.js` 不再读客户端 MCP 凭据库（`mcp.json`）找 GitHub PAT、删除硬编码 home 路径 → 只认 `GH_TOKEN`/`GITHUB_TOKEN` 环境变量；公开仓库匿名请求足够（限流 60 次/时，节假日刷新每天 1 次）
+- **仓库卫生**：`docs/` 7 个诊断文件与 `BACKLOG.md` 从仓库删除（本地诊断日志不入库，含个人路径信息；`docs/` 本地保留，`.gitignore` 排除）
+- **N3**：pricing.json 损坏时先改名备份为 `pricing.json.corrupt-<ts>` 再重建（自愈，与账本 `.corrupt` 处理一致）；文案区分「缺失/损坏/重建失败」，删除误导性的「沿用本地价」（损坏时并无可用本地价）；`refresh-prices.js` 容忍 pricing.json 缺失（空库起步重建；文件损坏原地存在时仍拒绝处理）
+- **N6**：模型「已查未收录」列表迁出 pricing.json → 本地 `.lookedup-models.json`（不入库，上限 200 条）——本机自定义模型名不再随公开仓库分发；存量 9 条清理；`stripLocalDbEntries` 防御性剥离旧字段
+- **价格库元数据**：`daily_refresh`/`source_note` 更新为多源现状（llmabacus 主 + llm-prices-cn 备 + OpenRouter/litellm/portkey USD 参考 + DeepSeek 官方价），不再停留在 OpenRouter 单源描述
+- **M10 残留**：SKILL.md 删除 L143 起 22 个历史版本要点块 + 诚实复盘块（CHANGELOG 已有全量，此前只迁走一半）——64KB→39KB，版本块 23→1（仅留 v3.18 当前要点）
+- **M9**：README 安装说明修正——clone 后需改名 `token-usage-tracker`；hook 命令不用 `~`（Windows 部分环境不展开）改完整路径示例；补文件清单表
+- **N4**：README 新增「隐私与数据安全」章节，指向 CHANGELOG「隐私与安全」（L515 起）集中维护
+- **版本**：manifest / 主脚本头 / README badge 三处统一 v3.18.1
+
 ## v3.18.0（2026-09-30）—— 外部审查报告落地：安全三件套 + 数据卫生 + 文档对齐
 
 - **H1**：余额查询开关改读本地未入库 `local-config.json`（默认 false）——README/manifest「默认零密钥联网」名实相符；本机由 local-config.json 保持开启

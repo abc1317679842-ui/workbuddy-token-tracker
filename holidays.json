@@ -1,5 +1,5 @@
 {
- "updated_at": "2026-09-28 07:26:22",
+ "updated_at": "2026-09-30 02:42:26",
  "note": "只列「放假」日期；峰谷判定用它排除法定假日。双源交叉验证，不一致时取交集。",
  "sources": {
   "primary": "NateScarlet/holiday-cn",

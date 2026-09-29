@@ -5,14 +5,14 @@
   "usd_cny_rate": 7.2,
   "peak_hours_cn": "仅 DeepSeek 原厂系有峰谷：北京时间 9:00-12:00、14:00-18:00 价格×2；其余模型无峰谷（peak_multiplier=1）",
   "cache_discount_note": "缓存命中价通常远低于未命中输入价（DeepSeek 约 98% 折扣）",
-  "daily_refresh": "每天首次运行（date 过期）自动拉取 OpenRouter API（openrouter.ai/api/v1/models，免费无需 key）更新 USD 参考价；本地官方人民币价优先，未收录模型用 USD×usd_cny_rate 补估算价。当天已刷新则不再联网。",
+  "daily_refresh": "每天首次运行（date 过期）自动多源刷新：国内源 llmabacus（人民币主）+ 备源 llm-prices-cn，国外源 OpenRouter/litellm/portkey（USD 参考，仅 region=US 模型写 usd_*）；DeepSeek 系用官方 API 定价；未收录模型触发联网补录或 USD×usd_cny_rate 估算。当天已刷新则不再联网。",
   "sources": [
     "OpenRouter API https://openrouter.ai/api/v1/models（实时，每 12 小时更新，自动刷新源）",
     "LiteLLM model_prices_and_context_window.json（GitHub BerriAI/litellm，静态聚合）",
     "Portkey https://configs.portkey.ai/pricing/<provider>.json（免费 API，每日更新，人工核对用）",
     "厂商官方定价页：DeepSeek api-docs.deepseek.com / 智谱 open.bigmodel.cn / Kimi platform.moonshot.cn / MiniMax platform.minimaxi.com / 混元 cloud.tencent.com"
   ],
-  "source_note": "2026-08-04 由官方定价页 + OpenRouter 交叉核对该日期；未收录模型 toast 显示「费用未收录」。",
+  "source_note": "多源刷新（v3.18.1 起）：llmabacus(国内·人民币·主)+llm-prices-cn(备)+OpenRouter/litellm/portkey(USD 参考)+DeepSeek 官方价；价格以各厂商官方定价页为最终权威。",
   "models": {
     "deepseek-v4-flash": {
       "name": "DeepSeek-V4 Flash",
@@ -186,17 +186,6 @@
   },
   "last_source": "multi-source",
   "last_refresh_note": "2026-09-29T17:27:21.632Z 多源刷新：llmabacus(国内·人民币·主)✓ | llm-prices-cn(国内·人民币·备)✗(fetch failed) | openrouter(USD)✓ | litellm(USD)✗(fetch failed) | portkey(USD)✓；人民币主价更新 8 个，USD参考 14 个，region 设定 0 个（汇率 7.2）；DeepSeek官方价✓",
-  "_lookedup_models": [
-    "gemma-4-12b-qat",
-    "qwen3.6-35b-a3b-instruct-revised",
-    "gpt-oss-20b-mxfp4.gguf",
-    "gpt-oss-20b-local",
-    "qwen3.8-27b-xxxs-fixed",
-    "hy3-x",
-    "fast-model",
-    "balanced-model",
-    "deep-model"
-  ],
   "deepseek_rules": {
     "peak_schedule": "",
     "weekend_off_peak": true,

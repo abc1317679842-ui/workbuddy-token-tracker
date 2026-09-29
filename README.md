@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.18.0-blue)
+![Version](https://img.shields.io/badge/version-v3.18.1-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -95,6 +95,10 @@ const ENABLE_MODEL_LOOKUP = true;   // 新模型价格自动补录（llmabacus +
 
 要开启余额查询：在技能目录新建 `local-config.json`（内容 `{"enable_balance_query": true}`，文件不进仓库、不会被推送），并确认 `models.json` 里配置了 DeepSeek key。
 
+## 🔐 隐私与数据安全
+
+> 完整的**出网主机清单、本地写盘位置、诊断日志内容、已知限制（固定汇率）**见 [CHANGELOG.md](CHANGELOG.md) 的「隐私与安全」章节（L515 起）（v3.18 起集中维护，本文件不重复抄写）。
+
 ## 🔐 余额查询安全性说明
 
 启用余额查询（`local-config.json` 写 `{"enable_balance_query": true}`，且 `models.json` 配置 DeepSeek key）后，请知悉以下事实：
@@ -136,12 +140,32 @@ DeepSeek-V4 Flash 高峰双倍
 
 ## 安装
 
+仓库目录名是 `workbuddy-token-tracker`，技能目录名必须是 `token-usage-tracker`（`token-tracker.js` 按此路径定位），**clone 后需改名**：
+
 ```bash
-# 1. 拷贝技能目录到用户级技能目录
-cp -r token-usage-tracker ~/.workbuddy/skills/
+# 1. clone 并改名为技能目录名，拷入用户级技能目录
+git clone https://github.com/abc1317679842-ui/workbuddy-token-tracker.git
+cp -r workbuddy-token-tracker ~/.workbuddy/skills/token-usage-tracker
 
 # 2. 在 ~/.workbuddy/settings.json 配置 hooks（见下）
 ```
+
+> Windows 提示：hook 命令里**不要用 `~`**（部分执行环境不展开），请写完整路径，如 `node "C:/Users/<你的用户名>/.workbuddy/skills/token-usage-tracker/token-tracker.js" --hook`。
+
+### 文件清单
+
+| 文件 | 作用 |
+|---|---|
+| `token-tracker.js` | 主脚本：`--hook` 注入 / `--stop` 通知 / `--report` 账本 / `--recalc` 重算 |
+| `refresh-prices.js` | 多源价格刷新（每天首次运行自动触发，也可手动跑） |
+| `deepseek-official.js` | DeepSeek 官方定价抓取（被 refresh-prices 调用） |
+| `refresh-holidays.js` | 中国法定节假日双源刷新（峰谷计费用，手动运行） |
+| `fetch-cn-prices.py` | 国内厂商官网价抓取（Python 3 + requests，可选） |
+| `parse_tokenhub.py` / `build_index.py` | 本地官方价库解析/建索引（可选） |
+| `pricing.json` / `holidays.json` | 价格库 / 节假日数据（技能目录内） |
+| `recalc-day.js` / `backfill.js` | 账本维护工具（指定日重算 / 历史回填） |
+| `SKILL.md` / `CHANGELOG.md` / `manifest.yaml` / `LICENSE` | 技能说明 / 变更史 / 元数据 / 许可 |
+| `.gitignore` | 排除本地运行时文件与私密配置 |
 
 ### Hook 配置示例（`settings.json`）
 
@@ -154,7 +178,7 @@ cp -r token-usage-tracker ~/.workbuddy/skills/
         "hooks": [
           {
             "type": "command",
-            "command": "node ~/.workbuddy/skills/token-usage-tracker/token-tracker.js --hook"
+            "command": "node \"C:/Users/<你的用户名>/.workbuddy/skills/token-usage-tracker/token-tracker.js\" --hook"
           }
         ]
       }
@@ -165,7 +189,7 @@ cp -r token-usage-tracker ~/.workbuddy/skills/
         "hooks": [
           {
             "type": "command",
-            "command": "node ~/.workbuddy/skills/token-usage-tracker/token-tracker.js --stop"
+            "command": "node \"C:/Users/<你的用户名>/.workbuddy/skills/token-usage-tracker/token-tracker.js\" --stop"
           }
         ]
       }
@@ -180,7 +204,7 @@ cp -r token-usage-tracker ~/.workbuddy/skills/
 ### 手动使用（不想配 hook 时）
 
 ```bash
-node ~/.workbuddy/skills/token-usage-tracker/token-tracker.js
+node "C:/Users/<你的用户名>/.workbuddy/skills/token-usage-tracker/token-tracker.js"
 # 输出示例：
 # 上一轮 DeepSeek-V4 Flash ｜ 耗时 1m 47s ｜ 输入 69.8万 / 输出 1.1万 tokens（该轮累计 70.9万，缓存命中 64.1万）
 ```

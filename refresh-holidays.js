@@ -22,16 +22,11 @@ const OUT = path.join(DIR, 'holidays.json');
 const SRC_A = 'NateScarlet/holiday-cn';
 const SRC_B = 'HankAviator/china-holiday-calendar';
 
+// v3.18.1：token 只从环境变量读取（GH_TOKEN / GITHUB_TOKEN），不再读任何本地凭据文件。
+// 公开仓库无 token 也能读（受 GitHub 限流 60 次/小时，节假日刷新每天最多 1 次，够用）。
 function ghToken() {
-  try {
-    const c = JSON.parse(fs.readFileSync('C:/Users/14779/.workbuddy/mcp.json', 'utf-8'));
-    const s = c.mcpServers || {};
-    for (const k of Object.keys(s)) {
-      const t = (((s[k] || {}).env) || {}).GITHUB_PERSONAL_ACCESS_TOKEN;
-      if (t && String(t).length > 20) return String(t);
-    }
-  } catch (e) { /* 公开仓库无 token 也能读（受限流） */ }
-  return '';
+  const t = process.env.GH_TOKEN || process.env.GITHUB_TOKEN || '';
+  return t && String(t).length > 20 ? String(t) : '';
 }
 
 async function ghJson(repo, p, tok) {

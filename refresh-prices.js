@@ -93,7 +93,12 @@ function todayStr() {
 
 function load() {
   try { return JSON.parse(fs.readFileSync(PRICING, 'utf-8')); }
-  catch (e) { throw new Error(`pricing.json 读取失败: ${e.message}`); }
+  catch (e) {
+    // v3.18.1（N3）：文件缺失（含损坏被备份改名后）→ 从空库起步重建（DeepSeek 官方抓取器先建底，
+    // 聚合源再合并）。损坏文件原地存在时仍 throw 拒绝处理（M7 守卫语义不变）。
+    if (e.code === 'ENOENT') return { models: {} };
+    throw new Error(`pricing.json 读取失败: ${e.message}`);
+  }
 }
 
 // 独立文件锁（与 token-tracker.js 的 withFileLock 完全同构：原子 openSync 'wx' + pid 存活探测 + TTL 兜底）。

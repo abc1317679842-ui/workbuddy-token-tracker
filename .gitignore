@@ -31,3 +31,12 @@ token-tracker.js.v2.*
 *.bak
 *.bak-*
 *.tmp
+
+# v3.18: 本机私有开关与密钥类文件不入库
+local-config.json
+.env
+
+# 本地诊断/审计文档（含个人路径，禁止入库）
+docs/
+# 模型已查列表（本地运行时，不入库）
+.lookedup-models.json
