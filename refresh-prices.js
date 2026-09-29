@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// refresh-prices.js v2.2 — 多源价格自动刷新（token-usage-tracker 技能配套）
+// refresh-prices.js v3.18 — 多源价格自动刷新（token-usage-tracker 技能配套）
 //
 // 用户需求（2026-08-14）：
 //   1) 已有模型每天刷新一次；新模型由 token-tracker.js 的 ensureNewModelPricing 立即补录；
@@ -195,10 +195,14 @@ async function fetchJson(url) {
   try {
     const res = await fetch(url, {
       signal: ctrl.signal,
-      headers: { 'User-Agent': 'token-usage-tracker/2.2 (WorkBuddy skill)' },
+      headers: { 'User-Agent': 'token-usage-tracker/3.18 (WorkBuddy skill)' },
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
+    const j = await res.json();
+    // v3.18（M6）：响应零校验修复——上游返回 `{}`/数组/改 schema 时旧版静默产出空索引
+    // 且仍被计为"源成功"。这里至少保证顶层是对象。
+    if (!j || typeof j !== 'object' || Array.isArray(j)) throw new Error('响应不是 JSON 对象');
+    return j;
   } finally {
     clearTimeout(timer);
   }
@@ -285,27 +289,47 @@ function parsePortkey(j) {
   return out;
 }
 
+// v3.18（M5）：无界双向子串匹配修复——旧版对全量源索引做 `includes` 且取首个命中，
+// 无歧义检测（短 key 极易撞到无关模型，错价还会带上正常来源标签）。现规则：
+//   ① 归一化精确相等 → 直接命中；
+//   ② 模糊匹配：双方归一化名都 ≥4 字符才参与，收集**全部**命中——
+//      唯一命中 → 采用；多个命中但价格一致 → 取首个（无害）；多个命中且价格不同 → 判歧义放弃并告警。
+const AMBIG_WARNINGS = [];
+function looseFind(index, localNorm, kind, forKey) {
+  if (!index) return null;
+  let hits = [];
+  for (const k of Object.keys(index)) {
+    const kn = norm(k);
+    if (!kn) continue;
+    if (kn === localNorm) return index[k];
+    if (localNorm.length >= 4 && kn.length >= 4 && (kn.includes(localNorm) || localNorm.includes(kn))) hits.push(k);
+  }
+  if (!hits.length) return null;
+  if (hits.length === 1) return index[hits[0]];
+  const priceSig = (v) => JSON.stringify([v.usdIn != null ? v.usdIn : v.in, v.usdOut != null ? v.usdOut : v.out]);
+  const sigs = new Set(hits.map((k) => priceSig(index[k])));
+  if (sigs.size === 1) return index[hits[0]];
+  AMBIG_WARNINGS.push(`${forKey}: ${kind} 模糊命中 ${hits.length} 个不同价候选(${hits.slice(0, 3).join(',')})，已放弃`);
+  return null;
+}
+
 function usdFind(usdIndex, localKey, orId, localNorm) {
   if (!usdIndex) return null;
   if (usdIndex[localKey]) return usdIndex[localKey];
   if (orId && usdIndex[orId]) return usdIndex[orId];
-  for (const k of Object.keys(usdIndex)) {
-    const kn = norm(k);
-    if (kn && (kn.includes(localNorm) || localNorm.includes(kn))) return usdIndex[k];
-  }
-  return null;
+  return looseFind(usdIndex, localNorm, 'USD源', localKey);
 }
 
-// 在人民币源索引里找模型：先 srcId（归一化），再精确，再包含
-function cnFind(cnIndex, srcId, localNorm) {
+// 在人民币源索引里找模型：先 srcId（归一化），再精确，再模糊（带歧义防护）
+function cnFind(cnIndex, srcId, localNorm, forKey) {
   if (!cnIndex) return null;
   if (srcId && cnIndex[srcId]) return cnIndex[srcId];
-  for (const id of Object.keys(cnIndex)) {
-    const inorm = norm(id);
-    if (inorm && (inorm === localNorm || inorm.includes(localNorm) || localNorm.includes(inorm))) return cnIndex[id];
-  }
-  return null;
+  return looseFind(cnIndex, localNorm, '国内源', forKey || localNorm);
 }
+
+// v3.18（M6）：解析器注册表——拉取后立即解析并校验"解析出 >0 个模型"，
+// 上游 schema 变更/返回空体不再被计为"源成功"。
+const PARSERS = { llma: parseLlma, llc: parseLlc, or: parseOr, litellm: parseLitellm, portkey: parsePortkey };
 
 async function main() {
   // DeepSeek 官方定价抓取（v2.59，2026-08-23）放在 load() 之前：
@@ -328,8 +352,9 @@ async function main() {
           officialOk = true;
         }
       } else {
-        const reason = (sp.stderr.match(/FAIL_REASON=([^\n]+)/) || [])[1] || sp.stderr.trim().slice(0, 200);
-        process.stderr.write(`[refresh-prices] DeepSeek 官方定价抓取失败（回落聚合源）: ${reason || '未知'}\n`);
+        // v3.18：sp.stderr 可能为 null（spawn 本身失败，如 EBUSY/ENOENT），先兜底空串
+        const reason = (((sp.stderr || '') + '').match(/FAIL_REASON=([^\n]+)/) || [])[1] || String(sp.stderr || '').trim().slice(0, 200) || (sp.error && sp.error.code) || '未知';
+        process.stderr.write(`[refresh-prices] DeepSeek 官方定价抓取失败（回落聚合源）: ${reason}\n`);
       }
     } catch (e) {
       process.stderr.write(`[refresh-prices] DeepSeek 官方抓取器执行异常（回落聚合源）: ${e.message}\n`);
@@ -346,11 +371,17 @@ async function main() {
     return;
   }
 
-  // 并行拉 5 源
+  // 并行拉 5 源（v3.18/M6：拉取后立刻解析+校验，解析失败/零模型 = 源失败）
   const results = NO_NET
     ? Object.fromEntries(Object.keys(SOURCES).map((k) => [k, { ok: false, err: 'WB_NO_NET=1' }]))
     : await Promise.all(Object.entries(SOURCES).map(async ([k, s]) => {
-        try { return { ok: true, data: await fetchJson(s.url) }; }
+        try {
+          const j = await fetchJson(s.url);
+          const parsed = PARSERS[k](j);
+          const n = Object.keys(parsed || {}).length;
+          if (!n) throw new Error('解析出 0 个模型（上游 schema 可能已变更）');
+          return { ok: true, data: parsed };
+        }
         catch (e) { return { ok: false, err: e.message }; }
       })).then((arr) => {
         const o = {};
@@ -372,12 +403,12 @@ async function main() {
     process.exit(1);
   }
 
-  // 解析各源
-  const llma = results.llma.ok ? parseLlma(results.llma.data) : null;
-  const llc = results.llc.ok ? parseLlc(results.llc.data) : null;
-  const or = results.or.ok ? parseOr(results.or.data) : null;
-  const litellm = results.litellm.ok ? parseLitellm(results.litellm.data) : null;
-  const portkey = results.portkey.ok ? parsePortkey(results.portkey.data) : null;
+  // 解析各源（v3.18/M6：main 拉取阶段已完成解析与校验，这里只取结果）
+  const llma = results.llma.ok ? results.llma.data : null;
+  const llc = results.llc.ok ? results.llc.data : null;
+  const or = results.or.ok ? results.or.data : null;
+  const litellm = results.litellm.ok ? results.litellm.data : null;
+  const portkey = results.portkey.ok ? results.portkey.data : null;
   const usdSources = [or, litellm, portkey].filter(Boolean);
 
   const rate = Number(pricing.usd_cny_rate) > 0 ? pricing.usd_cny_rate : DEFAULT_RATE;
@@ -441,8 +472,8 @@ async function main() {
 
     const localNorm = norm(key);
     const srcId = SRC_ID_MAP[key] || null;
-    const llmaHit = llma ? cnFind(llma, srcId, localNorm) : null;
-    const llcHit = llc ? cnFind(llc, srcId, localNorm) : null;
+    const llmaHit = llma ? cnFind(llma, srcId, localNorm, key) : null;
+    const llcHit = llc ? cnFind(llc, srcId, localNorm, key) : null;
 
     // region 推断：模型无 region 字段时，优先用 llmabacus vendors country（US→US，其余→CN）
     if (!m.region) {
@@ -451,10 +482,13 @@ async function main() {
       regionSet++;
     }
 
-    // USD 参考价：三 USD 源中位数（所有模型都更新）
+    // USD 参考价：三 USD 源中位数
     const usdIn = median(usdSources.map((u) => usdFind(u, key, m.or_id, localNorm)?.usdIn));
     const usdOut = median(usdSources.map((u) => usdFind(u, key, m.or_id, localNorm)?.usdOut));
-    if (usdIn != null && usdOut != null) {
+    // v3.18（H3）：usd_* 参考字段只对 region=US 模型写盘——region=CN 的人民币主价是权威口径，
+    // 计费从不读 usd_*，留着只会与主价互相矛盾（实测偏差 -78%~+8%）并污染人工对账。
+    // CN 模型的 usdIn/usdOut 仍保留在循环变量里，供下方 auto_converted 估算兜底使用。
+    if (m.region === 'US' && usdIn != null && usdOut != null) {
       m.usd_input_price = Number(usdIn.toFixed(6));
       m.usd_output_price = Number(usdOut.toFixed(6));
       usdUpdated++;
@@ -524,6 +558,24 @@ async function main() {
   delete pricing.last_refresh_error;
   delete pricing.last_refresh_error_at;
 
+  // v3.18（H3+H4）：写盘前一致性自检——静默错价没有任何测试会发现，这里兜一道：
+  //   ① 人民币主价 vs usd×汇率 偏差 >25% → 告警（US 模型主价即换算结果，正常应≈0%；
+  //      CN 模型已不再写 usd_*，存量脏数据被检测出来提醒清理）；
+  //   ② peak_multiplier>1 但不是 DeepSeek 原厂系 → 与 peak_hours_cn 声明矛盾，告警。
+  const auditWarnings = [];
+  for (const [key, m] of Object.entries(models)) {
+    if (!m || typeof m !== 'object') continue;
+    if (typeof m.input_price === 'number' && typeof m.usd_input_price === 'number' && m.input_price > 0) {
+      const dev = Math.abs(m.input_price - m.usd_input_price * rate) / m.input_price;
+      if (dev > 0.25) auditWarnings.push(`${key}: 人民币价 ${m.input_price} vs usd×${rate}=${(m.usd_input_price * rate).toFixed(2)} 偏差 ${(dev * 100).toFixed(0)}%`);
+    }
+    if ((m.peak_multiplier || 1) > 1 && !/deepseek/i.test(key) && !/deepseek/i.test(String(m.or_id || ''))) {
+      auditWarnings.push(`${key}: peak_multiplier=${m.peak_multiplier} 但非 DeepSeek 原厂系，与 peak_hours_cn 声明矛盾`);
+    }
+  }
+  if (auditWarnings.length) pricing._price_audit = { at: new Date().toISOString(), warnings: auditWarnings };
+  else delete pricing._price_audit;
+
   const noteParts = [];
   for (const [k, s] of Object.entries(SOURCES)) {
     const r = results[k];
@@ -538,7 +590,7 @@ async function main() {
     pricing.deepseek_refresh_error = `DeepSeek 官方定价抓取失败（${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}），DeepSeek 系价格沿用本地/聚合源价`;
     // 失败不阻塞整体刷新：其余模型照常更新
   }
-  pricing.last_refresh_note = `${new Date().toISOString()} 多源刷新：${noteParts.join(' | ')}；人民币主价更新 ${updatedMain} 个${autoConverted ? `，USD换算 ${autoConverted} 个` : ''}，USD参考 ${usdUpdated} 个，region 设定 ${regionSet} 个（汇率 ${rate}）${bigDiff.length ? `；⚠️峰谷模型价差>60%需核验：${bigDiff.join('、')}` : ''}${officialOk ? '；DeepSeek官方价✓' : '；DeepSeek官方价✗(回落聚合源)'}`;
+  pricing.last_refresh_note = `${new Date().toISOString()} 多源刷新：${noteParts.join(' | ')}；人民币主价更新 ${updatedMain} 个${autoConverted ? `，USD换算 ${autoConverted} 个` : ''}，USD参考 ${usdUpdated} 个，region 设定 ${regionSet} 个（汇率 ${rate}）${bigDiff.length ? `；⚠️峰谷模型价差>60%需核验：${bigDiff.join('、')}` : ''}${officialOk ? '；DeepSeek官方价✓' : '；DeepSeek官方价✗(回落聚合源)'}${AMBIG_WARNINGS.length ? `；⚠️模糊匹配歧义: ${AMBIG_WARNINGS.join('；')}` : ''}${auditWarnings.length ? `；⚠️价格一致性自检: ${auditWarnings.join('；')}` : ''}`;
 
   try { save(pricing); }
   catch (e) { process.stderr.write(`[refresh-prices] 写入失败: ${e.message}\n`); process.exit(1); }
@@ -555,4 +607,4 @@ if (require.main === module) {
 }
 
 // 供测试/外部复用（不影响脚本直接运行）
-module.exports = { save, load, todayStr, PRICING };
+module.exports = { save, load, todayStr, PRICING, usdFind, cnFind, looseFind, norm, median };

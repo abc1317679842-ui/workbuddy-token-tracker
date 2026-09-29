@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.16 (2026-09-28)
+// token-usage-tracker v3.18.0 (2026-09-30)
 // v2.63：调试日志机制重构——废弃 TOKEN_TRACKER_DEBUG 环境变量开关 + poll 全量记录，改为「弹窗时自动记录」：
 //   每次 showToast 无条件向 ~/.workbuddy/token-tracker-toast.log 追加一行 JSON 诊断（原因/sessionId/行数/稳定计数/compaction 状态等）。
 // v2.62：compaction 检测由"行数减少>5"改为"扫描 transcript 末尾 30 行识别压缩标记（compactionMode 方案）"。
@@ -59,15 +59,21 @@ const TRACE_DIR = path.join(WB, 'traces');
 // 公开价表（OpenRouter）每日自动刷新/新模型补录默认开启，均无需密钥，失败自动降级为本地价。
 // 三个分开关各自独立；ENABLE_NETWORK=false 时所有联网请求一律跳过（一键零联网）。
 const ENABLE_NETWORK = true;        // 总开关：false = 全部联网功能关闭（含分开关）
-const ENABLE_BALANCE_QUERY = true; // 分开关1：余额查询（携带 DeepSeek API key 请求官方接口，最敏感）
-// 2026-09-28 用户明确指令开启（原为 false）：弹窗第二行恢复显示「余额¥X」，数据来自官方
-//   https://api.deepseek.com/user/balance（key 从 models.json 读取，仅本机使用、不外传，15s 缓存）。
-//   要临时关闭：把本行改回 false。
+// v3.18（2026-09-30）：余额查询开关改读**本地未入库**配置 local-config.json（仓库分发版默认 false）。
+//   要开启：在技能目录放 local-config.json 写 {"enable_balance_query": true}（该文件不进仓库，
+//   密钥本身仍在 models.json）。2026-09-28 用户曾指令本机开启（弹窗第二行显示「余额¥X」），
+//   本机由 local-config.json 承接，不再改源码默认值。
+function loadLocalFlag(name, dflt) {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, 'local-config.json'), 'utf-8'));
+    return typeof cfg[name] === 'boolean' ? cfg[name] : dflt;
+  } catch (e) { return dflt; }
+}
+const ENABLE_BALANCE_QUERY = loadLocalFlag('enable_balance_query', false);
 const ENABLE_PRICE_REFRESH = true;  // 分开关2：每日价格自动刷新（OpenRouter 公开价表，无需密钥）
 const ENABLE_MODEL_LOOKUP = true;   // 分开关3：新模型价格自动补录（OpenRouter 公开价表，无需密钥）
 // 余额查询安全性：开启后仅向官方 https://api.deepseek.com/user/balance 发送请求，密钥只通过
 // Authorization: Bearer 头传给该官方域名，不会发给第三方；请求内容不含任何本地数据。
-// 注意：余额查询默认关闭，需要时把 ENABLE_BALANCE_QUERY 改为 true（且 models.json 需配置 DeepSeek key）。
 const SNAP_DIR = path.join(WB, 'skills', 'token-usage-tracker');
 const SNAP = path.join(SNAP_DIR, '.snapshot.json');
 // v2.21（2026-08-06）：快照按 session_id 拆分。多会话并发时全局单快照会被互相覆盖
@@ -167,8 +173,8 @@ function writeToastLog(reason, state) {
       compactionSuspected: st.compactionSuspected != null ? st.compactionSuspected : null,
       compactionMode: st.compactionMode != null ? st.compactionMode : null,
       lastMarkerId: st.lastMarkerId != null ? st.lastMarkerId : null,
-      tailRawPrefix: String(st.tailRawPrefix || '').slice(0, 80),
-      lastTailRawPrefix: String(st.lastTailRawPrefix || '').slice(0, 80),
+      tailFingerprint: st.tailFingerprint != null ? st.tailFingerprint : null, // v3.18（M14）：原 tailRawPrefix 存原文前 80 字符，改指纹
+      lastTailFingerprint: st.lastTailFingerprint != null ? st.lastTailFingerprint : null,
       pendingSubCount: st.pendingSubCount != null ? st.pendingSubCount : null,
       hasNewTail: st.hasNewTail != null ? st.hasNewTail : null,
       watchStartTime: st.watchStartTime != null ? st.watchStartTime : null,
@@ -261,7 +267,7 @@ function startWatcherVerified(sid) {
     try {
       if (fs.existsSync(lockF) && fs.statSync(lockF).mtimeMs > lockBefore) return true; // 锁被新建/更新 → watcher 已接管
     } catch (e) { /* 读取瞬时失败：下一轮重试 */ }
-    try { cp.execSync('ping -n 1 -w 100 127.0.0.1 >NUL', { stdio: 'ignore' }); } catch (e) { /* sleep 150ms */ }
+    try { syncSleepMs(150); } catch (e) { /* sleep 150ms（v3.18：原 ping.exe 模拟，改 Atomics.wait） */ }
   }
   return false;
 }
@@ -303,7 +309,7 @@ const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
 //   fetch-cn-prices.py && parse_tokenhub.py && build_index.py → prices/index.json（原子写，含 built_at 闸门）
 // 可用环境变量覆盖路径；默认指向价格库项目目录。
 // v3.02（2026-09-11 解耦·自适应）：价库路径**自动发现**，不再写死某个具体工作区。
-//   背景：原实现硬编码 `C:\Users\14779\WorkBuddy\2026-08-30-22-25-15\prices`，
+//   背景：原实现曾硬编码作者本机的某个具体工作区路径（v3.18 已彻底删除，见下方 cands 注释），
 //   该工作区一旦改名/迁移/删除，价库即**静默失效**（国内模型失去官方价、费用显示为空）。
 //   WorkBuddy 更新频繁且会重建工作区，这类"写死路径"是最典型的易碎点。
 //   自适应策略（按优先级，命中即用）：
@@ -331,7 +337,8 @@ function autoDiscoverCnPriceDir() {
     if (best) cands.push(best);
   } catch (e) { /* ~/WorkBuddy 不存在 → 跳过该级 */ }
   cands.push(path.join(__dirname, 'prices'));
-  cands.push('C:\\Users\\14779\\WorkBuddy\\2026-08-30-22-25-15\\prices');
+  // v3.18（M1）：删除旧实现遗留的作者个人绝对路径兜底——对其他用户必然是死路径，
+  // 且向所有安装者泄漏作者用户名/目录结构。自动发现（①②③）未命中时返回空串走降级路径即可。
   for (const c of cands) {
     if (!c) continue;
     try { if (fs.existsSync(path.join(c, 'index.json'))) return c; } catch (e) { /* 继续下一候选 */ }
@@ -340,23 +347,18 @@ function autoDiscoverCnPriceDir() {
 }
 const CN_PRICE_DIR = autoDiscoverCnPriceDir();
 const CN_PRICE_DB = path.join(CN_PRICE_DIR, 'index.json');
-// 抓价流水线目录：同样自适应——优先环境变量，其次价库所在目录，最后旧硬编码。
+// 抓价流水线目录：同样自适应——优先环境变量，其次价库所在目录（v3.18 删个人路径兜底）。
 const CN_PRICE_PIPELINE_DIR = process.env.CN_PRICE_PIPELINE_DIR
-  || (CN_PRICE_DIR ? path.dirname(CN_PRICE_DIR) : 'C:\\Users\\14779\\WorkBuddy\\2026-08-30-22-25-15');
+  || (CN_PRICE_DIR ? path.dirname(CN_PRICE_DIR) : '');
 const CN_PRICE_REFRESH_LOCK = path.join(CN_PRICE_DIR, '.refresh.lock');
 const CN_PRICE_REFRESH_ERR = path.join(CN_PRICE_DIR, '.refresh.error'); // v2.82：刷新失败原因留档
 const PRICING_LOCK_FILE = path.join(WB, 'skills', 'token-usage-tracker', '.pricing.lock'); // 修复6：pricing 并发写锁
 const MODELS_CFG = path.join(WB, 'models.json'); // 自定义 API 配置（含 apiKey），仅 DeepSeek 官方模型启用余额显示
 const BALANCE_CACHE = path.join(WB, 'skills', 'token-usage-tracker', '.balance.json');
 const DAILY_USAGE_FILE = path.join(WB, 'skills', 'token-usage-tracker', 'daily-usage.json'); // v2.39：每日账本（按本地日期分桶，{日期:{models:{模型:{in,out,cached,total,cost}}, total:{...}}}，长期保存不裁剪）
-// v2.59：写入 daily-usage.json 顶层的「读取方指令」，AI 直接读文件即可看到展示要求，无需翻技能说明。
-// 仅作读取参考，展示给用户时务必剥离本字段（见 normalizeDailyUsage 跳过逻辑）。
-const DAILY_INSTRUCTIONS = {
-  _comment: '本字段仅供读取方（AI助手）参考，向用户展示时请勿包含本字段',
-  show_table: '向用户展示以上账本时，必须使用 Markdown 表格原文（完整 7 列：模型、输入、输出、缓存、缓存命中、总 token、金额），不要手排、不要转纯文本、不要汇总',
-  number_format: '数字用中文简写展示，如 10000 显示为 1万，1000000 显示为 100万，保留合适精度',
-  currency: '成本字段 cost 单位为人民币，展示时使用 ¥ 符号，无需换算'
-};
+// v3.18（M3 修复）：不再往账本写「读取方指令」字段——数据文件里塞指令 = 任何能写账本的本地进程
+// 都能给 AI 下指令（数据→指令通道），且 --report 会把它原样打印进用户界面。展示约定只保留在
+// SKILL.md；历史账本里已存在的 _instructions 由 normalizeDailyUsage 继续剥离，下次写盘自然消失。
 const LEDGER_WATERMARK_FILE = path.join(WB, 'skills', 'token-usage-tracker', '.ledger-watermark.json'); // v2.50：增量记账水位线（{sid:{main:已记账主transcript行数, subs:{子代理文件名:已记账行数}}}）
 const BALANCE_TTL_MS = 15 * 1000; // 余额缓存 15 秒（v2.18 从 60s 压短：用户要求实时，接口实测 300ms 级；正常轮询间隔 >15s 即每轮拿实时数，15s 内连发才复用）
 // 积分/自定义 API 模式识别（v2.10）：官方文档证实内置模型列表就有 deepseek-v4-flash（与自定义 id 同名），
@@ -472,7 +474,7 @@ function saveDailyUsageRaw(d) {
   const tmp = DAILY_USAGE_FILE + '.tmp';
   try {
     fs.mkdirSync(path.dirname(DAILY_USAGE_FILE), { recursive: true });
-    const merged = Object.assign({ _instructions: DAILY_INSTRUCTIONS }, d);
+    const merged = Object.assign({}, d); // v3.18：不再注入 _instructions（见 DAILY_USAGE_FILE 上方注释）
     fs.writeFileSync(tmp, JSON.stringify(merged, null, 2));
     fs.renameSync(tmp, DAILY_USAGE_FILE);
     return true;
@@ -1337,6 +1339,24 @@ function readTailRaw(tsPath) {
 // v2.62/compactionMode：读 transcript 文件【原始末 n 行】（不做 JSON.parse）。用于扫描末尾窗口内的
 // 压缩标记（append-only transcript 行数永不减少，旧 lineCount 检测方案失效）。n 行可能较长，故取末尾
 // 64KB 足以覆盖；返回按文件顺序（旧→新）的最后 n 条非空行。
+// v3.18（M14）：诊断日志不再存对话内容原文——transcript 末行改存「sha1 前 10 位 + 长度」指纹。
+// 同内容 → 同指纹，排查"末行是否变化"类问题仍然可用，但不再把助手回复片段明文落盘。
+function fpOfStr(s) {
+  if (!s) return '';
+  let h = 'err';
+  try { h = require('crypto').createHash('sha1').update(String(s)).digest('hex').slice(0, 10); } catch (e) { /* crypto 异常降级 */ }
+  return h + ':' + String(s).length;
+}
+function tailFingerprint(tsPath) {
+  return fpOfStr(readTailRaw(tsPath));
+}
+// v3.18（M1）：价格补录已查列表的键——路径型模型名（本地 .gguf 等）取末段，
+// 避免把本机绝对路径（如 D:/LMStudioModels/...）写进 pricing.json 并随仓库分发。
+function lookupKeyOf(modelName) {
+  let s = String(modelName || '').toLowerCase();
+  if (/[\\/]/.test(s)) s = s.split(/[\\/]/).pop() || s;
+  return s;
+}
 function readTailRawLines(tsPath, n) {
   try {
     const fd = fs.openSync(tsPath, 'r');
@@ -1875,7 +1895,7 @@ function mergeLocalPriceDb(pricing) {
   // 仍失败则沿用 pricing.json（原子写保证旧完整版仍在，只是恰好撞上替换窗口）
   for (let attempt = 0; attempt < 2; attempt++) {
     try { db = JSON.parse(fs.readFileSync(CN_PRICE_DB, 'utf-8')); break; }
-    catch (e) { if (attempt === 0) { require('child_process').execSync('ping -n 1 -w 60 127.0.0.1 >NUL', { stdio: 'ignore' }); } }
+    catch (e) { if (attempt === 0) { try { syncSleepMs(60); } catch (e2) {} } } // v3.18：原 ping.exe 模拟，改 Atomics.wait
   }
   if (!db) {
     // v2.96：价库缺失不再静默。原先直接 return pricing，会让国内模型价格悄悄退化为聚合源/估算价，
@@ -2435,8 +2455,14 @@ function normalizeDailyUsage(d) {
   return out;
 }
 function loadDailyUsage() {
+  let raw = '';
   try {
-    const parsed = normalizeDailyUsage(JSON.parse(fs.readFileSync(DAILY_USAGE_FILE, 'utf-8')));
+    raw = fs.readFileSync(DAILY_USAGE_FILE, 'utf-8');
+    // v3.18（H6）：剥 UTF-8 BOM——PowerShell `Out-File -Encoding utf8` 等工具写出的文件带 BOM，
+    // JSON.parse 直接失败 → 整个历史被判"损坏"且 --report 显示为空（v3.06 水位线同类事故，
+    // 当时只修了水位线，账本路径漏了）。剥掉 BOM 后正常解析，数据无损。
+    raw = raw.replace(/^\uFEFF/, '');
+    const parsed = normalizeDailyUsage(JSON.parse(raw));
     gDailyCorrupt = false; // v2.99：只在**成功解析**后清除标志
     return parsed;
   } catch (e) {
@@ -2449,12 +2475,23 @@ function loadDailyUsage() {
       //   现在标志只由"成功解析"来清除，损坏状态在本进程内保持，确保跳过写入生效。
       return {};
     }
-    // 损坏文件：重命名为 .corrupt-<时间戳> 备份（保留历史数据），本轮禁止写回空对象以免覆盖
+    // 损坏文件：重命名为 .corrupt-<时间戳> 备份（保留历史数据），本轮禁止写回空对象以免覆盖。
+    // v3.18（H6）：只备份一次——已存在 .corrupt-* 备份时不再生成新备份（源文件保持原位，
+    // gDailyCorrupt 照样阻止写回），避免"每次运行都多一个备份"的无上限增长。
     try {
       if (fs.existsSync(DAILY_USAGE_FILE)) {
-        const corruptPath = DAILY_USAGE_FILE + '.corrupt-' + Date.now();
-        fs.renameSync(DAILY_USAGE_FILE, corruptPath);
-        process.stderr.write(`[token-tracker] 账本损坏，已备份为 ${path.basename(corruptPath)}（本轮不写回覆盖）\n`);
+        let hasBackup = false;
+        try {
+          hasBackup = fs.readdirSync(path.dirname(DAILY_USAGE_FILE))
+            .some((f) => f.startsWith(path.basename(DAILY_USAGE_FILE) + '.corrupt-'));
+        } catch (e3) { /* 列目录失败按无备份处理 */ }
+        if (!hasBackup) {
+          const corruptPath = DAILY_USAGE_FILE + '.corrupt-' + Date.now();
+          fs.renameSync(DAILY_USAGE_FILE, corruptPath);
+          process.stderr.write(`[token-tracker] 账本损坏，已备份为 ${path.basename(corruptPath)}（本轮不写回覆盖）\n`);
+        } else {
+          process.stderr.write(`[token-tracker] 账本损坏（此前已备份过，不重复备份；本轮不写回覆盖）\n`);
+        }
       }
     } catch (e2) { process.stderr.write(`[token-tracker] 账本损坏文件处理失败: ${e2.message}\n`); }
     gDailyCorrupt = true;
@@ -2681,13 +2718,9 @@ function reportTxt(arg) {
       for (const n of names) lines.push(cells({ label: n, ...models[n] }, false));
       lines.push(cells({ label: '合计', ...total }, true));
     }
-    // v2.58（2026-08-22）：展示约定固化的提示行——每次 --report 读数据，最下面这行字直接告诉
-    // 调用方（AI 助手）"向用户展示账本必须用上面的 Markdown 表格原文"，无需再翻技能规定。
-    // 固定贴在最底部（合计行之后），任何日期档都输出。
-    // v2.59：与 daily-usage.json 顶层 _instructions 保持同一套要求（表格原文 7 列 / 中文简写 / 人民币 ¥），避免 AI 看到两套说法。
-    // 本行仅作读取参考，展示给用户时务必剥离。
-    lines.push('> 【读取方指令】向用户展示以上账本时，必须使用 Markdown 表格原文（完整 7 列：模型、输入、输出、缓存、缓存命中、总 token、金额），不要手排、不要转纯文本、不要汇总；数字用中文简写（10000→1万，1000000→100万）；cost 单位为人民币，用 ¥ 符号，无需换算。本行仅供读取方参考，向用户展示请勿包含本行。');
-    lines.push('');
+    // v3.18（M3 修复）：删除 v2.58 引入的「【读取方指令】」提示行——SKILL.md 要求 AI"原样贴出
+    // --report 输出"，而该行自带"请勿包含本行"，两者矛盾；且"数据输出里嵌给 AI 的指令"本身就是
+    // 指令注入面。展示约定只保留在 SKILL.md（展示格式约束节）。
   }
   return lines.join('\n');
 }
@@ -3012,10 +3045,14 @@ function deepSeekApiKey() {
 // 同步子进程 fetch 余额（主流程是同步的，沿用 lookupOrPrice 的子进程模式）。
 // 返回 { total, currency } 或 null（失败/无余额）。
 function queryBalance(key, timeoutMs) {
+  // v3.18（2026-09-30）：key 不再拼进脚本字符串（会经 argv 出现在子进程命令行，进程列表/审计日志
+  // 可读）——改经环境变量 WB_DS_KEY 传给子进程，命令行只剩 '-e' 与脚本（脚本内不含 key 原文）。
   const script = [
     '(async () => {',
     '  try {',
-    `    const res = await fetch('https://api.deepseek.com/user/balance', { headers: { 'Accept': 'application/json', 'Authorization': 'Bearer ' + ${JSON.stringify(key)} } });`,
+    `    const key = process.env.WB_DS_KEY || '';`,
+    `    if (!key) { console.error('NO_KEY'); process.exit(5); }`,
+    `    const res = await fetch('https://api.deepseek.com/user/balance', { headers: { 'Accept': 'application/json', 'Authorization': 'Bearer ' + key } });`,
     '    if (!res.ok) { console.error(\'HTTP \' + res.status); process.exit(2); }',
     '    const j = await res.json();',
     '    const arr = (j && Array.isArray(j.balance_infos)) ? j.balance_infos : [];',
@@ -3028,6 +3065,7 @@ function queryBalance(key, timeoutMs) {
   try {
     const out = require('child_process').execFileSync(process.execPath, ['-e', script], {
       timeout: timeoutMs || 5000, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf-8', windowsHide: true,
+      env: Object.assign({}, process.env, { WB_DS_KEY: String(key) }),
     });
     const lines = out.trim().split('\n');
     return JSON.parse(lines[lines.length - 1]);
@@ -3246,7 +3284,7 @@ function ensureNewModelPricing(pricing, stat) {
   if (isLocalModel(stat.model)) return { status: 'none', note: '' }; // 本地模型不计费，禁止自动补录云端价
   const hit = findModel(pricing, stat.model, 'price'); // v2.71：计费模式——宽松命中（如 hy3-x→hy3）即视为已收录，避免无谓联网补录
   if (hit && typeof hit.m.input_price === 'number') return { status: 'none', note: '' };
-  const name = String(stat.model).toLowerCase();
+  const name = lookupKeyOf(stat.model); // v3.18：路径型模型名（本地 .gguf 等）取末段做键，避免把本机绝对路径写进价格库
   const looked = (pricing._lookedup_models || []).indexOf(name) >= 0;
   if (looked) {
     return { status: 'skipped', note: `⚠️ 新模型 ${stat.model} 价格已查过未收录，可搜官方定价页人工补录` };
@@ -3274,13 +3312,17 @@ function ensureNewModelPricing(pricing, stat) {
   if (ref === null) {
     // 国内外源均确认没有 → 记入已查列表，避免每次运行都联网
     pricing._lookedup_models = pricing._lookedup_models || [];
-    if (pricing._lookedup_models.indexOf(name) < 0) pricing._lookedup_models.push(name);
+    if (pricing._lookedup_models.indexOf(name) < 0) {
+      pricing._lookedup_models.push(name);
+      // v3.18（M1）：上限 200 条，防止无界追加把价格库越写越大
+      if (pricing._lookedup_models.length > 200) pricing._lookedup_models.splice(0, pricing._lookedup_models.length - 200);
+    }
     // 修复6：加锁写，避免与 refresh-prices.js 并发覆盖。
     // v2.80：内存 pricing 含本地官方库合并条目（只属于 index.json），写盘前剥离，防止两源互相覆盖/膨胀
     const persist = stripLocalDbEntries(pricing);
     const lr = withFileLock(PRICING_LOCK_FILE, () => savePricingAtomic(persist), { ttl: 300000, retries: 50, retryDelay: 100 });
     if (lr.skipped) process.stderr.write(`[token-tracker] 已查列表写入跳过（被其他进程持锁）\n`);
-    return { status: 'not-found', note: `⚠️ 新模型 ${stat.model} 国内外价格源均未收录，请用 unified-search 搜官方定价页补录` };
+    return { status: 'not-found', note: `⚠️ 新模型 ${stat.model} 国内外价格源均未收录，请搜索厂商官方定价页人工补录` };
   }
   if (ref === undefined) {
     return { status: 'error', note: `⚠️ 新模型 ${stat.model} 联网查价失败（国内外源均不可达），稍后自动重试` };
@@ -3785,8 +3827,8 @@ function main() {
         pendingSubCount: pendingSub.length, interrupted, deadTeam,
         compactionSuspected: compactionSuspected,
         lastMarkerId, processedMarkerCount: processedMarkers.size, compactionMode,
-        tailRawPrefix: readTailRaw(tsPath).slice(0, 80),
-        lastTailRawPrefix: lastTailRaw.slice(0, 80),
+        tailFingerprint: tailFingerprint(tsPath), // v3.18（M14）：原 readTailRaw().slice(0,80) 存原文，改指纹
+        lastTailFingerprint: fpOfStr(lastTailRaw), // v3.18（M14）：原 lastTailRaw.slice(0,80) 存原文，改指纹
       };
       gLastWatchState = pollState; // 最近快照供 showToast 内部 writeToastLog 补全诊断字段
       lastPollSnapshot = pollState; // 供循环退出后的 idle-timeout 日志复用

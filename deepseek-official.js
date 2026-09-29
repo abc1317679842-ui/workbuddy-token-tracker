@@ -214,7 +214,17 @@ async function main() {
       const rules = parseRules(html);
       if (!RAW) {
         // 写回 pricing.json：官方模型对齐（新增/更新/标记 retired）
-        const pricing = loadPricing() || { models: {} };
+        // v3.18（M7）：文件存在但解析失败（损坏）→ 拒绝覆盖式重建。旧实现 `|| { models: {} }`
+        // 会用官方极简清单（只有 DeepSeek 系）覆盖整个价格库——lock/人工核验价/_manual_audit/
+        // _lookedup_models 与全部其他厂商模型被静默清空。宁可本次失败，也不能静默降级。
+        let pricing = loadPricing();
+        if (!pricing) {
+          if (fs.existsSync(PRICING)) {
+            process.stderr.write('FAIL_REASON=pricing.json 存在但损坏，deepseek-official 拒绝覆盖式重建（请人工修复后重试）\n');
+            process.exit(2);
+          }
+          pricing = { models: {} }; // 首次运行（文件不存在）：允许从零建档
+        }
         const officialSet = new Set(parsed.models);
         // 1) 官方有的模型：新增或更新价格
         parsed.models.forEach((mkey, i) => {
