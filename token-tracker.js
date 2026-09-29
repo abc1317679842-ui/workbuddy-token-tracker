@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.18.1 (2026-09-30)
+// token-usage-tracker v3.18.2 (2026-09-30)
 // v2.63：调试日志机制重构——废弃 TOKEN_TRACKER_DEBUG 环境变量开关 + poll 全量记录，改为「弹窗时自动记录」：
 //   每次 showToast 无条件向 ~/.workbuddy/token-tracker-toast.log 追加一行 JSON 诊断（原因/sessionId/行数/稳定计数/compaction 状态等）。
 // v2.62：compaction 检测由"行数减少>5"改为"扫描 transcript 末尾 30 行识别压缩标记（compactionMode 方案）"。
@@ -2152,9 +2152,10 @@ function autoRefreshPricing(pricing) {
       process.stderr.write(`[token-tracker] pricing.json ${missing ? '缺失' : '损坏'}且联网开关关闭，无法重建（所有模型费用将无法计算）；请手动修复文件或开启联网刷新\n`);
       return null;
     }
+    let bak = null;
     if (!missing) {
       try {
-        const bak = `${PRICING}.corrupt-${new Date().toISOString().replace(/[:.]/g, '').slice(0, 17)}`;
+        bak = `${PRICING}.corrupt-${new Date().toISOString().replace(/[:.]/g, '').slice(0, 17)}`;
         fs.renameSync(PRICING, bak);
         process.stderr.write(`[token-tracker] pricing.json 损坏，已备份为 ${path.basename(bak)}，尝试重建\n`);
       } catch (e) {
@@ -2176,6 +2177,32 @@ function autoRefreshPricing(pricing) {
       return null;
     }
     const rebuilt = loadPricing();
+    // v3.18.2（R4）：重建规模护栏——防止「16 模型库被重建为 2 模型」这类长期缩水。
+    // 备份可解析 → 并回缺失条目；备份本身解析不了（真损坏）→ 按文件大小比对告警。备份文件始终保留。
+    if (rebuilt && bak && fs.existsSync(bak)) {
+      try {
+        const szNew = fs.statSync(PRICING).size, szBak = fs.statSync(bak).size;
+        let oldModels = null;
+        try {
+          const o = JSON.parse(fs.readFileSync(bak, 'utf-8'));
+          if (o && typeof o === 'object' && o.models && typeof o.models === 'object') oldModels = o.models;
+        } catch (e) { /* 真损坏解析不了 → 走大小告警 */ }
+        const nNew = Object.keys(rebuilt.models || {}).length;
+        if (oldModels) {
+          const nOld = Object.keys(oldModels).length;
+          const miss = Object.keys(oldModels).filter((k) => !(k in (rebuilt.models || {})));
+          if (miss.length > 0 && nOld > nNew) {
+            for (const k of miss) rebuilt.models[k] = oldModels[k];
+            try {
+              fs.writeFileSync(PRICING, JSON.stringify(stripLocalDbEntries(rebuilt), null, 2) + '\n');
+              process.stderr.write(`[token-tracker] ⚠价库 重建规模异常（备份 ${nOld} 模型 → 重建 ${nNew}），已并回备份条目（+${miss.length}）；建议手动跑 refresh-prices.js --force 用最新数据补全\n`);
+            } catch (e) { /* 并回写失败只影响本轮，下次刷新自愈 */ }
+          }
+        } else if (szBak > szNew * 3 && szBak > 4096) {
+          process.stderr.write(`[token-tracker] ⚠价库 重建结果 ${szNew}B 明显小于损坏备份 ${szBak}B，可能仅部分源重建成功（大量模型将显示「费用未收录」）；建议手动跑 refresh-prices.js --force 补全（备份 ${path.basename(bak)} 保留）\n`);
+        }
+      } catch (e) { /* 护栏自身异常不影响主流程 */ }
+    }
     return rebuilt || null;
   }
   // v2.30：联网开关——总开关或分开关关闭时跳过自动刷新（沿用本地价，不联网）

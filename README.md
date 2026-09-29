@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.18.1-blue)
+![Version](https://img.shields.io/badge/version-v3.18.2-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -97,7 +97,7 @@ const ENABLE_MODEL_LOOKUP = true;   // 新模型价格自动补录（llmabacus +
 
 ## 🔐 隐私与数据安全
 
-> 完整的**出网主机清单、本地写盘位置、诊断日志内容、已知限制（固定汇率）**见 [CHANGELOG.md](CHANGELOG.md) 的「隐私与安全」章节（L515 起）（v3.18 起集中维护，本文件不重复抄写）。
+> 完整的**出网主机清单、本地写盘位置、诊断日志内容、已知限制（固定汇率）**见 [CHANGELOG.md](CHANGELOG.md) 的「隐私与安全」章节（v3.18 起集中维护，本文件不重复抄写）。
 
 ## 🔐 余额查询安全性说明
 
@@ -156,7 +156,7 @@ cp -r workbuddy-token-tracker ~/.workbuddy/skills/token-usage-tracker
 
 | 文件 | 作用 |
 |---|---|
-| `token-tracker.js` | 主脚本：`--hook` 注入 / `--stop` 通知 / `--report` 账本 / `--recalc` 重算 |
+| `token-tracker.js` | 主脚本：`--hook` 注入 / `--stop` 通知 / `--report` 账本（重算用 `recalc-day.js`，见下行） |
 | `refresh-prices.js` | 多源价格刷新（每天首次运行自动触发，也可手动跑） |
 | `deepseek-official.js` | DeepSeek 官方定价抓取（被 refresh-prices 调用） |
 | `refresh-holidays.js` | 中国法定节假日双源刷新（峰谷计费用，手动运行） |
@@ -165,6 +165,8 @@ cp -r workbuddy-token-tracker ~/.workbuddy/skills/token-usage-tracker
 | `pricing.json` / `holidays.json` | 价格库 / 节假日数据（技能目录内） |
 | `recalc-day.js` / `backfill.js` | 账本维护工具（指定日重算 / 历史回填） |
 | `SKILL.md` / `CHANGELOG.md` / `manifest.yaml` / `LICENSE` | 技能说明 / 变更史 / 元数据 / 许可 |
+| `selftest.js` | 离线冒烟自测（`node selftest.js`，不碰真实账本；沙箱类受限环境自动 SKIP） |
+| `KNOWN-ISSUES.md` | 已知未修问题（脱敏公开记录） |
 | `.gitignore` | 排除本地运行时文件与私密配置 |
 
 ### Hook 配置示例（`settings.json`）
