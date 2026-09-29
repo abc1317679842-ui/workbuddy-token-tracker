@@ -3,6 +3,18 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.18.4（2026-09-30）—— 第五轮复审：G1 判定口径 + G3 落盘 + G2 自测隔离
+
+- **G1【重要】**：v3.18.3 的护栏**判定口径不一致**——`rebuilt` 是 loadPricing() 的结果，内部已合并本地官方价库（实测本机 52 条），却拿它与"备份文件抢救出的条目数"比 `nOld > nNew`，在真实用户环境（有本地价库）下 100% 失效，且因新分支抢在体积告警之前，比 v3.18.2（能告警）**更差**。修复：
+  - 口径统一到**重建文件本身**（读 PRICING 原始 models），不再用合并后的内存对象
+  - 判据只看 `miss.length > 0`（`nOld > nNew` 这个附加条件多余且有害，已删）
+  - 未触发并回时**仍评估体积告警**（两分支解耦）
+- **G3**：`_shrink_note` 移到写盘**之前**赋值并在两个分支都落盘——原先标记在写盘后才赋值，只活在内存，`⚠价库缩水` 从未真正持久化（与 KNOWN-ISSUES 的描述不符）
+- **G2**：selftest 不再受本机环境影响——`autoDiscoverCnPriceDir` 第②级扫 `~/WorkBuddy/*/prices/index.json` 是 WB_ROOT 管不到的隔离泄漏，自测现显式传 `CN_PRICE_DB_DIR` 指向空库
+- **self-test 结构**：guard 抽为可导出 `guardRebuildScale`（与 salvage/dbStaleTag 一并导出），selftest 新增 T6 段**直接 require 单测**（不依赖 spawn，受限环境同样运行）；原"前置探测失败即整表 SKIP"改为**只跳过需 spawn 的用例**（否则能验的也一起跳了）
+- **G4**：KNOWN-ISSUES 锚点修正（原指 `withFileLock`=L414 通用账本锁 → 应为 watcher 内 `acquireWatchLock`≈L3658-3720）
+- **版本**：三处统一 v3.18.4
+
 ## v3.18.3（2026-09-30）—— 第四轮复审：F1 死代码做实 + KNOWN-ISSUES 修正 + 自测补口
 
 - **F1【重要修正】**：v3.18.2 的 R4「并回缺失条目」分支实为**不可达代码**——进入护栏的前提是备份文件 JSON.parse 失败，护栏再用同一 parse 必然失败（逻辑互斥），release note 把它当已交付能力描述错误。本版以 `salvageModelsFromText` 容错抢救做实：整体 parse 失败后定位 "models" 逐条花括号匹配提取（截断尾部丢弃、单条坏跳过、转义 key 兼容），实测 16 模型库截断 70% 可抢救 11 条

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.18.3 (2026-09-30)
+// token-usage-tracker v3.18.4 (2026-09-30)
 // v2.63：调试日志机制重构——废弃 TOKEN_TRACKER_DEBUG 环境变量开关 + poll 全量记录，改为「弹窗时自动记录」：
 //   每次 showToast 无条件向 ~/.workbuddy/token-tracker-toast.log 追加一行 JSON 诊断（原因/sessionId/行数/稳定计数/compaction 状态等）。
 // v2.62：compaction 检测由"行数减少>5"改为"扫描 transcript 末尾 30 行识别压缩标记（compactionMode 方案）"。
@@ -2179,6 +2179,40 @@ function todayStr() {
 
 // 每日价格自动刷新：当天已刷新（date==今天）→ 不联网直接返回；过期 → 同步调 refresh-prices.js
 // 联网拉 OpenRouter 更新（execFileSync 保证刷新完成才继续；失败保留本地价并 stderr 暴露，不静默）。
+// v3.18.2（R4）→ v3.18.3（F1 做实）→ v3.18.4（G1/G3 修接线）：重建规模护栏（可导出，供 selftest 直接单测）。
+// 关键口径（G1 教训）：rebuilt 是 loadPricing() 的结果，**内部已合并本地官方价库**（可达数十条），
+// 绝不能拿 rebuilt.models 与"原始文件抢救出的条目"比大小——必须用**重建文件本身**的 models。
+// 流程：① 容错抢救备份（salvageModelsFromText）；② 抢救出条目 → 按"缺失键"并回（只看 miss.length，
+// 不再加v3.18.3 那个有害的 nOld > nNew）；③ 未触发并回 → 仍要评估体积告警（解耦，不再整支跳过）；
+// ④ _shrink_note 必须在写盘**之前**赋值（G3），否则 ⚠价库缩水 标记不会落盘，进程退出即丢。
+function guardRebuildScale(rebuilt, bak) {
+  if (!rebuilt || !bak || !fs.existsSync(bak)) return;
+  try {
+    const szNew = fs.statSync(PRICING).size, szBak = fs.statSync(bak).size;
+    const oldModels = salvageModelsFromText(fs.readFileSync(bak, 'utf-8'));
+    let rawModels = {};
+    try { const raw = JSON.parse(fs.readFileSync(PRICING, 'utf-8')); rawModels = (raw && raw.models) || {}; } catch (e) { /* 读不出按空算 */ }
+    const nFile = Object.keys(rawModels).length;
+    let merged = false;
+    if (oldModels) {
+      const nOld = Object.keys(oldModels).length;
+      const miss = Object.keys(oldModels).filter((k) => !(k in rawModels));
+      if (miss.length > 0) {
+        merged = true;
+        for (const k of miss) rebuilt.models[k] = oldModels[k];
+        rebuilt._shrink_note = `重建缩水（备份 ${nOld} 模型 → 重建文件 ${nFile}），已并回 ${miss.length} 条；建议跑 refresh-prices.js --force 补全`;
+        try { fs.writeFileSync(PRICING, JSON.stringify(stripLocalDbEntries(rebuilt), null, 2) + '\n'); } catch (e) { /* 写失败只影响本轮 */ }
+        process.stderr.write(`[token-tracker] ⚠价库 重建规模异常（备份 ${nOld} 模型 → 重建文件 ${nFile}），已并回备份条目（+${miss.length}）；建议手动跑 refresh-prices.js --force 用最新数据补全\n`);
+      }
+    }
+    if (!merged && szBak > szNew * 3) {
+      rebuilt._shrink_note = `重建缩水（备份 ${szBak}B → 重建 ${szNew}B），无法抢救，费用大面积未收录`;
+      try { fs.writeFileSync(PRICING, JSON.stringify(stripLocalDbEntries(rebuilt), null, 2) + '\n'); } catch (e) { /* 同上 */ }
+      process.stderr.write(`[token-tracker] ⚠价库 重建结果 ${szNew}B 明显小于损坏备份 ${szBak}B，可能仅部分源重建成功（大量模型将显示「费用未收录」）；建议手动跑 refresh-prices.js --force 补全（备份 ${path.basename(bak)} 保留）\n`);
+    }
+  } catch (e) { /* 护栏自身异常不影响主流程 */ }
+}
+
 function autoRefreshPricing(pricing) {
   if (!pricing || typeof pricing !== 'object') {
     // v3.18.1（N3）：区分「文件缺失」与「文件损坏」。损坏时先改名备份为 .corrupt-<ts> 再重建（自愈，
@@ -2213,32 +2247,7 @@ function autoRefreshPricing(pricing) {
       return null;
     }
     const rebuilt = loadPricing();
-    // v3.18.2（R4）→ v3.18.3（F1 做实）：重建规模护栏。
-    // 备份经 salvageModelsFromText 容错抢救（整体 parse 或逐条花括号提取），捞回的条目并回重建结果；
-    // 完全抢救不出（如 20B stub）→ 按文件大小比对告警（去掉 4KB 下限：小库损坏同样可能缩水）。
-    // 告警同时写 _shrink_note → dbStaleTag 显示 ⚠价库缩水（toast 可见，不只 stderr）。
-    if (rebuilt && bak && fs.existsSync(bak)) {
-      try {
-        const szNew = fs.statSync(PRICING).size, szBak = fs.statSync(bak).size;
-        const oldModels = salvageModelsFromText(fs.readFileSync(bak, 'utf-8'));
-        const nNew = Object.keys(rebuilt.models || {}).length;
-        if (oldModels) {
-          const nOld = Object.keys(oldModels).length;
-          const miss = Object.keys(oldModels).filter((k) => !(k in (rebuilt.models || {})));
-          if (miss.length > 0 && nOld > nNew) {
-            for (const k of miss) rebuilt.models[k] = oldModels[k];
-            try {
-              fs.writeFileSync(PRICING, JSON.stringify(stripLocalDbEntries(rebuilt), null, 2) + '\n');
-              rebuilt._shrink_note = `重建缩水（备份 ${nOld} 模型 → 重建 ${nNew}），已并回 ${miss.length} 条`;
-              process.stderr.write(`[token-tracker] ⚠价库 重建规模异常（备份 ${nOld} 模型 → 重建 ${nNew}），已并回备份条目（+${miss.length}）；建议手动跑 refresh-prices.js --force 用最新数据补全\n`);
-            } catch (e) { /* 并回写失败只影响本轮，下次刷新自愈 */ }
-          }
-        } else if (szBak > szNew * 3) {
-          rebuilt._shrink_note = `重建缩水（备份 ${szBak}B → 重建 ${szNew}B），无法抢救，费用大面积未收录`;
-          process.stderr.write(`[token-tracker] ⚠价库 重建结果 ${szNew}B 明显小于损坏备份 ${szBak}B，可能仅部分源重建成功（大量模型将显示「费用未收录」）；建议手动跑 refresh-prices.js --force 补全（备份 ${path.basename(bak)} 保留）\n`);
-        }
-      } catch (e) { /* 护栏自身异常不影响主流程 */ }
-    }
+    guardRebuildScale(rebuilt, bak);
     return rebuilt || null;
   }
   // v2.30：联网开关——总开关或分开关关闭时跳过自动刷新（沿用本地价，不联网）
@@ -4675,4 +4684,6 @@ module.exports = {
   traceWallDurMs, withFileLock,
   loadPricing, autoRefreshPricing, addModelPrice, savePricing, normalizeModelName, saveDailyUsageRaw,
   getTranscriptStats, sidFromPath, ledgerKey,
+  // v3.18.4（G2/G3）：护栏与抢救函数导出，selftest 可直接单测（不再只能靠 spawn，受限环境也能验）
+  guardRebuildScale, salvageModelsFromText, dbStaleTag,
 };

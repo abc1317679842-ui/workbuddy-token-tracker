@@ -7,7 +7,7 @@
 
 ## 已修复（避免重复排查）
 
-- **陈旧锁漏弹 / 双 watcher TOCTOU**：已于 2026-08-23 修复——锁获取改 `openSync('wx')` 原子建锁（消除 check-then-act 竞态）+ pid 探活接管（`process.kill(pid,0)`，ESRCH 判死才接管），见 `token-tracker.js` `withFileLock` 实现（v3.18.3 约 L3640-3696）。
+- **陈旧锁漏弹 / 双 watcher TOCTOU**：已于 2026-08-23 修复——锁获取改 `openSync('wx')` 原子建锁（消除 check-then-act 竞态）+ pid 探活接管（`process.kill(pid,0)`，ESRCH 判死才接管），见 `token-tracker.js` watcher 内的 `acquireWatchLock`（v3.18.4 约 L3658-3720；注：`withFileLock` 是 L414 的通用账本锁，勿混淆）。
 
 ## KI-1 静默间隙误判（premature popup）—— 存活
 
