@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.18.2 (2026-09-30)
+// token-usage-tracker v3.18.3 (2026-09-30)
 // v2.63：调试日志机制重构——废弃 TOKEN_TRACKER_DEBUG 环境变量开关 + poll 全量记录，改为「弹窗时自动记录」：
 //   每次 showToast 无条件向 ~/.workbuddy/token-tracker-toast.log 追加一行 JSON 诊断（原因/sessionId/行数/稳定计数/compaction 状态等）。
 // v2.62：compaction 检测由"行数减少>5"改为"扫描 transcript 末尾 30 行识别压缩标记（compactionMode 方案）"。
@@ -2103,6 +2103,42 @@ function noteRefreshFailure(attempts, reason) {
 }
 function tail(s, n) { return String(s || '').replace(/\s+/g, ' ').slice(-n); }
 
+// v3.18.3（F1）：损坏备份的容错抢救解析——v3.18.2 的"并回"分支用 JSON.parse 解析备份，
+// 但进入该分支的前提恰是同一份字节 JSON.parse 失败（逻辑互斥，分支不可达）。这里改为
+// 花括号逐条提取：先试整体 parse（覆盖"合法 JSON 但形状不对"），失败则定位 "models" 后
+// 逐条匹配完整条目（截断尾部自动丢弃、单条坏跳过），把能抢救的模型条目捞回来。
+function salvageModelsFromText(text) {
+  try {
+    const o = JSON.parse(text);
+    return (o && typeof o === 'object' && o.models && typeof o.models === 'object') ? o.models : null;
+  } catch (e) { /* 整体解析失败 → 走逐条抢救 */ }
+  const m = String(text || '').match(/"models"\s*:\s*\{/);
+  if (!m) return null;
+  const t = text;
+  let i = m.index + m[0].length - 1; // 指向 models 的 '{'
+  i++;
+  const models = {};
+  let count = 0;
+  while (i < t.length) {
+    while (i < t.length && /[\s,]/.test(t[i])) i++;
+    if (i >= t.length || t[i] === '}') break;
+    const km = t.slice(i).match(/^"((?:[^"\\]|\\.)*)"\s*:\s*\{/);
+    if (!km) break;
+    let j = i + km[0].length; // 条目 '{' 之后
+    let depth = 1, inStr = false, esc = false;
+    while (j < t.length && depth > 0) {
+      const ch = t[j];
+      if (inStr) { if (esc) esc = false; else if (ch === '\\') esc = true; else if (ch === '"') inStr = false; }
+      else { if (ch === '"') inStr = true; else if (ch === '{') depth++; else if (ch === '}') depth--; }
+      j++;
+    }
+    if (depth !== 0) break; // 文件在此截断，后面全是残片
+    try { models[km[1]] = JSON.parse(t.slice(i + km[0].length - 1, j)); count++; } catch (e) { /* 单条坏，跳过 */ }
+    i = j;
+  }
+  return count ? models : null;
+}
+
 function loadPricing() {
   let p = null;
   try { p = JSON.parse(fs.readFileSync(PRICING, 'utf-8')); } catch (e) { return null; }
@@ -2177,16 +2213,14 @@ function autoRefreshPricing(pricing) {
       return null;
     }
     const rebuilt = loadPricing();
-    // v3.18.2（R4）：重建规模护栏——防止「16 模型库被重建为 2 模型」这类长期缩水。
-    // 备份可解析 → 并回缺失条目；备份本身解析不了（真损坏）→ 按文件大小比对告警。备份文件始终保留。
+    // v3.18.2（R4）→ v3.18.3（F1 做实）：重建规模护栏。
+    // 备份经 salvageModelsFromText 容错抢救（整体 parse 或逐条花括号提取），捞回的条目并回重建结果；
+    // 完全抢救不出（如 20B stub）→ 按文件大小比对告警（去掉 4KB 下限：小库损坏同样可能缩水）。
+    // 告警同时写 _shrink_note → dbStaleTag 显示 ⚠价库缩水（toast 可见，不只 stderr）。
     if (rebuilt && bak && fs.existsSync(bak)) {
       try {
         const szNew = fs.statSync(PRICING).size, szBak = fs.statSync(bak).size;
-        let oldModels = null;
-        try {
-          const o = JSON.parse(fs.readFileSync(bak, 'utf-8'));
-          if (o && typeof o === 'object' && o.models && typeof o.models === 'object') oldModels = o.models;
-        } catch (e) { /* 真损坏解析不了 → 走大小告警 */ }
+        const oldModels = salvageModelsFromText(fs.readFileSync(bak, 'utf-8'));
         const nNew = Object.keys(rebuilt.models || {}).length;
         if (oldModels) {
           const nOld = Object.keys(oldModels).length;
@@ -2195,10 +2229,12 @@ function autoRefreshPricing(pricing) {
             for (const k of miss) rebuilt.models[k] = oldModels[k];
             try {
               fs.writeFileSync(PRICING, JSON.stringify(stripLocalDbEntries(rebuilt), null, 2) + '\n');
+              rebuilt._shrink_note = `重建缩水（备份 ${nOld} 模型 → 重建 ${nNew}），已并回 ${miss.length} 条`;
               process.stderr.write(`[token-tracker] ⚠价库 重建规模异常（备份 ${nOld} 模型 → 重建 ${nNew}），已并回备份条目（+${miss.length}）；建议手动跑 refresh-prices.js --force 用最新数据补全\n`);
             } catch (e) { /* 并回写失败只影响本轮，下次刷新自愈 */ }
           }
-        } else if (szBak > szNew * 3 && szBak > 4096) {
+        } else if (szBak > szNew * 3) {
+          rebuilt._shrink_note = `重建缩水（备份 ${szBak}B → 重建 ${szNew}B），无法抢救，费用大面积未收录`;
           process.stderr.write(`[token-tracker] ⚠价库 重建结果 ${szNew}B 明显小于损坏备份 ${szBak}B，可能仅部分源重建成功（大量模型将显示「费用未收录」）；建议手动跑 refresh-prices.js --force 补全（备份 ${path.basename(bak)} 保留）\n`);
         }
       } catch (e) { /* 护栏自身异常不影响主流程 */ }
@@ -2914,6 +2950,7 @@ function dispWidthTitle(s) {
 //   今天已更新正常             → 空串（弹窗与原来一字不差）
 function dbStaleTag(pricing) {
   if (!pricing) return '';
+  if (pricing._shrink_note) return '⚠价库缩水'; // v3.18.3（F1）：损坏重建缩水告警进 toast，不只 stderr
   const ldb = pricing.local_db;
   if (!ldb) return '⚠价库缺失';
   if (ldb.built_at && ldb.built_at !== todayStr()) {

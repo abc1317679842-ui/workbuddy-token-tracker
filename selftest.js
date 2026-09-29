@@ -29,7 +29,7 @@ function ok(name, cond, extra) {
 }
 
 // T0：语法检查（全部可执行 JS）
-for (const f of ['token-tracker.js', 'refresh-prices.js', 'deepseek-official.js', 'refresh-holidays.js']) {
+for (const f of ['token-tracker.js', 'refresh-prices.js', 'deepseek-official.js', 'refresh-holidays.js', 'backfill.js', 'recalc-day.js', 'selftest.js']) {
   const r = spawnSync(NODE, ['--check', path.join(SRC, f)], { windowsHide: true });
   ok(`语法 ${f}`, r.status === 0, String(r.stderr || '').slice(0, 120));
 }
@@ -61,16 +61,22 @@ const env = Object.assign({}, process.env, { WB_ROOT: tmp, TOKEN_TRACKER_NO_TOAS
 }
 
 // T3：损坏 pricing → 备份 .corrupt-* 创建 + 原文件被改名移走（自愈链路第一步，离线可验证）
+// v3.18.3（F3）：用「截断的较大库」造损坏（现实中最常见的形态），若重建成功则进一步断言
+// stderr 含 ⚠价库 缩水告警（R4 护栏 + F1 抢救/告警通道）；重建失败（离线/受限）则只验备份行为。
 {
-  fs.writeFileSync(path.join(skillDir, 'pricing.json'), '{"broken');
-  spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'], {
-    input: JSON.stringify({ session_id: 'selftest', prompt: 't' }), env, timeout: 90000, windowsHide: true,
+  const big = JSON.stringify({ date: '2020-01-01', models: Object.fromEntries(Array.from({ length: 16 }, (_, i) => [`model-${i}`, { input_price: 1 + i, output_price: 2 + i, region: 'US' }])) }, null, 2);
+  fs.writeFileSync(path.join(skillDir, 'pricing.json'), big.slice(0, Math.floor(big.length * 0.7))); // 截断 30%
+  const r = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'], {
+    input: JSON.stringify({ session_id: 'selftest', prompt: 't' }), env, timeout: 90000, windowsHide: true, encoding: 'utf8',
   });
   const baks = fs.readdirSync(skillDir).filter((f) => f.startsWith('pricing.json.corrupt-'));
   ok('损坏 pricing 产生 .corrupt-* 备份', baks.length === 1, `found=${baks.length}`);
   ok('损坏文件已改名移走', !fs.existsSync(path.join(skillDir, 'pricing.json')) || (() => {
     try { JSON.parse(fs.readFileSync(path.join(skillDir, 'pricing.json'), 'utf8')); return true; } catch (e) { return false; }
   })());
+  const rebuilt = (() => { try { return JSON.parse(fs.readFileSync(path.join(skillDir, 'pricing.json'), 'utf8')); } catch (e) { return null; } })();
+  if (rebuilt) ok('R4 护栏告警进 stderr（⚠价库）', String(r.stderr || '').indexOf('⚠价库') >= 0, String(r.stderr || '').slice(0, 120));
+  else console.log('  - 重建未完成（离线/受限环境），R4 告警断言跳过');
 }
 
 // T4：deepseek-official M7 守卫——损坏 pricing 原地存在时拒绝覆盖式重建

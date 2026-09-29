@@ -3,6 +3,15 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.18.3（2026-09-30）—— 第四轮复审：F1 死代码做实 + KNOWN-ISSUES 修正 + 自测补口
+
+- **F1【重要修正】**：v3.18.2 的 R4「并回缺失条目」分支实为**不可达代码**——进入护栏的前提是备份文件 JSON.parse 失败，护栏再用同一 parse 必然失败（逻辑互斥），release note 把它当已交付能力描述错误。本版以 `salvageModelsFromText` 容错抢救做实：整体 parse 失败后定位 "models" 逐条花括号匹配提取（截断尾部丢弃、单条坏跳过、转义 key 兼容），实测 16 模型库截断 70% 可抢救 11 条
+- **F1-2**：大小告警去掉 4KB 下限（小库损坏同样缩水）；告警新增 `_shrink_note` 字段 → `dbStaleTag` 显示 **⚠价库缩水**（toast 可见，不再只有 stderr）；refresh-prices 成功全量刷新时清除标记
+- **F2**：KNOWN-ISSUES.md 修正——v3.18.2 版把 2026-08-23 已修复的根因（陈旧锁不校验 pid / TOCTOU 非原子）误写为「存活」，与当前代码直接矛盾；现改为「已修复」节 + 真实残留（pid 复用误判存活、无 pid/EPERM 保守不接管、watcher 被宿主收割），全部带函数名+行号锚点
+- **F3**：selftest 补口——语法扫描补 backfill.js/recalc-day.js/selftest.js（原漏 3 个）；T3 改用「截断的大库」造损坏并在重建成功时断言 stderr 含 ⚠价库（原 T3 恰好漏掉 R4）
+- **F4**：SKILL.md 总览标题 v3.18 → v3.18.x（写死小版本必漂移，声明以 manifest.yaml 为准）
+- **版本**：三处统一 v3.18.3；`node selftest.js` 供第三方复跑
+
 ## v3.18.2（2026-09-30）—— 第三轮复审：文档细节 + 重建护栏 + 自测入库
 
 - **R1**：README 文件清单删去不存在的 `--recalc`（主脚本实际只认 --hook/--stop/--report/--round-watch，重算是独立脚本 recalc-day.js）

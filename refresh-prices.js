@@ -174,6 +174,7 @@ function withPricingLock(fn) {
 }
 
 function save(p) {
+  delete p._shrink_note; // v3.18.3（F1）：成功全量刷新后清除「⚠价库缩水」标记
   // 修复6 + 修复9：临时文件 + rename 原子写，加锁避免与 addModelPrice 并发覆盖
   const ok = withPricingLock(() => {
     const tmp = PRICING + '.tmp';
