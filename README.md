@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.22.1-blue)
+![Version](https://img.shields.io/badge/version-v3.23.0-blue)
 
 > 在每次回答后显示 **Token 消耗 / 耗时 / 折算费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -321,10 +321,30 @@ cp -r workbuddy-token-tracker ~/.workbuddy/skills/token-usage-tracker
 | `SKILL.md` / `CHANGELOG.md` / `manifest.yaml` / `LICENSE` | 技能说明 / 变更史 / 元数据 / 许可 |
 | `selftest.js` | 离线冒烟自测（`node selftest.js`，不碰真实账本；沙箱类受限环境自动 SKIP） |
 | `KNOWN-ISSUES.md` | 已知未修问题（脱敏公开记录） |
+| `TROUBLESHOOTING.md` | **故障排查手册**（弹窗诊断日志 + 31 行故障速查表），v3.23.0 从 SKILL.md 移出 |
+| `docs/balance.md` | 余额显示细节（原理 / 启用条件 / 模式识别 / 隐私） |
+| `docs/pricing-refresh.md` | 价格刷新策略（5 源）+ 峰谷时段口径 + 计费公式 |
+| `docs/windows-notification.md` | Windows「不弹横幅」修复（SmartOptOut 注册表法 + 实测证据） |
 | `rounds/`（运行时生成） | 轮次明细留档 `rounds-YYYY-MM.jsonl`，保留最近 6 个月，**不入库** |
 | `exports/`（运行时生成） | `--report --csv` 的 CSV 导出目录，**不入库** |
 | `.update-check.json`（运行时生成） | 版本检查状态（上次检查时间 / 已知最新版 / 已提示次数），**不入库** |
 | `.gitignore` | 排除本地运行时文件与私密配置 |
+
+### 文档怎么读（v3.23.0 起 SKILL.md 已瘦身）
+
+v3.23.0 把 `SKILL.md` 从 **76.2 KB（≈18,400 token）精简到 42.4 KB（≈10,000 token）**——精简掉的是「CHANGELOG 副本 + 排障手册 + 历史细节」，挪进下面这些**按需加载**的文件（模型默认不读，命中症状才读）：
+
+| 你想知道什么 | 看哪个文件 |
+|---|---|
+| 怎么用、怎么问 | 本 README（给**你**看的门面） |
+| 技能的触发规则与铁律 | `SKILL.md`（给**模型**看的，精简版） |
+| 不弹窗 / 账本数字不对 / 价库异常 / 更新提示异常 | `TROUBLESHOOTING.md` |
+| 余额怎么来的、为什么不显示 | `docs/balance.md` |
+| 价格怎么刷新的、峰谷怎么算的 | `docs/pricing-refresh.md` |
+| 「有提示音但不弹横幅」 | `docs/windows-notification.md` |
+| 某个版本改了什么 | `CHANGELOG.md` |
+
+功能行为**没有任何变化**——这次是纯文档重构，主脚本除版本号外未动一行。
 
 ### Hook 配置示例（`settings.json`）
 

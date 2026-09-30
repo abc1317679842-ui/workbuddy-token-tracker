@@ -12,73 +12,41 @@ type: skill
 - **Node.js ≥ 20**：脚本零依赖单文件，无需 npm install。
 - **Python 3 + `requests`**（可选）：国内厂商官方价格库流水线（`fetch-cn-prices.py` 等 3 个脚本）需要；缺失时该功能降级为聚合源价并持续弹 `⚠价库缺失` 提示，token 统计与 toast 不受影响。
 
-## ⚠️ 常见故障：通知「不弹横幅」（Windows 会静默"长期没点开"的应用通知）
+## 📦 按需加载的旁支文件（默认不要读）
 
-> 2026-09 实机遇到并已定位修复，**放在最前面**，因为现象诡异、极易误判成"技能坏了"。
+以下内容已从主文档移出——**只有命中对应场景时才 Read**，平时不要加载，那是纯浪费：
 
-**症状**：技能本身正常（账本、日志都在更新），但通知**还有提示音、在「通知中心」（Win+N）里也能翻到**，**唯独右下角不再弹出横幅**了。
+| 场景 | 读哪个文件 |
+|---|---|
+| 有提示音 / 通知中心能翻到，但右下角不弹横幅 | `docs/windows-notification.md` |
+| 不弹窗 / 弹窗内容不对 / 弹多了 / 账本数字对不上 / 价库异常 / 更新提示异常 | `TROUBLESHOOTING.md` |
+| 问「余额怎么来的 / 为什么不显示 / 余额不对」 | `docs/balance.md` |
+| 问「价格怎么刷新的 / 峰谷怎么算的 / 时段标注不对」 | `docs/pricing-refresh.md` |
+| 问「某个版本改了什么」 | `CHANGELOG.md` |
 
-**根因**：Windows 有个「**通知建议**」机制（内部名 `SmartOptOut`）—— 系统发现你对某应用的通知**长期不点开**，就会弹一条建议问你"要不要关掉这个应用的通知"；**无论你点了确认，还是系统按习惯自动降级**，它都会在注册表里给该应用写下：
+本文件只保留：触发规则、命令映射、核心机制、铁律、反借口表。
 
-```
-HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\Settings\<AppId>
-    ShowBanner     = 0            ← ★横幅被关（"不弹"的直接原因）
-    LastOptOutTime = <时间戳>      ← 那次"关闭"操作的记录
-```
+## ⚠️ 通知「有提示音但不弹横幅」？（一次性问题，别当成技能坏了）
 
-实机证据（2026-09-26 本机）：`ShowBanner=0`、`LastOptOutTime=1790248477`、`PeriodicNotificationCount=52`；同机 `Windows.ActionCenter.SmartOptOut` 项也已存在（说明建议机制确实触发过）。
+**症状**：有提示音、通知中心（Win+N）里能翻到，**唯独右下角不弹横幅**。
+**根因**：Windows「通知建议」机制（`SmartOptOut`）把本技能 AppId 的 `ShowBanner` 写成了 0——**不是技能故障**。
+**修复**：Read `docs/windows-notification.md`（两条 PowerShell，普通权限，含实测证据与回退说明）。
 
-**为什么在「设置 → 系统 → 通知」里找不到这个应用**：本技能的 toast 用**自定义 AppId「WorkBuddy Token Tracker」**直接调 Windows API ——
-`[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('WorkBuddy Token Tracker').Show($t)`
-它**不是已安装应用**，因此**不出现在设置的应用列表里**（这是刻意设计：不经过 WorkBuddy 客户端通知开关，两者互不影响）→ **只能用注册表改**。
+> 前提：先确认账本 / `token-tracker-toast.log` 仍在更新。若它们也不更新，那是另一回事——走 `TROUBLESHOOTING.md` 的「完全无弹窗」。
+> ⚠️ **禁止**把"直接改注册表"当作"没弹窗"的默认第一反应。
 
-**解决方法（普通权限，无需管理员）**：
 
-> ⚠️ **约束（必须遵守）**：以下命令会修改用户注册表。仅当用户明确同意"帮我修通知横幅"后才执行；执行前先说明要改哪两项、改完如何回退。**禁止**把"直接改注册表"当作"没弹窗"的默认第一反应（先查本表其余排查点）。
-
-```powershell
-# ① 重新打开横幅（必做）
-Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\Settings\WorkBuddy Token Tracker" -Name ShowBanner -Value 1
-
-# ② 关掉"通知建议"，免得以后又被问"要不要关掉该应用通知"（可选但推荐）
-$k = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.ActionCenter.SmartOptOut"
-New-Item -Path $k -Force | Out-Null
-New-ItemProperty -Path $k -Name Enabled -Value 0 -PropertyType DWord -Force | Out-Null
-```
-
-**验证**（回显 `ShowBanner : 1` 即已恢复）：
-
-```powershell
-Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\Settings\WorkBuddy Token Tracker" | Select-Object ShowBanner
-```
-
-**实测结果**：2026-09-26 执行 ① 后**当场恢复**（`ShowBanner 0 → 1`，后续弹窗正常）。
-
-**其他会让横幅消失的原因**（若上面无效，按此顺序排查）：专注助手/免打扰（含自动规则：全屏、游戏、投影时段）→ 该应用通知总开关 → 电量节能限制后台活动 → 全屏应用抑制横幅 → 系统时间/时区异常。这些都在「设置 → 系统 → 通知」里可核对；**只有"自定义 AppId"这一类（本技能）必须走上面的注册表法**。
-
-## 当前功能总览（v3.22.1 · 2026-10-01，版本以 manifest.yaml 为准）
+## 当前功能总览（版本以 manifest.yaml 为准）
 
 > **v3.22.1 要点（2026-10-01）：把「怎么问 → 得到什么表」写进文档（纯文档版，代码零改动）。** 起因是用户追问「介绍和技能里有没有说清楚？怎么通过问模型得到不同的数据表格？」——逐条核过后确认：**功能 v3.20.0 就有**（`week` / `month` / 任意区间 / `forecast` / `--csv`），但**两份文档里从头到尾没有一份「自然语言问法 → 命令」的对照**，两头都抓瞎。本次补两处：① **SKILL.md 新增「自然语言问法 → 命令映射」强制表**（这是触发层——用户说「这周用了多少」，你必须跑 `--report week`，**不许**跑 `--report all` 让他在几十天里自己找；区间必须让脚本一次出表，你自己按天相加会把命中率算错）+ 反模式表；② **README 新增「怎么查消耗：直接问模型就行」章节**，含问法→表格对照表与 **6 段真实输出示例**。另如实写明两个拿不到的东西：**单轮明细没有 CLI 入口**（只有 `rounds/*.jsonl`，账本粒度是天）、**拿不到小时粒度**（按天分桶）。
 >
 > **v3.22.0 要点（2026-10-01）：版本更新提示的检测点修准 + 覆盖盲区补齐。** 起因是用户质疑「检测的点准确吗？不准确会导致别人收不到更新」——逐条实测后确认 **2 处真缺陷**：①**挂载点被早退分支绕过**：v3.21.0 把提示挂在两个 `out()` 调用点上，而 `--hook` 路径有 3 条早退分支（`trace 文件尚未完成写入`、手动取消轮补弹 等）走的是**另外的** `out()`，命中这些分支的那一轮根本不会带上提示。修法：追加逻辑**下沉到 `out()` 内部**、检查提前到 `main()` 最开头算一次缓存 → 只要这一轮有任何 hook 输出就必然带上，**结构上不可能再被 `return` 绕过**（新增早退分支也自动覆盖）；实测已确认「暂无 trace 数据」这类早退分支同样带上提示。②**检测点漏「有 tag 无 release」**：v3.21.0 只查 `releases/latest`，某次只打 tag 不发 release（或顺序颠倒）就会漏报。修法：**同时查 `git/matching-refs/tags/v`，两者取版本号较大者**（宁可早报不可漏报；两次请求合并在同一个子进程里，实测总耗时约 1.5s）。③**补覆盖盲区**：只配了 `Stop`、没配 `UserPromptSubmit` hook 的用户**永远**触发不了注入通道 → Stop 端按 `lastHookAt`（每次 `--hook` 刷新）判断，超过 **3 天**没动静就认为"没配 hook"，改走 **toast 兜底**：弹窗前做同一套检查，命中就在**弹窗第一行尾部**加 `｜⬆vX.Y.Z`，**放不下就整个不显示**（绝不触发缩略模型名、绝不动第二行的耗时/今日/余额）。已配 hook 的用户**永远不会**看到该标记，不产生打扰。④**回归**：`--report` 五种入口 + 手动模式 + `--hook` + `--stop` 共 8 种输出与 v3.21.0 **逐字节相同**（`cmp` 验证）。
->
-> **v3.21.0 要点（2026-10-01）：版本更新提示（每周一次、匿名只读、注入给模型）。** —— 装了旧版的用户不会主动去仓库看更新，本版起每 **7 天**匿名查一次 `releases/latest`，有新版就**向模型注入一行极短提示**，由模型在回答末尾带一句。①**为什么不用弹窗**：toast 第二行实测 ≈41u、上限 42u，再塞内容必然触发降级链（丢余额 → 丢今日价 → 保底耗时）→ 等于**用本轮真实数据换一句提示**；独立再弹一条又会被 Windows SmartOptOut 静默关掉且阅后即焚。②**为什么走 `--hook` 注入**：不占显示空间、载体是用户必然会看的回答本身，已有现成先例（新模型未收录提醒走的就是这条通道）。③**规格**：只在提问时触发（**绝不放 `--stop`**，联网会把 toast 推迟）；超时 5 秒；失败**完全静默** + 退避 1h→6h→1d（连败 3 次当周不再试）；同一新版本**最多提示 2 次、间隔 ≥24h**；版本比较按 `major.minor.patch` **逐段转整数**（直接字符串比较会把 `3.9.0 > 3.10.0` 判成 true）。④**注入文案不含任何升级步骤**（`[技能更新] 有新版 vX.Y.Z，回复末尾提一句即可，勿展开`）——**升级操作只写在本文件的「版本更新提示与如何升级」章节**，模型照那一节回答追问即可。⑤**开关**：`ENABLE_UPDATE_CHECK`（默认 true，`local-config.json` 写 `{"enable_update_check": false}` 可关）。⑥**边界（务必如实告知）**：**帮不了「已装旧版」的存量用户**——检查逻辑在被安装的那份代码里，旧版没有它；也不做全自动更新（安装方式是拷目录，自动覆盖会动用户文件）。
->
-> **v3.20.0 要点（2026-10-01）：账本查询能力扩展 + 轮次明细留档（两项一起）。** —— ①**区间报表**：`--report` 新增 `week` / `month` / `<起>..<止>`（任意闭区间，起止写反自动纠正）→ 输出**一张按模型的汇总表**，列结构与单日入口**完全一致**。区间命中率按 **`hitRate(Σ输入, Σ缓存)` 重算**，不是各天 hit 的算术均值（跨天 token 量可能差 100 倍，均值无意义）；`total` 保持逐日累加，便于与逐日核对账。**既有 `--report` / `--report <日期>` / `--report all` / `--report summary` 四条入口的输出逐字节不变**（`selftest` 有硬编码期望输出的断言兜底）。②**CSV 导出**：`--report <范围> --csv`（同样支持 `all` / 单日 / 不带参数=今天）→ 落盘 `exports/report-<范围>-<时间戳>.csv`，内容为**逐日 × 逐模型**明细 + `ALL` 合计行；**必须带 UTF-8 BOM**（否则 Excel 打开中文列头乱码——与 `loadDailyUsage` 剥 BOM 是同一个坑的两面）；命令只回一行路径，不把几十行数据灌进上下文。③**消耗外推** `--report forecast`：**只推 token、不推金额**——金额本身是按 API 单价折算的虚拟计价，在虚拟数上再外推一次只会制造「这个月要花多少钱」的错觉；样本 < 2 天时拒绝计算。④**轮次明细留档**：每轮向 `rounds/rounds-YYYY-MM.jsonl` 追加一条，含分模型 token 明细、耗时、主/子代理模型、子代理数、`source` 来源标记、`costApiEquiv`，以及**从本轮首条非注入型 user 消息自动提取的 `label`**（注入型标 `[注入] <类型>`）——用来回答「哪一轮异常大 / 子代理占了多少」这类每日账本答不了的问题。⑤**落点决策（关键）**：明细**只写在 `recordUsage` 一处**（账本确认落盘之后、锁内），而不是在 Stop 的 4 个互斥出口各写一遍——于是「同轮重复 Stop 不重复落档」由记账自身的幂等性白送，无需额外维护去重状态；`meta` 是**可选参数**，其余 8 个调用点不传即完全保持旧行为。⑥**金额口径（硬规矩，README 同步声明）**：`in/out/cached/total` 是平台落盘的**实测值**；金额一律按 `pricing.json` 的 API 单价折算，**不是真实扣费**——内置模型走客户端自带额度，本技能读不到额度扣减，**不做任何「金额 ↔ 积分」换算**（自备 API key 模式下才等同真实花费）。明细字段名直接写成 `costApiEquiv` 就是为了防后人误当真实花费。⑦**自测**：`selftest.js` 新增 T11 段 30 项（含「既有入口逐字节不变」硬编码断言、区间 hit 重算、CSV BOM 字节、明细幂等、`label` 提取与注入识别），**80 过 0 败**；另跑隔离端到端：Stop 主路径（账本 md5 与 v3.19.3 基线**逐字节相同**，同时落 1 条明细）、重放同一轮 Stop（不重复落档）、专家团 `--flush-delayed` 路径（落 1 条 `source=flush-delayed` 明细且正常收口）。
->
-> **v3.19.3 要点（2026-10-01）：压缩弹窗判定整体降级——删掉一套从未生效过的死机制，只留一个真正管用的单点豁免。** —— ①**取证**：全量复核 `token-tracker-toast.log`（1560 条）/ `token-tracker-compaction.log`（3006 条）——`compactionMode=true` 出现 **0 次**、`compression-omen/resumed/timeout` 各 **0 次**、185 次 `flush-watch-start` 快照命中压缩标记 **0 次**、1158 次 `stop-transcript` 仅 **6 次**命中（0.5%）。②**根因（三层）**：v3.01 把普通轮改为 Stop 端同步弹窗后**不再 spawn watcher**，而压缩判定只活在 flush watcher 内 → 占全部弹窗 **55%（862/1560）** 的 `plain-immediate` 路径完全绕过它；且压缩标记在**压缩完成瞬间**落盘，等 Stop 触发时 transcript 已追加成百上千行、标记早已滑出末尾 30 行窗口；语义上也错位——标记出现时压缩已结束、模型已恢复输出。③**认知纠偏（重要）**：压缩后弹出的窗口 **99% 是那一轮的正常结算弹窗**（实测 12 次压缩现场后 9 次弹窗，内容为真实用量：输入 4.9万~70万、耗时 46s~8m24s）——**压掉它就是丢数据**，不该抑制。④**真正该修的是压缩期噪音**：2026-09-12 07:31 一个现场 18 秒内连弹 3 条「本轮无 token 消耗记录」，而该分支在 Stop 路径上、原 watcher 判定同样够不着。⑤**处置**：删除 `compactionMode` / `compressionPending` 两套状态机（含每轮末尾 30 行扫描 + 每轮末尾 5 行的超长前兆扫描）+ 死函数 `contextOverflowOmenTs` / `contextOverflowOmen` + 死常量 `WATCH_COMPACT_GRACE_MS` / `COMPRESSION_WAIT_MAX_MS`；新增 `freshCompactionMarker()`（末尾 30 行内存在压缩标记**且**该标记行 timestamp 距今 ≤10 分钟，`COMPACTION_MARKER_TTL_MS` 可调）作为 Stop 端 `no-token` 分支的**单点豁免**——命中则静默跳过弹窗（落 `stop-no-token-compaction-skip`），`lastStopAt` 照常推进、账本不受影响。TTL 用于排除上一轮遗留的旧标记（实测标记可在末尾窗口停留很久）。⑥**顺带清理**：`compactionSuspected`（置 true 后立刻 `continue`，**结构性永远进不了日志**）/ `compactionMode` / `lastMarkerId` 三个误导性日志字段 + 零引用的 `lastUnknownTs` 一并删除。⑦**自测**：`selftest.js` 新增 T10 段 9 项（判据单测 + 源码零残留守卫 + 豁免分支位置守卫），**48 过 0 败**；另跑 3 组隔离端到端（新鲜标记→0 弹窗 / 无标记→照弹 / 1 小时旧标记→照弹，证明 TTL 未误杀），**14 过 0 败**；`--flush-delayed` 主循环冒烟正常收口。
->
-> **v3.19.2 要点（2026-10-01 · 外部全量逐行重审 B1–B10）：账本正确性 + 消灭「两份实现靠注释同步」** —— ①**B1【高】水位线口径漂移导致账本静默重复记账**：`readTranscLinesFrom` 用「**已解析行数**」当水位线、却用「**原始换行符个数**」做字节偏移定位，两者只在"每行都能解析"时相等 → transcript 中途出现**空行或永久坏 JSON 行**时，水位线比真实偏移小 k，下一轮从偏早位置重读已计过的行、**再记一遍**（实测：10 行真实用量 1000/100，账本记成 **1100/110**，无 stderr 无告警；触发后自愈但多记的不回滚）。现水位线口径统一为**物理完整行数**（文件 `\n` 累计），空行/坏行不再造成漂移，半写尾行仍不计入。②**B5 + B3【中】复制实现彻底清理**：`backfill.js` 删除自带的价库合并镜像与 `findModel`/`normalizeModelName` 副本（镜像缺了并发半写重读、`tier_note` 传递等三处逻辑），改为在主脚本 `require` 前钉住 `CN_PRICE_DB_DIR` 后**直接复用 `tt.mergeLocalPriceDb` / `tt.findModel`**；主脚本内两份**零调用死副本** `parsePeakSchedule`（仍丢分钟的 N4 旧 bug）/ `isChineseHolidayBeijing`（时区口径与模块不一致）连同 exports 一并删除——"留着带旧 bug 的副本 + 详细正确注释"是最高级的误导。③**B8【低·口径】峰谷按 token 发生时刻判，不再按脚本运行时刻**：`calcCost` 新增可选 `tsMs`，取 `tsMs > stat.lastTs > 当下` 优先级；`incrementalRecord` 传入本批新行的最大时间戳 → 跨 12:00/18:00 边界的长轮不再整轮按"终点档"计价，与 `backfill`/`recalc-day` 的逐行口径收敛。④**B4【中】删掉 `peak_rules` 半截链路**：该字段是 TokenHub 原文**自由文本**（非机器可读的分厂商时段表），抓了、存了、**从不参与判定**（非 DeepSeek 厂商一律按 1× 计价）——`build_index.py` 停止生成、`mergeLocalPriceDb` 停止合并。⑤**B2**【中】`resolveWorkspaceLogFile` 改走探测出的数据根 `WB`（原先写死 `~/.workbuddy/logs`，数据根迁到 `~/.workbuddy-ai` 的用户「取消确认第二信号源」永久失效，且是 `WB_ROOT` 隔离泄漏）。⑥**B6/B7/B9/B10**【低】`aggregateTranscript` 的 `subModels` 补行级时间过滤（子代理被唤醒复用时旧行不再外溢到弹窗）；3 处 `agent-*.jsonl` 正则补 `i` 标志（全仓 11 处统一）；`estimateInterrupted` 的 `fromTs` 显式声明为 **epoch 毫秒**（此前 `estimateInterruptedInc` 把行数当时间戳传、过滤器空转）；`firstTs` 空集不再依赖 `Infinity` 传播。⑦**自测**：`selftest.js` 新增 T9 段 16 项（含 B1 端到端、B8 端到端到账本金额、B6 旧行不外溢），**39 过 0 败**。
->
-> **v3.19 要点（2026-10-01）：全仓审计落地——①峰谷时段判定收敛为单一实现 `peak-rules.js`（主脚本 / `backfill.js` / `recalc-day.js` 共用；此前三份硬编码副本，官方一旦调时段，增量记账与回溯重算会判出不同峰谷、金额静默差一倍且无报错）；②`recalc-day.js` 写盘改为「写前备份 + `tmp`+`rename` 原子写」，读取端剥 BOM 并把损坏文件隔离为 `.corrupt-*`；③watcher 改增量读 transcript（此前每 2 秒全量 parse，大 trace 下开销显著；文件被截断/重写时自动重建缓存）；④`backfill.js` 不再继承旧账本的 `_instructions`（数据→指令通道保持关闭）；⑤`refresh-holidays.js` 加 15s 超时 + 原子写；⑥`recalc-day.js` 合并本地官方价库（重算不再把国内模型误判为无价）；⑦`deepseek-official.js` 原子写 `pricing.json`；⑧`maybeRefreshLocalDb` 去掉 `shell:true` 改数组 spawn。⑨v3.19.1 修复峰谷「静默失效」：官方 2026-09 改文案为倒装句导致时段解析一直失败、并把 `peak_schedule` 静默清成空串（下游回落默认值恰好正确，故毫无异常表现）——现改为句式无关解析 + 失败不覆盖 + toast `⚠时段` 告警。v3.18 安全修复要点（余额开关本地化 / 账本 BOM 防损坏 / 个人路径清除）详见 `CHANGELOG.md`。**
 
 > **⚠️ 强制（查询触发总纲）：所有统计查询必须调用 `--report` 命令并原样贴出脚本输出，禁止自行解析 JSON。** 无论用户问「今日消耗」「今天用了多少」「账本」「报告」「统计」「花费」还是历史某天，一律先跑 `node token-tracker.js --report`（或 `--report <日期>`），再把脚本打印的 Markdown 表格原文贴给用户；不得自行读取 `daily-usage.json`、不得自行汇总、不得转成列表/纯文本/代码块。详细规则见下方「查询触发规则（强制）」与「展示格式约束（强制）」。
 
-以下为 v2.55 的功能总览（保持不变）：
-
 > 本技能以 **Windows 系统通知（toast）** 为唯一展示通道：每次回答结束后，由 `Stop` 钩子读取本轮真实落盘数据，自动弹出本条消耗。以下是当前支持的全部能力：
 
-- **本地模型识别增强（v2.54~v2.55，2026-08-18）**：`isLocalModel()` 构建本地集合时按 url 特征判断——**host 是本机（localhost/127.0.0.1/0.0.0.0/::1）→ 无条件本地；host 是局域网 IP（192.168.x/10.x/172.16-31.x）且端口命中已知本地服务端口 → 本地**。已知本地端口：Ollama:11434 / LM Studio:1234 / llama.cpp·llamafile·LocalAI:8080 / vLLM:8000 / Jan:1337 / GPT4All:4891 / koboldcpp·oobabooga:5000·5001。本地部署（Ollama/LM Studio/llama.cpp/vLLM 等）模型即使名字与云端同名（如 `qwen3.8-27b` 撞 OpenRouter 的 `qwen/qwen3.8-27b`）也一律计费 0、只统计 token，并禁止自动补录云端价。修复动机：本地模型改名 `qwen3.8-27b` 后与 pricing.json 云端条目精确同名，被按云价误计费 3.32 元（详见 daily-usage 修复）。
+- **本地模型识别增强（v2.54~v2.55）**：`isLocalModel()` 按 url 特征判本地——host 是本机（localhost/127.0.0.1/::1）→ 无条件本地；host 是局域网 IP（192.168.x/10.x/172.16-31.x）且端口命中已知本地服务端口（Ollama:11434 / LM Studio:1234 / llama.cpp·vLLM:8080·8000 / Jan:1337 / GPT4All:4891 / koboldcpp·oobabooga:5000·5001）→ 本地。本地模型即使与云端同名也**计费 0、只统计 token，且禁止自动补录云端价**（修复动机：本地 `qwen3.8-27b` 与云端条目精确同名，被误计费 3.32 元）。
 - **本条精确统计**：`Stop` 钩子在回答完全结束后触发，此时本轮 trace/transcript 已写完，弹出的是**本条回答**的真实 token、耗时与费用（不是上一轮）。
 - **toast 两行大字布局**：行1 标题大字 = 模型完整名 + 时段标注（`高峰双倍`/`夜间X折`）＋ 换行后 = `耗时` + `今日¥X` + `余额¥Y`；行2 正文小字 = `输入/输出 token` + `缓存占比` + `本条费用`。
 - **每日分模型账本（v2.39）**：每轮 Stop 自动把消耗**按模型**累计进 `daily-usage.json`（本地日期分桶，`{日期:{models:{模型:{in,out,cached,hit,total,cost}}, total:{...}}}`，`hit` = 缓存命中率%（两位小数，cached/in）），**每天保留两套统计**：`models` 各模型明细 + `total` 不分模型的当日总合计（输入/输出/缓存命中/总 token/金额，含总命中率）。**长期保存不裁剪**，可查任意历史天。查看：`node token-tracker.js --report`（今天）／`--report all`（全部天）／`--report <日期>`，也可让助手直接读文件整理展示。**v3.20.0 新增区间汇总**：`--report week`（近 7 天）／`--report month`（本月至今）／`--report 2026-09-01..2026-09-30`（任意闭区间）→ 输出与单日**同列**的按模型汇总表 + 合计行（命中率按 `Σ缓存/Σ输入` 重算）；`--report forecast` 看 token 消耗外推。
@@ -174,7 +142,7 @@ Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\
 
 1. **主通道 —— 回答里**：`--hook`（你提交问题时）触发，检查结果拼进注入上下文，模型在回答末尾提一句。
    追加逻辑在 `out()` 内部完成，所以 `--hook` 的**任何**输出路径（含各种提前返回的分支）都会带上，不存在"走了某个分支就漏掉"的可能。
-2. **兜底通道 —— 弹窗标记**：只给**没配 `UserPromptSubmit` hook** 的用户（判据：状态文件里 `lastHookAt` 缺失或距今 ≥3 天）。命中时弹窗第一行尾部出现 `｜⬆v3.22.0`，**放不下就整个不显示**。已配 hook 的机器永远不会出现这个标记。
+2. **兜底通道 —— 弹窗标记**：只给**没配 `UserPromptSubmit` hook** 的用户（判据：状态文件里 `lastHookAt` 缺失或距今 ≥3 天）。命中时弹窗第一行尾部出现 `｜⬆vX.Y.Z`，**放不下就整个不显示**。已配 hook 的机器永远不会出现这个标记。
 
 > ⚠️ **对用户要如实说的边界**：这套机制**帮不了「已经装了旧版」的用户**——检查逻辑在被安装的那份代码里，v3.21.0 之前的版本根本没有它，他们只能靠 README / 发布页知道更新。这是机制使然，不是配置问题。
 
@@ -183,12 +151,12 @@ Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\
 发现新版本时会在 `--hook` 注入的上下文里**多出一行**：
 
 ```
-[技能更新] 有新版 v3.22.0，回复末尾提一句即可，勿展开
+[技能更新] 有新版 vX.Y.Z，回复末尾提一句即可，勿展开
 ```
 
 **模型该怎么做**（就这一件事，别多做）：
 
-1. **在本次回复的最末尾加一句**，例如：`本技能有新版本 v3.21.0，可更新`。**一句话说完就停**。
+1. **在本次回复的最末尾加一句**，例如：`本技能有新版本 vX.Y.Z，可更新`。**一句话说完就停**。
 2. **不要展开**、不要贴目录树、不要贴命令、不要列 changelog 摘要——**除非用户追问**「怎么更新 / 更新了什么」。
 3. 用户追问升级方法时，**照本节下面的「升级操作」回答**（这是唯一权威步骤）。用户追问更新内容时，回答「跑 `git log` 或看仓库的 CHANGELOG.md」或直接读 `CHANGELOG.md` 顶部那节。
 4. 用户没追问 = 到此为止。同一版本最多提示 2 次、间隔 ≥24h，脚本自动节流，你**不需要**自己做去重。
@@ -268,11 +236,8 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
   耗时 4m 26s 今日¥8.21 余额¥2.77
   输入 391.2万 / 输出 1.9万｜缓存99.74%｜¥0.25
   ```
-  ——**布局原则（v2.34/2.35 两行大字定稿）**：行1（标题大字）分两行——第一行 = 模型完整名 + 时段标注（`高峰双倍`/`夜间X折`，仅有时段策略的模型显示，空格分隔）；第二行 = `耗时` + `今日¥X` + `余额¥Y`（今日价 = 当天 24 小时总消费，余额仅开启余额查询且检测到变化时显示）。行2（正文小字）= 输入/输出 + 缓存占比（两位小数）+ 费用（未收录显示「未收录」）。**换行点固定在「时间」前**——行1 第二行永远从行首对齐，与第一行长度无关。**宽度双模型（v2.33）**：行1 标题大字用 `dispWidthTitle`（中文按 2.5 半角单位，v2.17 纯半角实测上限 47u、含中文更紧）+ 阈值 45u（= `TOAST_ROW1_MAX_W`，**以代码为准**）；行1 第二行阈值 42u（= `TOAST_ROW2_MAX_W`，**以代码为准**）；行2 正文小字用 `dispWidth`（中文按 2）+ 阈值 52u（= `TOAST_LINE_MAX_W`，**以代码为准**）。**降级链（v2.35 定稿）**：行1 第二行超 42u → 丢余额 → 再超丢今日价 → 保底 `耗时`（绝对安全）；行1 第一行超宽（长模型名）→ 丢时段标注保模型名。**时段标注 `periodNote()`**：`peak_multiplier>1`（DeepSeek 原厂系=2）且当前在高峰时段（北京时间 9-12/14-18）→ `高峰双倍`；`night_discount`（如 0.5）且当前在 `night_hours` → `夜间X折`；无时段策略不显示。**布局演进（历史）**：v2.6 行1 带时段标注 → v2.8 余额移至行1 → v2.11 余额紧跟时间 → v2.14 时段只显示「高峰」两字 → v2.17 实测上限 47u + 分隔符两侧加空格 → v2.18 恢复「¥」符号 → v2.32 加今日累计 → v2.33 行1 中文按 2.5 宽度模型 → v2.34/2.35 换行点移到时间前、两行大字布局定稿。**实现说明**：旧式 ToastText 系列无展开按钮，ToastText04 的第 3 个 text 元素在部分环境不渲染（v2.34 实测被吞），故用「ToastText02 标题 text 内插 `&#10;` 换行符」实现两行大字（用户实测 A1 方案成功）。这是当前唯一确认有效的"本条可见"通道（UI 内 `systemMessage` 通道实测不显示，v2.37 已移除该死代码）
-- **时段折扣数据（2026-08-05 搜索核验；DeepSeek 原厂时段 v3.19.1 起自动跟随官方；v3.22.0 修正本节过时表述）**：目前仅 **DeepSeek 原厂系**有峰谷定价（V4 起推出，工作日北京时间 9-12/14-18 高峰，所有计费项 ×2，含缓存价；原因=算力挤兑削峰填谷；2025 年的「夜间错峰优惠」已被高峰溢价模式取代）。智谱 GLM / MiniMax / Kimi / 混元均为统一定价无峰谷；小米 MiMo 是 2026-05 永久降价 99%（非时段折扣）。⚠️ **时段数据的来源分两类，别再把它们混为一谈**（v3.22.0 修正过时表述——此前本节与 README 都写「无公开 API 数据源，需手动维护」，对 DeepSeek 原厂并不成立）：
-  - ① **DeepSeek 原厂系 → 官方自动跟随**：`deepseek-official.js` 每日抓官方定价页，写入 `pricing.json` 顶层的 `deepseek_rules.peak_schedule`（含 `weekend_off_peak`）。官方调时段 / 取消周末低峰 / 改文案，本地自动同步；**解析失败保留旧值**并亮 `⚠时段`（v3.19.1 前的旧版会把 `peak_schedule` 静默清成空串，下游回落默认值恰好正确所以毫无异常表现——这是历史坑）。无 `deepseek_rules` 时回落内置默认 9-12/14-18。
-  - ② **其他厂商 → 需人工维护**：这些厂商的时段政策（高峰/低谷/夜间折扣/取消）**没有**可程序化读取的数据源，变动时在 `pricing.json` 该模型条目上更新 `peak_multiplier`（高峰倍率）、`night_discount`（夜间系数，0<d<1，如 0.2=夜间2折）、`night_hours`（可选 `[起,止]`，覆盖默认夜间窗口 00:00–08:00）字段，代码自动读取显示（可在对话中提示模型更新）。
-  - ⚠️ **不存在 `peak_hours` 字段**：高峰时段只来自 `deepseek_rules.peak_schedule` 或内置默认，历史文档里写的 `peak_hours` 是错的（全仓无任何代码读取该键），不要照它去改 `pricing.json`。新模型自动补录默认 `peak_multiplier:1`。
+  ——**布局**：行1 第一行 = 模型完整名 + 时段标注；行1 第二行 = `耗时` + `今日¥X` + `余额¥Y`（**换行点固定在「时间」前**，与第一行长度无关）。行2 = 输入/输出 + 缓存占比（两位小数）+ 费用。宽度阈值 `TOAST_ROW1_MAX_W=45` / `TOAST_ROW2_MAX_W=42` / `TOAST_LINE_MAX_W=52`（**均以代码为准**）。**降级链**：行1 第二行超宽 → 丢余额 → 再超丢今日价 → 保底 `耗时`（绝对安全）；行1 第一行超宽（长模型名）→ 丢时段标注保模型名。**时段标注 `periodNote()`**：`peak_multiplier>1` 且当前在高峰时段 → `高峰双倍`；`night_discount` 且当前在 `night_hours` → `夜间X折`；无时段策略不显示。这是当前唯一确认有效的"本条可见"通道（UI 内 `systemMessage` 通道实测不显示，v2.37 已移除该死代码）
+- **时段折扣数据**：仅 **DeepSeek 原厂系**有峰谷定价（工作日 9-12/14-18 高峰 ×2）；**DeepSeek 时段自动跟随官方**（`deepseek_rules.peak_schedule` 每日抓取，无需手动维护），其他厂商的 `peak_multiplier`/`night_discount`/`night_hours` 需人工维护。⚠️ **不存在 `peak_hours` 字段**（历史文档写错了，全仓无代码读它）。详见 `docs/pricing-refresh.md`。
 - Stop 端输出 `hookSpecificOutput:{}`（v2.37：`systemMessage` 通道 WorkBuddy UI 实测不显示、弹不进对话回复，已移除该无效注入；toast 为唯一结算展示通道）。
 - 探针 `.stop-probe.json` 记录每次触发：`sameRound=false`+`waited=ok` = 成功拿到本条；`waited=timeout` = 3 秒内 trace 未落盘，退化为「上一轮」且不弹通知。
 - 若用户不需要系统通知，可删除 `settings.json` 中 `hooks.Stop` 配置（`--hook`/手动模式不受影响）。
@@ -292,22 +257,16 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 - 计费公式：`未命中输入×输入价 + 命中输入×缓存价 + 输出×输出价`，按当前时段取倍率；结果不足 ¥0.01 显示 `¥<0.01`。
 - toast 为两行：行1 `模型名 | 时段标注 | 耗时[ 空格]余额¥X（半角 | 两侧各 1 空格）`，行2 `输入 X / 输出 Y｜缓存NN.NN%｜¥费用`（详见方式 C）。
 
-## 余额显示（v2.8 新增，v2.10 改为"默认隐藏 + 变化检测"，仅自定义 API 的 DeepSeek 官方模型）
-- **原理（NIX 客户端同款）**：DeepSeek 官方接口 `GET https://api.deepseek.com/user/balance` + `Authorization: Bearer <API key>` 即可查询账户余额，**无需网页登录**——这就是 NIX 等 DeepSeek 客户端"只给 API key 就能显示余额"的原因。
-- **启用条件**：仅当 `~/.workbuddy/models.json` 里存在 url 指向 `api.deepseek.com` 的模型（即用户自己的 DeepSeek API key）时启用；无 key → 不显示余额，不影响其他功能。
-- **模式识别（v2.10，用户定调"默认不显示、抓到变化才显示"）**：积分模式与自定义 API 模式无法从本地数据区分——官方文档证实内置模型列表就有 `Deepseek-V4-Flash`（与自定义 id 同名）；trace/hook payload/transcript 无模式标记；进程级探测（tasklist/wmic/netstat）被本机安全策略禁用。"密钥是否在用"信号抓不到，但 **余额变化 = 账户在真实消耗** 是其等价信号（有密钥才有消耗）。判定规则：每次查询与上次观测对比（`toFixed(2)` 字符串比较避免浮点陷阱）——
-  - **余额变了**（降=消费 / 升=充值）→ 显示 `余额¥X`（自定义 API 模式，或其他处用同一 key，显示的是真实余额）；
-  - **余额不变** → 不显示（积分模式余额恒定 → 永不显示）；
-  - **首次观测**只记录 baseline 不显示（用户："宁愿先几轮不显示"）。
-- **显示位置**：Stop toast **行1 紧跟耗时**（1 空格分隔）`余额¥2.77`（金额两位小数，**带 ¥ 符号**——v2.18 恢复：实测行1 上限 47u 后空间充裕，峰值场景 46u 仍有富余）。放行1 的原因：行2 已满（实测约 49u/上限 52u，= `TOAST_LINE_MAX_W`，**以代码为准**），追加余额会折叠变 3 行。**行1 是标题大字，宽度上限 `TOAST_ROW1_MAX_W=45`（**以代码为准**；v2.33 由 47 下调至 45，留 2u 余量，v2.63 保持该值不变）**；超宽（长模型名）时余额自动让位，不折叠。**v2.17 定稿：行1 分隔符用半角 `|`（全角「｜」dispWidth 算 2u 太浪费）且两侧各 1 空格**——`模型名 | 高峰 | 耗时 余额¥X`，模型名与分隔符不再贴死。
-- **缓存（实时性）**：余额写入 `.balance.json`（含 history 数组，保留最近 20 条观测），**15 秒 TTL**（v2.18 从 60s 压短：用户要求实时，接口实测 300ms 级，正常轮询间隔 >15s 即每轮拿实时数；15s 内连发 toast 才复用缓存秒回）——查询失败降级用旧缓存，无缓存则隐藏余额（不报错、不影响 toast）。
-- **隐私**：API key 仅用于本机向官方 `api.deepseek.com` 发请求，缓存文件只存余额数值与观测历史、不存 key；脚本不打印、不上传 key。
-- **每日刷新策略（用户要求"当天第一次打开软件/第一次回答才搜，当天搜过就不搜"）**：
-  - 脚本自动兜底（**v2.65 起触发点收敛**）：**仅 `--hook`（用户提交提问时）**才检查 `pricing.json` 的 `date`，**过期才**同步调用 `refresh-prices.js` 联网刷新；`--stop` 路径**不再**做全量刷新（此前会在 Stop 时联网，阻塞弹窗）。判定仍是「当天已刷新则直接跳过、不联网」。手动运行 `node refresh-prices.js`（加 `--force` 可强制）随时可刷。**v2.66 补充**：`pricing.json` 缺失或损坏时会自动尝试重建；刷新子进程超时为 60 秒。**v2.2（2026-08-14，多源 + 国内外区分）**：并行拉 **5 源**——国内 2 个：llmabacus（`llmabacus.com/api/prices`，**主**，每日自动核价、人民币、含 vendors country）、llm-prices-cn（`raw.githubusercontent.com/szp2005/llm-prices-cn/main/prices.json`，**备份**，llmabacus 每日镜像）；国外 3 个：OpenRouter（USD，接近实时）、LiteLLM `model_prices_and_context_window.json`（USD，1-3 天滞后）、Portkey `configs.portkey.ai/pricing/<provider>.json`（USD，美分/token）；**按模型 `region` 区分国内外**（CN=国内模型主价来自国内源人民币价；US=国外模型主价用三 USD 源中位数×汇率），region 自动从 llmabacus vendors country 推断；USD 参考价取三源中位数；国内源都没有的模型仅当本地原本是 `auto_converted` 才用 USD 兜底，人工核验过的官方价保留不被覆盖；**全源失败写 `last_refresh_error`，token-tracker 在 toast 显示「价⚠️」提示费用按上次价格估算**；当天已刷新则直接跳过、不联网；`--force` 可强制刷新。备份：`refresh-prices.js.bak-20260814`。
-  - 新模型补录（v2.31）：`ensureNewModelPricing` 检测到未收录模型时**立即联网补录**——先查国内源 llmabacus（`priceCurrency=CNY` 直接人民币价补录 region=CN；`USD` 走 USD×汇率 region=US），再回退 OpenRouter（region=US）。已收录模型不触发，只有真遇到新模型才联网。**v2.67 起匹配变严格后**，新模型/新构建名更容易落到这条路径（找不到精确键即触发）。
-  - 陈旧模型清理（v2.65）：每次刷新时删除「曾出现在 `daily-usage.json` 且超过 14 天未使用」的模型（**从未出现在账本的模型一律保留**——v2.82 修复后与代码一致），`lock: true` 的三个（deepseek-v4-flash / -vision-exp / v4-pro）始终保留。被删模型再次使用时会由上面的新模型补录自动回补。
-  - 人工权威核验（兜底）：**每日首次对话时**，若发现自动刷新覆盖的国内源价格与厂商官方定价页有出入（尤其峰谷模型如 DeepSeek 的基准价口径），按 SKILL.md 数据源清单核对官方定价页后修正 `pricing.json`。自动刷新的 `last_refresh_note` 会在峰谷模型价差 >60% 时提示人工核验。
-  - 开源/实时价格源清单（已全部接入自动刷新）：**llmabacus.com/api/prices**（国内人民币主源，每日自动核价，szp2005/llm-prices-cn 的上游，含 vendors country/currency）、**llm-prices-cn**（国内人民币备份源，每日镜像同步）、OpenRouter API（USD，接近实时）、LiteLLM `model_prices_and_context_window.json`（USD，社区 PR 1-3 天滞后）、Portkey `https://configs.portkey.ai/pricing/<provider>.json`（USD，美分/token，SaaS 即时）、厂商官方定价页（权威，兜底人工核验）。国内网页参考（不可程序化）：51token.com / jingxialai.com / tokenbijia.com。
+## 余额显示（仅自定义 API 的 DeepSeek 官方模型）
+
+**摘要（够回答大多数提问）**：只有用户配了**自己的 DeepSeek API key** 才可能显示；**默认隐藏**，仅当余额发生变化时才显示（余额不变 = 判定为积分模式 → 永不显示；首次观测只记 baseline）。写入 `.balance.json`，**15 秒 TTL**。
+
+**细节**（原理 / 启用条件 / 模式识别判据 / 显示位置与宽度让位规则 / 隐私）：Read `docs/balance.md`。
+## 每日价格刷新策略
+
+**摘要**：`pricing.json` **每天自动刷新一次**——只在 `--hook`（用户提交提问时）触发，`--stop` 不刷；当天刷过就跳过。5 源并行（国内 llmabacus / llm-prices-cn + 国外 OpenRouter / LiteLLM / Portkey），按模型 `region` 区分取价。
+
+**细节**（触发点 / 多源策略 / 新模型补录 / 陈旧清理 / 峰谷时段口径 / 计费公式）：Read `docs/pricing-refresh.md`。
 
 ## ⏱️ 时序限制（务必理解，不要对用户造假）
 - **一个 trace 文件 = 一轮完整 LLM 调用，整轮结束后才落盘**。因此在「回答生成完毕」那一刻，本轮自己的 trace 还没写出来——手动/`--hook` 模式读到的永远是**最新已完成的一轮**（即上一条回答，精确但滞后一轮）。**回答末尾贴出的行不可能显示本条**（本条尚未落盘），必须如实标注「上一轮/最近完成轮」，不许冒充"本条"。
@@ -335,55 +294,16 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 
 ## 维护与排查
 
-### 弹窗诊断日志
-- 每次弹窗时，代码**自动**向 `~/.workbuddy/token-tracker-toast.log` 追加一行 JSON 诊断记录（无需任何开关，默认开启）。
-- 记录内容包含：`ts`（时间）、`reason`（触发原因）、`sessionId`、`watchStartTime`（本次 watcher 启动时间）、`lineCount`、`stableCount`、`tailFingerprint`、`lastTailFingerprint`、`pendingSubCount`、`hasNewTail`、`traceFile`（当前处理的 trace 文件名，获取不到为 null）、`toastText`（弹窗真实文本前 200 字符）。
-  - v3.19.3 起删除了 `compactionSuspected` / `compactionMode` / `lastMarkerId` 三个字段：前者在原压缩状态机里结构性恒为 false/null（置 true 后立刻 continue，永远到不了日志），后两者从未被置 true——留着只会误导排查。
-- `reason` 取值：`busy-timeout` / `interrupted` / `deadTeam` / `stableCount>=3` / `idle-timeout` / `estimate` / `no-token` / `hook-fallback`。
-- 日志文件超过 5MB 会自动清空后重新追加，避免无限增长。
-- 写入失败（权限/磁盘问题）被 try-catch 吞掉，绝不影响弹窗主流程。
+**排障内容已移出主文档**（约 14 KB，日常用不到）。命中下列任一情况时才 Read `TROUBLESHOOTING.md`：
 
-### 常见排查步骤
-1. 如果用户反馈"压缩上下文后仍然弹窗"或"漏弹"，直接打开 `~/.workbuddy/token-tracker-toast.log`。
-2. 搜索最近的记录，查看 `reason` 是 `stableCount>=3` 还是 `interrupted` 或其他。
-3. 查看该记录的 `tailFingerprint` / `lastTailFingerprint`（末行指纹），判断触发时末行是否已连续多帧不变。
-4. 根据日志判断是判定逻辑问题还是数据源问题，不要凭记忆修改代码。
+- 不弹窗 / 弹窗内容不对 / 弹多了 / 弹窗延迟
+- 账本数字对不上（多记 / 少记 / 重复记 / 与 `recalc-day.js` 不一致）
+- 价库刷新异常、时段标注不对、模型计费不对
+- 更新提示异常（收不到 / 重复出现 / 弹窗第一行出现 `⬆vX.Y.Z`）
 
-### 故障排查速查表
+日常问答（查消耗、出报表）**不需要**读它。
 
-| 现象 | 优先查看文件 | 关键判断依据 |
-|---|---|---|
-| 完全无弹窗 | `.stop-probe.json`（mtime 是否更新）、`token-tracker-toast.log`（是否存在） | 若 probe 未更新，说明 Stop hook 未触发或命令失败；若 toast.log 无记录，说明判定未收口 |
-| 弹窗延迟过长 | `token-tracker-toast.log` | 查看 `reason` 是否为 `stableCount>=3`，并看 `ts` 与 run 结束时间差 |
-| 压缩上下文后提前弹窗 | `token-tracker-compaction.log` + transcript 尾部 | **v3.19.3 起判定已降级**：压缩状态机（compactionMode/compressionPending）经全量日志复核从未生效，已删除。现在只有一种压缩豁免——Stop 端 `no-token` 分支检测到「10 分钟内落盘的压缩标记」→ 静默跳过（落 `stop-no-token-compaction-skip`）。压缩后弹出的**正常轮结算窗**属预期行为，不再抑制 |
-| 压缩期间连弹多条「本轮无 token 消耗记录」 | `token-tracker-compaction.log` | 查 `stop-no-token-compaction-skip` 是否存在：存在说明豁免已生效；缺失则说明末尾 30 行未命中标记或标记已超 10 分钟 TTL（`COMPACTION_MARKER_TTL_MS` 可调） |
-| 弹窗内容异常（会话错乱） | `token-tracker-toast.log` + trace 文件 | 查看 `sessionId` 是否为空或与实际会话不一致；检查 trace 的 `sessionId` 字段 |
-| 账本数据未更新 | `daily-usage.json`（mtime）、`.ledger-watermark.json` | 若 mtime 停在某时间，说明 Stop 路径未执行；结合 probe 判断 |
-| 弹窗频繁重复 | `.ledger-watermark.json` + `token-tracker-toast.log` | 查看 watermark 去重是否生效，以及 toast.log 中同一 `reason` 是否反复出现 |
-| 弹窗提示「⚠价库8/31」/ 价库不刷新 | `WorkBuddy\2026-08-30-22-25-15\prices\.refresh.lock`（失败会常驻）+ `.refresh.error`（v2.82 起失败留档）+ `binaries/python/envs/default`（venv 是否有 requests） | 刷新失败首查 `.refresh.error` 内容；「python 环境」问题查 resolvePython 是否命中 venv（v2.82 根修：候选表必须含 venv 路径） |
-| 弹窗耗时与 WorkBuddy 显示差很多 | 本轮 trace 文件数量（`~/.workbuddy/traces/<pid>/` 同窗口几个 trace） | 长任务会分多个 trace 文件，v2.74 单文件口径只算最后一段（11:27 显示 4:22）；v2.82.1 起 = 最新 trace endedAt − 用户提交时刻（roundStart0），差 ≤1s |
-| 新模型计费明显不对 / 显示 unknown | `pricing.json` 对应条目 + `daily-usage.json` 模型名 | v2.82.2 起 findModel 为单向边界匹配：`glm-5.3-air` 不会撞 `glm-5` 的价；模型名缺失（`unknown`）只记 token 不记钱——若出现 unknown 条目，说明 transcript 的 `providerData.model` 缺失 |
-| 已下线模型（`retired: true`）仍按旧价计费 | `pricing.json` 该条目的 `retired` 与 `price_source` | **设计行为（v3.19.1 起明确写入文档）**：官方下线后仍保留最后已知官方价，供历史账本回溯；`findModel`/`calcCost` **不检查 `retired`** → 若该模型仍被调用则按留存旧价计费，且因官方已不再给价、该条目永不再更新、也不告警。要停用请显式删除条目或手工接管价格 |
-| 官方调价后本地价一直不更新 / 手动条目长期 `pending-official` | `pricing.json` 该条目（`manual`/`lock`/`alias_of`）+ `_manual_audit` | v3.07 起官方页「模型版本」行与本地 key/name 对齐后**跨 key 接管**（官方价覆盖手动价 + 解绑 `manual`/`lock` + 打 `alias_of`）。若仍 pending：① 「模型版本」列数与模型列数不一致 → 安全降级为纯 key 匹配（不猜测对齐）；② 官方现行 ID 与本地 key 同名时走常规精确匹配；③ `alias_of` 条目在聚合源刷新时靠 `official.official[m.alias_of]` 回退取官方价，若被 llmabacus 价覆盖说明该回退失效 |
-| 手动取消后不弹窗（v2.83+，v2.85 起实时补弹） | `token-tracker-toast.log`（搜 `cancelled-round-watch` / `cancelled-round-flush`）+ transcript 取消标记（`role=assistant`/`status=incomplete`/`error.message` = `Interrupted by user`） | v2.85 起每个新轮 hook spawn 轮级 watcher（`--round-watch`），取消标记收尾 + 8s 无新行即补弹，reason=`cancelled-round-watch`（有 usage）/`-est`（估算）/`-no-token`（无凭据）。若仍不弹：① 取消标记后直接跟 assistant 回复（续跑，设计内不弹）；② 轮已被结算（`lastStopAt ≥ roundStart`，防双弹退出）；③ 应用关闭时 watcher 被 Job Object 连带收割（失效边界，退回下一轮 hook 兜底 `cancelled-round-flush`） |
-| 未取消却弹「（手动取消）」（v3.08 修复的误判） | 该轮 transcript（搜 `Interrupted by user`）+ 取消标记那一行是否带 `skipRun=true` + 标记之后是否存在「正常完成」的 assistant 行 + `~/.workbuddy/<proj>/token-tracker/<sid>/snapshot.json` 的 `lastStopAt` | v3.08 起：① 标记行 `skipRun===true`（应用中止在飞请求/编辑重发分叉，非用户取消）→ 不算取消；② 标记之后任意位置存在 `role=assistant` 且 `status!=='incomplete'` 的完成行 → 该轮已继续完成，不算取消；③ no-token Stop 已推进 `lastStopAt`，`intrInfo.ts > lastStopAt` 不成立则兜底不触发。若仍误弹：核查标记行是否确为 `skipRun=true` 且其后有完成行——若是而仍误判，说明兜底 `intrInfo.ts > lastStopAt` 校验没挡住（lastStopAt 陈旧），检查 no-token 分支是否真的写了快照 |
-| 专家团金额疑似翻倍（双记） | `.ledger-watermark.json` 各会话水位线 + 账本模型 token | v2.82.2 起 incrementalRecord 整体加 `.ledger-watermark.json.lock` 水位线锁，watcher 与 Stop 并发只记一次；仍翻倍则查是否锁被异常跳过（stderr 有「水位线保持不推进」则下轮会补记） |
-| 当日弹窗金额与 `recalc-day.js` 重算结果对不上 | `peak-rules.js`（唯一口径）+ `pricing.json` 的 `deepseek_rules.peak_schedule` | v3.19.0 前主脚本 / `backfill.js` / `recalc-day.js` 各存一份峰谷硬编码——官方调时段后增量记账判低峰、回溯重算判高峰，**金额静默差一倍且无报错**。v3.19.0 起三处统一委托 `peak-rules.js`；若仍不一致，`grep -n "9, *12" *.js` 查是否残留旧副本。**跨时段边界轮**（如 11:55→12:08）v3.19.2 起账本侧按**行时间戳**判峰谷（`calcCost` 的 `tsMs`/`stat.lastTs`），与 backfill/recalc 的逐行口径收敛；窗口未跨边界的轮不受影响 |
-| 账本比实际用量**多记一行**（金额略高于预期，无任何报错） | transcript 中途是否存在**空行**或**永久坏 JSON 行**（`grep -c '^$'` / 逐行 `JSON.parse` 试）+ `.ledger-watermark.json` 的 `main` 值 | **v3.19.2 前**：`readTranscLinesFrom` 用「已解析行数」当水位线、却按「原始 `\n` 个数」做字节偏移 → 两者差 k（被跳过的空行/坏行数）→ 下一轮从偏早偏移重读已计过的行再记一遍（实测 1000/100 记成 **1100/110**），触发后自愈但不回滚。**v3.19.2 起**水位线口径统一为**物理完整行数**，不再漂移。若在旧版发现该症状：升级后重跑 `backfill.js --write` 重建账本 |
-| 区间汇总的「缓存命中」与各天百分比对不上 | `--report <起>..<止>` 的输出 | **设计如此，不是 bug**：命中率是比率，区间值按 `Σ缓存 / Σ输入` **重算**（按 token 量加权），不是各天 hit 的算术平均——跨天量级差 100 倍时均值会严重偏离。要核对请手算 `Σ缓存/Σ输入` |
-| CSV 用 Excel 打开中文列头乱码 | `exports/report-*.csv` 前 3 字节是否为 `EF BB BF` | 必须带 UTF-8 BOM，否则 Excel 按 GBK 解码必乱码。`--report --csv` 已固定写入 BOM；若仍乱码，先确认该文件是否被别的工具改写过 |
-| 轮次明细里同一轮出现多条 | 各条的 `roundStart` 与 `source` | **正常**：同一轮可能分多批落盘（如 Stop 记一批、`--flush-delayed` 再补一批），`source` 区分来源。被幂等拦掉的只有「无新增用量」的重复 Stop。按轮聚合请用 `sid + roundStart` 分组 |
-| 明细 `label` 为空 | 该轮 `roundStart` 与 transcript 中 user 行的 timestamp | `roundLabel` 只取 **timestamp ≥ roundStart** 的 user 行，且只扫 transcript **尾部 400 行**；取不到就留空（不编造）。常见原因：本轮很长、首行已被挤出尾部窗口；或测试夹具用了与真实时间不符的 `roundStart` |
-| 回答末尾出现「本技能有新版本」 | `.update-check.json` 的 `latestVersion` / `notifyCount` | **正常**（v3.21.0 版本更新提示）。`notifyCount ≥ 2` 后自动静默；升级后本地版本 ≥ 远端即不再提示。想彻底关：`local-config.json` 写 `{"enable_update_check": false}` |
-| 从没见过更新提示（但确实有新版本） | `.update-check.json`（是否存在 / `lastCheckAt` 是否在 7 天内 / `failCount`） | ① 检查只在 `--hook` 触发，`--stop`/手动模式永远不会提示；② 7 天闸门内不重复查；③ `failCount ≥ 3` 会当周停止重试；④ `ENABLE_UPDATE_CHECK` 或 `ENABLE_NETWORK` 关掉时静默跳过。**注意：装了旧版的用户根本不会有这个文件——检查逻辑在被安装的那份代码里** |
-| 更新提示重复出现很多次 | `.update-check.json` 的 `notifiedVersion` / `notifyCount` / `lastNotifyAt` | 设计上限是**同一版本最多 2 次、间隔 ≥24h**。若远超此数：确认状态文件是否可写（写失败会导致次数不累计），或每次都在换技能目录（状态文件跟着目录走） |
-| 弹窗第一行尾部出现 `｜⬆v3.22.0` | `.update-check.json` 的 `lastHookAt` | **正常且只应出现在"没配 UserPromptSubmit hook"的机器上**（v3.22.0 toast 兜底）。判据：`lastHookAt` 缺失或距今 ≥3 天。若已配 hook 却仍出现 → 说明 `--hook` 根本没被触发（检查 `settings.json` 的 `UserPromptSubmit` 配置），顺手就把"注入通道失效"这个更大的问题暴露出来了 |
-| 怀疑「有新版但用户收不到提示」 | `.update-check.json` + 该用户是否配了 `UserPromptSubmit` hook | 逐条排查：① `ENABLE_UPDATE_CHECK`/`ENABLE_NETWORK` 关了；② 7 天闸门未到；③ `failCount ≥ 3` 当周停；④ 远端版本没高于本地 `SKILL_VERSION`；⑤ **没配 `--hook`** → 只有 toast 兜底（首轮会因检查而略慢约 1.5s，之后正常）；⑥ 用户装的是 v3.21.0 之前的版本 —— **那些版本的代码里根本没有检查逻辑，收不到是必然而非 bug** |
-| 用户问「这周/本月」却拿到一大张全部天的表 | 你实际跑的命令 | 跑错命令了：「这周」→ `--report week`、「本月」→ `--report month`、「某段日期」→ `--report <起>..<止>`；只有「全部/历史」才用 `--report all`。详见「自然语言问法 → 命令映射」 |
-| 用户问「哪一轮最贵 / 子代理占了多少」但答不上来 | `rounds/rounds-YYYY-MM.jsonl` | **没有 CLI 入口**，账本粒度是天。只能读那个 jsonl 文件（这不算「绕过 --report 解析账本」，账本与轮次明细是两回事） |
-| 用户说「统计的比我实际扣的少」 | 弹窗是否标了 `（估算）`、账本该轮 token | **很可能属实，不要辩解**：长思考被手动停止那部分云端已计费但本地不落盘，本技能只能估算且通常偏低；内置积分模式的额度扣减本技能也读不到。正确回答：以服务商账单 / WorkBuddy 积分记录为准（见「数据源与准确性」的统计范围边界） |
-
-> ⚠️ **hooks 命令铁律**：所有 hook 命令必须保持**纯净的 `node` 调用**（如 `node C:/.../token-tracker.js --stop`），**禁止使用 `cmd /c` 包装或环境变量前缀**（如 `cmd /c "set X=1 && node ..."`）。此类包装会被 WorkBuddy 判为无效 hook 配置（`Invalid hook config`），导致整个事件组（Stop / UserPromptSubmit）跳过、进程瞬间失败且无任何日志产物。调试日志已改为弹窗时自动记录，无需通过环境变量或命令前缀开启。
+> ⚠️ **hooks 命令铁律**：hook 命令必须是**纯净的 `node` 调用**（如 `node C:/.../token-tracker.js --stop`），**禁止 `cmd /c` 包装或环境变量前缀**（如 `cmd /c "set X=1 && node ..."`）——那样会被判 `Invalid hook config`，整个事件组（Stop / UserPromptSubmit）被跳过、进程瞬间失败且**无任何日志产物**。
 
 ## 反借口表（2026-09-14 补）
 

@@ -1,5 +1,23 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.22.1 (2026-10-01)
+// token-usage-tracker v3.23.0 (2026-10-01)
+// v3.23.0：**SKILL.md 瘦身 76.2 KB → 42.4 KB，排障/边缘内容改为按需加载（纯文档重构，代码逻辑零改动）** ——
+//   起因（用户原话）：「这个技能字符占据了多少？算是很超标吗？需要精简吗？哪些可以挪出去、
+//   哪些可以挪到其他地方启用？」——实测：SKILL.md 77,999B（76.2 KB）/ ≈18,401 token / 406 行，
+//   对照「单 skill 建议 ≤5,000 token」= **3.7 倍**；而常驻的 frontmatter description 只有 2.3 KB（触发键，不能动）。
+//   病灶是**结构性**的：51% 的内容属于「CHANGELOG 副本 + 排障手册 + 历史细节」——
+//   版本要点堆积 14,799B(19.0%)、故障排查速查表 12,266B(15.7%)、余额显示 6,576B(8.4%)、
+//   方式 C 布局演进史 5,570B(7.1%)、Windows 通知横幅设置 3,358B(4.3%)。
+//   本次挪出 4 个**默认不加载**的旁支文件（SKILL.md 只留触发规则 / 命令映射 / 核心机制 / 铁律 / 反借口表）：
+//   ① `TROUBLESHOOTING.md`（弹窗诊断日志 + 排查步骤 + 31 行故障速查表，约 14 KB）；
+//   ② `docs/balance.md`（余额原理 / 启用条件 / 模式识别判据 / 宽度让位 / 隐私）；
+//   ③ `docs/pricing-refresh.md`（每日刷新 5 源策略 + 峰谷时段口径 + 计费公式）；
+//   ④ `docs/windows-notification.md`（SmartOptOut 横幅修复，两条 PowerShell + 实测证据）。
+//   SKILL.md 新增「📦 按需加载的旁支文件（默认不要读）」索引节，按症状指向对应文件。
+//   实测结果：77,999B → 42,402B（−45.6%），估算 token ≈18,401 → ≈10,000，行数 406 → 326；
+//   版本要点段 7 段 14,799B → 2 段 2,988B（v3.22.0 / v3.22.1）。
+//   代码侧除 `SKILL_VERSION` 与头注释版本号外**未动一行**。
+//   新增两条防漂移守卫（selftest T12）：i5 = SKILL.md「当前功能总览」标题不得内嵌版本号
+//   （版本以 manifest.yaml 为准）；i6 = SKILL.md 里 Read 指向的旁支文件必须真实存在（4 个）。
 // v3.22.1：**把「怎么问 → 得到什么表」写进文档（纯文档版，代码零改动）** ——
 //   起因（用户原话）：「介绍和技能里面有没有说清楚？可以通过直接问模型问消耗……怎么通过说哪些话、
 //   问哪些问题可以得到不同的数据表格？」——逐条核过后确认：**功能本身 v3.20.0 就有**（week / month /
@@ -3983,7 +4001,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.22.1'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.23.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

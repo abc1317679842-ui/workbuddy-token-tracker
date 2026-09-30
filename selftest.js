@@ -795,6 +795,17 @@ else {
     new RegExp(`^## v${v.replace(/\./g, '\\.')}（`, 'm').test(src('CHANGELOG.md')));
   ok('T12-i4 SKILL_VERSION 与主脚本头注释一致',
     new RegExp(`^// token-usage-tracker v${v.replace(/\./g, '\\.')} `, 'm').test(mainSrc));
+  // i5：SKILL.md「当前功能总览」标题不得内嵌硬版本号（版本以 manifest 为准——标题里的硬版本号是历史漂移源）
+  const skillMd = src('SKILL.md');
+  const overviewHead = (skillMd.match(/^##.*当前功能总览.*$/m) || [''])[0];
+  ok('T12-i5 SKILL.md「当前功能总览」标题不内嵌版本号',
+    overviewHead.indexOf('当前功能总览') >= 0 && !/^##\s*当前功能总览（\s*v\d/.test(overviewHead),
+    overviewHead.slice(0, 70));
+  // i6：SKILL.md 里 Read 指向的旁支文件必须真实存在（防引用了不存在的文件，模型 Read 时扑空）
+  const SIDE_FILES = ['TROUBLESHOOTING.md', 'docs/balance.md', 'docs/pricing-refresh.md', 'docs/windows-notification.md'];
+  const missingSide = SIDE_FILES.filter((f) => !fs.existsSync(path.join(SRC, f)));
+  ok(`T12-i6 SKILL.md 指向的旁支文件全部存在（${SIDE_FILES.length} 个）`,
+    missingSide.length === 0, missingSide.join(', ') || '全部存在');
 
   // j：端到端（spawn）—— 预置「有新版」状态跑 --hook，提示必须出现在注入里
   if (!SPAWN_OK) skip('T12-j --hook 端到端注入提示');
