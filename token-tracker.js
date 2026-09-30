@@ -1,5 +1,17 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.22.0 (2026-10-01)
+// token-usage-tracker v3.22.1 (2026-10-01)
+// v3.22.1：**把「怎么问 → 得到什么表」写进文档（纯文档版，代码零改动）** ——
+//   起因（用户原话）：「介绍和技能里面有没有说清楚？可以通过直接问模型问消耗……怎么通过说哪些话、
+//   问哪些问题可以得到不同的数据表格？」——逐条核过后确认：**功能本身 v3.20.0 就有**（week / month /
+//   任意区间 / forecast / --csv），但 README 与 SKILL.md **从头到尾没有一份「自然语言问法 → 命令」的对照**，
+//   后果是两头都抓瞎：用户不知道能问什么，模型不知道该跑哪条命令（问「这周」却跑 `--report all`
+//   让用户自己在几十天里找，就是典型翻车）。本次只补文档：
+//   ① README 新增「💬 怎么查消耗：直接问模型就行」章节 —— 问法→表格对照表 + **6 段真实输出示例**
+//      （今天 / 本周 / 历史某天 / 外推 / CSV 路径 / summary 一行式），让人一眼看到会得到什么；
+//   ② SKILL.md 新增「自然语言问法 → 命令映射」**强制表** + 反模式表 —— 这才是触发层，不改模型就不会触发对；
+//   ③ 排查速查表补 2 行（跑错命令 / 轮次明细无 CLI 入口）；④ frontmatter 触发词补齐
+//      （最近 7 天 / 某段日期 / 照这速度 / 上一轮）。⑤ 如实写明两个拿不到的东西：
+//      **单轮明细无 CLI 入口**（只有 rounds/*.jsonl）、**账本按天分桶拿不到小时粒度**。
 // v3.22.0：**版本更新提示的检测点修准 + 覆盖盲区补齐**（用户质疑「检测点选的准不准？不准确会导致别人收不到更新」→ 实测后确认两处真缺陷）——
 //   ① **挂载点被早退分支绕过（真缺陷）**：v3.21.0 把提示挂在两个 `out()` 调用点上，而 `--hook` 路径有
 //      3 条早退分支（`trace 文件尚未完成写入` / `手动取消轮补弹` / …）走的是**另外的** `out()`，
@@ -3971,7 +3983,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.22.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.22.1'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
