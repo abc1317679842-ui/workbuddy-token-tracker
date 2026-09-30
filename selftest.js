@@ -457,6 +457,203 @@ else {
     `snap=${idxSnapshot} guard=${idxGuard} toast=${idxToast}`);
 }
 
+// ── T11（v3.20.0）：--report 区间/CSV/外推 + 轮次明细留档 ────────────────────
+{
+  const src = (f) => fs.readFileSync(path.join(SRC, f), 'utf-8');
+  const ttMod = require(path.join(skillDir, 'token-tracker.js'));
+  const mainSrc = src('token-tracker.js');
+
+  // a：新函数全部导出（受限环境同样运行）
+  const exported = ['formatUsageRow', 'aggregateRangeModels', 'parseReportRange', 'reportRangeTxt',
+    'exportReportCsv', 'reportForecastTxt', 'pruneRoundFiles', 'appendRoundDetail', 'roundLabel', 'transcTextOfRow', 'hitRate'];
+  ok('T11-a 新函数已全部导出', exported.every((n) => typeof ttMod[n] === 'function'),
+    exported.filter((n) => typeof ttMod[n] !== 'function').join(','));
+
+  // b：parseReportRange —— 区间识别 / 起止写反自动纠正 / 非区间一律 null
+  const dayDiff = (a, b) => Math.round((Date.parse(b + 'T00:00:00') - Date.parse(a + 'T00:00:00')) / 86400000);
+  const rWeek = ttMod.parseReportRange('week');
+  ok('T11-b1 week = 最近 7 天（含今天）',
+    Boolean(rWeek) && rWeek.to === ttMod.todayStr() && dayDiff(rWeek.from, rWeek.to) === 6,
+    JSON.stringify(rWeek));
+  const rMonth = ttMod.parseReportRange('month');
+  ok('T11-b2 month = 本月 1 号 ~ 今天',
+    Boolean(rMonth) && rMonth.to === ttMod.todayStr() && /-01$/.test(rMonth.from) && rMonth.from <= rMonth.to,
+    JSON.stringify(rMonth));
+  const rRev = ttMod.parseReportRange('2026-09-30..2026-09-01');
+  const rFwd = ttMod.parseReportRange('2026-09-01..2026-09-30');
+  ok('T11-b3 起止写反自动纠正（等价于正序）',
+    Boolean(rRev) && rRev.from === '2026-09-01' && rRev.to === '2026-09-30'
+    && Boolean(rFwd) && rFwd.from === rRev.from && rFwd.to === rRev.to, JSON.stringify(rRev));
+  const notRange = ['', 'all', '2026-09-30', 'summary', 'forecast', 'weekly', '2026-09-01..', '..2026-09-01']
+    .filter((x) => ttMod.parseReportRange(x) !== null);
+  ok('T11-b4 非区间写法一律返回 null（不会误吞既有入口）', notRange.length === 0, notRange.join(','));
+
+  // c：区间聚合 —— hit 必须按 Σcached/Σin 重算，不能取各天算术均值
+  const dd = {
+    '2026-01-01': { models: { m: { in: 100, out: 0, cached: 0, total: 100, cost: 1, hit: 0 } } },
+    '2026-01-02': { models: { m: { in: 1000000, out: 0, cached: 1000000, total: 1000000, cost: 2, hit: 100 } } },
+  };
+  const ag = ttMod.aggregateRangeModels(dd, '2026-01-01', '2026-01-02');
+  const avgHit = (0 + 100) / 2;
+  ok('T11-c1 ★区间 hit 按 Σcached/Σin 重算（不是各天均值）',
+    Math.abs(ag.models.m.hit - ttMod.hitRate(1000100, 1000000)) < 1e-9 && Math.abs(ag.models.m.hit - avgHit) > 1,
+    `hit=${ag.models.m.hit} 均值=${avgHit}`);
+  ok('T11-c2 区间 total 严格等于逐日相加（可与逐日核对账）',
+    ag.models.m.total === 1000100 && ag.total.total === 1000100, `m=${ag.models.m.total} t=${ag.total.total}`);
+  ok('T11-c3 天数与日期列表正确', ag.days === 2 && ag.dates.join(',') === '2026-01-01,2026-01-02',
+    `days=${ag.days} dates=${ag.dates.join(',')}`);
+  const ag1 = ttMod.aggregateRangeModels(dd, '2026-01-02', '2026-01-02');
+  ok('T11-c4 闭区间边界不越界', ag1.days === 1 && ag1.models.m.in === 1000000, `days=${ag1.days}`);
+  const ag0 = ttMod.aggregateRangeModels(dd, '2030-01-01', '2030-01-02');
+  ok('T11-c5 空区间不崩且合计全 0', ag0.days === 0 && ag0.total.total === 0 && ag0.total.hit === 0);
+
+  // d：既有四个入口「逐字节不变」——硬编码期望输出（本版新增分支最多的风险点）
+  const led11 = {
+    '2026-01-02': {
+      models: { 'm-a': { in: 1500000, out: 20000, cached: 1400000, total: 1520000, cost: 3.5, hit: 93.33 } },
+      total: { in: 1500000, out: 20000, cached: 1400000, total: 1520000, cost: 3.5, hit: 93.33 },
+    },
+    '2026-01-01': {
+      models: { 'm-b': { in: 1000000, out: 1000, cached: 0, total: 1001000, cost: 1.25, hit: 0 } },
+      total: { in: 1000000, out: 1000, cached: 0, total: 1001000, cost: 1.25, hit: 0 },
+    },
+  };
+  fs.writeFileSync(path.join(skillDir, 'daily-usage.json'), JSON.stringify(led11, null, 2));
+  if (!SPAWN_OK) skip('T11-d 既有 --report 入口逐字节不变');
+  else {
+    const run = (...a) => spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--report'].concat(a),
+      { env, timeout: 30000, windowsHide: true, encoding: 'utf8' }).stdout || '';
+    const HDR = ['| 模型 | 输入 | 输出 | 缓存 | 缓存命中 | 总 token | 金额 |', '| --- | --- | --- | --- | --- | --- | --- |'];
+    const wantAll = [
+      '===== 2026-01-02 =====',
+      ...HDR,
+      '| m-a | 150万 | 2万 | 140万 | 93.33% | 152万 | ¥3.50 |',
+      '| **合计** | **150万** | **2万** | **140万** | **93.33%** | **152万** | **¥3.50** |',
+      '===== 2026-01-01 =====',
+      ...HDR,
+      '| m-b | 100万 | 1000 | 0 | 0.00% | 100.1万 | ¥1.25 |',
+      '| **合计** | **100万** | **1000** | **0** | **0.00%** | **100.1万** | **¥1.25** |',
+    ].join('\n') + '\n';
+    ok('T11-d1 --report all 逐字节不变', run('all') === wantAll, JSON.stringify(run('all').slice(0, 160)));
+    const wantOne = ['===== 2026-01-01 =====', ...HDR,
+      '| m-b | 100万 | 1000 | 0 | 0.00% | 100.1万 | ¥1.25 |',
+      '| **合计** | **100万** | **1000** | **0** | **0.00%** | **100.1万** | **¥1.25** |'].join('\n') + '\n';
+    ok('T11-d2 --report <date> 逐字节不变', run('2026-01-01') === wantOne, JSON.stringify(run('2026-01-01').slice(0, 160)));
+    const wantSum = '2026-01-02  输入 150万 / 输出 2万 / 缓存 140万 / 总 152万 tokens ｜ ¥3.50\n'
+      + '2026-01-01  输入 100万 / 输出 1000 / 缓存 0 / 总 100.1万 tokens ｜ ¥1.25\n';
+    ok('T11-d3 --report summary all 逐字节不变', run('summary', 'all') === wantSum, JSON.stringify(run('summary', 'all').slice(0, 160)));
+  }
+
+  // e：区间报告 —— 列头与单日一致 + 必带金额口径声明 + 空区间不崩
+  const rTxt = ttMod.reportRangeTxt('2026-01-01', '2026-01-02');
+  ok('T11-e1 区间报告列头与单日入口完全一致',
+    rTxt.includes('| 模型 | 输入 | 输出 | 缓存 | 缓存命中 | 总 token | 金额 |'));
+  ok('T11-e2 区间报告必带金额口径声明（不是真实扣费 / 无换算关系）',
+    rTxt.includes('不是真实扣费') && rTxt.includes('不存在换算关系'));
+  ok('T11-e3 空区间报告不崩', typeof ttMod.reportRangeTxt('1999-01-01', '1999-01-02') === 'string');
+
+  // f：forecast 只推 token，输出里不得出现金额符号
+  const fTxt = ttMod.reportForecastTxt();
+  ok('T11-f forecast 不含金额符号 ¥（只推 token）', !/¥/.test(fTxt) && fTxt.includes('tokens'), fTxt.split('\n')[1]);
+
+  // g：CSV 导出 —— UTF-8 BOM 必须存在（否则 Excel 中文列头乱码）
+  const csvMsg = ttMod.exportReportCsv({ from: '2026-01-01', to: '2026-01-02', label: 't11' });
+  const csvPath = (/已导出：(.+?)（/.exec(csvMsg) || [])[1];
+  ok('T11-g1 CSV 导出返回路径', Boolean(csvPath) && fs.existsSync(csvPath), csvMsg);
+  if (csvPath && fs.existsSync(csvPath)) {
+    const buf = fs.readFileSync(csvPath);
+    ok('T11-g2 ★CSV 前 3 字节为 UTF-8 BOM(EF BB BF)',
+      buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF, buf.slice(0, 3).toString('hex'));
+    const csvTxt = buf.toString('utf-8');
+    ok('T11-g3 CSV 含表头与 ALL 合计行',
+      csvTxt.includes('date,model,in,out,cached,hit_pct,total,cost_api_equiv') && /^ALL,__TOTAL__,/m.test(csvTxt));
+    ok('T11-g4 CSV 行数 = 表头 + 明细 + 合计（2 天各 1 模型 → 4 行）',
+      csvTxt.trim().split('\n').length === 4, String(csvTxt.trim().split('\n').length));
+  }
+
+  // h：轮次明细 —— 唯一落点、幂等、无 meta 零影响
+  const roundsDir = ttMod.ROUNDS_DIR;
+  const roundsFile = path.join(roundsDir, 'rounds-' + ttMod.todayStr().slice(0, 7) + '.jsonl');
+  const readRounds = () => {
+    try {
+      return fs.readFileSync(roundsFile, 'utf-8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    } catch (e) { return []; }
+  };
+  fs.rmSync(roundsDir, { recursive: true, force: true });
+  const projDir11 = path.join(tmp, 'projects', 't11');
+  fs.mkdirSync(projDir11, { recursive: true });
+  const tsPath11 = path.join(projDir11, 'sess-t11.jsonl');
+  const mkRow11 = (i) => JSON.stringify({
+    type: 'assistant', timestamp: 1700000000000 + i * 1000,
+    providerData: { model: 'm-x', messageId: 'x' + i, usage: { inputTokens: 1000000, outputTokens: 0 } },
+  });
+  fs.writeFileSync(tsPath11, mkRow11(1) + '\n');
+  fs.writeFileSync(path.join(skillDir, 'pricing.json'), JSON.stringify({
+    models: { 'm-x': { name: 'x', input_price: 1000, cached_price: 100, output_price: 2000 } },
+  }, null, 2));
+  try { fs.rmSync(path.join(skillDir, '.ledger-watermark.json'), { force: true }); } catch (e) { /* 干净起点 */ }
+  try { fs.rmSync(path.join(skillDir, 'daily-usage.json'), { force: true }); } catch (e) { /* 干净起点 */ }
+  const meta11 = {
+    sid: 'sess-t11', roundStart: 1700000000000, durMs: 12345, model: 'm-x', subModels: [],
+    subCount: 0, teamActive: false, source: 'test', label: '测试轮',
+  };
+  ttMod.incrementalRecord(tsPath11, 'sess-t11', meta11);
+  const rr1 = readRounds();
+  ok('T11-h1 带 meta 记账后落一条轮次明细', rr1.length === 1 && rr1[0].in === 1000000 && rr1[0].source === 'test',
+    `n=${rr1.length} in=${rr1[0] && rr1[0].in}`);
+  ok('T11-h2 ★明细字段名为 costApiEquiv 而非 cost（口径命名，防后人误当真实花费）',
+    rr1.length === 1 && rr1[0].costApiEquiv > 0 && rr1[0].cost === undefined,
+    JSON.stringify(rr1[0] || {}).slice(0, 120));
+  ttMod.incrementalRecord(tsPath11, 'sess-t11', meta11);
+  const rr2 = readRounds();
+  ok('T11-h3 ★同轮二次记账（无新增行）不重复落档（幂等由记账水位线白送）', rr2.length === 1, `n=${rr2.length}`);
+  fs.appendFileSync(tsPath11, mkRow11(2) + '\n');
+  ttMod.incrementalRecord(tsPath11, 'sess-t11'); // 不传 meta = 其余 8 个调用点的形态
+  const rr3 = readRounds();
+  ok('T11-h4 不传 meta 的调用点零影响：账本照记、明细不落', rr3.length === 1, `n=${rr3.length}`);
+  const ledNow = (() => { try { return JSON.parse(fs.readFileSync(path.join(skillDir, 'daily-usage.json'), 'utf-8').replace(/^\uFEFF/, '')); } catch (e) { return {}; } })();
+  const rec11 = ledNow[ttMod.todayStr()] && ledNow[ttMod.todayStr()].models['m-x'];
+  ok('T11-h5 不传 meta 时账本仍正确累加（200 万 in）', Boolean(rec11) && rec11.in === 2000000, rec11 && rec11.in);
+
+  // i：roundLabel —— 取出本轮首条非注入 user 消息
+  const tsL = path.join(tmp, 'label-t11.jsonl');
+  const labRow = (c) => JSON.stringify({ type: 'message', role: 'user', timestamp: 1700000000000, content: c });
+  fs.writeFileSync(tsL, [labRow('帮我看看这个方案'), JSON.stringify({ type: 'assistant', timestamp: 1700000001000 })].join('\n') + '\n');
+  ok('T11-i1 提取本轮首条 user 消息（≤40 字）', ttMod.roundLabel(tsL, 1699999999000) === '帮我看看这个方案',
+    JSON.stringify(ttMod.roundLabel(tsL, 1699999999000)));
+  fs.writeFileSync(tsL, labRow('<task-notification>x') + '\n');
+  ok('T11-i2 注入型 user 行标为 [注入]（不拿注入文本当标签）',
+    ttMod.roundLabel(tsL, 1699999999000) === '[注入] task-notification', JSON.stringify(ttMod.roundLabel(tsL, 1699999999000)));
+  fs.writeFileSync(tsL, labRow('上一条消息') + '\n');
+  ok('T11-i3 早于 roundStart 的 user 行不算本轮（返回空串）',
+    ttMod.roundLabel(tsL, 1700000001000) === '', JSON.stringify(ttMod.roundLabel(tsL, 1700000001000)));
+  ok('T11-i4 文件不存在不抛错', ttMod.roundLabel(path.join(tmp, 'no-such-file.jsonl'), 1) === '');
+
+  // j：过期 rounds 清理
+  fs.mkdirSync(roundsDir, { recursive: true });
+  fs.writeFileSync(path.join(roundsDir, 'rounds-2020-01.jsonl'), '{}\n');
+  fs.writeFileSync(roundsFile, '{}\n');
+  const removed11 = ttMod.pruneRoundFiles();
+  ok('T11-j 清理过期月份、保留当月',
+    removed11 === 1 && !fs.existsSync(path.join(roundsDir, 'rounds-2020-01.jsonl')) && fs.existsSync(roundsFile),
+    `removed=${removed11}`);
+  fs.rmSync(roundsDir, { recursive: true, force: true });
+
+  // k：源码级守卫
+  const gi = fs.readFileSync(path.join(SRC, '.gitignore'), 'utf-8');
+  ok('T11-k1 .gitignore 已排除 rounds/ 与 exports/', /^rounds\/$/m.test(gi) && /^exports\/$/m.test(gi));
+  ok('T11-k2 明细唯一落点在 recordUsage 内（不在 Stop 三个出口各写一遍）',
+    /if \(saved\) \{ try \{ appendRoundDetail\(/.test(mainSrc));
+  ok('T11-k3 明细写在账本落盘之后、锁释放之前', (() => {
+    const i1 = mainSrc.indexOf('const saved = saveDailyUsageRaw(d);');
+    const i2 = mainSrc.indexOf('appendRoundDetail(byModel, stat, pricing, tsMs, meta)', i1);
+    const i3 = mainSrc.indexOf('}, { ttl: 300000, retries: 50 });', i1);
+    return i1 > 0 && i2 > i1 && i3 > i2;
+  })());
+  ok('T11-k4 recordUsage 的 meta 为可选参数（不传 = 旧行为，8 个调用点零改动）',
+    /function recordUsage\(stat, pricing, byModel, tsMs, meta\)/.test(mainSrc));
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log(`\n结果：${pass} 过 / ${fail} 败${skipped ? '（有跳过项：本环境禁止 node 子进程）' : ''}`);
 process.exit(fail ? 1 : 0);

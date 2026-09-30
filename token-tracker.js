@@ -1,7 +1,14 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.19.3 (2026-10-01)
+// token-usage-tracker v3.20.0 (2026-10-01)
 // v2.63：调试日志机制重构——废弃 TOKEN_TRACKER_DEBUG 环境变量开关 + poll 全量记录，改为「弹窗时自动记录」：
 //   每次 showToast 无条件向 ~/.workbuddy/token-tracker-toast.log 追加一行 JSON 诊断（原因/sessionId/行数/稳定计数等）。
+// v3.20.0：**账本查询能力扩展 + 轮次明细留档**（两项）——
+//   ① `--report` 新增区间（week / month / <起>..<止>）、`--csv` 导出（UTF-8 BOM，落 exports/）、
+//      `forecast` 外推；既有 `--report` / `--report <date>` / `all` / `summary` 四条入口输出**逐字节不变**。
+//   ② 新增 rounds/rounds-YYYY-MM.jsonl 轮次明细（唯一落点在 recordUsage，账本落盘成功后追加）。
+//   ⚠️ 金额口径（硬规矩）：cost / costApiEquiv 是按 pricing.json 的 **API 单价折算的等价金额，
+//      不是真实扣费**。WorkBuddy 内置模型走客户端自带额度，本技能读不到额度扣减，
+//      因此**不存在任何"金额 ↔ 积分/额度"换算**（用自备 API key 时才等于真实花费）。
 // v3.19.3：**压缩弹窗判定整体降级**——原 v2.62 的 compactionMode 状态机与 v2.70 的 compressionPending
 //   等待窗经全量日志复核在生产环境从未生效过一次（详见 freshCompactionMarker 注释），已整体删除。
 //   压缩期噪音（压缩期间连续 Stop → 连弹"本轮无 token 消耗记录"）改由 Stop 端 no-token 分支单点豁免。
@@ -369,6 +376,17 @@ const BALANCE_TTL_MS = 15 * 1000; // 余额缓存 15 秒（v2.18 从 60s 压短�
 // 余额会变 = DeepSeek 账户在真实消耗 = 自定义 API 模式（或其他处使用同一 key），这正是"有密钥才有消耗"的等价信号；
 // 积分模式余额恒定 → 永不显示。
 const BALANCE_HISTORY_MAX = 20;        // 缓存里保留的余额观测条数（用于与上次对比判定"是否变化"）
+
+// ===== v3.20.0：轮次明细留档（rounds/rounds-YYYY-MM.jsonl）=====
+// 用途：每日账本只回答"某天某模型花了多少"，回答不了"哪一轮异常大 / 子代理占了多少"——
+//   本轮次留档把每轮 token 用量落一条 JSONL，作为下钻分析的地基。
+// 口径（**硬规矩，不要改**）：in/out/cached/total 是平台落盘的真实用量；
+//   costApiEquiv 是按 pricing.json 的 API 单价折算的**等价金额，不是真实扣费**——
+//   WorkBuddy 内置模型走客户端自带额度，本技能读不到额度扣减，故一律不做"金额↔积分"换算。
+const ROUNDS_DIR = path.join(__dirname, 'rounds');
+const ROUNDS_KEEP_MONTHS = 6;          // 保留最近 N 个月，--report 运行时顺带清理
+const ROUND_LABEL_MAX = 40;            // 轮次标签（本轮首条 user 消息）截断长度
+const EXPORTS_DIR = path.join(__dirname, 'exports'); // v3.20.0：--report --csv 落盘目录（已 gitignore）
 
 // ===== v2.66 通用工具：模型名归一化 + 文件锁 + 原子写 =====
 // 账本文件曾损坏 → 本轮禁止写回空对象以免覆盖历史（损坏文件已备份为 .corrupt）
@@ -2604,6 +2622,82 @@ function saveDailyUsage(d) {
   // 独立调用场景：加锁保护整段写，避免与其他进程并发覆盖
   withFileLock(DAILY_USAGE_FILE + '.lock', () => saveDailyUsageRaw(d), { ttl: 300000, retries: 50 });
 }
+// ===== v3.20.0：轮次明细留档 =====
+// 从原始 transcript 行里取纯文本（content 可能是字符串，也可能是 [{type:'text',text}] 数组）
+function transcTextOfRow(obj) {
+  try {
+    const c = obj && obj.content;
+    if (typeof c === 'string') return c;
+    if (Array.isArray(c)) return c.map((x) => (x && (x.text || x.content)) || '').join('');
+    return '';
+  } catch (e) { return ''; }
+}
+// 本轮标签：取 roundStart 之后第一条「非注入型」user 消息的前 ROUND_LABEL_MAX 字符。
+// 为什么必须有它：没有标签的明细就只是一堆数字，回答不了「这一轮到底在干什么」。
+// 只读尾部 400 行而非全文件——Stop 端本次已多次全量读 transcript（40MB 级），不再加一次。
+function roundLabel(tsPath, roundStartMs) {
+  try {
+    if (!tsPath || !(roundStartMs > 0)) return '';
+    for (const ln of readTailRawLines(tsPath, 400)) {
+      let r;
+      try { r = JSON.parse(ln); } catch (e) { continue; }
+      if (!r || r.type !== 'message' || r.role !== 'user') continue;
+      const ts = Number(r.timestamp) || 0;
+      if (ts && ts < roundStartMs) continue; // 上一轮的 user 行
+      const txt = transcTextOfRow(r).trim();
+      if (!txt) continue;
+      // 注入型 user 行（客户端 / 钩子塞进来的）不是「用户说了什么」，不能当标签
+      const inj = /^<(task-notification|conversation_history_summary|cb_summary|system-reminder|user-context)/.exec(txt);
+      if (inj) return '[注入] ' + inj[1];
+      return txt.slice(0, ROUND_LABEL_MAX).replace(/\s+/g, ' ');
+    }
+    return '';
+  } catch (e) { return ''; }
+}
+// 落一条轮次明细。**调用点唯一**（recordUsage 内），且只在账本真正写盘成功后调用——
+//   于是「同一轮无新增用量时不重复落档」由记账自身的幂等性白送，不需要额外维护去重状态
+//   （同轮二次 Stop 时 byModel 为空 → recordUsage 提前 return false → 到这里之前就结束了）。
+// 任何异常都不得影响记账（调用方另有 try/catch，这里再兜一层）。
+function appendRoundDetail(byModel, stat, pricing, tsMs, meta) {
+  if (!meta || typeof meta !== 'object') return;
+  const models = {};
+  if (byModel && Object.keys(byModel).length) {
+    for (const [n, b] of Object.entries(byModel)) {
+      models[n] = { in: b.in || 0, out: b.out || 0, cached: b.cached || 0, total: b.total || 0 };
+    }
+  } else if (stat && ((stat.in || 0) + (stat.out || 0)) > 0) {
+    models[stat.model || 'unknown'] = { in: stat.in || 0, out: stat.out || 0, cached: stat.cached || 0, total: stat.total || 0 };
+  } else return;
+  let inT = 0, outT = 0, cachedT = 0, totalT = 0, costT = 0;
+  for (const [n, b] of Object.entries(models)) {
+    inT += b.in; outT += b.out; cachedT += b.cached; totalT += b.total;
+    const c = calcCost(Object.assign({ model: n }, b), pricing, tsMs);
+    if (c != null) costT += c;
+  }
+  const rec = {
+    ts: Date.now(),
+    date: todayStr(),
+    sid: String(meta.sid || ''),
+    roundStart: Number(meta.roundStart) || 0,
+    durMs: Number(meta.durMs) || 0,
+    in: inT, out: outT, cached: cachedT, total: totalT,
+    hitPct: hitRate(inT, cachedT),
+    models,
+    model: String(meta.model || ''),
+    subModels: Array.isArray(meta.subModels) ? meta.subModels : [],
+    subCount: Number(meta.subCount) || 0,
+    teamActive: meta.teamActive === true,
+    source: String(meta.source || ''),
+    label: String(meta.label || ''),
+    // 字段名刻意带 ApiEquiv：这是按 API 单价折算的等价金额，**不是真实扣费**，
+    // 与 WorkBuddy 客户端自带积分/额度之间不存在换算关系（改名前先想清楚这一点）。
+    costApiEquiv: Math.round(costT * 10000) / 10000,
+  };
+  fs.mkdirSync(ROUNDS_DIR, { recursive: true });
+  fs.appendFileSync(path.join(ROUNDS_DIR, 'rounds-' + todayStr().slice(0, 7) + '.jsonl'),
+    JSON.stringify(rec) + '\n', 'utf-8');
+}
+
 // 把一条 stat（单模型）累加进某天的 models，并重算该日 total（保证总合计永远=各模型之和）
 // tsMs（v3.19.2/B8）：本批 token 的发生时刻，透传给 calcCost 做峰谷判定；缺省回退 stat.lastTs / 当下
 function addModelUsage(day, model, stat, pricing, tsMs) {
@@ -2620,7 +2714,9 @@ function addModelUsage(day, model, stat, pricing, tsMs) {
 // v2.68 修复1：返回 true/false 表示本轮用量是否真的落盘。调用方（incrementalRecord）必须据此
 // 决定是否推进水位线——记账失败却推进水位线 = 这部分用量永久丢失。
 // 返回 false 的三种情形：账本此前损坏 / 锁获取失败 / 无用量可记；写盘失败也返回 false。
-function recordUsage(stat, pricing, byModel, tsMs) {
+// meta（v3.20.0）：轮次元信息（sid/roundStart/durMs/model/subCount/teamActive/source/label），
+//   仅用于轮次明细留档；**可选**——不传即完全保持旧行为（其余 8 个调用点都没传，明细里也不会出现它们）。
+function recordUsage(stat, pricing, byModel, tsMs, meta) {
   // v3.06（审查结论·**刻意保持当前顺序，不要"修正"它**）：
   //   表面看这个守卫像是"死代码"——`gDailyCorrupt` 初始为 false，而真正置位它的 `loadDailyUsage()`
   //   在下面（锁内）才执行，于是首次遇损坏时本守卫不会命中。
@@ -2646,7 +2742,12 @@ function recordUsage(stat, pricing, byModel, tsMs) {
     } else {
       return false; // 无用量可记：不算失败也不算成功（调用方无需推进水位线，因为没记任何东西）
     }
-    return saveDailyUsageRaw(d);
+    const saved = saveDailyUsageRaw(d);
+    // v3.20.0：账本确认落盘后才落轮次明细，且写在锁内（与记账串行化，不会出现半条记录）。
+    //   saved 为假（写盘失败）→ 不落明细，避免"账本没记但明细有"的不一致。
+    //   明细自身异常一律吞掉——它只是附带产物，绝不能影响记账返回值与水位线推进。
+    if (saved) { try { appendRoundDetail(byModel, stat, pricing, tsMs, meta); } catch (e) { /* 明细失败不影响记账 */ } }
+    return saved;
   }, { ttl: 300000, retries: 50 });
   if (!r.ok) process.stderr.write(`[token-tracker] 账本锁获取失败，本轮记账跳过（避免并发覆盖）\n`);
   return r.ok ? Boolean(r.result) : false;
@@ -2717,7 +2818,7 @@ function saveLedgerWatermark(wm) {
 // watcher(--flush-delayed) 与新一轮 Stop 并发时，两进程可能读到同一旧水位线 → 同一批行
 // 各记一遍 = 账本重复计费（专家团 6s 确认窗 ∩ 新 Stop 真实可触发）。串行化后：后到者读到
 // 先到者推进的新水位线，只记增量。锁获取失败 → 本轮跳过（下轮 Stop 补记，不丢不重）。
-function incrementalRecord(tsPath, sid) {
+function incrementalRecord(tsPath, sid, meta) {
   if (!tsPath || !fs.existsSync(tsPath)) return;
   withFileLock(LEDGER_WATERMARK_FILE + '.lock', () => {
   // 修复1 补充：水位线损坏时跳过记账，宁可少记也不重复计费
@@ -2778,7 +2879,7 @@ function incrementalRecord(tsPath, sid) {
   // 3. 累加进账本（loadDailyUsage + addModelUsage + saveDailyUsage）
   //    无用量的轮次视为成功（无需落盘，推进水位线无害）；有用量时必须确认真的写进去了。
   let recorded = true;
-  if (Object.keys(byModel).length) recorded = recordUsage({}, loadPricing(), byModel, peakTs || undefined);
+  if (Object.keys(byModel).length) recorded = recordUsage({}, loadPricing(), byModel, peakTs || undefined, meta);
   if (!recorded) {
     // 记账失败（账本损坏 / 锁获取失败 / 写盘失败）→ 绝不推进水位线，
     // 否则这些用量再也不会被补记 = 永久丢失。保持旧水位线，下轮重新记账。
@@ -2790,6 +2891,173 @@ function incrementalRecord(tsPath, sid) {
   for (const f of Object.keys(nextSubs)) entry.subs[f] = nextSubs[f];
   saveLedgerWatermark(wm);
   }, { ttl: 300000, retries: 30, retryDelay: 100 }); // v2.82.1：水位线锁；拿不到锁 → 本轮跳过，下轮补记
+}
+
+// ===== v3.20.0：账本表格行格式化（reportTxt / reportRangeTxt 共用）=====
+// 抽出来只为一件事：让「单日/all」与「区间」两个入口的列格式**永远不可能失配**。
+// 若以后要加列，只改这里一处；selftest 有一条「既有入口逐字节不变」的断言兜底。
+function formatUsageRow(s, bold) {
+  const f = (v) => (bold ? `**${v}**` : v);
+  // hit 列：优先读已存字段，旧数据兜底现算；两位小数 %
+  const hit = (s.hit != null ? s.hit : (s.in > 0 ? hitRate(s.in, s.cached) : 0)).toFixed(2) + '%';
+  return `| ${f(s.label)} | ${f(fmt(s.in))} | ${f(fmt(s.out))} | ${f(fmt(s.cached))} | ${f(hit)} | ${f(fmt(s.total))} | ${f(s.cost > 0 ? fmtCost(s.cost) : '¥0.00')} |`;
+}
+// ===== v3.20.0：--report 区间 / CSV / 外推 =====
+// 设计红线：既有的 `--report`、`--report <date>`、`--report all`、`--report summary [all|<date>]`
+// 四条入口的输出必须**逐字节不变**（selftest 有断言），新区间能力全部走新分支。
+function daysAgoStr(n) {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${m}-${dd}`;
+}
+function monthStartStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-01`;
+}
+// 解析区间参数：week / month / <起>..<止>；非区间写法（'' / all / 具体日期 / summary）→ null。
+// 起止写反时自动纠正（`2026-09-30..2026-09-01` 不该报错，用户意图显然）。
+function parseReportRange(arg) {
+  const a0 = String(arg || '');
+  if (a0 === 'week') return { from: daysAgoStr(6), to: todayStr(), label: 'week' };
+  if (a0 === 'month') return { from: monthStartStr(), to: todayStr(), label: 'month' };
+  const m = /^(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})$/.exec(a0);
+  if (m) {
+    const a = m[1], b = m[2];
+    return { from: a <= b ? a : b, to: a <= b ? b : a, label: 'range' };
+  }
+  return null;
+}
+// 区间聚合：只做两件事——按字段求和（token/金额）、按 Σin/Σcached **重算** hit。
+//   为什么必须重算 hit：它是比率。跨天 token 量可能差 100 倍，取各天 hit 的算术均值毫无意义。
+//   total 保持累加（不重算 in+out），以便与「逐日 total 相加」严格可对账。
+function aggregateRangeModels(d, from, to) {
+  const models = {};
+  const dates = Object.keys(d || {}).filter((k) => k >= from && k <= to).sort();
+  let days = 0;
+  for (const date of dates) {
+    const day = d[date];
+    if (!day) continue;
+    days++;
+    for (const [n, m] of Object.entries(day.models || {})) {
+      const t = models[n] || (models[n] = { in: 0, out: 0, cached: 0, total: 0, cost: 0 });
+      t.in += m.in || 0; t.out += m.out || 0; t.cached += m.cached || 0;
+      t.total += m.total || 0; t.cost += m.cost || 0;
+    }
+  }
+  for (const t of Object.values(models)) t.hit = hitRate(t.in, t.cached);
+  const total = { in: 0, out: 0, cached: 0, total: 0, cost: 0 };
+  for (const m of Object.values(models)) {
+    total.in += m.in; total.out += m.out; total.cached += m.cached;
+    total.total += m.total; total.cost += m.cost;
+  }
+  total.hit = hitRate(total.in, total.cached);
+  return { models, total, days, dates };
+}
+// 区间汇总表（一行/模型 + 合计行）。列结构与 reportTxt 完全一致。
+function reportRangeTxt(from, to) {
+  const d = loadDailyUsage();
+  const agg = aggregateRangeModels(d, from, to);
+  const names = Object.keys(agg.models).sort();
+  const lines = [];
+  lines.push(`===== ${from} ~ ${to}（${agg.days} 天有记录）=====`);
+  lines.push('| 模型 | 输入 | 输出 | 缓存 | 缓存命中 | 总 token | 金额 |');
+  lines.push('| --- | --- | --- | --- | --- | --- | --- |');
+  if (!names.length) {
+    lines.push(formatUsageRow(Object.assign({ label: '合计' }, agg.total), true));
+  } else {
+    for (const n of names) lines.push(formatUsageRow(Object.assign({ label: n }, agg.models[n]), false));
+    lines.push(formatUsageRow(Object.assign({ label: '合计' }, agg.total), true));
+  }
+  lines.push('');
+  lines.push('口径：金额按 pricing.json 的 API 单价折算（缓存价 / 峰谷倍数已计入），**不是真实扣费**；');
+  lines.push('      本技能只读 WorkBuddy 落盘的 token 用量，与客户端自带积分/额度之间不存在换算关系。');
+  return lines.join('\n');
+}
+// CSV 导出：逐日 × 逐模型明细 + 末尾 ALL 合计行（用户可在 Excel 里自行透视）。
+// 编码必须带 UTF-8 BOM，否则 Excel 打开中文列头必乱码（与 loadDailyUsage 剥 BOM 是同一个坑的两面）。
+function exportReportCsv(range) {
+  const d = loadDailyUsage();
+  const agg = aggregateRangeModels(d, range.from, range.to);
+  const cell = (v) => {
+    const s = String(v == null ? '' : v);
+    return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const rows = [['date', 'model', 'in', 'out', 'cached', 'hit_pct', 'total', 'cost_api_equiv'].join(',')];
+  for (const date of agg.dates) {
+    const day = d[date];
+    if (!day) continue;
+    for (const n of Object.keys(day.models || {}).sort()) {
+      const m = day.models[n] || {};
+      const hit = (m.hit != null ? m.hit : hitRate(m.in || 0, m.cached || 0)).toFixed(2);
+      rows.push([date, cell(n), m.in || 0, m.out || 0, m.cached || 0, hit, m.total || 0, (m.cost || 0).toFixed(6)].join(','));
+    }
+  }
+  rows.push(['ALL', '__TOTAL__', agg.total.in, agg.total.out, agg.total.cached,
+    agg.total.hit.toFixed(2), agg.total.total, agg.total.cost.toFixed(6)].join(','));
+  const now = new Date();
+  const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`
+    + `-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
+  const file = path.join(EXPORTS_DIR, `report-${range.label}-${stamp}.csv`);
+  try {
+    fs.mkdirSync(EXPORTS_DIR, { recursive: true });
+    fs.writeFileSync(file, '\uFEFF' + rows.join('\n') + '\n', 'utf-8');
+  } catch (e) {
+    return `导出失败：${e.message}`;
+  }
+  return `已导出：${file}（${rows.length - 1} 行，UTF-8 BOM，金额为 API 单价折算值）`;
+}
+// 消耗外推（v3.20.0）：**只推 token，不推金额**。
+//   为什么砍掉金额外推：金额本身是 API 单价折算值，不是真实扣费，外推它等于在虚拟数上再乘一次，
+//   只会制造"这个月要花多少钱"的错觉。token 数是平台真实落盘的，外推它才有意义。
+function reportForecastTxt() {
+  const d = loadDailyUsage();
+  const today = todayStr();
+  const day = d[today];
+  const t = day ? (day.total || dayTotalOf(day.models || {})) : { total: 0 };
+  const now = new Date();
+  const minsPassed = now.getHours() * 60 + now.getMinutes() + now.getSeconds() / 60;
+  const lines = [];
+  lines.push('===== 消耗外推（只推 token，不推金额）=====');
+  lines.push(`今日至 ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
+    + `   总 ${fmt(t.total || 0)} tokens（已过 ${(minsPassed / 60).toFixed(1)}h）`);
+  if (minsPassed >= 10 && (t.total || 0) > 0) {
+    lines.push(`按当前速率到 24:00   约 ${fmt(Math.round((t.total || 0) / minsPassed * 1440))} tokens`);
+  } else {
+    lines.push('按当前速率到 24:00   不外推（今日已过 < 10 分钟，或无用量）');
+  }
+  const past = Object.keys(d || {}).filter((k) => k < today).sort().reverse().slice(0, 7);
+  const vals = past.map((k) => { const x = d[k].total || dayTotalOf(d[k].models || {}); return x.total || 0; });
+  if (vals.length >= 2) {
+    lines.push(`近 ${vals.length} 日实测均值   ${fmt(Math.round(vals.reduce((s, v) => s + v, 0) / vals.length))} tokens/日`);
+  } else {
+    lines.push(`近 7 日实测均值   不计算（历史样本 ${vals.length} 天 < 2 天）`);
+  }
+  lines.push('');
+  lines.push('说明：外推 = 今日已消耗 ÷ 已过时间 × 24h 的线性估算，只推 token；');
+  lines.push('      金额列一律为「按 API 单价折算」，与 WorkBuddy 客户端额度之间不存在换算关系。');
+  return lines.join('\n');
+}
+// 清理超过保留期的轮次明细文件。只在 --report 时跑（用户手动触发），不引入常驻任务。
+function pruneRoundFiles(keepMonths) {
+  try {
+    if (!fs.existsSync(ROUNDS_DIR)) return 0;
+    const n = Number(keepMonths) > 0 ? Number(keepMonths) : ROUNDS_KEEP_MONTHS;
+    const keep = new Set();
+    const now = new Date();
+    for (let i = 0; i < n; i++) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      keep.add(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
+    }
+    let removed = 0;
+    for (const f of fs.readdirSync(ROUNDS_DIR)) {
+      const m = /^rounds-(\d{4}-\d{2})\.jsonl$/.exec(f);
+      if (!m || keep.has(m[1])) continue;
+      try { fs.unlinkSync(path.join(ROUNDS_DIR, f)); removed++; } catch (e) { /* 单个失败不影响其它 */ }
+    }
+    return removed;
+  } catch (e) { return 0; }
 }
 
 // ===== 每日账本报告（v2.39）：--report [all|<date>] =====
@@ -2813,12 +3081,9 @@ function reportTxt(arg) {
     lines.push(`===== ${date}${tag} =====`);
     const names = Object.keys(models).sort();
     // Markdown 表格输出（v2.39.2）：聊天界面渲染真表格列，天然对齐，不依赖空格/字体宽度
-    const cells = (s, bold) => {
-      const f = (v) => (bold ? `**${v}**` : v);
-      // hit 列：优先读已存字段，旧数据兜底现算；两位小数 %
-      const hit = (s.hit != null ? s.hit : (s.in > 0 ? hitRate(s.in, s.cached) : 0)).toFixed(2) + '%';
-      return `| ${f(s.label)} | ${f(fmt(s.in))} | ${f(fmt(s.out))} | ${f(fmt(s.cached))} | ${f(hit)} | ${f(fmt(s.total))} | ${f(s.cost > 0 ? fmtCost(s.cost) : '¥0.00')} |`;
-    };
+    // v3.20.0：函数体上移到模块级 formatUsageRow（与区间报告共用，保证两个入口列格式永不失配），
+    //   本行输出一字未改——selftest 有「既有入口逐字节不变」的断言。
+    const cells = formatUsageRow;
     lines.push('| 模型 | 输入 | 输出 | 缓存 | 缓存命中 | 总 token | 金额 |');
     lines.push('| --- | --- | --- | --- | --- | --- | --- |');
     if (!names.length) {
@@ -3587,7 +3852,13 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
           aggC.durMs = aggC.durMs || durC;
           const modelC = shortModelName(aggC, pricing);
           ensureNewModelPricing(pricing, aggC);
-          incrementalRecord(tsPath, sid);
+          // v3.20.0：手动取消轮同样留明细（用户会关心"取消了但也烧了"）
+          incrementalRecord(tsPath, sid, {
+            sid, roundStart, durMs: aggC.durMs,
+            model: aggC.modelMain || aggC.model, subModels: aggC.subModels,
+            subCount: aggC.subCount, teamActive: aggC.teamActive === true,
+            source: 'cancelled-round-watch', label: roundLabel(tsPath, roundStart),
+          });
           writeProbe({ time: new Date().toISOString(), event: 'RoundWatch', ok: true, sid, sameRound: false,
             note: 'cancelled-round-watch', transcriptPath: tsPath, stat: aggC,
             line: lineFor(aggC, false, modelC), source: 'transcript-cancelled-round-watch',
@@ -3650,9 +3921,38 @@ function main() {
   // 纯文本输出，不影响 hooks 流程；无参=今天，all=全部天，也可指定日期。
   if (process.argv.includes('--report')) {
     const ri = process.argv.indexOf('--report');
-    const rArg = process.argv[ri + 1] || '';
+    const rest = process.argv.slice(ri + 1);
+    const wantCsv = rest.includes('--csv');           // v3.20.0：CSV 导出血开关
+    const pos = rest.filter((a) => !a.startsWith('--')); // 位置参数（剥掉 --csv）
+    const rArg = pos[0] || '';
+
+    // v3.20.0：--report forecast —— 纯 token 外推（不含金额，理由见 reportForecastTxt 注释）
+    if (rArg === 'forecast') {
+      pruneRoundFiles();
+      process.stdout.write(reportForecastTxt() + '\n');
+      return;
+    }
+    // v3.20.0：区间模式（week / month / <起>..<止>）—— 全新分支，不影响下方既有四个入口
+    const range = parseReportRange(rArg);
+    if (range) {
+      pruneRoundFiles();
+      process.stdout.write((wantCsv ? exportReportCsv(range) : reportRangeTxt(range.from, range.to)) + '\n');
+      return;
+    }
+    // v3.20.0：--csv 也可用于既有写法（今天 / all / 指定日期）—— 只在带 --csv 时介入，不带则完全走原逻辑
+    if (wantCsv) {
+      const d0 = loadDailyUsage();
+      const allDates0 = Object.keys(d0).sort();
+      let from = todayStr(), to = todayStr(), label = 'today';
+      if (rArg === 'all') { if (!allDates0.length) { process.stdout.write('账本为空（暂无可导出数据）\n'); return; } from = allDates0[0]; label = 'all'; }
+      else if (/^\d{4}-\d{2}-\d{2}$/.test(rArg)) { from = rArg; to = rArg; label = rArg; }
+      else if (rArg) { process.stdout.write(`无法识别的参数：${rArg}（可用：week / month / <起>..<止> / all / <日期> / forecast）\n`); return; }
+      pruneRoundFiles();
+      process.stdout.write(exportReportCsv({ from, to, label }) + '\n');
+      return;
+    }
     if (rArg === 'summary' || rArg === 'totals') {
-      process.stdout.write(reportSummaryTxt(process.argv[ri + 2] || '') + '\n');
+      process.stdout.write(reportSummaryTxt(pos[1] || '') + '\n');
     } else {
       process.stdout.write(reportTxt(rArg) + '\n');
     }
@@ -3988,7 +4288,13 @@ function main() {
       const pricing = loadPricing();
       const agg = info.agg;
       // v2.50：弹窗前补一次增量记账（子代理收尾可能在 Stop 之后才落盘，水位线保证不重复）
-      if (info.tsPath) incrementalRecord(info.tsPath, fSid);
+      // v3.20.0：带上轮次元信息（watcher 汇总路径也会落明细，source 区分来源）
+      if (info.tsPath) incrementalRecord(info.tsPath, fSid, {
+        sid: fSid, roundStart: info.roundStart || 0, durMs: agg.durMs,
+        model: agg.modelMain || agg.model, subModels: agg.subModels,
+        subCount: agg.subCount, teamActive: agg.teamActive === true,
+        source: 'flush-delayed', label: roundLabel(info.tsPath, info.roundStart || 0),
+      });
       const bal = balanceText();
       if (info.mainToastedAt) {
         // v3.12：异常轮——主模型已在 Stop 先弹，此处只补弹【子代理】部分（不含主模型用量，否则重复）
@@ -4129,7 +4435,13 @@ function main() {
       // v2.64：补价完成后再记账——确保新模型首用时 pricing.json 已含该模型价格，
       // 否则 incrementalRecord 内 loadPricing() 读不到价、calcCost 返回 null，cost 被静默丢弃。
       // 记账与弹窗解耦：即使弹窗时机错（多弹/漏弹），账本也已正确。
-      incrementalRecord(tsPath, sid);
+      // v3.20.0：带上轮次元信息 → 这一轮会在 rounds/rounds-YYYY-MM.jsonl 留一条明细。
+      incrementalRecord(tsPath, sid, {
+        sid, roundStart: roundStart0, durMs: agg.durMs,
+        model: agg.modelMain || agg.model, subModels: agg.subModels,
+        subCount: agg.subCount, teamActive: agg.teamActive === true,
+        source: 'stop-transcript', label: roundLabel(tsPath, roundStart0),
+      });
       const line = lineFor(agg, false, modelShort);
         writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sid, sameRound: false, transcriptPath: tsPath, stat: agg, line, source: 'transcript', payload: summarizePayload(payloadRaw) });
         // 只有专家团（本轮有子代理 subagents 或有团队活动）才走合并延迟弹一次汇总——避免普通
@@ -4643,6 +4955,11 @@ module.exports = {
   readTranscLines, parseTranscChunk, readTranscLinesFrom, extractUsage, perModelFromRows, aggregatePerModel,
   aggregateMainOnly, aggregateSubsOnly, aggregateTranscript,
   todayDisplay, reportTxt, reportSummaryTxt, normalizeDailyUsage,
+  // v3.20.0：--report 区间 / CSV / 外推 + 轮次明细留档（selftest 直接单测，不再只能靠 spawn 看 stdout）
+  formatUsageRow, aggregateRangeModels, parseReportRange, reportRangeTxt,
+  exportReportCsv, reportForecastTxt, pruneRoundFiles,
+  appendRoundDetail, roundLabel, transcTextOfRow,
+  ROUNDS_DIR, EXPORTS_DIR,
   mainModelState, lastTranscLine, coalescePath, hasActiveSubagentsSince, subagentsDirFromTranscript, subagentPending, subagentsAllStagnant, interruptedByUser, hasSubagentsRecentlyActive,
   interruptedRowsAfter,
   incrementalRecord, loadLedgerWatermark, saveLedgerWatermark,

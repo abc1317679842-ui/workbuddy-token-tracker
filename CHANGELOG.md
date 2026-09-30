@@ -3,6 +3,91 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.20.0（2026-10-01）—— `--report` 扩展（区间 / CSV / 外推）+ 轮次明细留档
+
+> 缘起两句用户原话：
+> ①「这两项一起做，做好测试，然后推仓库。」
+> ②「这里的金额统计……只是把当前模型换算成使用外部 API 的价格，**根本不能跟 WorkBuddy 自带积分做明确换算**。」
+>
+> 第②句直接改变了本版的设计口径（见下「金额口径」一节）——**token 为准，金额退为辅**。
+
+### 一、`--report` 扩展（区间 / CSV / 外推）
+
+| 新命令 | 行为 |
+|---|---|
+| `--report week` | 最近 7 个自然日（含今天）→ **一张按模型的汇总表** + 合计行 |
+| `--report month` | 本月 1 日 ~ 今天，同上 |
+| `--report 2026-09-15..2026-09-30` | 任意闭区间，同上；**起止写反自动纠正** |
+| `--report <以上任一> --csv` | 改为导出 `exports/report-<范围>-<时间戳>.csv`，命令只回一行路径 |
+| `--report all --csv` / `--report <日期> --csv` | 既有写法也能导出 |
+| `--report forecast` | 今日 token 速率外推 + 近 7 日实测均值对照 |
+
+**设计红线：既有四个入口输出逐字节不变。** `--report`（今天）/ `--report <日期>` / `--report all` / `--report summary [all|<日期>]` 在改造后必须与 v3.19.3 完全一致——`selftest` 用**硬编码期望输出**做断言（T11-d 三项），另在推仓库前用 v3.19.3 二进制跑了 7 组逐字节 diff（`--report` / `all` / `2026-09-30` / `2026-08-15` / `summary` / `summary all` / `totals 2026-09-30`，**7/7 相同**）。为此新增 `formatUsageRow()` 把表格行格式化提到模块级、单日与区间两个入口共用——若以后加列，只改一处，两个入口不可能失配。
+
+**区间聚合的三个口径决定：**
+
+1. **命中率必须重算，不能取均值**。区间值 = `hitRate(Σin, Σcached)`。取各天 `hit` 的算术平均值是错的——跨天 token 量可能差 100 倍（本机实测：某模型单日 1.5 亿 vs 25 万），均值会被小样本天严重带偏。selftest 有一条专门断言 `|区间值 − 均值| > 1`。
+2. **`total` 保持逐日累加**（不重算 `in+out`），这样区间结果与"逐日 `total` 相加"严格可对账，便于人工核对。
+3. **空区间不崩**：返回 0 值合计行，不抛错。
+
+**CSV 的两个硬要求：**
+
+- **必须带 UTF-8 BOM**。不带 BOM 时简体中文环境的 Excel 按 GBK 解码 → 中文列头必乱码。这与 `loadDailyUsage()` 里剥 BOM 是同一个坑的两面（`:2563` 的注释早已记过）。selftest 直接断言前 3 字节为 `EF BB BF`。
+- **只回一行路径，不把内容打到 stdout**。CSV 几十行会被助手全读进上下文，纯烧 token；落地到 `exports/`（已加 `.gitignore`）让用户用 Excel 打开。
+
+**外推为什么只推 token、不推金额**：金额本身已是按 API 单价折算的虚拟计价，在虚拟数上再外推一次，只会制造「这个月要花多少钱」的错觉。`reportForecastTxt()` 输出里**不含 `¥` 符号**（selftest 有断言），样本 < 2 天时直接拒绝计算而不是硬编一个数。
+
+### 二、轮次明细留档（`rounds/rounds-YYYY-MM.jsonl`）
+
+每日账本只回答「某天某模型花了多少」，回答不了「**哪一轮**异常大 / 子代理占了多少」。本版把每轮落一条 JSONL 补上这个维度。
+
+**落点决策（本项最关键的一处）**：明细**只写在 `recordUsage()` 一处**——账本确认落盘之后、文件锁之内。
+
+为什么不是「在 Stop 的各个出口各写一遍」：Stop 端有 **4 个互斥出口**（`plain-immediate` 普通轮 / `team-split` 专家团 / `same-round-settled` 静默跳过 / `estimate` + `no-token`），每个出口各写一遍，迟早会出现"加了新出口忘了写"。放在 `recordUsage` 后，两个好处白送：
+
+- **幂等不需要额外状态**：同轮重复 Stop 时 `byModel` 为空 → `recordUsage` 提前 `return false` → 根本走不到明细写入。实测重放同一轮 Stop，明细条数保持 1 条。
+- **账本与明细同生共死**：`saved === false`（写盘失败）时不落明细，不会出现"账本没记但明细有"的不一致。
+
+`meta` 是**可选参数**——其余 8 个 `incrementalRecord` / `recordUsage` 调用点不传，行为与 v3.19.3 完全一致（selftest T11-h4 断言：不传 meta 时账本照记、明细不落）。只给 3 处传了 meta：Stop transcript 主路径、`--flush-delayed` watcher 汇总、`cancelled-round-watch` 手动取消轮。
+
+**字段契约**（每条一行 JSON）：
+
+| 字段 | 说明 |
+|---|---|
+| `sid` / `roundStart` / `ts` / `date` | 会话、本轮起点、落档时刻、自然日。按轮聚合请用 `sid + roundStart` |
+| `durMs` | 本轮墙上耗时（与 toast 同口径，已含压缩段） |
+| `in` / `out` / `cached` / `total` / `hitPct` | **实测值**（平台落盘），命中率按 `Σ缓存/Σ输入` 重算 |
+| `models` | 分模型 token 明细（`{模型:{in,out,cached,total}}`） |
+| `model` / `subModels` / `subCount` / `teamActive` | 主模型与子代理模型、子代理调用数、是否有团队活动 |
+| `source` | `stop-transcript` / `flush-delayed` / `cancelled-round-watch` |
+| `label` | **本轮首条非注入型 user 消息的前 40 字符**；注入型（`task-notification` 等）标 `[注入] <类型>`；取不到就留空，不编造 |
+| `costApiEquiv` | **按 API 单价折算的等价金额，不是真实扣费**（字段名刻意如此，防后人误当真实花费） |
+
+`label` 是这一项能不能用起来的关键——没有标签的明细只是一堆数字。`roundLabel()` 只扫 transcript **尾部 400 行**（Stop 端本次已多次全量读 40MB 级 transcript，不再加一次全量读），并且只认 `timestamp ≥ roundStart` 的 user 行。
+
+**保留策略**：保留最近 6 个月，过期文件在跑 `--report` 时顺带清理（不引入常驻进程、不建定时任务）。`rounds/` 已加 `.gitignore`。
+
+### 三、金额口径（README / SKILL.md / manifest 三处同步声明）
+
+用户纠正的事实：**本技能的"金额"是把 token 按 API 单价折算出来的等价计价，不是真实扣费**——内置模型走 WorkBuddy 客户端自带额度，本技能读不到额度扣减，因此**不存在任何「金额 ↔ 积分/额度」换算**（只有自备 API key 模式下才等同真实花费）。
+
+本机实测佐证：账本近 6 日折算金额日均 **¥39.03**，而同一时期 `.balance.json` 的余额**恒定 5.36、20 条观测全相同**——按折算金额推"余额只够 0.14 天"，显然荒谬。
+
+落实为：README 顶部新增「⚠️ 金额口径声明（看数据前必读）」章节（含模式对照表 + 为什么不做换算 + 实测佐证）；SKILL.md 功能总览与反借口表同步；明细字段命名 `costApiEquiv`；区间报表末尾固定追加口径行。
+
+### 四、测试
+
+- `selftest.js` 新增 **T11 段 30 项**：`parseReportRange` 边界（含写反纠正、非区间写法必须返回 null 以免误吞既有入口）、区间命中率重算、`total` 逐日相加可对账、空区间不崩、**既有三个入口的硬编码逐字节断言**、区间报告必带口径声明、forecast 不含 `¥`、**CSV BOM 三字节**、明细落档 / 幂等 / 无 meta 零影响、`label` 提取与注入识别、过期清理、落点在 `recordUsage` 内的源码守卫。**结果 80 过 / 0 败。**
+- **隔离端到端**（`D:/测试临时文件夹/wtt-audit/`，`TOKEN_TRACKER_NO_TOAST=1`）：
+  - Stop 主路径：新版与 v3.19.3 基线跑同一套 transcript，`daily-usage.json` **md5 完全相同**（`b194e7de…`）；新版落 1 条明细（`source=stop-transcript`、`label` 取到中文提问、`costApiEquiv` 与账本 `cost` 一致）。
+  - 重放同一轮 Stop：明细仍为 1 条、账本不变 → **幂等成立**。
+  - `--flush-delayed`（专家团 watcher）路径：落 1 条 `source=flush-delayed` 明细，coalesce 正常清理、watcher 正常收口。
+- 推仓库前用 v3.19.3 二进制做了 7 组既有入口逐字节 diff，**7/7 相同**。
+
+### 五、改动量
+
+`token-tracker.js` 4,664 → **4,980 行**（298,205 → 316,853 字节）；`selftest.js` 462 → **659 行**。全部为新增分支 + 一个可选参数，未改动任何既有出口的判定条件。
+
 ## v3.19.3（2026-10-01）—— 压缩弹窗判定降级：删掉从未生效的机制，只留一个真正管用的单点豁免
 
 > 用户反馈：「压缩上下文时几乎必定弹窗，这个功能修了很多版本都没解决，还能不能做得更好？做不到就干脆别管它。」

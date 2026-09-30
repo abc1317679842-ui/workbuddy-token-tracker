@@ -1,6 +1,6 @@
 ---
 name: token-usage-tracker
-description: 在每次回答结束后弹出 Windows 系统通知（toast），显示本条真实 token 消耗、耗时与费用估算；并在本地记录每日分模型账本（各模型输入/输出/缓存命中/总 token/金额 + 当日合计，长期保存可查历史）。【仅适配 WorkBuddy 桌面客户端（Windows），不适用于其他 AI 工具/平台——数据源是 WorkBuddy 每轮调用后落盘的 trace/transcript 文件，依赖其 hooks 机制】WorkBuddy 客户端不显示 token（内置模式只显示积分、自有 API 模式也不显示），但每轮 LLM 调用结束都会把真实 token/耗时落盘。本技能通过 Stop hook 读取该数据，在每次回答结束后自动弹出 toast（模型名/耗时/今日累计/输入输出 token/费用），同时把本轮消耗按模型累计进 `daily-usage.json` 每日账本；`--hook` 模式在下一轮提交时把上一轮用量注入上下文作兜底；`--report` 命令可查看今日/历史每日明细与合计。当用户说「显示 token」「看消耗」「这次用了多少 token」「统计用量」「看每日消耗」「看历史用量」或任何希望看到每次回答成本时触发。
+description: 在每次回答结束后弹出 Windows 系统通知（toast），显示本条真实 token 消耗、耗时与费用估算；并在本地记录每日分模型账本（各模型输入/输出/缓存命中/总 token/金额 + 当日合计，长期保存可查历史）。【仅适配 WorkBuddy 桌面客户端（Windows），不适用于其他 AI 工具/平台——数据源是 WorkBuddy 每轮调用后落盘的 trace/transcript 文件，依赖其 hooks 机制】WorkBuddy 客户端不显示 token（内置模式只显示积分、自有 API 模式也不显示），但每轮 LLM 调用结束都会把真实 token/耗时落盘。本技能通过 Stop hook 读取该数据，在每次回答结束后自动弹出 toast（模型名/耗时/今日累计/输入输出 token/费用），同时把本轮消耗按模型累计进 `daily-usage.json` 每日账本；`--hook` 模式在下一轮提交时把上一轮用量注入上下文作兜底；`--report` 命令可查看今日/历史每日明细与合计，并支持区间（周 / 月 / 任意日期段）汇总、CSV 导出、消耗外推，以及每轮轮次明细留档。当用户说「显示 token」「看消耗」「这次用了多少 token」「统计用量」「看每日消耗」「看历史用量」「这周用了多少」「这个月消耗」「导个 CSV」或任何希望看到每次回答成本时触发。token 用量为平台落盘的实测值；金额为按 API 单价折算的等价计价——自备 API key 模式下等同真实花费，内置模型模式下只是参考值，与客户端积分/额度无换算关系。
 type: skill
 ---
 
@@ -56,8 +56,10 @@ Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\
 
 **其他会让横幅消失的原因**（若上面无效，按此顺序排查）：专注助手/免打扰（含自动规则：全屏、游戏、投影时段）→ 该应用通知总开关 → 电量节能限制后台活动 → 全屏应用抑制横幅 → 系统时间/时区异常。这些都在「设置 → 系统 → 通知」里可核对；**只有"自定义 AppId"这一类（本技能）必须走上面的注册表法**。
 
-## 当前功能总览（v3.19.x · 2026-10-01，版本以 manifest.yaml 为准）
+## 当前功能总览（v3.20.x · 2026-10-01，版本以 manifest.yaml 为准）
 
+> **v3.20.0 要点（2026-10-01）：账本查询能力扩展 + 轮次明细留档（两项一起）。** —— ①**区间报表**：`--report` 新增 `week` / `month` / `<起>..<止>`（任意闭区间，起止写反自动纠正）→ 输出**一张按模型的汇总表**，列结构与单日入口**完全一致**。区间命中率按 **`hitRate(Σ输入, Σ缓存)` 重算**，不是各天 hit 的算术均值（跨天 token 量可能差 100 倍，均值无意义）；`total` 保持逐日累加，便于与逐日核对账。**既有 `--report` / `--report <日期>` / `--report all` / `--report summary` 四条入口的输出逐字节不变**（`selftest` 有硬编码期望输出的断言兜底）。②**CSV 导出**：`--report <范围> --csv`（同样支持 `all` / 单日 / 不带参数=今天）→ 落盘 `exports/report-<范围>-<时间戳>.csv`，内容为**逐日 × 逐模型**明细 + `ALL` 合计行；**必须带 UTF-8 BOM**（否则 Excel 打开中文列头乱码——与 `loadDailyUsage` 剥 BOM 是同一个坑的两面）；命令只回一行路径，不把几十行数据灌进上下文。③**消耗外推** `--report forecast`：**只推 token、不推金额**——金额本身是按 API 单价折算的虚拟计价，在虚拟数上再外推一次只会制造「这个月要花多少钱」的错觉；样本 < 2 天时拒绝计算。④**轮次明细留档**：每轮向 `rounds/rounds-YYYY-MM.jsonl` 追加一条，含分模型 token 明细、耗时、主/子代理模型、子代理数、`source` 来源标记、`costApiEquiv`，以及**从本轮首条非注入型 user 消息自动提取的 `label`**（注入型标 `[注入] <类型>`）——用来回答「哪一轮异常大 / 子代理占了多少」这类每日账本答不了的问题。⑤**落点决策（关键）**：明细**只写在 `recordUsage` 一处**（账本确认落盘之后、锁内），而不是在 Stop 的 4 个互斥出口各写一遍——于是「同轮重复 Stop 不重复落档」由记账自身的幂等性白送，无需额外维护去重状态；`meta` 是**可选参数**，其余 8 个调用点不传即完全保持旧行为。⑥**金额口径（硬规矩，README 同步声明）**：`in/out/cached/total` 是平台落盘的**实测值**；金额一律按 `pricing.json` 的 API 单价折算，**不是真实扣费**——内置模型走客户端自带额度，本技能读不到额度扣减，**不做任何「金额 ↔ 积分」换算**（自备 API key 模式下才等同真实花费）。明细字段名直接写成 `costApiEquiv` 就是为了防后人误当真实花费。⑦**自测**：`selftest.js` 新增 T11 段 30 项（含「既有入口逐字节不变」硬编码断言、区间 hit 重算、CSV BOM 字节、明细幂等、`label` 提取与注入识别），**80 过 0 败**；另跑隔离端到端：Stop 主路径（账本 md5 与 v3.19.3 基线**逐字节相同**，同时落 1 条明细）、重放同一轮 Stop（不重复落档）、专家团 `--flush-delayed` 路径（落 1 条 `source=flush-delayed` 明细且正常收口）。
+>
 > **v3.19.3 要点（2026-10-01）：压缩弹窗判定整体降级——删掉一套从未生效过的死机制，只留一个真正管用的单点豁免。** —— ①**取证**：全量复核 `token-tracker-toast.log`（1560 条）/ `token-tracker-compaction.log`（3006 条）——`compactionMode=true` 出现 **0 次**、`compression-omen/resumed/timeout` 各 **0 次**、185 次 `flush-watch-start` 快照命中压缩标记 **0 次**、1158 次 `stop-transcript` 仅 **6 次**命中（0.5%）。②**根因（三层）**：v3.01 把普通轮改为 Stop 端同步弹窗后**不再 spawn watcher**，而压缩判定只活在 flush watcher 内 → 占全部弹窗 **55%（862/1560）** 的 `plain-immediate` 路径完全绕过它；且压缩标记在**压缩完成瞬间**落盘，等 Stop 触发时 transcript 已追加成百上千行、标记早已滑出末尾 30 行窗口；语义上也错位——标记出现时压缩已结束、模型已恢复输出。③**认知纠偏（重要）**：压缩后弹出的窗口 **99% 是那一轮的正常结算弹窗**（实测 12 次压缩现场后 9 次弹窗，内容为真实用量：输入 4.9万~70万、耗时 46s~8m24s）——**压掉它就是丢数据**，不该抑制。④**真正该修的是压缩期噪音**：2026-09-12 07:31 一个现场 18 秒内连弹 3 条「本轮无 token 消耗记录」，而该分支在 Stop 路径上、原 watcher 判定同样够不着。⑤**处置**：删除 `compactionMode` / `compressionPending` 两套状态机（含每轮末尾 30 行扫描 + 每轮末尾 5 行的超长前兆扫描）+ 死函数 `contextOverflowOmenTs` / `contextOverflowOmen` + 死常量 `WATCH_COMPACT_GRACE_MS` / `COMPRESSION_WAIT_MAX_MS`；新增 `freshCompactionMarker()`（末尾 30 行内存在压缩标记**且**该标记行 timestamp 距今 ≤10 分钟，`COMPACTION_MARKER_TTL_MS` 可调）作为 Stop 端 `no-token` 分支的**单点豁免**——命中则静默跳过弹窗（落 `stop-no-token-compaction-skip`），`lastStopAt` 照常推进、账本不受影响。TTL 用于排除上一轮遗留的旧标记（实测标记可在末尾窗口停留很久）。⑥**顺带清理**：`compactionSuspected`（置 true 后立刻 `continue`，**结构性永远进不了日志**）/ `compactionMode` / `lastMarkerId` 三个误导性日志字段 + 零引用的 `lastUnknownTs` 一并删除。⑦**自测**：`selftest.js` 新增 T10 段 9 项（判据单测 + 源码零残留守卫 + 豁免分支位置守卫），**48 过 0 败**；另跑 3 组隔离端到端（新鲜标记→0 弹窗 / 无标记→照弹 / 1 小时旧标记→照弹，证明 TTL 未误杀），**14 过 0 败**；`--flush-delayed` 主循环冒烟正常收口。
 >
 > **v3.19.2 要点（2026-10-01 · 外部全量逐行重审 B1–B10）：账本正确性 + 消灭「两份实现靠注释同步」** —— ①**B1【高】水位线口径漂移导致账本静默重复记账**：`readTranscLinesFrom` 用「**已解析行数**」当水位线、却用「**原始换行符个数**」做字节偏移定位，两者只在"每行都能解析"时相等 → transcript 中途出现**空行或永久坏 JSON 行**时，水位线比真实偏移小 k，下一轮从偏早位置重读已计过的行、**再记一遍**（实测：10 行真实用量 1000/100，账本记成 **1100/110**，无 stderr 无告警；触发后自愈但多记的不回滚）。现水位线口径统一为**物理完整行数**（文件 `\n` 累计），空行/坏行不再造成漂移，半写尾行仍不计入。②**B5 + B3【中】复制实现彻底清理**：`backfill.js` 删除自带的价库合并镜像与 `findModel`/`normalizeModelName` 副本（镜像缺了并发半写重读、`tier_note` 传递等三处逻辑），改为在主脚本 `require` 前钉住 `CN_PRICE_DB_DIR` 后**直接复用 `tt.mergeLocalPriceDb` / `tt.findModel`**；主脚本内两份**零调用死副本** `parsePeakSchedule`（仍丢分钟的 N4 旧 bug）/ `isChineseHolidayBeijing`（时区口径与模块不一致）连同 exports 一并删除——"留着带旧 bug 的副本 + 详细正确注释"是最高级的误导。③**B8【低·口径】峰谷按 token 发生时刻判，不再按脚本运行时刻**：`calcCost` 新增可选 `tsMs`，取 `tsMs > stat.lastTs > 当下` 优先级；`incrementalRecord` 传入本批新行的最大时间戳 → 跨 12:00/18:00 边界的长轮不再整轮按"终点档"计价，与 `backfill`/`recalc-day` 的逐行口径收敛。④**B4【中】删掉 `peak_rules` 半截链路**：该字段是 TokenHub 原文**自由文本**（非机器可读的分厂商时段表），抓了、存了、**从不参与判定**（非 DeepSeek 厂商一律按 1× 计价）——`build_index.py` 停止生成、`mergeLocalPriceDb` 停止合并。⑤**B2**【中】`resolveWorkspaceLogFile` 改走探测出的数据根 `WB`（原先写死 `~/.workbuddy/logs`，数据根迁到 `~/.workbuddy-ai` 的用户「取消确认第二信号源」永久失效，且是 `WB_ROOT` 隔离泄漏）。⑥**B6/B7/B9/B10**【低】`aggregateTranscript` 的 `subModels` 补行级时间过滤（子代理被唤醒复用时旧行不再外溢到弹窗）；3 处 `agent-*.jsonl` 正则补 `i` 标志（全仓 11 处统一）；`estimateInterrupted` 的 `fromTs` 显式声明为 **epoch 毫秒**（此前 `estimateInterruptedInc` 把行数当时间戳传、过滤器空转）；`firstTs` 空集不再依赖 `Infinity` 传播。⑦**自测**：`selftest.js` 新增 T9 段 16 项（含 B1 端到端、B8 端到端到账本金额、B6 旧行不外溢），**39 过 0 败**。
@@ -73,7 +75,8 @@ Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\
 - **本地模型识别增强（v2.54~v2.55，2026-08-18）**：`isLocalModel()` 构建本地集合时按 url 特征判断——**host 是本机（localhost/127.0.0.1/0.0.0.0/::1）→ 无条件本地；host 是局域网 IP（192.168.x/10.x/172.16-31.x）且端口命中已知本地服务端口 → 本地**。已知本地端口：Ollama:11434 / LM Studio:1234 / llama.cpp·llamafile·LocalAI:8080 / vLLM:8000 / Jan:1337 / GPT4All:4891 / koboldcpp·oobabooga:5000·5001。本地部署（Ollama/LM Studio/llama.cpp/vLLM 等）模型即使名字与云端同名（如 `qwen3.8-27b` 撞 OpenRouter 的 `qwen/qwen3.8-27b`）也一律计费 0、只统计 token，并禁止自动补录云端价。修复动机：本地模型改名 `qwen3.8-27b` 后与 pricing.json 云端条目精确同名，被按云价误计费 3.32 元（详见 daily-usage 修复）。
 - **本条精确统计**：`Stop` 钩子在回答完全结束后触发，此时本轮 trace/transcript 已写完，弹出的是**本条回答**的真实 token、耗时与费用（不是上一轮）。
 - **toast 两行大字布局**：行1 标题大字 = 模型完整名 + 时段标注（`高峰双倍`/`夜间X折`）＋ 换行后 = `耗时` + `今日¥X` + `余额¥Y`；行2 正文小字 = `输入/输出 token` + `缓存占比` + `本条费用`。
-- **每日分模型账本（v2.39）**：每轮 Stop 自动把消耗**按模型**累计进 `daily-usage.json`（本地日期分桶，`{日期:{models:{模型:{in,out,cached,hit,total,cost}}, total:{...}}}`，`hit` = 缓存命中率%（两位小数，cached/in）），**每天保留两套统计**：`models` 各模型明细 + `total` 不分模型的当日总合计（输入/输出/缓存命中/总 token/金额，含总命中率）。**长期保存不裁剪**，可查任意历史天。查看：`node token-tracker.js --report`（今天）／`--report all`（全部天）／`--report <日期>`，也可让助手直接读文件整理展示。
+- **每日分模型账本（v2.39）**：每轮 Stop 自动把消耗**按模型**累计进 `daily-usage.json`（本地日期分桶，`{日期:{models:{模型:{in,out,cached,hit,total,cost}}, total:{...}}}`，`hit` = 缓存命中率%（两位小数，cached/in）），**每天保留两套统计**：`models` 各模型明细 + `total` 不分模型的当日总合计（输入/输出/缓存命中/总 token/金额，含总命中率）。**长期保存不裁剪**，可查任意历史天。查看：`node token-tracker.js --report`（今天）／`--report all`（全部天）／`--report <日期>`，也可让助手直接读文件整理展示。**v3.20.0 新增区间汇总**：`--report week`（近 7 天）／`--report month`（本月至今）／`--report 2026-09-01..2026-09-30`（任意闭区间）→ 输出与单日**同列**的按模型汇总表 + 合计行（命中率按 `Σ缓存/Σ输入` 重算）；`--report forecast` 看 token 消耗外推。
+- **轮次明细留档（v3.20.0）**：每轮记账成功后在 `rounds/rounds-YYYY-MM.jsonl` 追加一条 JSONL，字段含 `roundStart` / `durMs` / `in,out,cached,total` / `hitPct` / `models`（分模型明细）/ `model` / `subModels` / `subCount` / `teamActive` / `source`（`stop-transcript` / `flush-delayed` / `cancelled-round-watch`）/ `label`（本轮首条用户消息前 40 字，注入型标 `[注入]`）/ `costApiEquiv`（**按 API 单价折算，非真实扣费**）。保留最近 6 个月，过期文件在跑 `--report` 时顺带清理。用途是**分布分析**（哪些轮异常大、子代理占比多少），不是归因分析——`label` 只给一个开头线索，别指望它解释"这一轮为什么贵"。
 - **今日累计**：toast 行1 显示 `今日¥X.XX`（读当日账本 total.cost，含本条）。
 - **时段标注**：DeepSeek 原厂系支持峰谷定价（工作日北京 9-12/14-18 高峰 ×2），自动标注 `高峰双倍`；其他模型无峰谷。策略存于 `pricing.json` 手动维护字段。
 - **余额显示**：仅 DeepSeek 自定义 API 且开启开关时启用，默认隐藏 + 变化检测（余额变才显示），15 秒 TTL 缓存。
@@ -83,7 +86,8 @@ Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\
 - **快照自动清理**：`.snapshot-<sid>.json` 保留最近 30 天 + 最多 50 个，当前会话永不清。
 - **兜底通道**：`--hook`（UserPromptSubmit）在下一轮提交时把上一轮用量注入上下文；手动运行 `token-tracker.js --stop` 查看最近一轮。
 - **每日账本报告**：`node token-tracker.js --report [all|<日期>]` 输出每日分模型明细 + 当日合计（今天/历史任意天）；`--report summary [all|<日期>]` 只输出每天**总合计**（一行/天，不含模型明细）——仅供助手内部快速判断/调试用，**禁止**作为给用户的展示输出。
-- **展示格式约束（v2.39.2，强制）**：向用户展示账本数据**一律用 `--report`（明细版）**，其输出为 **Markdown 表格**（表头 + 每个模型一行 + 合计行加粗，**含单模型明细与总计**），**表格列为 `模型 | 输入 | 输出 | 缓存 | 缓存命中 | 总 token | 金额`**，其中「缓存命中」列 = 缓存命中率百分比（两位小数，`cached/in`，如 `96.89%`），每条数据行与合计行都带该列。**必须**直接把脚本输出的 Markdown 表格原文贴给用户（聊天界面渲染为真表格列，天然对齐），**禁止**手排空格对齐、**禁止**转成纯文本/代码块、**禁止**改用 summary 一行式。原因：空格对齐依赖字体宽度，不同环境渲染必歪（用户反复纠正过的坑）。
+- **区间报表 / CSV 导出 / 消耗外推（v3.20.0）**：`--report week`（近 7 天）／`--report month`（本月至今）／`--report <起>..<止>`（任意闭区间）输出**按模型的区间汇总表**，列结构与 `--report <日期>` 完全一致，同样**原样贴出**；加 `--csv` 则改成导出文件——落 `exports/report-<范围>-<时间戳>.csv`（逐日 × 逐模型明细 + `ALL` 合计行，带 UTF-8 BOM），命令**只回一行路径**，此时**不要贴任何表格**（文件是给 Excel 用的）；`--report forecast` 输出 token 消耗外推，**不含金额**。
+- **展示格式约束（v2.39.2，强制）**：向用户展示账本数据**一律用 `--report`（明细版）**，其输出为 **Markdown 表格**（表头 + 每个模型一行 + 合计行加粗，**含单模型明细与总计**），**表格列为 `模型 | 输入 | 输出 | 缓存 | 缓存命中 | 总 token | 金额`**，其中「缓存命中」列 = 缓存命中率百分比（两位小数，`cached/in`，如 `96.89%`），每条数据行与合计行都带该列。**必须**直接把脚本输出的 Markdown 表格原文贴给用户（聊天界面渲染为真表格列，天然对齐），**禁止**手排空格对齐、**禁止**转成纯文本/代码块、**禁止**改用 summary 一行式。原因：空格对齐依赖字体宽度，不同环境渲染必歪（用户反复纠正过的坑）。**区间模式（`--report week|month|<起>..<止>`）适用同一条规则**：原样贴出汇总表；但带 `--csv` 时**不要贴表格**，命令只会回一行导出路径。
 
 ## 查询触发规则（强制）
 
@@ -91,6 +95,8 @@ Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\
 - 然后**原样贴出脚本输出的 Markdown 表格**，不得自行读取 daily-usage.json、不得自行汇总、不得转换成列表/纯文本/代码块。
 - 如果用户只问某一天的消耗，也使用 `--report <日期>` 并原样贴出。
 - 如果用户问的是 summary（只要总合计，不要模型明细），才允许使用 `--report summary`，但同样必须贴出脚本输出，不得自行加工。
+- 如果用户问的是**一段时间**（「这周」「本月」「最近 7 天」「9 月 1 号到 10 号」这类），用 `--report week` / `--report month` / `--report <起>..<止>`，同样**原样贴出**脚本输出的汇总表。
+- 如果用户明确要**导出成文件**（「导个 CSV」「给我一份 Excel 能打开的」），加 `--csv`，然后把命令回显的导出路径给用户——**不要贴表格内容**（文件是给 Excel 用的，贴出来只是刷屏）。
 - 任何情况下，禁止绕过脚本直接解析账本 JSON 后手工格式化输出。
 
 ## 安装与启用（新用户必读：装完必须配 hooks 才自动弹通知）
@@ -242,6 +248,10 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 | 专家团金额疑似翻倍（双记） | `.ledger-watermark.json` 各会话水位线 + 账本模型 token | v2.82.2 起 incrementalRecord 整体加 `.ledger-watermark.json.lock` 水位线锁，watcher 与 Stop 并发只记一次；仍翻倍则查是否锁被异常跳过（stderr 有「水位线保持不推进」则下轮会补记） |
 | 当日弹窗金额与 `recalc-day.js` 重算结果对不上 | `peak-rules.js`（唯一口径）+ `pricing.json` 的 `deepseek_rules.peak_schedule` | v3.19.0 前主脚本 / `backfill.js` / `recalc-day.js` 各存一份峰谷硬编码——官方调时段后增量记账判低峰、回溯重算判高峰，**金额静默差一倍且无报错**。v3.19.0 起三处统一委托 `peak-rules.js`；若仍不一致，`grep -n "9, *12" *.js` 查是否残留旧副本。**跨时段边界轮**（如 11:55→12:08）v3.19.2 起账本侧按**行时间戳**判峰谷（`calcCost` 的 `tsMs`/`stat.lastTs`），与 backfill/recalc 的逐行口径收敛；窗口未跨边界的轮不受影响 |
 | 账本比实际用量**多记一行**（金额略高于预期，无任何报错） | transcript 中途是否存在**空行**或**永久坏 JSON 行**（`grep -c '^$'` / 逐行 `JSON.parse` 试）+ `.ledger-watermark.json` 的 `main` 值 | **v3.19.2 前**：`readTranscLinesFrom` 用「已解析行数」当水位线、却按「原始 `\n` 个数」做字节偏移 → 两者差 k（被跳过的空行/坏行数）→ 下一轮从偏早偏移重读已计过的行再记一遍（实测 1000/100 记成 **1100/110**），触发后自愈但不回滚。**v3.19.2 起**水位线口径统一为**物理完整行数**，不再漂移。若在旧版发现该症状：升级后重跑 `backfill.js --write` 重建账本 |
+| 区间汇总的「缓存命中」与各天百分比对不上 | `--report <起>..<止>` 的输出 | **设计如此，不是 bug**：命中率是比率，区间值按 `Σ缓存 / Σ输入` **重算**（按 token 量加权），不是各天 hit 的算术平均——跨天量级差 100 倍时均值会严重偏离。要核对请手算 `Σ缓存/Σ输入` |
+| CSV 用 Excel 打开中文列头乱码 | `exports/report-*.csv` 前 3 字节是否为 `EF BB BF` | 必须带 UTF-8 BOM，否则 Excel 按 GBK 解码必乱码。`--report --csv` 已固定写入 BOM；若仍乱码，先确认该文件是否被别的工具改写过 |
+| 轮次明细里同一轮出现多条 | 各条的 `roundStart` 与 `source` | **正常**：同一轮可能分多批落盘（如 Stop 记一批、`--flush-delayed` 再补一批），`source` 区分来源。被幂等拦掉的只有「无新增用量」的重复 Stop。按轮聚合请用 `sid + roundStart` 分组 |
+| 明细 `label` 为空 | 该轮 `roundStart` 与 transcript 中 user 行的 timestamp | `roundLabel` 只取 **timestamp ≥ roundStart** 的 user 行，且只扫 transcript **尾部 400 行**；取不到就留空（不编造）。常见原因：本轮很长、首行已被挤出尾部窗口；或测试夹具用了与真实时间不符的 `roundStart` |
 
 > ⚠️ **hooks 命令铁律**：所有 hook 命令必须保持**纯净的 `node` 调用**（如 `node C:/.../token-tracker.js --stop`），**禁止使用 `cmd /c` 包装或环境变量前缀**（如 `cmd /c "set X=1 && node ..."`）。此类包装会被 WorkBuddy 判为无效 hook 配置（`Invalid hook config`），导致整个事件组（Stop / UserPromptSubmit）跳过、进程瞬间失败且无任何日志产物。调试日志已改为弹窗时自动记录，无需通过环境变量或命令前缀开启。
 
@@ -255,5 +265,7 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 | 金额估算随便填 | 走 `pricing.json` 口径，不自造单价 |
 | 这条没记上，算了 | 有行数水位线机制；缺记要查根因，不能放过 |
 | 表格列太多，精简一下 | 7 列一列都不能少，格式不许改 |
+| 金额就是我真花的钱 | 除非自备 API key，金额一律是按 API 单价折算的**等价计价**，与客户端积分/额度**无换算关系**——要分析用量以 token 列为准 |
+| 导 CSV 顺手把表格也贴一遍 | `--csv` 模式只回一行导出路径；表格贴出来纯刷屏，文件是给 Excel 用的 |
 
 **红旗（出现即停）**：手算费用；拿别处的数字代替账本；改了表格列或格式；绕过 `--report` 直接读原始文件。
