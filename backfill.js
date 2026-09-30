@@ -50,6 +50,23 @@ const HOLIDAYS = path.join(SKILL_DIR, 'holidays.json');
 const WATERMARK = path.join(SKILL_DIR, '.ledger-watermark.json');
 const PROJECTS = path.join(WB, 'projects');
 
+// v3.19.2（B5）：复用主脚本，不再自带价库合并 / findModel 镜像。
+// 「复制实现靠注释约束同步」正是 P1（峰谷口径分裂）的病根——镜像缺了并发半写重读、tier_note 等
+// 三处逻辑，且此后每次改主实现都要人肉同步。这里在主脚本 require **之前**显式对齐两个路径口径
+// （主脚本在 require 时即完成 CN_PRICE_DIR 解析），再直接用它的 mergeLocalPriceDb / findModel。
+if (!process.env.WB_ROOT) process.env.WB_ROOT = WB;
+if (!process.env.CN_PRICE_DB_DIR) {
+  // 仅当调用方未显式指定时自动发现并「钉住」价库目录——保证主脚本 require 时解析到同一目录，
+  // 避免两侧各扫一次目录却落在不同候选上。（若调用方已设 CN_PRICE_DB_DIR，两侧都直接用它。）
+  try {
+    const dbFile = discoverCnPriceDb();
+    if (dbFile) process.env.CN_PRICE_DB_DIR = path.dirname(dbFile);
+  } catch (e) { /* 发现失败 → 主脚本自带的多级发现逻辑兜底 */ }
+}
+const tt = require(path.join(__dirname, 'token-tracker.js'));
+const normalizeModelName = tt.normalizeModelName;
+const findModel = tt.findModel;
+
 const WRITE = process.argv.includes('--write');
 
 
@@ -80,17 +97,22 @@ function usageFromRow(r) {
   return extractUsage(pd.usage) || extractUsage(pd.rawUsage) || extractUsage(r.message && r.message.usage) || null;
 }
 
-// 读 jsonl 全部行（容错跳过空行/半写行，与 readTranscLines 同口径）
+// 读 jsonl：返回 { rows, physicalLines }。
+//   rows —— 容错跳过空行/半写行的可解析行（与 readTranscLines 同口径，供统计用）；
+//   physicalLines —— 文件内 '\n' 累计数（**物理完整行数**），仅供水位线使用。
+// v3.19.2（B1 对齐）：水位线口径必须 = physicalLines。主脚本 v3.19.2 起 readTranscLinesFrom 的
+//   totalLines 就是物理完整行数；此处若仍记「可解析行数」，空行/坏行会让记下的水位线比真实偏移小 k，
+//   主脚本下一轮从偏早的偏移重读已计过的行 → 重复记账。
 function readRows(fp) {
   let raw = '';
-  try { raw = fs.readFileSync(fp, 'utf-8'); } catch (e) { return []; }
+  try { raw = fs.readFileSync(fp, 'utf-8'); } catch (e) { return { rows: [], physicalLines: 0 }; }
   const rows = [];
   for (const line of raw.split('\n')) {
     const s = line.trim();
     if (!s) continue;
     try { rows.push(JSON.parse(s)); } catch (e) { /* 半写行跳过 */ }
   }
-  return rows;
+  return { rows, physicalLines: (raw.match(/\n/g) || []).length };
 }
 
 // 成本：单行级计算（峰谷按行时间）；findModel 与主脚本同口径（归一化/去标点/边界匹配）
@@ -161,13 +183,11 @@ function estimateInterruptedToDate(rows, acc) {
   }
 }
 
-// 扫描单个 transcript 文件（主或子代理），把 usage 行归入 acc[date][model] 与行数水位
+// 扫描单个 transcript 文件（主或子代理），把 usage 行归入 acc[date][model]，返回水位线值
 function scanFile(fp, acc, modelNames) {
-  const rows = readRows(fp);
+  const { rows, physicalLines } = readRows(fp);
   const seen = new Set();
-  let usedLines = 0;
   for (const r of rows) {
-    usedLines++; // 水位线口径 = 可解析行数（与 readTranscLinesFrom.totalLines 一致）
     const ts = r.timestamp;
     if (!(typeof ts === 'number')) continue;
     const pd = r.providerData || {};
@@ -187,64 +207,17 @@ function scanFile(fp, acc, modelNames) {
   }
   // v2.52 中断补偿（按日期归属）：与增量记账同口径，被中断的思考也补进账本
   estimateInterruptedToDate(rows, acc);
-  return usedLines;
+  return physicalLines; // v3.19.2（B1）：水位线 = 物理完整行数（'\n' 累计），与主脚本 totalLines 同口径
 }
 
 let _pricing = { models: {} };
 
-// ===== 以下三件与 token-tracker.js 严格同口径（镜像自 v3.16，勿单独改动）=====
-// normalizeModelName / alnumKey / findModel —— 回填计费必须与增量记账同价，否则会出现
-// 「同一模型增量记了钱、回填记不到」的口径分裂。改动任一侧时必须同步另一侧。
-function normalizeModelName(n) {
-  return String(n == null ? '' : n).replace(/\s+/g, ' ').trim().toLowerCase();
-}
-function alnumKey(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
-const MODEL_ALIASES = {};
-function findModel(pricing, modelName, mode) {
-  if (!pricing || !pricing.models || !modelName) return null;
-  const norm = normalizeModelName(modelName);
-  if (!norm) return null;
-  const models = pricing.models;
-  const keys = Object.keys(models);
-  if (models[norm]) return { key: norm, m: models[norm] };
-  for (const key of keys) {
-    if (normalizeModelName(key) === norm) return { key, m: models[key] };
-  }
-  const normAlnum = alnumKey(modelName);
-  if (normAlnum) {
-    for (const key of keys) {
-      if (alnumKey(key) === normAlnum) return { key, m: models[key] };
-    }
-  }
-  const alias = MODEL_ALIASES[norm];
-  if (alias) {
-    const ak = normalizeModelName(alias);
-    if (models[ak]) return { key: ak, m: models[ak] };
-    for (const key of keys) {
-      if (normalizeModelName(key) === ak) return { key, m: models[key] };
-    }
-  }
-  if (mode === 'price') {
-    const BOUND = /[-/_: \u4e00-\u9fa5]/;
-    const boundaryHit = (short, long) => {
-      if (!long.includes(short)) return false;
-      const i = long.indexOf(short);
-      const leftOk = i === 0 || BOUND.test(long.charAt(i - 1));
-      const rightOk = (i + short.length) === long.length || BOUND.test(long.charAt(i + short.length));
-      return leftOk && rightOk;
-    };
-    let best = null;
-    for (const key of keys) {
-      const kn = normalizeModelName(key);
-      if (!kn || kn.length > norm.length) continue;
-      if (boundaryHit(kn, norm) && (!best || kn.length > best.len)) best = { key, m: models[key], len: kn.length };
-    }
-    if (best) return { key: best.key, m: best.m };
-  }
-  return null;
-}
-
-// 本地官方价库路径自动发现（与 token-tracker.js autoDiscoverCnPriceDir 同序，镜像简化版）
+// v3.19.2（B5）：normalizeModelName / findModel 已改为直接复用主脚本导出（见文件顶部 require 块），
+// 原先这里手抄的三件镜像（normalizeModelName / alnumKey / findModel）已删除——「命名/匹配口径」由
+// 主脚本单一实现，回填与增量记账再不会因一侧改动而分叉。
+//
+// 本地官方价库路径自动发现（与 token-tracker.js autoDiscoverCnPriceDir 同序；仅用于 require 前
+// 对齐 CN_PRICE_DB_DIR，合并工作本身已交给主脚本的 mergeLocalPriceDb）
 function discoverCnPriceDb() {
   const cands = [];
   if (process.env.CN_PRICE_DB_DIR) cands.push(String(process.env.CN_PRICE_DB_DIR));
@@ -268,51 +241,8 @@ function discoverCnPriceDb() {
   return null;
 }
 
-// 本地官方价库合并镜像（与 mergeLocalPriceDb 同规则）：lock 永远赢；坏数据不收；
-// 缓存价官方未列时保守按输入价计（宁高估不错账）。
-function mergeLocalDbMirror(pricing) {
-  const dbPath = discoverCnPriceDb();
-  if (!dbPath) return pricing;
-  let db = null;
-  try { db = JSON.parse(fs.readFileSync(dbPath, 'utf-8')); } catch (e) {
-    process.stderr.write(`[backfill] ⚠️ 本地官方价库解析失败: ${dbPath}（该部分模型将无价可用）\n`);
-    return pricing;
-  }
-  if (!pricing.models || typeof pricing.models !== 'object') pricing.models = {};
-  const byAlnum = {};
-  for (const key of Object.keys(pricing.models)) {
-    const ak = alnumKey(key);
-    if (ak && !byAlnum[ak]) byAlnum[ak] = key;
-  }
-  let n = 0;
-  for (const [k, v] of Object.entries(db.models || {})) {
-    if (!v || typeof v.in_price !== 'number' || typeof v.out_price !== 'number') continue;
-    const ak = alnumKey(k);
-    const existingKey = byAlnum[ak];
-    if (existingKey && pricing.models[existingKey] && pricing.models[existingKey].lock === true) continue;
-    const rec = {
-      name: v.name || k,
-      input_price: v.in_price,
-      output_price: v.out_price,
-      cached_price: (typeof v.cache_hit === 'number') ? v.cache_hit : v.in_price,
-      region: 'CN',
-      price_source: '本地官方库(' + String(v.primary_source || '').replace(/^本地官方库\(|\)$/g, '').slice(0, 40) + ')',
-    };
-    if (v.peak && v.peak.idle && v.peak.peak) {
-      const i = Number(v.peak.idle.in), p = Number(v.peak.peak.in);
-      if (i > 0 && p > 0) {
-        const mult = Math.round((p / i) * 100) / 100;
-        if (Math.abs(mult - 2) < 0.05) rec.peak_multiplier = 2;
-        else if (mult) { rec.peak_multiplier = mult; rec.tier_note = '峰谷非整数倍(' + mult + '×)，需人工核验'; }
-      }
-    }
-    if (existingKey) Object.assign(pricing.models[existingKey], rec);
-    else { pricing.models[k] = rec; byAlnum[ak] = k; }
-    n++;
-  }
-  process.stderr.write(`[backfill] 本地官方价库已合并 ${n} 条（${dbPath}）\n`);
-  return pricing;
-}
+// v3.19.2（B5）：本地官方价库合并已改为调用主脚本 tt.mergeLocalPriceDb（含并发半写重读、tier_note 等
+// 全部逻辑），原先这里的 mergeLocalDbMirror 手抄镜像已删除。
 
 function main() {
   if (!fs.existsSync(PROJECTS)) {
@@ -320,7 +250,8 @@ function main() {
     process.exit(1);
   }
   try { _pricing = JSON.parse(fs.readFileSync(PRICING, 'utf-8')); } catch (e) { _pricing = { models: {} }; }
-  try { _pricing = mergeLocalDbMirror(_pricing); } catch (e) { /* 合并失败沿用 pricing.json */ }
+  // v3.19.2（B5）：复用主脚本的价库合并（口径与增量记账完全一致）
+  try { _pricing = tt.mergeLocalPriceDb(_pricing); } catch (e) { /* 合并失败沿用 pricing.json */ }
 
   const acc = {};            // date -> model -> stat
   const modelNames = new Set();

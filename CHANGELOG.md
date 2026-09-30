@@ -3,6 +3,34 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.19.2（2026-10-01）—— 全量逐行重审：账本静默重复记账（B1）+ 复制实现清零
+
+> 外部对 v3.19.1 做**不复用前几轮结论**的逐行重读（`token-tracker.js` 4721 行全域 + 全部伴随脚本 + `build_index.py`），
+> 提出 B1–B10。本节按"核验 → 复现 → 修复 → 回归"逐条落地，并对报告中**归因有误的两条**（B4/B9）做了修正说明。
+
+- **B1【高·已实证】水位线口径漂移 → 账本静默重复记账（本轮最重）** —— `readTranscLinesFrom` 用「**已解析行数**」当水位线，却用「**原始换行符个数**」做字节偏移定位；`parseTranscChunk` 会跳过空行与不可解析行，两者只在"每行都能解析"时相等。transcript 中途一旦出现**空行**或**永久坏 JSON 行**（compaction 重写、进程被杀留下的残行、双写竞争都会造出来），水位线就比真实偏移小 k → **下一轮从偏早位置重读已计过的行、再记一遍**，且**无任何 stderr、无告警**。
+  - 实测（真调 `incrementalRecord`、读真实账本）：10 行真实用量 1000 in / 100 out，账本记成 **1100 / 110**（多记一行，长上下文单行可达十万级 token）；水位线轨迹 轮1 `main=10` → 轮2 `main=11`（多吞一行）。触发后自愈（不再累积），但已多记的不回滚。子代理文件走同一函数，同样受影响。
+  - 修复：水位线口径统一为**物理完整行数**（文件内 `\n` 累计个数），只解析 `[offset, 最后一个换行]` 区间内的完整行；文件被截断（完整行数 < 水位线）时不推进；**半写尾行仍不计入**（补齐后才被消费）。同时把 `estimateInterruptedInc` 的"回退全量"起点改由**长度相减**得出（不再拿水位线当数组下标）。
+  - 回归：t-b1 12 过 0 败（原报告复现场景 ③ 现为 1000/100 正确）；`selftest.js` T9-B1a/b/c 三项固化。
+- **B5 + B3【中】「复制实现靠注释同步」清零（本项目最该防的复发点）** —— v3.19.0 的 P1 号称把峰谷口径收敛到单一模块，实际只把"三份"降到"两份（模块 + 死代码）"，`backfill.js` 还整份手抄着价库合并与 `findModel`：
+  - `backfill.js` 删除 `mergeLocalDbMirror`（缺 v2.81.2 并发半写重读、缺 `tier_note = '缓存价官方未列…'`、缺 `if (v.tier_note) rec.tier_note += …`，撞上价库原子替换窗口会整份不合并）与 `normalizeModelName`/`alnumKey`/`findModel` 三件副本 → 改为在 `require` 主脚本**之前**钉住数据根与 `CN_PRICE_DB_DIR`，然后直接调 `tt.mergeLocalPriceDb` / `tt.findModel`；
+  - 主脚本内两份**零调用死副本** `parsePeakSchedule`（`:2431`，仍**丢分钟** = v3.19.1 刚在模块修掉的 N4 旧 bug）与 `isChineseHolidayBeijing`（`:2450`，用本地时区 `getFullYear()`，与模块 `tsMs+8h` 口径不一致）连同 `exports` 一并删除。**「留着带旧 bug 的副本 + 详细正确注释」，是最高级的误导。**
+  - **连带修正（报告未提）**：B1 改了水位线口径后，`backfill.js` 写出的水位线也必须同步改为**物理换行数**（原先记"可解析行数"）——否则回填后主脚本会从偏早偏移重读，造成新的跨工具不一致。已一并修复并加 T9-B5c 守卫。
+  - 实测：隔离环境实跑 `backfill --write` → 水位线 `main=5`（= 物理换行数，文件含 1 空行 1 坏行）、账本 3300、主脚本续跑无变更时增量 0、追加 1 行后增量恰为 55（无重复记账）；伪造本地价库合并端到端验证 `tbtest-x1`（主 `pricing.json` 中不存在）被正确计价 ¥3.00。
+- **B8【低·设计口径】峰谷倍数按"脚本运行时刻"判，而非"token 发生时刻"** —— `calcCost` 走 `isPeakHour()` 内部 `new Date()`：Stop / hook 若在跨 12:00 / 18:00 边界之后才跑，整轮按**终点**那一档计价，而 `backfill.js` / `recalc-day.js` 按每行 `ts` 逐条判定 → **同一批数据两条路径金额不同**（P1 口径分裂的残留形态，触发条件收窄到跨边界轮）。
+  - 修复：`calcCost(stat, pricing, tsMs)` 新增可选时刻参数，来源优先级 **显式 `tsMs` > `stat.lastTs` > 当下**；`incrementalRecord` 传入本批新行（主 + 子代理）的**最大 timestamp**。弹窗路径的 `stat` 自带 `lastTs`，自动一并受益；两者都缺时退回旧行为。
+  - 回归：T9-B8a（峰 = 2×谷）、T9-B8b（`lastTs` 回退）、**T9-B8c 端到端**（真跑 `incrementalRecord`，断言账本金额等于按行时间戳的峰价、且 ≠ 谷价）。
+- **B4【中】`peak_rules` 是半截死链路 —— 决定「删掉」而非「接上」** —— 报告称它"抓来的各厂商峰谷规则"，**核验后修正归因**：实测 `index.json` 里这 3 条是**自由文本**（TokenHub `peak_rule` 原文 2 条 + `build_index.py` 拼的 1 条 DeepSeek 规则串），**不是机器可读的分厂商时段表**，无从解析 → "接上"不可行。而它全程**从未被读取**（`calcCost`/`isPeakHour`/`isPeakAt` 只认 `pricing.deepseek_rules`），非 DeepSeek 厂商一律按 1× 计价 —— 属"数据链路通了一半"的静默缺口。按"别悬着"原则：`build_index.py` 停止生成该字段、`mergeLocalPriceDb` 停止合并；`stripLocalDbEntries` 保留 `delete out.peak_rules` 作防御（磁盘上可能仍是旧版 index.json）。
+- **B2【中】`resolveWorkspaceLogFile` 绕过数据根探测** —— `token-tracker.js:286` 写死 `path.join(os.homedir(), '.workbuddy', 'logs', todayStr())`，而同一文件 `detectWorkBuddyRoot()` 支持数据根迁移到 `~/.workbuddy-ai`，`backfill/recalc-day/refresh-prices/deepseek-official` 也都已跟上，**只有这一处没跟上**。后果：①数据根是 `.workbuddy-ai` 的用户该目录不存在 → `logFile=''` → `roundWatchMain` 的「取消确认第二信号源（客户端日志）」**永久失效**；②`WB_ROOT` 隔离泄漏（隔离测试会去读真实 `~/.workbuddy/logs`）。修复：改用 `path.join(WB, 'logs', todayStr())`。
+- **B6【低】** `aggregateTranscript` 的 `subModels` 漏了 v3.13 的行级时间过滤（`:1215` 仍传 `0`，而 `:1207`/`:1273` 已传 `roundStartMs`）：子代理文件被"唤醒复用"时，旧轮的行会被算进本轮，弹窗第一行「（子代理 XXX）」可能标到一个本轮没跑的模型。**仅影响显示**，token 数与账本不受影响。修复：改传 `roundStartMs`，并加 T9-B6 功能回归（构造"mtime=现在但含旧行"的子代理文件，断言旧模型不外溢）。
+- **B7【低】** `agent-*.jsonl` 正则大小写不统一 —— 全仓 11 处中 3 处缺 `i` 标志（报告写 2 处，实为 3 处：`aggregatePerModel`/`aggregateTranscript`/`hasNewTranscSince`）。补全后 11/11 带 `i`，加 T9-B7 源码守卫。
+- **B9【低·类型混淆】`estimateInterruptedInc` 把"行数水位线"当时间戳用** —— `estimateInterrupted(fullRows, newStart, fromTs)` 里 `fromTs` 收到的是行数（如 15234），与 epoch 毫秒（~1.7e12）比较**恒真** → 该过滤器形同空转。**报告归因需修正**：此处"当前恰好正确"依赖"解析行数 ≡ 完整行数"这一**未强制**的假设，B1 修复后该等式不再成立 → 必须同步改。修复：该调用点不再传第三参，并在 `estimateInterrupted` 上方显式声明三个参数的**量纲**（下标 / 下标 / epoch 毫秒）。
+- **B10【低·防御性】** `firstTs` 用 `Math.min(...[].filter(Boolean))` → 空集得 `Infinity` → `durMs = max(0, lastTs - Infinity) = 0`。现实不可达（上游已保证 main/sub 至少一个非空），改为显式判空，不再依赖 `Infinity` 传播（结果与旧行为一致）。
+- **复核为正确的关键机制（避免"只报坏不报好"）**：文件锁 pid 探活分级、水位线损坏**不**回退 `.bak`、`gDailyCorrupt` 只在成功解析后清除、`saveDailyUsageRaw` 原子写并返回布尔决定是否推进水位线、水位线 `Math.max` 只进不退、PowerShell 注入面（XML 由单引号字面量承载）、`isNightHour` 时区换算、`resolvePython` 两轮探测、`guardRebuildScale` 用重建文件自身 models 比大小、`loadDailyUsage` BOM 剥离 + 只备份一次、`startWatcherVerified` 监听 spawn 异步 error —— 均确认无误。
+- **自测**：`selftest.js` 新增 **T9 段 16 项**（B1 三项 + B2/B3/B4/B5/B7 源码守卫 + B5c 口径守卫 + B6 功能 + B8 三项含端到端落账）→ 全量 **39 过 0 败**
+- **端到端**：隔离环境实跑 `--report`（表格正常）/ `--hook`（exit 0，`additionalContext` 无注入）/ `backfill --write` / `recalc-day` 全通过
+- **版本**：四处统一 v3.19.2（`token-tracker.js` 头 / `manifest.yaml` / `README.md` 徽章 / `SKILL.md` 要点）
+
 ## v3.19.1（2026-10-01）—— 深度复检：峰谷时段「静默失效」根因修复 + watcher IO 短路
 
 - **N1【中·高】宣称的「官方调时段自动跟随」此前从未真正生效，且故障零可见性** —— v3.19.0 统一三处口径后，三处**一起读一个空值**：

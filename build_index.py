@@ -100,10 +100,12 @@ def main():
             })
 
     # 摄入腾讯云 TokenHub 文档（含峰谷分档 / 原厂直供 / 输入长度分档）
-    peak_rules = []
+    # v3.19.2（B4）：不再汇总顶层 peak_rules。原实现把 TokenHub 的 peak_rule 自由文本
+    #   （+ 一条 DeepSeek 规则串）写进 index.json，但技能侧从未读取（峰谷判定只认
+    #   pricing.deepseek_rules），且自由文本无法机器解析 → 删掉这半截链路，别让
+    #   "看起来支持各厂商峰谷" 的空字段误导后人。
     if os.path.exists(TOKENHUB):
         th = json.load(open(TOKENHUB, encoding='utf-8'))
-        peak_rules = th.get('peak_rule', [])
         for m in th.get('models', []):
             key = norm(m.get('api_name') or m.get('name'))
             if not key:
@@ -186,12 +188,7 @@ def main():
     injected = 0
     if os.path.exists(PRICING):
         p = json.load(open(PRICING, encoding='utf-8'))
-        # DeepSeek 峰谷时段规则并入顶层 peak_rules
-        ds = p.get('deepseek_rules') or {}
-        if ds:
-            dr = 'DeepSeek 原厂峰谷：北京时间 %s 价格×2；周末全天空闲' % ds.get('peak_schedule', '未知')
-            if dr not in peak_rules:
-                peak_rules.append(dr)
+        # v3.19.2（B4）：原先此处把 DeepSeek 峰谷规则串并入顶层 peak_rules，已随该字段一并删除
         for key, v in p.get('models', {}).items():
             if not v.get('lock'):
                 continue
@@ -303,7 +300,6 @@ def main():
         'currency': 'CNY',
         'conflict_resolved': conflicts,
         'authoritative_overrides': overlay,
-        'peak_rules': peak_rules,
         'models': merged,
     }
     # 原子写：先写临时文件再替换，保证读取方(技能)在刷新中途读到的要么是旧完整版要么是新完整版
@@ -312,8 +308,8 @@ def main():
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     os.replace(tmp, OUT)
-    print('合并完成：%d 个归一化模型，解决 %d 处来源冲突，%d 个被 pricing.json(lock) 权威覆盖（其中 %d 个为新注入的官方项），峰谷规则 %d 条'
-          % (len(merged), conflicts, overlay, injected, len(peak_rules)))
+    print('合并完成：%d 个归一化模型，解决 %d 处来源冲突，%d 个被 pricing.json(lock) 权威覆盖（其中 %d 个为新注入的官方项）'
+          % (len(merged), conflicts, overlay, injected))
     print('已写入 %s' % OUT)
     # 打印关键冲突 / 覆盖样例
     print('\n--- 官方 vs 转售 冲突（已采用官方 first_party）---')

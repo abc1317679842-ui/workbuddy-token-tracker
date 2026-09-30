@@ -256,6 +256,137 @@ else {
   fs.rmSync(hp, { force: true });
 }
 
+// ── T9：v3.19.2 新增回归（外部全量重审 B1–B10）─────────────────────────────
+{
+  const src = (f) => fs.readFileSync(path.join(SRC, f), 'utf-8');
+  const ttMod = require(path.join(skillDir, 'token-tracker.js'));
+
+  // B1：水位线口径必须是「物理完整行数」（'\n' 累计），不能是「可解析行数」
+  //   旧实现两者混用 → 空行/坏行使水位线偏小 → 下一轮从偏早偏移重读已计过的行 = 静默重复记账。
+  {
+    const d1 = path.join(tmp, 'b1');
+    fs.mkdirSync(d1, { recursive: true });
+    const fp = path.join(d1, 'a.jsonl');
+    const good = (i) => JSON.stringify({ type: 'assistant', timestamp: 1000 + i, providerData: { model: 'm1', messageId: 'k' + i, usage: { inputTokens: 10, outputTokens: 1 } } });
+    // 内容：good / 空行 / 坏 JSON / good / good（5 个物理行，4 个有效解析行）
+    const content = [good(1), '', '{broken', good(2), good(3)].join('\n') + '\n';
+    fs.writeFileSync(fp, content);
+    const phys = (content.match(/\n/g) || []).length;
+    const r1 = ttMod.readTranscLinesFrom(fp, 0);
+    ok('T9-B1a 水位线 = 物理换行数（空行/坏行不缩水）', r1.totalLines === phys && r1.rows.length === 3, `totalLines=${r1.totalLines} phys=${phys} rows=${r1.rows.length}`);
+    const r2 = ttMod.readTranscLinesFrom(fp, r1.totalLines);
+    ok('T9-B1b 从水位线续读不重复（同轮再来 0 行）', r2.rows.length === 0 && r2.totalLines === phys, `rows=${r2.rows.length}`);
+
+    // 半写尾行（无结尾 \n）不计入水位线
+    const fp2 = path.join(d1, 'b.jsonl');
+    fs.writeFileSync(fp2, good(1) + '\n' + '{"type":"assist'); // 尾行未写完
+    const r3 = ttMod.readTranscLinesFrom(fp2, 0);
+    ok('T9-B1c 半写尾行不计入水位线（补齐后才会被消费）', r3.totalLines === 1 && r3.rows.length === 1, `totalLines=${r3.totalLines} rows=${r3.rows.length}`);
+    fs.rmSync(d1, { recursive: true, force: true });
+  }
+
+  // B2：日志目录必须走探测出的数据根 WB（否则数据根迁到 ~/.workbuddy-ai 的用户第二信号源永久失效）
+  ok('T9-B2 日志目录走数据根（无写死 ~/.workbuddy/logs）',
+    !/path\.join\(os\.homedir\(\),\s*'\.workbuddy',\s*'logs'/.test(src('token-tracker.js'))
+    && /path\.join\(WB,\s*'logs',\s*todayStr\(\)\)/.test(src('token-tracker.js')));
+
+  // B3：主脚本内的峰谷/假日死副本必须删除（否则后人照它改 = 改了没用）
+  const mainSrc = src('token-tracker.js');
+  ok('T9-B3a 主脚本无 parsePeakSchedule 死副本', !/function parsePeakSchedule\s*\(/.test(mainSrc));
+  ok('T9-B3b 主脚本无 isChineseHolidayBeijing 死副本 + 未导出',
+    !/function isChineseHolidayBeijing\s*\(/.test(mainSrc) && typeof ttMod.parsePeakSchedule === 'undefined');
+
+  // B4：peak_rules 半截链路已删（自由文本，从未参与判定）
+  ok('T9-B4a mergeLocalPriceDb 不再写入 peak_rules', !/pricing\.peak_rules\s*=\s*db\.peak_rules/.test(mainSrc));
+  ok('T9-B4b build_index.py 不再产出顶层 peak_rules', !/'peak_rules'/.test(src('build_index.py')));
+
+  // B5：backfill 复用主模块（不再手抄镜像）
+  const bfSrc = src('backfill.js');
+  ok('T9-B5a backfill 无 mergeLocalDbMirror 镜像，改用 tt.mergeLocalPriceDb',
+    !/function mergeLocalDbMirror/.test(bfSrc) && /tt\.mergeLocalPriceDb\(/.test(bfSrc));
+  ok('T9-B5b backfill 复用 tt.findModel（不再自带实现）',
+    !/^function findModel\s*\(/m.test(bfSrc) && /const findModel = tt\.findModel/.test(bfSrc));
+  ok('T9-B5c backfill 水位线口径 = 物理换行数',
+    /physicalLines:\s*\(raw\.match\(\/\\n\/g\) \|\| \[\]\)\.length/.test(bfSrc));
+
+  // B6：aggregateTranscript 的 subModels 必须做行级时间过滤（旧行不得算进本轮）
+  {
+    const projDir = path.join(tmp, 'projects', 'b6');
+    const subDir = path.join(projDir, 'sess-b6', 'subagents');
+    fs.mkdirSync(subDir, { recursive: true });
+    const roundStart = Date.UTC(2026, 2, 4, 2, 0, 0);
+    const mk = (model, ts, id) => JSON.stringify({ type: 'assistant', timestamp: ts, providerData: { model, messageId: id, usage: { inputTokens: 100, outputTokens: 100 } } });
+    const subF = path.join(subDir, 'agent-x.jsonl');
+    fs.writeFileSync(subF, mk('hy3-old-model', roundStart - 3600000, 'o1') + '\n' + mk('hy3-new-model', roundStart + 1000, 'n1') + '\n');
+    fs.utimesSync(subF, new Date(), new Date()); // mtime=现在 → 文件属本轮（模拟"被唤醒复用"）
+    const mainF = path.join(projDir, 'sess-b6.jsonl');
+    fs.writeFileSync(mainF, mk('deepseek-v4.1-flash', roundStart + 500, 'm1') + '\n');
+    const agg = ttMod.aggregateTranscript(mainF, roundStart);
+    const sm = (agg && agg.subModels) || [];
+    ok('T9-B6 subModels 只含本轮跑过的子代理模型（旧行不外溢）',
+      sm.includes('hy3-new-model') && !sm.includes('hy3-old-model'), JSON.stringify(sm));
+    fs.rmSync(projDir, { recursive: true, force: true });
+  }
+
+  // B7：全部 agent-*.jsonl 正则必须带 i 标志
+  {
+    const bad = [];
+    for (const f of SYNTAX_FILES) {
+      const s = src(f);
+      const re = /\^agent-[^\n]*\\\.jsonl\$\/\./g; // 命中 `$/` 紧跟 `.`（= 无 i 标志）
+      let m;
+      while ((m = re.exec(s)) !== null) bad.push(`${f}`);
+    }
+    ok('T9-B7 agent-*.jsonl 正则全部带 i 标志（0 处缺）', bad.length === 0, bad.join(','));
+  }
+
+  // B8：峰谷按 token 发生时刻判定，不再按"脚本运行时刻"
+  {
+    const pricing8 = {
+      deepseek_rules: { peak_schedule: '9:00 - 12:00、14:00 - 18:00' },
+      models: { 'deepseek-v4.1-flash': { name: 'x', input_price: 1, output_price: 2, cached_price: 0.1 } },
+    };
+    const peakTs = Date.UTC(2026, 2, 4, 2, 0, 0);  // 北京 2026-03-04(周三) 10:00
+    const offTs = Date.UTC(2026, 2, 4, 12, 0, 0);  // 北京 20:00
+    const st = { model: 'deepseek-v4.1-flash', in: 1000000, cached: 0, out: 0 };
+    const cPeak = ttMod.calcCost(st, pricing8, peakTs);
+    const cOff = ttMod.calcCost(st, pricing8, offTs);
+    ok('T9-B8a calcCost 按显式 tsMs 判峰谷（峰=2×谷）', Math.abs(cPeak - 2 * cOff) < 1e-9 && cOff > 0, `peak=${cPeak} off=${cOff}`);
+    const cLast = ttMod.calcCost(Object.assign({ lastTs: peakTs }, st), pricing8);
+    const cLastOff = ttMod.calcCost(Object.assign({ lastTs: offTs }, st), pricing8);
+    ok('T9-B8b calcCost 回退 stat.lastTs 判峰谷', Math.abs(cLast - 2 * cLastOff) < 1e-9 && cLast > 0, `peak=${cLast} off=${cLastOff}`);
+
+    // 端到端：incrementalRecord 落账必须按"行时间戳"计价（旧实现按脚本运行时刻）
+    //   注意 T6 会把 skillDir/pricing.json 覆写成 2 模型假库且不还原 → 此处自建确定的价目表。
+    const pricing8b = {
+      deepseek_rules: { peak_schedule: '9:00 - 12:00、14:00 - 18:00' },
+      models: { 'deepseek-v4.1-flash': { name: 'tb', input_price: 1000, cached_price: 100, output_price: 2000, peak_multiplier: 2, region: 'CN' } },
+    };
+    fs.writeFileSync(path.join(skillDir, 'pricing.json'), JSON.stringify(pricing8b, null, 2));
+    const projDir8 = path.join(tmp, 'projects', 'b8');
+    fs.mkdirSync(projDir8, { recursive: true });
+    const tsPath8 = path.join(projDir8, 'sess-b8.jsonl');
+    fs.writeFileSync(tsPath8, JSON.stringify({
+      type: 'assistant', timestamp: peakTs,
+      providerData: { model: 'deepseek-v4.1-flash', messageId: 'b8m1', usage: { inputTokens: 1000000, outputTokens: 0 } },
+    }) + '\n');
+    try { fs.rmSync(path.join(skillDir, '.ledger-watermark.json'), { force: true }); } catch (e) { /* 干净起点 */ }
+    ttMod.incrementalRecord(tsPath8, 'sess-b8');
+    const ledPath = path.join(skillDir, 'daily-usage.json');
+    const led = (() => { try { return JSON.parse(fs.readFileSync(ledPath, 'utf-8').replace(/^\uFEFF/, '')); } catch (e) { return null; } })();
+    const tok8 = ttMod.todayStr();
+    const rec8 = led && led[tok8] && led[tok8].models && led[tok8].models['deepseek-v4.1-flash'];
+    const pk8 = ttMod.mergeLocalPriceDb(JSON.parse(JSON.stringify(pricing8b)));
+    const cPeak8 = ttMod.calcCost({ model: 'deepseek-v4.1-flash', in: 1000000, cached: 0, out: 0 }, pk8, peakTs);
+    const cOff8 = ttMod.calcCost({ model: 'deepseek-v4.1-flash', in: 1000000, cached: 0, out: 0 }, pk8, offTs);
+    ok('T9-B8c incrementalRecord 端到端：账本金额按行时间戳（高峰）计价',
+      Boolean(rec8) && cPeak8 > 0 && Math.abs(cPeak8 - 2 * cOff8) < 1e-9 && Math.abs(rec8.cost - cPeak8) < 1e-6,
+      `ledger=${rec8 && rec8.cost} expect=${cPeak8} off=${cOff8}`);
+    fs.rmSync(projDir8, { recursive: true, force: true });
+    try { fs.rmSync(path.join(skillDir, '.ledger-watermark.json'), { force: true }); } catch (e) { /* 清理 */ }
+  }
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log(`\n结果：${pass} 过 / ${fail} 败${skipped ? '（有跳过项：本环境禁止 node 子进程）' : ''}`);
 process.exit(fail ? 1 : 0);

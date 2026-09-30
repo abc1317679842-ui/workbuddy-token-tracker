@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.19.1 (2026-10-01)
+// token-usage-tracker v3.19.2 (2026-10-01)
 // v2.63：调试日志机制重构——废弃 TOKEN_TRACKER_DEBUG 环境变量开关 + poll 全量记录，改为「弹窗时自动记录」：
 //   每次 showToast 无条件向 ~/.workbuddy/token-tracker-toast.log 追加一行 JSON 诊断（原因/sessionId/行数/稳定计数/compaction 状态等）。
 // v2.62：compaction 检测由"行数减少>5"改为"扫描 transcript 末尾 30 行识别压缩标记（compactionMode 方案）"。
@@ -283,7 +283,10 @@ function resolveWorkspaceLogFile(cwd) {
   try {
     const ws = path.basename(String(cwd || '').replace(/[\\/]+$/, ''));
     if (!ws) return '';
-    const dir = path.join(os.homedir(), '.workbuddy', 'logs', todayStr());
+    // v3.19.2（B2）：改用探测出的数据根 WB，与 detectWorkBuddyRoot() 一致。
+    // 原写死 ~/.workbuddy → 数据根迁到 ~/.workbuddy-ai 的用户此处永久失效（第二信号源丢失），
+    // 且 WB_ROOT 隔离测试会误读真实 ~/.workbuddy/logs。
+    const dir = path.join(WB, 'logs', todayStr());
     if (!fs.existsSync(dir)) return '';
     let best = '', bestM = 0;
     for (const f of fs.readdirSync(dir)) {
@@ -904,8 +907,9 @@ function parseTranscChunk(chunk) {
 
 // v2.69 性能：只解析"水位线之后的新行"（incrementalRecord 专用，不改任何统计口径）。
 // 背景：原实现每次 Stop 都 readTranscLines 全量 JSON.parse（实测 100MB/15476 行：399ms + 295MB 峰值）。
-// 等价性依据（实测 44 个 transcript，最大 100MB/15476 行）：文件总以 '\n' 结尾、无空行、无可解析失败行，
-// 因此"已解析行数" ≡ "原始行号"，定位第 fromLine 行后取后缀，与"解析后按下标 slice"完全等价。
+// v3.19.2（B1）：旧注释的等价性依据（"文件总以 '\n' 结尾、无空行、无可解析失败行，故已解析行数 ≡ 原始行号"）
+//   是**从未被强制的假设**——compaction 重写残留、进程被杀留下的残行都会打破它，
+//   而一旦打破就是静默多记账。现已把水位线口径直接改成"完整行数"，不再依赖该假设。
 //
 // 用字节缓冲而非字符串（实测，100MB/15476 行、水位线 15466）：
 //   readFileSync(utf-8) 全量解码 = 233.8ms ← 真正的瓶颈；indexOf 定位仅 3.8ms；解析 10 行仅 3.4ms
@@ -916,27 +920,37 @@ function parseTranscChunk(chunk) {
 // 因此在换行边界按字节切分永远落在合法 UTF-8 边界上，解码结果与整串解码再取后缀逐字符相同。
 //
 // 返回 { rows, totalLines }：
-//   rows       —— 第 fromLine 行（含，行号从 0 开始）之后解析成功的行，即 slice(fromLine) 的等价物
-//   totalLines —— fromLine + rows.length；行数只按"解析成功"推进，半写行不会被越过，下一轮仍会补记
-//                 （与旧实现 mainRows.length 同口径；读文件失败时返回 0，交由 Math.max 保护水位线）
+//   rows       —— 水位线之后、**完整行**中解析成功的行
+//   totalLines —— 已消费的**完整行数**（文件内 '\n' 的累计个数），水位线口径
+//
+// v3.19.2（B1 修复）：水位线口径由"解析成功行数"改为"物理完整行数"。
+//   旧实现拿「解析成功行数」当水位线，却用「换行符个数」做字节偏移定位——两者只在"每行都能解析"时相等。
+//   文件中间一旦出现空行或永久坏行（compaction 重写残留 / 进程被杀留下的残行 / 双写竞争），
+//   水位线就比真实偏移少 k → 下一轮从第 N-k 个换行符处开始读，而第 N-k…N-1 行**上一轮已经记过账**，
+//   于是被再读一遍、再记一遍：静默多记（无 stderr、无告警），实测多记 1 行。
+//   现改为：水位线 = 以 '\n' 结尾的完整行累计数，与定位口径严格一致——空行、坏行都照样计入，
+//   不再产生重读窗口。尾部没有 '\n' 的半写行不计入水位线（等写完下一轮再读），
+//   因此不存在"半写行被提前记账、写完后又记一次"的双记路径。
+//   读文件失败时返回 fromLine（水位线不倒退，交由 Math.max 保护）。
 function readTranscLinesFrom(tsPath, fromLine) {
   let buf;
-  try { buf = fs.readFileSync(tsPath); } catch (e) { return { rows: [], totalLines: 0 }; }
   const start = fromLine > 0 ? fromLine : 0;
-  if (start === 0) {
-    // 水位线为 0（首次记账）→ 全量解析，行为与 readTranscLines 一致
-    const rows = parseTranscChunk(buf.toString('utf-8'));
-    return { rows, totalLines: rows.length };
-  }
-  // 定位到第 start 行的起始位置：跳过 start 个 '\n'（0x0A）
+  try { buf = fs.readFileSync(tsPath); } catch (e) { return { rows: [], totalLines: start }; }
+  // 定位到第 start 个完整行之后：跳过 start 个 '\n'（0x0A）
   let off = 0;
   for (let i = 0; i < start; i++) {
     const nl = buf.indexOf(0x0a, off);
-    if (nl === -1) { off = buf.length; break; } // 文件被截断（行数 < 水位线）→ 无新行，水位线不前进
+    if (nl === -1) return { rows: [], totalLines: start }; // 文件被截断（完整行数 < 水位线）→ 不推进
     off = nl + 1;
   }
-  const rows = parseTranscChunk(buf.toString('utf-8', off));
-  return { rows, totalLines: start + rows.length };
+  // 只解析完整行：最后一个 '\n' 之后是半写行，留给下一轮
+  const lastNl = buf.lastIndexOf(0x0a);
+  if (lastNl < off) return { rows: [], totalLines: start };
+  // 统计本轮新增的完整行数（[off, lastNl] 内的 '\n' 个数）
+  let added = 0;
+  for (let p = buf.indexOf(0x0a, off); p !== -1 && p <= lastNl; p = buf.indexOf(0x0a, p + 1)) added++;
+  const rows = parseTranscChunk(buf.toString('utf-8', off, lastNl + 1));
+  return { rows, totalLines: start + added };
 }
 
 // 聚合 transcript 中 timestamp > fromTs 的全部调用（按 messageId/conversationRequestId 去重）
@@ -994,7 +1008,8 @@ function aggregateTranscLines(rows, fromTs) {
 //     新行是全文的后缀，能找到即说明"最近一次 usage"就在水位线之后，与全量扫描同解）
 //   新行内回溯找不到 usage    → 说明基数在历史行里 → 回退全量解析，用旧口径 (fullRows, watermark) 估算
 // 只有第二种情况才多付一次全量解析，且这种情况极罕见（见 verify-v269 的回退率统计）。
-function estimateInterruptedInc(tsPath, rows, watermark) {
+// v3.19.2（B1）：去掉 watermark 参数——它并入水位线体系后已无用途，且语义已与调用方脱节。
+function estimateInterruptedInc(tsPath, rows) {
   if (!rows || !rows.length) return {};
   let needHistory = false;
   for (let i = 0; i < rows.length && !needHistory; i++) {
@@ -1010,7 +1025,12 @@ function estimateInterruptedInc(tsPath, rows, watermark) {
     }
     if (!found) needHistory = true;
   }
-  return needHistory ? estimateInterrupted(readTranscLines(tsPath), watermark) : estimateInterrupted(rows, 0);
+  if (!needHistory) return estimateInterrupted(rows, 0);
+  // v3.19.2（B1）：回退全量时，本轮新增行就是全量解析成功行的**尾部**（readTranscLines 与
+  // parseTranscChunk 用同一套逐行解析规则，同样的行→同样的结果），起点由长度相减得出。
+  // 旧实现把 watermark 当索引用，而 watermark 已改为"完整行数"口径，与"解析成功行数"不同量纲 → 会错位。
+  const full = readTranscLines(tsPath);
+  return estimateInterrupted(full, Math.max(0, full.length - rows.length));
 }
 
 // 子代理 transcript 目录：主 transcript 同级 <session名>/subagents/（session 名 = 主文件去扩展名）
@@ -1108,6 +1128,11 @@ function perModelFromRows(rows, fromTs) {
 // 估算方法：输入=同会话最近一次完整落盘的 input/cached（上下文连续，误差 <5%）；输出=reasoning
 // 文本长度（中文 1字≈1.5 token，英文 4字符≈1 token）。只认 reasoning 行为被中断调用的起点（一个
 // 被中断调用只有一次 reasoning），用 conversationRequestId 天然去重（每个 cid 唯一）。
+// fullRows：全量解析后的行数组；newStart：**数组下标**（从第几个解析行开始扫）；
+// fromTs：**epoch 毫秒时间戳**（可选，仅弹窗路径传"本轮开始时刻"做行级过滤）。
+// v3.19.2（B9）：此前 estimateInterruptedInc 把「行数水位线」（如 15234）当 fromTs 传进来，
+//   与 ~1.7e12 的毫秒时间戳比较恒为真 → 该过滤器形同空转（当前无害，但语义是错的）。
+//   B1 修复后该调用点已不再传第三参，此处显式声明量纲，禁止再拿行数当时间戳。
 function estimateInterrupted(fullRows, newStart, fromTs) {
   const byModel = {};
   for (let i = newStart; i < fullRows.length; i++) {
@@ -1145,7 +1170,8 @@ function aggregatePerModel(tsPath, roundStartMs) {
   if (fs.existsSync(subDir)) {
     try {
       for (const f of fs.readdirSync(subDir)) {
-        if (!/^agent-.*\.jsonl$/.test(f)) continue;
+        // v3.19.2（B7）：补 i 标志，与其余 8 处 agent-*.jsonl 正则统一（大小写不敏感）
+        if (!/^agent-.*\.jsonl$/i.test(f)) continue;
         const fp = path.join(subDir, f);
         try { if (fs.statSync(fp).mtimeMs <= roundStartMs) continue; } catch (e) { continue; } // 本轮之前创建的排除
         const sub = perModelFromRows(readTranscLines(fp), 0); // 子代理文件本身只属于本次专家团
@@ -1189,7 +1215,7 @@ function aggregateTranscript(tsPath, roundStartMs) {
   if (fs.existsSync(subDir)) {
     try {
       for (const f of fs.readdirSync(subDir)) {
-        if (!/^agent-.*\.jsonl$/.test(f)) continue;
+        if (!/^agent-.*\.jsonl$/i.test(f)) continue;
         const fp = path.join(subDir, f);
         let mt = 0;
         try { mt = fs.statSync(fp).mtimeMs; } catch (e) { continue; }
@@ -1212,7 +1238,10 @@ function aggregateTranscript(tsPath, roundStartMs) {
   //   因此新增 modelMain（主转录主导模型）与 subModels（子代理模型，按 token 降序去重）专供弹窗显示。
   const subModels = (() => {
     try {
-      const m = perModelFromRows(subRows, 0);
+      // v3.19.2（B6）：行级时间过滤与 aggregateTranscLines(subRows, roundStartMs) 对齐。
+      //   原先传 0（不过滤）→ 子代理文件被唤醒复用时，旧轮的行会被算进本轮，
+      //   toast 第一行「（子代理 XXX）」可能标到一个本轮根本没跑的模型（仅影响显示，token/账本无关）。
+      const m = perModelFromRows(subRows, roundStartMs);
       return Object.entries(m)
         .filter(([n, b]) => n && b && b.total > 0)
         .sort((a, b) => b[1].total - a[1].total)
@@ -1232,7 +1261,11 @@ function aggregateTranscript(tsPath, roundStartMs) {
     teamActive: hasTeamActivity(tsPath, roundStartMs),
   };
   res.total = res.in + res.out;
-  const firstTs = Math.min(...[main && main.firstTs, sub && sub.firstTs].filter(Boolean));
+  // v3.19.2（B10）：显式处理"两个 firstTs 都为空"——原 Math.min(...[]) = Infinity，
+  //   durMs = Math.max(0, lastTs - Infinity) = 0。当前不可达（上方已保证 main/sub 至少一个非空
+  //   且 firstTs 恒为真实 epoch ms），属防御性写法，结果与旧行为一致但不再依赖 Infinity 传播。
+  const firstCands = [main && main.firstTs, sub && sub.firstTs].filter(Boolean);
+  const firstTs = firstCands.length ? Math.min(...firstCands) : 0;
   const lastTs = Math.max(main ? main.lastTs : 0, sub ? sub.lastTs : 0);
   res.durMs = Math.max(0, lastTs - (firstTs || lastTs));
   return res;
@@ -1294,7 +1327,7 @@ function hasNewTranscSince(tsPath, roundStartMs, sinceMs) {
   if (fs.existsSync(subDir)) {
     try {
       for (const f of fs.readdirSync(subDir)) {
-        if (!/^agent-.*\.jsonl$/.test(f)) continue;
+        if (!/^agent-.*\.jsonl$/i.test(f)) continue;
         try { if (fs.statSync(path.join(subDir, f)).mtimeMs > sinceMs) return true; } catch (e) { /* 忽略 */ }
       }
     } catch (e) { /* 忽略 */ }
@@ -1949,13 +1982,18 @@ function mergeLocalPriceDb(pricing) {
     else { pricing.models[k] = rec; byAlnum[ak] = k; }
     mergedCount++;
   }
-  if (Array.isArray(db.peak_rules) && db.peak_rules.length) pricing.peak_rules = db.peak_rules;
+  // v3.19.2（B4）：不再合并 index.json 的顶层 peak_rules。
+  //   该字段是 TokenHub 原文的**自由文本**（如「自2026-08-29起：工作日执行峰谷…」），
+  //   不是机器可读的分厂商时段表；calcCost / isPeakHour / isPeakAt 全程只认
+  //   pricing.deepseek_rules —— 合并进内存却从不读取，属"数据链路通了一半"的静默缺口：
+  //   看着像支持各厂商峰谷，实则非 DeepSeek 厂商一律按 1× 计价。
+  //   接上不可行（自由文本无从解析）→ 按"别悬着"原则删掉这半截（build_index.py 同步停止生成）。
   pricing.local_db = { built_at: db.built_at || null, models: mergedCount };
   return pricing;
 }
 
 // 写盘前剥离本地官方库合并条目 + 峰谷规则（它们由 index.json 每日重建，不入 pricing.json，
-// 避免与聚合源复检互相覆盖/膨胀；peak_rules 仅本地库持有）
+// 避免与聚合源复检互相覆盖/膨胀）
 function stripLocalDbEntries(pricing) {
   let out;
   try { out = JSON.parse(JSON.stringify(pricing)); } catch (e) { return pricing; }
@@ -1966,6 +2004,8 @@ function stripLocalDbEntries(pricing) {
     }
   }
   delete out.local_db;
+  // v3.19.2（B4）：防御性保留——现版本已不再读取 peak_rules，但磁盘上可能仍是旧版 index.json
+  //   合并过、或由其它写入方带进来的字段，一并剥离，避免污染 pricing.json。
   delete out.peak_rules;
   delete out._lookedup_models; // v3.18.1（N6）：已查列表已迁至 .lookedup-models.json，防御性剥离旧字段
   return out;
@@ -2421,44 +2461,16 @@ function cleanModelName(name) {
   return n;
 }
 
-// 高峰时段（北京时间，本地时区即北京）：9:00-12:00、14:00-18:00，价格翻倍
-// 峰谷时段判定（北京时间，v2.59 适配 2026-08-23 DeepSeek 新规：周末全天统一空闲价）
-// 时段来源（v2.59 通用跟随）：优先读 pricing.deepseek_rules（refresh 每日从官方页解析写入）——
-//   peak_schedule：官方高峰时段原文，如 "9:00 - 12:00、14:00 - 18:00"，官方调整时段则本地自动跟随；
-//   weekend_off_peak：官方是否声明"周末统一低谷"，官方取消/改规则则自动跟随；
-//   无 rules（抓取失败/旧数据）→ 回退内置默认（9-12/14-18 + 周末低峰）。
-// 返回布尔：当前时刻是否处于高峰时段。
-function parsePeakSchedule(sched) {
-  // 支持 "9:00 - 12:00、14:00 - 18:00" / "9:00-12:00,14:00-18:00" 等
-  const ranges = [];
-  const parts = String(sched || '').split(/[、,，;；]/).map((s) => s.trim()).filter(Boolean);
-  for (const p of parts) {
-    const m = p.match(/(\d{1,2}):?(\d{2})?\s*[-–—~至到]\s*(\d{1,2}):?(\d{2})?/);
-    if (!m) continue;
-    const sH = Number(m[1]), eH = Number(m[3]);
-    if (isNaN(sH) || isNaN(eH)) continue;
-    ranges.push({ s: sH, e: eH });
-  }
-  return ranges;
-}
-// v3.15（2026-09-28）：中国法定假日表（holidays.json，由 refresh-holidays.js 双源交叉验证生成）
-//   官方口径（api-docs.deepseek.com/quick_start/pricing）：峰时段「不含中国法定假日」→
-//   假日的 9:00-12:00 / 14:00-18:00（北京）同样算低峰。此前只判周末、不判假日 → 假日的工作日被多算一倍（高估）。
-//   ⚠️ 数据缺失/解析失败 → 降级为"不判假"（= 原行为），绝不抛错。
+// 峰谷时段判定（北京时间）。口径单一实现见 peak-rules.js（v3.19.0 P1）：
+//   peak_schedule / weekend_off_peak 读自 pricing.deepseek_rules（refresh 每日解析官方页写入），
+//   叠加 holidays.json 法定假日全天低峰（官方口径「峰时段不含法定假日」）。
+//   官方改时段 / 取消周末低峰时本地自动跟随；无 rules（抓取失败/旧数据）→ peak-rules.js 内部回退内置默认
+//   （9-12 / 14-18 + 周末低峰）。
+// v3.19.2（B3）：删除本文件内 parsePeakSchedule / isChineseHolidayBeijing 两份「零调用死副本」。
+//   它们与 peak-rules.js 重复，且 parsePeakSchedule 仍丢分钟（v3.19.1 已在模块修掉的 N4 旧 bug），
+//   isChineseHolidayBeijing 又用本地时区 getFullYear()（与模块的 tsMs+8h 口径不一致）——只留在 exports 里
+//   误导后人「照这里改」。现仅保留 HOLIDAYS_FILE 供 isPeakHour 使用；假日与时段判定全部走 peak-rules.js。
 const HOLIDAYS_FILE = path.join(WB, 'skills', 'token-usage-tracker', 'holidays.json');
-let _holidaysCache = null;
-function isChineseHolidayBeijing(bjDate) {
-  try {
-    if (_holidaysCache === null) {
-      try { _holidaysCache = JSON.parse(fs.readFileSync(HOLIDAYS_FILE, 'utf-8')); }
-      catch (e) { _holidaysCache = { years: {} }; }
-    }
-    const y = bjDate.getFullYear();
-    const key = `${y}-${String(bjDate.getMonth() + 1).padStart(2, '0')}-${String(bjDate.getDate()).padStart(2, '0')}`;
-    const arr = (_holidaysCache.years || {})[String(y)] || [];
-    return arr.indexOf(key) >= 0;
-  } catch (e) { return false; }
-}
 
 function isPeakHour(rules, now) {
   const t = now || new Date();
@@ -2468,7 +2480,7 @@ function isPeakHour(rules, now) {
 }
 
 // cost = 未命中输入×输入价 + 命中输入×缓存价 + 输出×输出价（元），按当前时段取倍率
-function calcCost(stat, pricing) {
+function calcCost(stat, pricing, tsMs) {
   if (!pricing || !stat) return null;
   const modelName = String(stat.model || '').trim();
   // v2.82.2：模型名缺失（空串 / unknown）不记价——「不知道模型名字还记价个毛」。
@@ -2484,7 +2496,17 @@ function calcCost(stat, pricing) {
   const isDeepSeek = /(^|[\/\-_])deepseek/i.test(String(stat.model || ''));
   const peakMult = isDeepSeek ? (typeof m.peak_multiplier === 'number' ? m.peak_multiplier : 2) : (typeof m.peak_multiplier === 'number' ? m.peak_multiplier : 1);
   // 时段判定跟随官方 deepseek_rules（通用：官方调时段/周末规则自动生效）
-  const mult = isPeakHour(pricing.deepseek_rules) ? peakMult : 1;
+  // v3.19.2（B8）：峰谷必须按 **token 实际发生时刻** 判，而不是「脚本运行时刻」。
+  //   原实现 isPeakHour() 内部取 new Date() → Stop/hook 若在跨时段边界（12:00 / 18:00）之后才跑，
+  //   整轮会按**终点**那一档计价，而 backfill.js / recalc-day.js 是按每行 ts 逐条判定 →
+  //   同一批数据两条路径金额不同（P1「口径分裂」的残留形态，只是触发条件收窄到跨边界轮）。
+  //   时刻来源优先级：显式 tsMs（incrementalRecord 传入的本批新行最大 ts）
+  //     > stat.lastTs（aggregateTranscLines 产出的本轮最后一个 usage 行 ts，epoch ms）
+  //     > 不传（stat 无时间信息）→ 退回「当下时刻」，与旧行为一致。
+  const effTs = (typeof tsMs === 'number' && tsMs > 0)
+    ? tsMs
+    : (Number(stat && stat.lastTs) > 0 ? Number(stat.lastTs) : 0);
+  const mult = isPeakHour(pricing.deepseek_rules, effTs > 0 ? new Date(effTs) : undefined) ? peakMult : 1;
   // v2.99（测试发现的防御性加固）：cached / out 补非负钳制。
   //   原实现 in 侧已有 Math.max(0,...)，但 cached 与 out 仅用 (v || 0)——负数会直接参与计算：
   //   · 负 out → 总价变负，污染当日账本合计；
@@ -2592,9 +2614,10 @@ function saveDailyUsage(d) {
   withFileLock(DAILY_USAGE_FILE + '.lock', () => saveDailyUsageRaw(d), { ttl: 300000, retries: 50 });
 }
 // 把一条 stat（单模型）累加进某天的 models，并重算该日 total（保证总合计永远=各模型之和）
-function addModelUsage(day, model, stat, pricing) {
+// tsMs（v3.19.2/B8）：本批 token 的发生时刻，透传给 calcCost 做峰谷判定；缺省回退 stat.lastTs / 当下
+function addModelUsage(day, model, stat, pricing, tsMs) {
   const name = String(model || '').trim() || 'unknown';
-  const cost = calcCost(Object.assign({ model: name }, stat), pricing);
+  const cost = calcCost(Object.assign({ model: name }, stat), pricing, tsMs);
   const m = day.models[name] || (day.models[name] = { in: 0, out: 0, cached: 0, total: 0, cost: 0 });
   m.in += stat.in || 0; m.out += stat.out || 0; m.cached += stat.cached || 0; m.total += stat.total || 0;
   m.hit = hitRate(m.in, m.cached);
@@ -2606,7 +2629,7 @@ function addModelUsage(day, model, stat, pricing) {
 // v2.68 修复1：返回 true/false 表示本轮用量是否真的落盘。调用方（incrementalRecord）必须据此
 // 决定是否推进水位线——记账失败却推进水位线 = 这部分用量永久丢失。
 // 返回 false 的三种情形：账本此前损坏 / 锁获取失败 / 无用量可记；写盘失败也返回 false。
-function recordUsage(stat, pricing, byModel) {
+function recordUsage(stat, pricing, byModel, tsMs) {
   // v3.06（审查结论·**刻意保持当前顺序，不要"修正"它**）：
   //   表面看这个守卫像是"死代码"——`gDailyCorrupt` 初始为 false，而真正置位它的 `loadDailyUsage()`
   //   在下面（锁内）才执行，于是首次遇损坏时本守卫不会命中。
@@ -2626,9 +2649,9 @@ function recordUsage(stat, pricing, byModel) {
     const date = todayStr();
     const day = d[date] || (d[date] = { models: {}, total: { in: 0, out: 0, cached: 0, total: 0, cost: 0 } });
     if (byModel && Object.keys(byModel).length) {
-      for (const [name, b] of Object.entries(byModel)) addModelUsage(day, name, b, pricing);
+      for (const [name, b] of Object.entries(byModel)) addModelUsage(day, name, b, pricing, tsMs);
     } else if (stat && ((stat.in || 0) + (stat.out || 0)) > 0) {
-      addModelUsage(day, stat.model || 'unknown', stat, pricing);
+      addModelUsage(day, stat.model || 'unknown', stat, pricing, tsMs);
     } else {
       return false; // 无用量可记：不算失败也不算成功（调用方无需推进水位线，因为没记任何东西）
     }
@@ -2721,6 +2744,11 @@ function incrementalRecord(tsPath, sid) {
       t.in += b.in; t.out += b.out; t.cached += b.cached; t.total += b.total;
     }
   };
+  // v3.19.2（B8）：本批新行的最大 timestamp —— 用作峰谷判定时刻，避免"脚本运行时刻"计价
+  let peakTs = 0;
+  const bumpTs = (rows) => {
+    for (const r of rows) { const t = Number(r && r.timestamp); if (Number.isFinite(t) && t > peakTs) peakTs = t; }
+  };
   // 1. 主 transcript 新行（行数水位线，单调递增，slice 可靠）
   // v2.68 修复1：先算出"候选新水位线"，记账成功后再落；失败则保持旧值，下轮重扫重记。
   // v2.68 修复2：候选值取 Math.max —— transcript 可能被截断（Context Compaction 覆盖重写、
@@ -2731,8 +2759,9 @@ function incrementalRecord(tsPath, sid) {
   const { rows: mainRows, totalLines } = readTranscLinesFrom(tsPath, entry.main || 0);
   const nextMain = Math.max(entry.main || 0, totalLines);
   if (totalLines > entry.main) {
+    bumpTs(mainRows);
     merge(perModelFromRows(mainRows, 0));
-    merge(estimateInterruptedInc(tsPath, mainRows, entry.main || 0)); // v2.52：中断补偿
+    merge(estimateInterruptedInc(tsPath, mainRows)); // v2.52：中断补偿
   }
   // 2. 各子代理文件新行
   const nextSubs = {};
@@ -2746,8 +2775,9 @@ function incrementalRecord(tsPath, sid) {
         const start = entry.subs[f] || 0;
         const { rows: subRows, totalLines: subTotal } = readTranscLinesFrom(fp, start);
         if (subTotal > start) {
+          bumpTs(subRows);
           merge(perModelFromRows(subRows, 0));
-          merge(estimateInterruptedInc(fp, subRows, start)); // v2.53：子代理被中断思考也估算
+          merge(estimateInterruptedInc(fp, subRows)); // v2.53：子代理被中断思考也估算
         }
         // 修复2：子代理水位线同样只许前进（子代理 transcript 也会被 compaction 截断重写）
         nextSubs[f] = Math.max(entry.subs[f] || 0, subTotal);
@@ -2757,7 +2787,7 @@ function incrementalRecord(tsPath, sid) {
   // 3. 累加进账本（loadDailyUsage + addModelUsage + saveDailyUsage）
   //    无用量的轮次视为成功（无需落盘，推进水位线无害）；有用量时必须确认真的写进去了。
   let recorded = true;
-  if (Object.keys(byModel).length) recorded = recordUsage({}, loadPricing(), byModel);
+  if (Object.keys(byModel).length) recorded = recordUsage({}, loadPricing(), byModel, peakTs || undefined);
   if (!recorded) {
     // 记账失败（账本损坏 / 锁获取失败 / 写盘失败）→ 绝不推进水位线，
     // 否则这些用量再也不会被补记 = 永久丢失。保持旧水位线，下轮重新记账。
@@ -4698,7 +4728,7 @@ module.exports = {
   todayStr, loadDailyUsage, saveDailyUsage, recordUsage, dayTotalOf, hitRate,
   calcCost, findModel, isLocalModel, fmtCost, cleanModelName,
   readTranscLines, parseTranscChunk, readTranscLinesFrom, extractUsage, perModelFromRows, aggregatePerModel,
-  aggregateMainOnly, aggregateSubsOnly,
+  aggregateMainOnly, aggregateSubsOnly, aggregateTranscript,
   todayDisplay, reportTxt, reportSummaryTxt, normalizeDailyUsage,
   mainModelState, lastTranscLine, coalescePath, hasActiveSubagentsSince, subagentsDirFromTranscript, subagentPending, subagentsAllStagnant, interruptedByUser, hasSubagentsRecentlyActive,
   interruptedRowsAfter,
@@ -4712,7 +4742,7 @@ module.exports = {
   // v3.18.4（G2/G3）：护栏与抢救函数导出，selftest 可直接单测（不再只能靠 spawn，受限环境也能验）
   guardRebuildScale, salvageModelsFromText, dbStaleTag,
   // v3.19.0（P6）：本地官方价库合并导出——recalc-day.js 复用它，避免"只读主库漏掉本地库"
-  mergeLocalPriceDb, isPeakHour, parsePeakSchedule,
+  mergeLocalPriceDb, isPeakHour,
   // v3.19.1（N1）：时段告警标签导出，selftest 直接单测（无法解析时 toast 必须可见）
   peakRuleTag,
   // v3.19.1（N2）：watcher 单轮读取导出，selftest 验证"未变化跳过 IO"与增量等价性
