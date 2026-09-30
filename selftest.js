@@ -55,6 +55,11 @@ const env = Object.assign({}, process.env, {
 });
 const HOOK_PAYLOAD = JSON.stringify({ session_id: 'selftest', prompt: 't' });
 
+// v3.21.0：预置版本检查状态（7 天闸门闭合 + 已知最新版 0.0.0）→ 让后续 --hook 冒烟
+// 不会因为「首次运行」而真的去联网查 GitHub，保持"离线自测"的承诺；T12 段会按需改写它。
+fs.writeFileSync(path.join(skillDir, '.update-check.json'),
+  JSON.stringify({ lastCheckAt: Date.now(), latestVersion: '0.0.0', failCount: 0, nextRetryAt: 0 }));
+
 // ── T1：--hook 正常路径 → exit 0 ───────────────────────────────────────────
 if (!SPAWN_OK) skip('T1 --hook exit 0');
 else {
@@ -652,6 +657,106 @@ else {
   })());
   ok('T11-k4 recordUsage 的 meta 为可选参数（不传 = 旧行为，8 个调用点零改动）',
     /function recordUsage\(stat, pricing, byModel, tsMs, meta\)/.test(mainSrc));
+}
+
+// ── T12（v3.21.0）：版本更新提示（版本比较 / 闸门 / 节流 / 退避 / 仅 hook 挂载） ────
+// 全部离线：把 `.update-check.json` 预置成「闸门闭合」状态，updateNotice 就不会发网络请求。
+{
+  const src = (f) => fs.readFileSync(path.join(SRC, f), 'utf-8');
+  const ttMod = require(path.join(skillDir, 'token-tracker.js'));
+  const mainSrc = src('token-tracker.js');
+  const UF = path.join(skillDir, '.update-check.json');
+  const put = (o) => fs.writeFileSync(UF, JSON.stringify(o));
+  const day = 24 * 3600 * 1000;
+  const now = Date.now();
+
+  // a：新增函数/常量已导出
+  const ex12 = ['updateNotice', 'cmpVersion', 'loadUpdateState', 'saveUpdateState', 'queryLatestTag'];
+  ok('T12-a 版本检查函数已全部导出',
+    ex12.every((n) => typeof ttMod[n] === 'function') && typeof ttMod.SKILL_VERSION === 'string',
+    ex12.filter((n) => typeof ttMod[n] !== 'function').join(','));
+
+  // b：版本号**数值**比较（直接字符串比较会把 '3.9.0' > '3.10.0' 判成 true）
+  const cv = ttMod.cmpVersion;
+  ok('T12-b1 ★3.9.0 < 3.10.0（数值比较，字符串比较会判错）', cv('3.9.0', '3.10.0') === -1, cv('3.9.0', '3.10.0'));
+  ok('T12-b2 v3.21.0 > 3.20.0（带 v 前缀同样正确）', cv('v3.21.0', '3.20.0') === 1);
+  ok('T12-b3 3.21 == 3.21.0（缺段按 0 补）', cv('3.21', '3.21.0') === 0);
+  ok('T12-b4 ★非版本形状的 tag（release-2026 / junk / 空）一律返回 0，绝不误报「有新版」',
+    cv('release-2026', '3.21.0') === 0 && cv('junk', '3.21.0') === 0 && cv('', '3.21.0') === 0);
+  ok('T12-b5 相等返回 0 / 缺段按 0 补（3.21.0 与 3.21.0.0 等价）',
+    cv('3.21.0', '3.21.0') === 0 && cv('3.21.0.0', '3.21.0') === 0);
+
+  // c：闸门闭合 + 远端更高 → 返回提示（离线：lastCheckAt=now 关掉 7 天检查）
+  put({ lastCheckAt: now, latestVersion: '9.9.9', failCount: 0, nextRetryAt: 0 });
+  const n1 = ttMod.updateNotice();
+  ok('T12-c1 ★远端更高时返回一行提示（闸门闭合 → 零联网）',
+    typeof n1 === 'string' && n1.indexOf('v9.9.9') >= 0, JSON.stringify(n1));
+  ok('T12-c2 提示文案极短（≤ 45 字符）且不含金额/链接/升级步骤',
+    n1.length > 0 && n1.length <= 45 && !/¥|http|git |覆盖|备份/.test(n1), `len=${n1.length} ${n1}`);
+
+  // d：节流 —— 同版本 24h 内第二次静默
+  ok('T12-d1 同版本 24h 内第二次不重复提示', ttMod.updateNotice() === '');
+  const st1 = ttMod.loadUpdateState();
+  ok('T12-d2 提示计数已落盘（notifiedVersion + notifyCount）',
+    st1.notifiedVersion === '9.9.9' && st1.notifyCount === 1, JSON.stringify(st1));
+  put(Object.assign({}, st1, { notifyCount: ttMod.UPDATE_MAX_NOTIFY }));
+  ok('T12-d3 达到提示上限后彻底静默', ttMod.updateNotice() === '');
+
+  // e：本地已是最新 / 远端更旧 → 静默
+  put({ lastCheckAt: now, latestVersion: ttMod.SKILL_VERSION });
+  ok('T12-e1 远端 == 本地 → 静默', ttMod.updateNotice() === '');
+  put({ lastCheckAt: now, latestVersion: '3.9.0' });
+  ok('T12-e2 远端低于本地（3.9.0 < 3.21.0）→ 静默', ttMod.updateNotice() === '');
+
+  // f：退避未到 → 静默且不联网（nextRetryAt 在未来）
+  put({ failCount: 1, nextRetryAt: now + 3600000 });
+  ok('T12-f 退避未到（nextRetryAt 在未来）→ 静默且不发起检查', ttMod.updateNotice() === '');
+
+  // g：状态文件损坏/缺失容错
+  fs.writeFileSync(UF, '{broken json');
+  ok('T12-g1 状态文件损坏 → 返回空状态不抛错', JSON.stringify(ttMod.loadUpdateState()) === '{}');
+  fs.rmSync(UF, { force: true });
+  ok('T12-g2 状态文件缺失 → 返回空状态不抛错', JSON.stringify(ttMod.loadUpdateState()) === '{}');
+
+  // h：源码级守卫 —— 挂载点必须在 asHook 上，且 --stop 路径不碰它
+  ok('T12-h1 ★挂载点只对 asHook 生效（withUpdate 内 `if (!asHook) return msg;`）',
+    /const withUpdate = \(msg\) => \{\s*if \(!asHook\) return msg;/.test(mainSrc));
+  ok('T12-h2 updateNotice 仅被 withUpdate 调用一处（未散落在 --stop / 弹窗路径）',
+    (mainSrc.match(/updateNotice\(\)/g) || []).length === 1);
+  ok('T12-h3 联网仍受总开关约束（ENABLE_NETWORK && ENABLE_UPDATE_CHECK）',
+    /if \(!\(ENABLE_NETWORK && ENABLE_UPDATE_CHECK\)\) return ''/.test(mainSrc));
+  ok('T12-h4 .gitignore 已排除 .update-check.json', /^\.update-check\.json$/m.test(src('.gitignore')));
+
+  // i：版本号四处一致（防漂移：源码常量 / manifest / README 徽章 / CHANGELOG 顶部条目）
+  const v = ttMod.SKILL_VERSION;
+  ok('T12-i1 SKILL_VERSION 与 manifest.yaml 一致',
+    new RegExp(`^version:\\s*${v.replace(/\./g, '\\.')}\\s*$`, 'm').test(src('manifest.yaml')));
+  ok('T12-i2 SKILL_VERSION 与 README 徽章一致',
+    src('README.md').indexOf(`badge/version-v${v}-blue`) >= 0);
+  ok('T12-i3 SKILL_VERSION 与 CHANGELOG 顶部条目一致',
+    new RegExp(`^## v${v.replace(/\./g, '\\.')}（`, 'm').test(src('CHANGELOG.md')));
+  ok('T12-i4 SKILL_VERSION 与主脚本头注释一致',
+    new RegExp(`^// token-usage-tracker v${v.replace(/\./g, '\\.')} `, 'm').test(mainSrc));
+
+  // j：端到端（spawn）—— 预置「有新版」状态跑 --hook，提示必须出现在注入里
+  if (!SPAWN_OK) skip('T12-j --hook 端到端注入提示');
+  else {
+    put({ lastCheckAt: Date.now(), latestVersion: '9.9.9', failCount: 0, nextRetryAt: 0 });
+    const r = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'],
+      { input: HOOK_PAYLOAD, env, timeout: 30000, windowsHide: true, encoding: 'utf8' });
+    const ac = (() => { try { return JSON.parse(r.stdout).hookSpecificOutput.additionalContext; } catch (e) { return ''; } })();
+    ok('T12-j1 ★有新版时 --hook 的 additionalContext 末尾带更新提示',
+      String(ac).indexOf('[技能更新]') >= 0, String(ac).slice(0, 160));
+    ok('T12-j2 提示位于注入内容最后一行（不插入到用量行中间）',
+      String(ac).split('\n').slice(-1)[0].indexOf('[技能更新]') === 0, JSON.stringify(String(ac).split('\n').slice(-2)));
+    // 换成「已是最新」再跑一次 → 注入内容必须**不含**提示（回归：旧行为逐字节不变）
+    put({ lastCheckAt: Date.now(), latestVersion: ttMod.SKILL_VERSION, notifyCount: 0 });
+    const r2 = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'],
+      { input: HOOK_PAYLOAD, env, timeout: 30000, windowsHide: true, encoding: 'utf8' });
+    ok('T12-j3 已是最新时 --hook 注入不含任何更新提示（旧行为不变）',
+      String(r2.stdout || '').indexOf('[技能更新]') < 0, String(r2.stdout).slice(0, 160));
+  }
+  fs.rmSync(UF, { force: true });
 }
 
 fs.rmSync(tmp, { recursive: true, force: true });

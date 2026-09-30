@@ -1,5 +1,16 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.20.0 (2026-10-01)
+// token-usage-tracker v3.21.0 (2026-10-01)
+// v3.21.0：**版本更新提示（每周一次，匿名只读）**——
+//   装了旧版的用户不会主动去仓库看更新 → 每 7 天在 `--hook` 路径匿名查一次
+//   `api.github.com/repos/<repo>/releases/latest`，有新版就向**模型**注入一行极短提示
+//   （`[技能更新] 有新版 vX.Y.Z，回复末尾提一句即可，勿展开`），由模型在回答末尾带一句。
+//   **不加 toast 弹窗**：toast 空间已被真实数据占满（第二行 42u 上限实测已贴边），
+//   塞更新提示必然触发降级链 → 等于用本轮真实数据换一句提示。**升级操作方法只写在 SKILL.md**，
+//   注入行本身不含任何升级步骤。开关 `ENABLE_UPDATE_CHECK`（默认 true，可经 local-config.json 关）。
+//   状态落 `.update-check.json`（不入库）：7 天闸门 + 失败退避 1h/6h/1d + 连败 3 次本周期不再试；
+//   同一新版本最多提示 2 次、两次间隔 ≥24h。
+//   ⚠️ 前提：**帮不了「已装旧版」的存量用户**——检查逻辑在被安装的那份代码里，旧版没有它；
+//   只对「第一个带检查的版本」之后的分发生效。
 // v2.63：调试日志机制重构——废弃 TOKEN_TRACKER_DEBUG 环境变量开关 + poll 全量记录，改为「弹窗时自动记录」：
 //   每次 showToast 无条件向 ~/.workbuddy/token-tracker-toast.log 追加一行 JSON 诊断（原因/sessionId/行数/稳定计数等）。
 // v3.20.0：**账本查询能力扩展 + 轮次明细留档**（两项）——
@@ -78,6 +89,10 @@ function loadLocalFlag(name, dflt) {
 const ENABLE_BALANCE_QUERY = loadLocalFlag('enable_balance_query', false);
 const ENABLE_PRICE_REFRESH = true;  // 分开关2：每日价格自动刷新（OpenRouter 公开价表，无需密钥）
 const ENABLE_MODEL_LOOKUP = true;   // 分开关3：新模型价格自动补录（OpenRouter 公开价表，无需密钥）
+// v3.21.0：分开关4——版本更新检查（匿名读 GitHub releases/latest，**只读、零密钥、不含任何本地数据**）。
+//   默认开启；要关掉在技能目录的 local-config.json 写 {"enable_update_check": false}。
+//   作用范围：仅在 `--hook` 路径触发（用户提问时），7 天闸门 → 绝大多数轮次零联网。
+const ENABLE_UPDATE_CHECK = loadLocalFlag('enable_update_check', true);
 // 余额查询安全性：开启后仅向官方 https://api.deepseek.com/user/balance 发送请求，密钥只通过
 // Authorization: Bearer 头传给该官方域名，不会发给第三方；请求内容不含任何本地数据。
 const SNAP_DIR = path.join(WB, 'skills', 'token-usage-tracker');
@@ -3913,6 +3928,133 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
   }
 }
 
+// ===== 版本更新检查（v3.21.0）=====
+// 目的：装了旧版的用户除非手动去看仓库，否则不知道有新版本 → 每周匿名查一次 releases/latest，
+//   有新版就向模型注入**一行极短提示**，由模型在回答末尾带一句。
+//
+// 通道决策（为什么不是 toast 弹窗）：
+//   ① toast 第二行实测约 41u 已贴 42u 上限（`TOAST_ROW2_MAX_W`），再塞更新提示必然触发降级链
+//      （丢余额 → 丢今日价 → 保底耗时）→ 等于**用本轮真实数据换一句提示**，不划算；
+//   ② 独立再弹一条通知 → 会被 Windows「SmartOptOut」（长期未点开该应用通知 → 注册表写
+//      `ShowBanner=0`）静默关掉，且阅后即焚；
+//   ③ `--hook` 的 `additionalContext` 注入给模型 → 不占任何显示空间，载体是用户必然会看的回答本身，
+//      且模型能把它说成人话。已有现成先例：新模型未收录提醒走的正是这条通道。
+//
+// 前提（必须知晓）：**帮不了「已装旧版」的存量用户**——检查逻辑在被安装的那份代码里，
+//   旧版没有它，只能靠 README / 发布页。本功能只对「第一个带检查的版本」之后的分发生效。
+//
+// 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
+//   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
+const SKILL_VERSION = '3.21.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章一致）
+const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
+const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
+const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
+const UPDATE_BACKOFF_MS = [3600 * 1000, 6 * 3600 * 1000, 24 * 3600 * 1000]; // 失败退避 1h / 6h / 1d
+const UPDATE_MAX_FAILS = 3;                                  // 连败 3 次 → 本周期内不再重试
+const UPDATE_MAX_NOTIFY = 2;                                 // 同一新版本最多提示 2 次（避免反复打扰）
+const UPDATE_NOTIFY_GAP_MS = 24 * 3600 * 1000;               // 两次提示至少间隔 24h
+
+// 版本号**数值**比较：a>b→1，a<b→-1，相等→0。
+// ⚠️ 绝不能直接字符串比较——`'3.9.0' > '3.10.0'` 会判成 true（错）。
+// 严格性：任一侧不是纯 `数字(.数字)*` 形状（如 `release-2026` / `junk` / 空）→ 一律返回 0（视为"无法确定"），
+//   保证**绝不因为畸形 tag 误报「有新版」**；缺段按 0 补（`3.21` == `3.21.0`）。
+function cmpVersion(a, b) {
+  const parse = (s) => {
+    const t = String(s == null ? '' : s).trim().replace(/^v/i, '');
+    if (!/^\d+(\.\d+)*$/.test(t)) return null;
+    return t.split('.').map((x) => parseInt(x, 10));
+  };
+  const pa = parse(a), pb = parse(b);
+  if (!pa || !pb) return 0;
+  const n = Math.max(pa.length, pb.length);
+  for (let i = 0; i < n; i++) {
+    const x = pa[i] || 0, y = pb[i] || 0;
+    if (x > y) return 1;
+    if (x < y) return -1;
+  }
+  return 0;
+}
+
+function loadUpdateState() {
+  try {
+    const j = JSON.parse(fs.readFileSync(UPDATE_CHECK_FILE, 'utf-8'));
+    if (j && typeof j === 'object') return j;
+  } catch (e) { /* 缺失/损坏 → 空状态（下次重新查） */ }
+  return {};
+}
+
+function saveUpdateState(s) {
+  try { fs.writeFileSync(UPDATE_CHECK_FILE, JSON.stringify(s, null, 2) + '\n'); }
+  catch (e) { /* 写失败只影响下次判断，不影响本轮输出 */ }
+}
+
+// 同步子进程匿名查询 GitHub releases/latest（沿用 queryBalance 的子进程模式：主流程是同步的）。
+// 返回 tag 字符串（如 `v3.21.0`）；任何失败返回 null——不抛错、不写 stderr、不污染 stdout。
+// 注意：不携带任何密钥、不发本地数据；请求头只声明 Accept 与 User-Agent（GitHub 要求 UA）。
+function queryLatestTag(timeoutMs) {
+  const script = [
+    '(async () => {',
+    '  try {',
+    `    const res = await fetch('https://api.github.com/repos/${UPDATE_REPO}/releases/latest', {`,
+    `      headers: { 'Accept': 'application/vnd.github+json', 'User-Agent': 'workbuddy-token-tracker' } });`,
+    "    if (!res.ok) { console.error('HTTP ' + res.status); process.exit(2); }",
+    '    const j = await res.json();',
+    "    const t = (j && j.tag_name) || '';",
+    "    if (!t) { console.error('NO_TAG'); process.exit(3); }",
+    '    console.log(String(t));',
+    '  } catch (e) { console.error(String(e && e.message)); process.exit(1); }',
+    '})();',
+  ].join('\n');
+  try {
+    const out = require('child_process').execFileSync(process.execPath, ['-e', script], {
+      timeout: timeoutMs || 5000, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf-8', windowsHide: true,
+    });
+    const lines = String(out).trim().split('\n');
+    return (lines[lines.length - 1] || '').trim() || null;
+  } catch (e) { return null; }
+}
+
+// 版本更新提示（**仅 `--hook` 调用**）：命中则返回一行极短注入文案，否则返回 ''。
+// 注入文案刻意**不含任何升级步骤**（升级方法只写在 SKILL.md），也不含任何用户数据。
+function updateNotice(nowMs) {
+  try {
+    if (!(ENABLE_NETWORK && ENABLE_UPDATE_CHECK)) return '';
+    const now = nowMs || Date.now();
+    const st = loadUpdateState();
+    let latest = st.latestVersion || '';
+    const dueCheck = !st.lastCheckAt || (now - Number(st.lastCheckAt) >= UPDATE_INTERVAL_MS);
+    const backoffOk = !st.nextRetryAt || now >= Number(st.nextRetryAt);
+    if (dueCheck && backoffOk) {
+      const tag = queryLatestTag(5000);
+      if (tag) {
+        latest = String(tag).replace(/^v/i, '');
+        st.latestVersion = latest; st.lastCheckAt = now; st.failCount = 0; st.nextRetryAt = 0;
+        saveUpdateState(st);
+      } else {
+        // 失败静默：不打扰用户，只记退避（1h → 6h → 1d；连败 3 次本周期内不再试）
+        const fc = (Number(st.failCount) || 0) + 1;
+        st.failCount = fc;
+        st.nextRetryAt = now + (fc >= UPDATE_MAX_FAILS
+          ? UPDATE_INTERVAL_MS
+          : UPDATE_BACKOFF_MS[Math.min(fc - 1, UPDATE_BACKOFF_MS.length - 1)]);
+        if (!st.lastCheckAt) st.lastCheckAt = now; // 首次即失败也要落时间，避免每轮重试
+        saveUpdateState(st);
+        return '';
+      }
+    }
+    if (!latest || cmpVersion(latest, SKILL_VERSION) <= 0) return ''; // 已是最新 → 静默
+    // 提示节流：同一版本最多 UPDATE_MAX_NOTIFY 次，两次之间至少隔 UPDATE_NOTIFY_GAP_MS
+    const sameVer = st.notifiedVersion === latest;
+    const cnt = sameVer ? (Number(st.notifyCount) || 0) : 0;
+    const lastAt = sameVer ? (Number(st.lastNotifyAt) || 0) : 0;
+    if (cnt >= UPDATE_MAX_NOTIFY) return '';
+    if (sameVer && lastAt && now - lastAt < UPDATE_NOTIFY_GAP_MS) return '';
+    st.notifiedVersion = latest; st.notifyCount = cnt + 1; st.lastNotifyAt = now;
+    saveUpdateState(st);
+    return `[技能更新] 有新版 v${latest}，回复末尾提一句即可，勿展开`;
+  } catch (e) { return ''; } // 任何异常都不该影响记账/注入主流程
+}
+
 function main() {
   const asHook = process.argv.includes('--hook');
   const asStop = process.argv.includes('--stop');
@@ -4337,6 +4479,14 @@ function main() {
     process.stdout.write(asHook || asStop ? JSON.stringify(hookOut) : hookOut);
   };
   const plain = (msg) => (asHook ? { hookSpecificOutput: { additionalContext: msg } } : msg);
+  // v3.21.0：版本更新提示的唯一挂载点（仅 --hook 生效；非 hook 模式原样返回）。
+  // 放在最末尾而不是 --stop：弹窗路径要立刻弹 toast，联网会把弹窗推迟。
+  // 空串时与旧版输出**逐字节相同**（`up ? msg + '\n' + up : msg`）。
+  const withUpdate = (msg) => {
+    if (!asHook) return msg;
+    const up = updateNotice();
+    return up ? `${msg}\n${up}` : msg;
+  };
 
   // v2.25：pricing 提前加载（transcript 数据源分支同样需要）
   let pricing = loadPricing();
@@ -4711,7 +4861,7 @@ function main() {
       const inProgress3 = prevStart3 > 0 && prevStop3 < prevStart3;
       saveSnapshot({ file: '', stat: null, lastUserMsgAt: inProgress3 ? prevStart3 : Date.now(), lastStopAt: psnap3.lastStopAt || 0 }, sid);
     }
-    out(plain('暂无 trace 数据（可能尚未发生模型调用）'));
+    out(plain(withUpdate('暂无 trace 数据（可能尚未发生模型调用）')));
     return;
   }
 
@@ -4941,9 +5091,8 @@ function main() {
   const nmNote = ensureNewModelPricing(pricing, shown).note;
   const line = lineFor(shown, sameRound, modelShort);
 
-  out(asHook
-    ? { hookSpecificOutput: { additionalContext: nmNote ? `${line}\n${nmNote}` : line } }
-    : (nmNote ? `${line}\n${nmNote}` : line));
+  // v3.21.0：版本更新提示（仅 --hook，最新版本 & 提示节流见 updateNotice）。
+  out(plain(withUpdate(nmNote ? `${line}\n${nmNote}` : line)));
 }
 
 // v2.39：被 require 时不执行 main()（hooks/手动仍走 node token-tracker.js，main 正常跑）；
@@ -4977,4 +5126,7 @@ module.exports = {
   peakRuleTag,
   // v3.19.1（N2）：watcher 单轮读取导出，selftest 验证"未变化跳过 IO"与增量等价性
   watchReadStep,
+  // v3.21.0：版本更新检查（selftest 直接单测版本比较/闸门/节流/退避，不必真联网）
+  updateNotice, cmpVersion, loadUpdateState, saveUpdateState, queryLatestTag,
+  SKILL_VERSION, UPDATE_CHECK_FILE, UPDATE_INTERVAL_MS, UPDATE_MAX_NOTIFY, UPDATE_NOTIFY_GAP_MS,
 };

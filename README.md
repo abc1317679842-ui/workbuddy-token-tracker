@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.20.0-blue)
+![Version](https://img.shields.io/badge/version-v3.21.0-blue)
 
 > 在每次回答后显示 **Token 消耗 / 耗时 / 折算费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -53,6 +53,7 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 | 📤 **CSV 导出**（v3.20.0） | `--report week --csv` / `--report all --csv` / `--report 2026-09-30 --csv` → 落盘到 `exports/report-<范围>-<时间戳>.csv`（**逐日 × 逐模型**明细 + `ALL` 合计行，可在 Excel 里自行透视）。带 **UTF-8 BOM**，中文列头不乱码；命令只回一行路径，不把几十行数据灌进对话 |
 | 📈 **消耗外推**（v3.20.0） | `--report forecast` → 今日 token 速率外推 + 近 7 日实测均值对照。**只推 token，不推金额**（金额本身是折算值，再外推一次只会制造"这个月要花多少钱"的错觉）；样本不足 2 天时拒绝计算 |
 | 🧾 **轮次明细留档**（v3.20.0） | 每轮向 `rounds/rounds-YYYY-MM.jsonl` 追加一条：分模型 token 明细、耗时、主/子代理模型、子代理数、来源标记，以及**自动从本轮首条用户消息提取的可读标签**——用来回答「哪一轮异常大 / 子代理占了多少」这类每日账本答不了的问题。写入点选在记账唯一入口（账本确认落盘之后），所以同轮重复 Stop **不会重复落档**；保留最近 6 个月，过期的由 `--report` 顺带清理 |
+| 🔔 **版本更新提示**（v3.21.0） | 每 **7 天**匿名查一次 GitHub 的 `releases/latest`（只读、零密钥、不带任何本地数据），发现新版本时**由模型在回答末尾提一句**（如「本技能有新版本，可更新」）——**不占 toast 空间**，也不反复打扰：同一版本最多提示 2 次、两次至少隔 24h。检查在用户提问时（`--hook`）触发，不在弹窗路径上，不会拖慢通知；失败**静默退避**（1h→6h→1d，连败 3 次当周不再试）。升级方法见下方「如何升级」。⚠️ 该功能**帮不了已装旧版的用户**——检查逻辑在被安装的那份代码里，只从本版起生效 |
 | 🧠 **专家团全量聚合** | WorkBuddy 专家团（多个子代理并行 + 主理人汇总）的全部模型调用，一次性聚合成整轮真实消耗——**平台不把子代理调用落盘 traces，本技能直接从主会话 + `subagents/*.jsonl` transcript 读取**，跑完一个专家团弹**一条**整轮汇总，不会弹 N 次 |
 | 🧩 **异步子代理识别** | 专家团子代理是异步 spawn，文件比 Agent 调用晚落盘——检测主会话是否有 `Agent`/`TeamCreate` 等团队活动，未落盘也能判定"这是专家团"→ 走合并延迟弹，不误判为普通轮 |
 | 🛡️ **中途插话守卫** | 专家团运行中你插话不会把统计起点刷晚（`lastStopAt` 轮次边界守卫）——整轮消耗不丢 |
@@ -90,7 +91,7 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 
 ## 🔌 联网功能与开关（v2.30 起）
 
-本脚本有 3 处会联网，均在 `token-tracker.js` **顶部**用常量开关单独控制：
+本脚本有 4 处会联网，均在 `token-tracker.js` **顶部**用常量开关单独控制：
 
 | 开关常量 | 默认值 | 联网功能 | 请求目标 | 是否携带密钥 |
 |---|---|---|---|---|
@@ -98,6 +99,7 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 | `ENABLE_BALANCE_QUERY` | **`false`** | 余额查询 | 仅 `https://api.deepseek.com/user/balance` | ⚠️ **是**（DeepSeek API key） |
 | `ENABLE_PRICE_REFRESH` | `true` | 每日价格自动刷新 | **5 个公开价格源**：llmabacus（`llmabacus.com/api/prices`）、llm-prices-cn（GitHub raw）、OpenRouter（`openrouter.ai/api/v1/models`）、LiteLLM（GitHub raw）、Portkey（`configs.portkey.ai/pricing/<provider>.json`） | 否 |
 | `ENABLE_MODEL_LOOKUP` | `true` | 新模型价格自动补录 | 同上（llmabacus 优先，OpenRouter 兜底） | 否 |
+| `ENABLE_UPDATE_CHECK` | `true` | 版本更新检查（**每 7 天最多 1 次**，仅在提问时触发） | 仅 `https://api.github.com/repos/abc1317679842-ui/workbuddy-token-tracker/releases/latest` | 否 |
 
 **默认配置 = 零密钥联网**：唯一携带 API key 的请求（余额查询）默认关闭；其余联网均为**公开价格源、无需任何密钥**，失败自动降级为本地价，不影响统计与 toast。
 
@@ -110,9 +112,12 @@ const ENABLE_NETWORK = true;        // 总开关：false = 全部联网功能关
 const ENABLE_BALANCE_QUERY = loadLocalFlag('enable_balance_query', false); // 默认关
 const ENABLE_PRICE_REFRESH = true;  // 每日价格自动刷新（5 个公开价格源）
 const ENABLE_MODEL_LOOKUP = true;   // 新模型价格自动补录（llmabacus + OpenRouter 公开价表）
+const ENABLE_UPDATE_CHECK = loadLocalFlag('enable_update_check', true);    // 版本更新检查（可关）
 ```
 
 要开启余额查询：在技能目录新建 `local-config.json`（内容 `{"enable_balance_query": true}`，文件不进仓库、不会被推送），并确认 `models.json` 里配置了 DeepSeek key。
+
+要关掉版本更新检查（不想让脚本每周访问一次 GitHub）：同一个 `local-config.json` 里写 `{"enable_update_check": false}` 即可（也可以整个用 `ENABLE_NETWORK = false` 一键全关）。关掉后**只影响「有没有新版本」这一条提示**，统计、账本、弹窗、价格刷新都不受影响。
 
 ## 🔐 隐私与数据安全
 
@@ -189,6 +194,7 @@ cp -r workbuddy-token-tracker ~/.workbuddy/skills/token-usage-tracker
 | `KNOWN-ISSUES.md` | 已知未修问题（脱敏公开记录） |
 | `rounds/`（运行时生成） | 轮次明细留档 `rounds-YYYY-MM.jsonl`，保留最近 6 个月，**不入库** |
 | `exports/`（运行时生成） | `--report --csv` 的 CSV 导出目录，**不入库** |
+| `.update-check.json`（运行时生成） | 版本检查状态（上次检查时间 / 已知最新版 / 已提示次数），**不入库** |
 | `.gitignore` | 排除本地运行时文件与私密配置 |
 
 ### Hook 配置示例（`settings.json`）
@@ -232,6 +238,27 @@ node "C:/Users/<你的用户名>/.workbuddy/skills/token-usage-tracker/token-tra
 # 输出示例：
 # 上一轮 DeepSeek-V4 Flash ｜ 耗时 1m 47s ｜ 输入 69.8万 / 输出 1.1万 tokens（该轮累计 70.9万，缓存命中 64.1万）
 ```
+
+## 如何升级（版本更新提示弹出来之后做什么）
+
+本技能**没有自动更新**——安装方式就是「把目录拷进技能目录」，自动覆盖会动你自己的文件（可能抹掉 `local-config.json`、本机改动）。所以脚本只负责**告诉你**有新版本，升级动作由你（或让助手）执行：
+
+```bash
+# 1) 备份你自己的本地配置（这两类文件不在仓库里，重装会丢）
+cd ~/.workbuddy/skills/token-usage-tracker
+cp local-config.json /tmp/     # 有的话
+cp models.json /tmp/           # 有的话
+
+# 2) 拉新版本（clone 后目录名是 workbuddy-token-tracker，需改名为 token-usage-tracker）
+git clone https://github.com/abc1317679842-ui/workbuddy-token-tracker.git /tmp/wtt-new
+
+# 3) 覆盖旧目录（保留你的运行时数据：账本/快照/水位线本来就在旧目录里，先备份再覆盖）
+cp /tmp/wtt-new/*.js /tmp/wtt-new/*.py /tmp/wtt-new/*.json /tmp/wtt-new/*.md ~/.workbuddy/skills/token-usage-tracker/ 2>/dev/null
+```
+
+> 更省事的做法：直接对新 clone 下来的目录执行一次「拷入技能目录」的安装步骤（见上方「安装」），再把 `/tmp/` 里备份的 `local-config.json` / `models.json` 拷回去。
+>
+> **hooks 配置不用改**（路径没变），账本 `daily-usage.json` 在旧目录里——**千万别删旧目录前不备份**。升级完 `node token-tracker.js --report` 能正常出表即成功。
 
 ## 只保留 Token 通知（关闭 WorkBuddy 自带通知）
 

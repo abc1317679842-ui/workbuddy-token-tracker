@@ -44,3 +44,6 @@ docs/
 # v3.20.0：--report --csv 导出目录 / 轮次明细留档（本地运行时数据，会持续增长，不入库）
 exports/
 rounds/
+
+# v3.21.0：版本更新检查的本地状态（每台机器各自不同，不入库）
+.update-check.json

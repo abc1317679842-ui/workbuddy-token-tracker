@@ -1,6 +1,6 @@
 ---
 name: token-usage-tracker
-description: 在每次回答结束后弹出 Windows 系统通知（toast），显示本条真实 token 消耗、耗时与费用估算；并在本地记录每日分模型账本（各模型输入/输出/缓存命中/总 token/金额 + 当日合计，长期保存可查历史）。【仅适配 WorkBuddy 桌面客户端（Windows），不适用于其他 AI 工具/平台——数据源是 WorkBuddy 每轮调用后落盘的 trace/transcript 文件，依赖其 hooks 机制】WorkBuddy 客户端不显示 token（内置模式只显示积分、自有 API 模式也不显示），但每轮 LLM 调用结束都会把真实 token/耗时落盘。本技能通过 Stop hook 读取该数据，在每次回答结束后自动弹出 toast（模型名/耗时/今日累计/输入输出 token/费用），同时把本轮消耗按模型累计进 `daily-usage.json` 每日账本；`--hook` 模式在下一轮提交时把上一轮用量注入上下文作兜底；`--report` 命令可查看今日/历史每日明细与合计，并支持区间（周 / 月 / 任意日期段）汇总、CSV 导出、消耗外推，以及每轮轮次明细留档。当用户说「显示 token」「看消耗」「这次用了多少 token」「统计用量」「看每日消耗」「看历史用量」「这周用了多少」「这个月消耗」「导个 CSV」或任何希望看到每次回答成本时触发。token 用量为平台落盘的实测值；金额为按 API 单价折算的等价计价——自备 API key 模式下等同真实花费，内置模型模式下只是参考值，与客户端积分/额度无换算关系。
+description: 在每次回答结束后弹出 Windows 系统通知（toast），显示本条真实 token 消耗、耗时与费用估算；并在本地记录每日分模型账本（各模型输入/输出/缓存命中/总 token/金额 + 当日合计，长期保存可查历史）。【仅适配 WorkBuddy 桌面客户端（Windows），不适用于其他 AI 工具/平台——数据源是 WorkBuddy 每轮调用后落盘的 trace/transcript 文件，依赖其 hooks 机制】WorkBuddy 客户端不显示 token（内置模式只显示积分、自有 API 模式也不显示），但每轮 LLM 调用结束都会把真实 token/耗时落盘。本技能通过 Stop hook 读取该数据，在每次回答结束后自动弹出 toast（模型名/耗时/今日累计/输入输出 token/费用），同时把本轮消耗按模型累计进 `daily-usage.json` 每日账本；`--hook` 模式在下一轮提交时把上一轮用量注入上下文作兜底；`--report` 命令可查看今日/历史每日明细与合计，并支持区间（周 / 月 / 任意日期段）汇总、CSV 导出、消耗外推，以及每轮轮次明细留档。当用户说「显示 token」「看消耗」「这次用了多少 token」「统计用量」「看每日消耗」「看历史用量」「这周用了多少」「这个月消耗」「导个 CSV」或任何希望看到每次回答成本时触发。本技能每 7 天匿名查一次 GitHub releases，有新版本时会在回答末尾提示一句（每版本最多 2 次）。token 用量为平台落盘的实测值；金额为按 API 单价折算的等价计价——自备 API key 模式下等同真实花费，内置模型模式下只是参考值，与客户端积分/额度无换算关系。
 type: skill
 ---
 
@@ -56,8 +56,10 @@ Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\
 
 **其他会让横幅消失的原因**（若上面无效，按此顺序排查）：专注助手/免打扰（含自动规则：全屏、游戏、投影时段）→ 该应用通知总开关 → 电量节能限制后台活动 → 全屏应用抑制横幅 → 系统时间/时区异常。这些都在「设置 → 系统 → 通知」里可核对；**只有"自定义 AppId"这一类（本技能）必须走上面的注册表法**。
 
-## 当前功能总览（v3.20.x · 2026-10-01，版本以 manifest.yaml 为准）
+## 当前功能总览（v3.21.x · 2026-10-01，版本以 manifest.yaml 为准）
 
+> **v3.21.0 要点（2026-10-01）：版本更新提示（每周一次、匿名只读、注入给模型）。** —— 装了旧版的用户不会主动去仓库看更新，本版起每 **7 天**匿名查一次 `releases/latest`，有新版就**向模型注入一行极短提示**，由模型在回答末尾带一句。①**为什么不用弹窗**：toast 第二行实测 ≈41u、上限 42u，再塞内容必然触发降级链（丢余额 → 丢今日价 → 保底耗时）→ 等于**用本轮真实数据换一句提示**；独立再弹一条又会被 Windows SmartOptOut 静默关掉且阅后即焚。②**为什么走 `--hook` 注入**：不占显示空间、载体是用户必然会看的回答本身，已有现成先例（新模型未收录提醒走的就是这条通道）。③**规格**：只在提问时触发（**绝不放 `--stop`**，联网会把 toast 推迟）；超时 5 秒；失败**完全静默** + 退避 1h→6h→1d（连败 3 次当周不再试）；同一新版本**最多提示 2 次、间隔 ≥24h**；版本比较按 `major.minor.patch` **逐段转整数**（直接字符串比较会把 `3.9.0 > 3.10.0` 判成 true）。④**注入文案不含任何升级步骤**（`[技能更新] 有新版 vX.Y.Z，回复末尾提一句即可，勿展开`）——**升级操作只写在本文件的「版本更新提示与如何升级」章节**，模型照那一节回答追问即可。⑤**开关**：`ENABLE_UPDATE_CHECK`（默认 true，`local-config.json` 写 `{"enable_update_check": false}` 可关）。⑥**边界（务必如实告知）**：**帮不了「已装旧版」的存量用户**——检查逻辑在被安装的那份代码里，旧版没有它；也不做全自动更新（安装方式是拷目录，自动覆盖会动用户文件）。
+>
 > **v3.20.0 要点（2026-10-01）：账本查询能力扩展 + 轮次明细留档（两项一起）。** —— ①**区间报表**：`--report` 新增 `week` / `month` / `<起>..<止>`（任意闭区间，起止写反自动纠正）→ 输出**一张按模型的汇总表**，列结构与单日入口**完全一致**。区间命中率按 **`hitRate(Σ输入, Σ缓存)` 重算**，不是各天 hit 的算术均值（跨天 token 量可能差 100 倍，均值无意义）；`total` 保持逐日累加，便于与逐日核对账。**既有 `--report` / `--report <日期>` / `--report all` / `--report summary` 四条入口的输出逐字节不变**（`selftest` 有硬编码期望输出的断言兜底）。②**CSV 导出**：`--report <范围> --csv`（同样支持 `all` / 单日 / 不带参数=今天）→ 落盘 `exports/report-<范围>-<时间戳>.csv`，内容为**逐日 × 逐模型**明细 + `ALL` 合计行；**必须带 UTF-8 BOM**（否则 Excel 打开中文列头乱码——与 `loadDailyUsage` 剥 BOM 是同一个坑的两面）；命令只回一行路径，不把几十行数据灌进上下文。③**消耗外推** `--report forecast`：**只推 token、不推金额**——金额本身是按 API 单价折算的虚拟计价，在虚拟数上再外推一次只会制造「这个月要花多少钱」的错觉；样本 < 2 天时拒绝计算。④**轮次明细留档**：每轮向 `rounds/rounds-YYYY-MM.jsonl` 追加一条，含分模型 token 明细、耗时、主/子代理模型、子代理数、`source` 来源标记、`costApiEquiv`，以及**从本轮首条非注入型 user 消息自动提取的 `label`**（注入型标 `[注入] <类型>`）——用来回答「哪一轮异常大 / 子代理占了多少」这类每日账本答不了的问题。⑤**落点决策（关键）**：明细**只写在 `recordUsage` 一处**（账本确认落盘之后、锁内），而不是在 Stop 的 4 个互斥出口各写一遍——于是「同轮重复 Stop 不重复落档」由记账自身的幂等性白送，无需额外维护去重状态；`meta` 是**可选参数**，其余 8 个调用点不传即完全保持旧行为。⑥**金额口径（硬规矩，README 同步声明）**：`in/out/cached/total` 是平台落盘的**实测值**；金额一律按 `pricing.json` 的 API 单价折算，**不是真实扣费**——内置模型走客户端自带额度，本技能读不到额度扣减，**不做任何「金额 ↔ 积分」换算**（自备 API key 模式下才等同真实花费）。明细字段名直接写成 `costApiEquiv` 就是为了防后人误当真实花费。⑦**自测**：`selftest.js` 新增 T11 段 30 项（含「既有入口逐字节不变」硬编码断言、区间 hit 重算、CSV BOM 字节、明细幂等、`label` 提取与注入识别），**80 过 0 败**；另跑隔离端到端：Stop 主路径（账本 md5 与 v3.19.3 基线**逐字节相同**，同时落 1 条明细）、重放同一轮 Stop（不重复落档）、专家团 `--flush-delayed` 路径（落 1 条 `source=flush-delayed` 明细且正常收口）。
 >
 > **v3.19.3 要点（2026-10-01）：压缩弹窗判定整体降级——删掉一套从未生效过的死机制，只留一个真正管用的单点豁免。** —— ①**取证**：全量复核 `token-tracker-toast.log`（1560 条）/ `token-tracker-compaction.log`（3006 条）——`compactionMode=true` 出现 **0 次**、`compression-omen/resumed/timeout` 各 **0 次**、185 次 `flush-watch-start` 快照命中压缩标记 **0 次**、1158 次 `stop-transcript` 仅 **6 次**命中（0.5%）。②**根因（三层）**：v3.01 把普通轮改为 Stop 端同步弹窗后**不再 spawn watcher**，而压缩判定只活在 flush watcher 内 → 占全部弹窗 **55%（862/1560）** 的 `plain-immediate` 路径完全绕过它；且压缩标记在**压缩完成瞬间**落盘，等 Stop 触发时 transcript 已追加成百上千行、标记早已滑出末尾 30 行窗口；语义上也错位——标记出现时压缩已结束、模型已恢复输出。③**认知纠偏（重要）**：压缩后弹出的窗口 **99% 是那一轮的正常结算弹窗**（实测 12 次压缩现场后 9 次弹窗，内容为真实用量：输入 4.9万~70万、耗时 46s~8m24s）——**压掉它就是丢数据**，不该抑制。④**真正该修的是压缩期噪音**：2026-09-12 07:31 一个现场 18 秒内连弹 3 条「本轮无 token 消耗记录」，而该分支在 Stop 路径上、原 watcher 判定同样够不着。⑤**处置**：删除 `compactionMode` / `compressionPending` 两套状态机（含每轮末尾 30 行扫描 + 每轮末尾 5 行的超长前兆扫描）+ 死函数 `contextOverflowOmenTs` / `contextOverflowOmen` + 死常量 `WATCH_COMPACT_GRACE_MS` / `COMPRESSION_WAIT_MAX_MS`；新增 `freshCompactionMarker()`（末尾 30 行内存在压缩标记**且**该标记行 timestamp 距今 ≤10 分钟，`COMPACTION_MARKER_TTL_MS` 可调）作为 Stop 端 `no-token` 分支的**单点豁免**——命中则静默跳过弹窗（落 `stop-no-token-compaction-skip`），`lastStopAt` 照常推进、账本不受影响。TTL 用于排除上一轮遗留的旧标记（实测标记可在末尾窗口停留很久）。⑥**顺带清理**：`compactionSuspected`（置 true 后立刻 `continue`，**结构性永远进不了日志**）/ `compactionMode` / `lastMarkerId` 三个误导性日志字段 + 零引用的 `lastUnknownTs` 一并删除。⑦**自测**：`selftest.js` 新增 T10 段 9 项（判据单测 + 源码零残留守卫 + 豁免分支位置守卫），**48 过 0 败**；另跑 3 组隔离端到端（新鲜标记→0 弹窗 / 无标记→照弹 / 1 小时旧标记→照弹，证明 TTL 未误杀），**14 过 0 败**；`--flush-delayed` 主循环冒烟正常收口。
@@ -77,6 +79,7 @@ Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\
 - **toast 两行大字布局**：行1 标题大字 = 模型完整名 + 时段标注（`高峰双倍`/`夜间X折`）＋ 换行后 = `耗时` + `今日¥X` + `余额¥Y`；行2 正文小字 = `输入/输出 token` + `缓存占比` + `本条费用`。
 - **每日分模型账本（v2.39）**：每轮 Stop 自动把消耗**按模型**累计进 `daily-usage.json`（本地日期分桶，`{日期:{models:{模型:{in,out,cached,hit,total,cost}}, total:{...}}}`，`hit` = 缓存命中率%（两位小数，cached/in）），**每天保留两套统计**：`models` 各模型明细 + `total` 不分模型的当日总合计（输入/输出/缓存命中/总 token/金额，含总命中率）。**长期保存不裁剪**，可查任意历史天。查看：`node token-tracker.js --report`（今天）／`--report all`（全部天）／`--report <日期>`，也可让助手直接读文件整理展示。**v3.20.0 新增区间汇总**：`--report week`（近 7 天）／`--report month`（本月至今）／`--report 2026-09-01..2026-09-30`（任意闭区间）→ 输出与单日**同列**的按模型汇总表 + 合计行（命中率按 `Σ缓存/Σ输入` 重算）；`--report forecast` 看 token 消耗外推。
 - **轮次明细留档（v3.20.0）**：每轮记账成功后在 `rounds/rounds-YYYY-MM.jsonl` 追加一条 JSONL，字段含 `roundStart` / `durMs` / `in,out,cached,total` / `hitPct` / `models`（分模型明细）/ `model` / `subModels` / `subCount` / `teamActive` / `source`（`stop-transcript` / `flush-delayed` / `cancelled-round-watch`）/ `label`（本轮首条用户消息前 40 字，注入型标 `[注入]`）/ `costApiEquiv`（**按 API 单价折算，非真实扣费**）。保留最近 6 个月，过期文件在跑 `--report` 时顺带清理。用途是**分布分析**（哪些轮异常大、子代理占比多少），不是归因分析——`label` 只给一个开头线索，别指望它解释"这一轮为什么贵"。
+- **版本更新提示（v3.21.0）**：每 **7 天**匿名查一次 GitHub 的 `releases/latest`（只读、零密钥、不带任何本地数据），发现新版本时**由模型在回答末尾提一句**，不占 toast 空间。检查只在提问时（`--hook`）触发，失败静默退避（1h→6h→1d，连败 3 次当周不再试）；同一新版本**最多提示 2 次、间隔 ≥24h**。开关 `ENABLE_UPDATE_CHECK`（默认开，`local-config.json` 可关）。**升级操作方法见「版本更新提示与如何升级」章节**——注入的提示里不含升级步骤。⚠️ 该功能**帮不了已装旧版的用户**（检查逻辑在被安装的那份代码里）。
 - **今日累计**：toast 行1 显示 `今日¥X.XX`（读当日账本 total.cost，含本条）。
 - **时段标注**：DeepSeek 原厂系支持峰谷定价（工作日北京 9-12/14-18 高峰 ×2），自动标注 `高峰双倍`；其他模型无峰谷。策略存于 `pricing.json` 手动维护字段。
 - **余额显示**：仅 DeepSeek 自定义 API 且开启开关时启用，默认隐藏 + 变化检测（余额变才显示），15 秒 TTL 缓存。
@@ -120,6 +123,63 @@ Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\
 - 挂好 `UserPromptSubmit` hook → 下轮提问时自动注入上一轮用量
 - **不挂 hooks 也能用**：手动运行 `node <技能目录>/token-tracker.js --stop` 查看最近一轮消耗（方式 A）
 - 不需要通知：只删 `Stop` 段即可，其余功能不受影响
+
+## 🔔 版本更新提示与「如何升级」（v3.21.0 · 本节是升级操作的唯一权威处）
+
+### 提示长什么样
+
+脚本每 7 天匿名查一次仓库的 `releases/latest`，发现新版本时会在 `--hook` 注入的上下文里**多出一行**：
+
+```
+[技能更新] 有新版 v3.21.0，回复末尾提一句即可，勿展开
+```
+
+**模型该怎么做**（就这一件事，别多做）：
+
+1. **在本次回复的最末尾加一句**，例如：`本技能有新版本 v3.21.0，可更新`。**一句话说完就停**。
+2. **不要展开**、不要贴目录树、不要贴命令、不要列 changelog 摘要——**除非用户追问**「怎么更新 / 更新了什么」。
+3. 用户追问升级方法时，**照本节下面的「升级操作」回答**（这是唯一权威步骤）。用户追问更新内容时，回答「跑 `git log` 或看仓库的 CHANGELOG.md」或直接读 `CHANGELOG.md` 顶部那节。
+4. 用户没追问 = 到此为止。同一版本最多提示 2 次、间隔 ≥24h，脚本自动节流，你**不需要**自己做去重。
+
+> ⚠️ 不要因为收到这一行，就把回答写长、或每轮都提一遍——那正是这个功能要避免的「让用户反感」。它只是提醒，不是任务。
+
+### 升级操作（用户追问时照此回答）
+
+**本技能没有自动更新**——安装方式就是「把目录拷进技能目录」，自动覆盖会动用户自己的文件（可能抹掉 `local-config.json`、`models.json`、本机改动）。脚本只负责告诉你，升级动作由用户执行：
+
+```bash
+cd ~/.workbuddy/skills/token-usage-tracker
+
+# 1) 备份本地配置与运行时数据（这些不在仓库里，重装会丢）
+cp local-config.json models.json /tmp/ 2>/dev/null      # 有才需要
+cp daily-usage.json .ledger-watermark.json /tmp/ 2>/dev/null   # 想保老账本就一起备
+
+# 2) 拉新版本（clone 后目录名是 workbuddy-token-tracker，需改名）
+git clone https://github.com/abc1317679842-ui/workbuddy-token-tracker.git /tmp/wtt-new
+
+# 3) 覆盖技能目录里的程序文件（.js/.py/.json/.md），不删旧目录
+cp /tmp/wtt-new/*.js /tmp/wtt-new/*.py /tmp/wtt-new/pricing.json /tmp/wtt-new/holidays.json ~/.workbuddy/skills/token-usage-tracker/
+cp /tmp/wtt-new/*.md ~/.workbuddy/skills/token-usage-tracker/
+
+# 4) 把本机配置拷回来
+cp /tmp/local-config.json /tmp/models.json ~/.workbuddy/skills/token-usage-tracker/ 2>/dev/null
+
+# 5) 验证
+node ~/.workbuddy/skills/token-usage-tracker/token-tracker.js --report
+```
+
+**要点（回答时务必带上）**：
+
+- **hooks 配置不用改**（`settings.json` 里的路径没变）。
+- **账本 `daily-usage.json` 在旧目录里**——覆盖前先备份，**不要直接删旧目录**。
+- 升级后可以用 `node token-tracker.js --report` 出表来验证；升级成功后脚本自己就把提示静默掉（本地版本 ≥ 远端即不再提示）。
+- 更省事的替代方案：按「安装与启用」一节重新安装一次到技能目录，再把备份的两个配置文件拷回去。
+
+### 想关掉这个检查
+
+在技能目录的 `local-config.json` 写 `{"enable_update_check": false}`（文件不进仓库）。关掉后只少一条提示，统计 / 账本 / 弹窗 / 价格刷新都不受影响。也可以整个用 `ENABLE_NETWORK = false` 一键全关。
+
+> ⚠️ **前提（对用户要如实说）**：这个功能**帮不了「已经装了旧版」的用户**——检查逻辑在被安装的那份代码里，旧版根本没有它。存量用户只能靠 README / 发布页知道更新。
 
 ## 为什么需要
 WorkBuddy 客户端 UI 不显示每轮对话的 token 用量：内置模型只显示「积分」，自有 API 模式也不展示 token。但平台在每次模型调用**整轮结束后**都会把真实用量写进一个新的 `traces/<pid>/trace_*.json`（含 `totalTokens` / `totalInputTokens` / `totalOutputTokens` / `totalCachedTokens` / `duration` / `startedAt` / `endedAt`）。本技能把这些数据读出来，让你每轮都能看到真实消耗。
@@ -252,6 +312,9 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 | CSV 用 Excel 打开中文列头乱码 | `exports/report-*.csv` 前 3 字节是否为 `EF BB BF` | 必须带 UTF-8 BOM，否则 Excel 按 GBK 解码必乱码。`--report --csv` 已固定写入 BOM；若仍乱码，先确认该文件是否被别的工具改写过 |
 | 轮次明细里同一轮出现多条 | 各条的 `roundStart` 与 `source` | **正常**：同一轮可能分多批落盘（如 Stop 记一批、`--flush-delayed` 再补一批），`source` 区分来源。被幂等拦掉的只有「无新增用量」的重复 Stop。按轮聚合请用 `sid + roundStart` 分组 |
 | 明细 `label` 为空 | 该轮 `roundStart` 与 transcript 中 user 行的 timestamp | `roundLabel` 只取 **timestamp ≥ roundStart** 的 user 行，且只扫 transcript **尾部 400 行**；取不到就留空（不编造）。常见原因：本轮很长、首行已被挤出尾部窗口；或测试夹具用了与真实时间不符的 `roundStart` |
+| 回答末尾出现「本技能有新版本」 | `.update-check.json` 的 `latestVersion` / `notifyCount` | **正常**（v3.21.0 版本更新提示）。`notifyCount ≥ 2` 后自动静默；升级后本地版本 ≥ 远端即不再提示。想彻底关：`local-config.json` 写 `{"enable_update_check": false}` |
+| 从没见过更新提示（但确实有新版本） | `.update-check.json`（是否存在 / `lastCheckAt` 是否在 7 天内 / `failCount`） | ① 检查只在 `--hook` 触发，`--stop`/手动模式永远不会提示；② 7 天闸门内不重复查；③ `failCount ≥ 3` 会当周停止重试；④ `ENABLE_UPDATE_CHECK` 或 `ENABLE_NETWORK` 关掉时静默跳过。**注意：装了旧版的用户根本不会有这个文件——检查逻辑在被安装的那份代码里** |
+| 更新提示重复出现很多次 | `.update-check.json` 的 `notifiedVersion` / `notifyCount` / `lastNotifyAt` | 设计上限是**同一版本最多 2 次、间隔 ≥24h**。若远超此数：确认状态文件是否可写（写失败会导致次数不累计），或每次都在换技能目录（状态文件跟着目录走） |
 
 > ⚠️ **hooks 命令铁律**：所有 hook 命令必须保持**纯净的 `node` 调用**（如 `node C:/.../token-tracker.js --stop`），**禁止使用 `cmd /c` 包装或环境变量前缀**（如 `cmd /c "set X=1 && node ..."`）。此类包装会被 WorkBuddy 判为无效 hook 配置（`Invalid hook config`），导致整个事件组（Stop / UserPromptSubmit）跳过、进程瞬间失败且无任何日志产物。调试日志已改为弹窗时自动记录，无需通过环境变量或命令前缀开启。
 
@@ -267,5 +330,7 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 | 表格列太多，精简一下 | 7 列一列都不能少，格式不许改 |
 | 金额就是我真花的钱 | 除非自备 API key，金额一律是按 API 单价折算的**等价计价**，与客户端积分/额度**无换算关系**——要分析用量以 token 列为准 |
 | 导 CSV 顺手把表格也贴一遍 | `--csv` 模式只回一行导出路径；表格贴出来纯刷屏，文件是给 Excel 用的 |
+| 收到「[技能更新]」就顺手把升级步骤贴出来 | 注入行只要求**末尾提一句**；升级步骤只在用户追问时给，且照 SKILL.md「版本更新提示与如何升级」那一节回答——注进上下文的内容本身不含任何升级步骤是有意的 |
+| 更新提示每轮都值得提一遍 | 脚本已按「同版本最多 2 次、间隔 ≥24h」节流；重复提只会让用户反感 |
 
-**红旗（出现即停）**：手算费用；拿别处的数字代替账本；改了表格列或格式；绕过 `--report` 直接读原始文件。
+**红旗（出现即停）**：手算费用；拿别处的数字代替账本；改了表格列或格式；绕过 `--report` 直接读原始文件；主动展开版本更新说明或升级步骤。
