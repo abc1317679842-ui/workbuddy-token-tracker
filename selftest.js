@@ -387,6 +387,76 @@ else {
   }
 }
 
+// ── T10（v3.19.3）：压缩判定降级 —— 状态机整体移除 + Stop 端单点豁免 ──────────
+{
+  const src = (f) => fs.readFileSync(path.join(SRC, f), 'utf-8');
+  const ttMod = require(path.join(skillDir, 'token-tracker.js'));
+  // 剥掉块注释与整行 `//` 注释后再做"残留引用"检查——本版在注释里保留了大量历史说明，
+  // 直接对源码文本做正则会被注释误判（教训：守卫测试必须只看代码，不看注释）。
+  const stripComments = (s) => s
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .filter((l) => !/^\s*\/\//.test(l))
+    .join('\n');
+  const codeOnly = stripComments(src('token-tracker.js'));
+
+  // a：新判据已导出
+  ok('T10-a freshCompactionMarker / compactionMarkerId 已导出',
+    typeof ttMod.freshCompactionMarker === 'function' && typeof ttMod.compactionMarkerId === 'function');
+
+  // b~e：判据本身（新鲜命中 / 过期不命中 / 无标记 / 旧格式兼容）
+  if (typeof ttMod.freshCompactionMarker === 'function') {
+    const mp = path.join(tmp, 'compaction-marker.jsonl');
+    const nowMs = Date.now();
+    const rowOf = (tag, ts) => JSON.stringify({
+      type: 'message', role: 'user', timestamp: ts, uuid: 'u' + tag + ts,
+      content: '<' + tag + '>\n历史摘要\n</' + tag + '>',
+    });
+    const plainRow = JSON.stringify({ type: 'message', role: 'assistant', timestamp: nowMs - 3000, status: 'completed' });
+
+    fs.writeFileSync(mp, [plainRow, rowOf('conversation_history_summary', nowMs - 2000)].join('\n') + '\n');
+    const hitFresh = ttMod.freshCompactionMarker(mp);
+    ok('T10-b 新鲜压缩标记（2 秒前）→ 命中并返回标记 id',
+      typeof hitFresh === 'string' && hitFresh.length > 0, String(hitFresh));
+
+    fs.writeFileSync(mp, rowOf('conversation_history_summary', nowMs - 60 * 60 * 1000) + '\n');
+    ok('T10-c 过期压缩标记（1 小时前）→ 不命中（TTL 生效，防旧标记长期留在末尾窗口）',
+      ttMod.freshCompactionMarker(mp) === null, String(ttMod.freshCompactionMarker(mp)));
+
+    fs.writeFileSync(mp, JSON.stringify({ type: 'message', role: 'user', timestamp: nowMs, content: '普通用户消息' }) + '\n');
+    ok('T10-d 末尾窗口无压缩标记 → null', ttMod.freshCompactionMarker(mp) === null);
+
+    fs.writeFileSync(mp, rowOf('cb_summary', nowMs - 1000) + '\n');
+    ok('T10-e 旧格式 <cb_summary> 同样命中', ttMod.freshCompactionMarker(mp) !== null);
+
+    ok('T10-f TTL 可经 COMPACTION_MARKER_TTL_MS 覆盖（传 0 走 env，显式传参优先）',
+      ttMod.freshCompactionMarker(mp, 1) === null, 'ttl=1ms 应判过期');
+    fs.rmSync(mp, { force: true });
+  }
+
+  // g：旧压缩状态机的全部标识符在【代码】中零残留
+  const staleIds = [
+    'compactionSuspected', 'compactionMode', 'compressionPending', 'compressionWaitStart',
+    'lastOmenTs', 'processedMarkers', 'processedMarkerCount', 'curMarkerId', 'tailRawLines',
+    'contextOverflowOmenTs', 'contextOverflowOmen', 'WATCH_COMPACT_GRACE_MS', 'COMPRESSION_WAIT_MAX_MS',
+  ];
+  const staleHits = staleIds.filter((n) => new RegExp('\\b' + n + '\\b').test(codeOnly));
+  ok('T10-g 旧压缩状态机标识符在代码中零残留（注释里的历史说明不算）', staleHits.length === 0, staleHits.join(','));
+
+  // h：Stop 端 no-token 分支已接入单点豁免
+  ok('T10-h Stop 端 no-token 分支已接入 freshCompactionMarker 豁免',
+    /freshCompactionMarker\(tsPath\)/.test(codeOnly)
+    && /stop-no-token-compaction-skip/.test(codeOnly));
+
+  // i：豁免分支仍在 no-token 弹窗【之前】，且保留 lastStopAt 推进（顺序错了就白改）
+  const idxSnapshot = codeOnly.indexOf('const snap0 = loadSnapshot(sid)');
+  const idxGuard = codeOnly.indexOf('freshCompactionMarker(tsPath)');
+  const idxToast = codeOnly.indexOf("showToast('本轮无 token 消耗记录'");
+  ok('T10-i 豁免判定位于快照推进之后、no-token 弹窗之前',
+    idxSnapshot > 0 && idxGuard > idxSnapshot && idxToast > idxGuard,
+    `snap=${idxSnapshot} guard=${idxGuard} toast=${idxToast}`);
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log(`\n结果：${pass} 过 / ${fail} 败${skipped ? '（有跳过项：本环境禁止 node 子进程）' : ''}`);
 process.exit(fail ? 1 : 0);

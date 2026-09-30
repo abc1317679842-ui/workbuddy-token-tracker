@@ -1,12 +1,10 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.19.2 (2026-10-01)
+// token-usage-tracker v3.19.3 (2026-10-01)
 // v2.63：调试日志机制重构——废弃 TOKEN_TRACKER_DEBUG 环境变量开关 + poll 全量记录，改为「弹窗时自动记录」：
-//   每次 showToast 无条件向 ~/.workbuddy/token-tracker-toast.log 追加一行 JSON 诊断（原因/sessionId/行数/稳定计数/compaction 状态等）。
-// v2.62：compaction 检测由"行数减少>5"改为"扫描 transcript 末尾 30 行识别压缩标记（compactionMode 方案）"。
-//   原因：该客户端 transcript 为 append-only，行数永不减少，旧方案在该客户端永远不触发、检测失效。
-//   新方案：每轮 poll 用 readTailRawLines 读末尾 30 行，若最新压缩标记（role=user 且内容以
-//   <conversation_history_summary> 或 <cb_summary> 开头）的 id 与上一轮不同（新标记）→ compactionMode=true、
-//   重置稳定计数并暂停本轮收口；之后标记不再新增时进入正常 stableCount>=3 收口。旧 showToast 同步修复见 v2.61。
+//   每次 showToast 无条件向 ~/.workbuddy/token-tracker-toast.log 追加一行 JSON 诊断（原因/sessionId/行数/稳定计数等）。
+// v3.19.3：**压缩弹窗判定整体降级**——原 v2.62 的 compactionMode 状态机与 v2.70 的 compressionPending
+//   等待窗经全量日志复核在生产环境从未生效过一次（详见 freshCompactionMarker 注释），已整体删除。
+//   压缩期噪音（压缩期间连续 Stop → 连弹"本轮无 token 消耗记录"）改由 Stop 端 no-token 分支单点豁免。
 // v2.61：修复 showToast 回归——v2.59 的 compaction-fix 误将 execFileSync 改为 spawn(detached+unref)，
 // 导致 watcher 退出时 PowerShell 子进程被提前终止、toast 丢失。本版回退为同步 execFileSync。
 // token-tracker.js — 读取 WorkBuddy 最新 trace 的真实 token / 耗时。
@@ -171,9 +169,9 @@ function writeToastLog(reason, state) {
       sessionId: st.sessionId != null ? st.sessionId : null,
       lineCount: st.lineCount != null ? st.lineCount : null,
       stableCount: st.stableCount != null ? st.stableCount : null,
-      compactionSuspected: st.compactionSuspected != null ? st.compactionSuspected : null,
-      compactionMode: st.compactionMode != null ? st.compactionMode : null,
-      lastMarkerId: st.lastMarkerId != null ? st.lastMarkerId : null,
+      // v3.19.3：compactionSuspected / compactionMode / lastMarkerId 三个字段已删除。
+      // 前两者在原压缩状态机里结构性恒为 false/null（compactionSuspected 置 true 后立刻 continue，
+      // 永远到不了这里；compactionMode 从未被置 true），留在日志里只会误导排查。
       tailFingerprint: st.tailFingerprint != null ? st.tailFingerprint : null, // v3.18（M14）：原 tailRawPrefix 存原文前 80 字符，改指纹
       lastTailFingerprint: st.lastTailFingerprint != null ? st.lastTailFingerprint : null,
       pendingSubCount: st.pendingSubCount != null ? st.pendingSubCount : null,
@@ -785,43 +783,36 @@ function terminalErrorFromRow(r) {
 // 判据：读取 transcript 末尾 N 行（默认 5），存在 role=assistant 且 status=incomplete 且
 // 错误/消息内容含超长关键词（input length too long / context length / too many tokens /
 // context_window / maximum context）的行 → 判定"上下文超长，压缩即将发生或正在发生"。
-// contextOverflowOmenTs 返回末尾 N 行内"最新一条前兆行"的 timestamp（无前兆返回 null）——
-// watcher 用它做"新前兆"守卫：同一场停滞（末行冻结无新行）不会在超时/恢复后每轮重复进入等待窗口。
-function contextOverflowOmenTs(tsPath, n) {
-  const rawLines = readTailRawLines(tsPath, n || 5);
-  let latestTs = null;
-  for (const raw of rawLines) {
-    let r;
-    try { r = JSON.parse(raw); } catch (e) { continue; }
-    if (!r || typeof r !== 'object') continue;
-    if (r.role !== 'assistant' || r.status !== 'incomplete') continue;
-    const texts = [];
-    const err = (r.providerData && r.providerData.error) || r.error || null;
-    if (typeof err === 'string') texts.push(err);
-    else if (err && typeof err === 'object') {
-      if (err.message != null) texts.push(String(err.message));
-      if (err.type != null) texts.push(String(err.type));
-      if (err.code != null) texts.push(String(err.code));
+// v3.19.3（压缩判定降级）：判断 transcript 末尾窗口内是否存在"新鲜的"压缩标记，返回标记 id 或 null。
+// 背景：原 compactionMode / compressionPending 状态机（v2.62 / v2.70）经全量日志复核，在生产环境
+// **从未生效过一次**（compactionMode=true 出现 0 次、compression-omen/resumed/timeout 各 0 次、
+// 185 次 flush-watch 启动快照命中标记 0 次）——原因是压缩判定只活在 flush watcher 内，而 55% 的
+// 弹窗走 Stop 端同步路径、根本不启动 watcher；且压缩标记在 Stop 时刻早已滑出末尾 30 行窗口
+// （1158 次 stop-transcript 仅 6 次命中）。该状态机已整体删除，只在下方 Stop 端 no-token 分支
+// 保留这一个单点判据。
+// 唯一需要豁免的真实场景（2026-09-12 07:31 实测）：上下文压缩期间客户端会连续触发多次 Stop，
+// 每次本轮都无 usage → 连弹 3 条"本轮无 token 消耗记录"。
+// 判据：末尾 30 行内存在压缩标记，且该标记行 timestamp 距现在不超过 ttl（默认 10 分钟，
+// COMPACTION_MARKER_TTL_MS 可覆盖）——TTL 用于排除上一轮遗留的旧标记（标记在压缩完成瞬间落盘，
+// 之后 transcript 仍会追加大量行，旧标记可能长期停留在末尾窗口内）。
+function freshCompactionMarker(tsPath, ttlMs) {
+  try {
+    if (!tsPath) return null;
+    const now = Date.now();
+    const ttl = (typeof ttlMs === 'number' && ttlMs > 0)
+      ? ttlMs
+      : (Number(process.env.COMPACTION_MARKER_TTL_MS) || 10 * 60 * 1000);
+    let hit = null;
+    for (const ln of readTailRawLines(tsPath, 30)) {
+      const id = compactionMarkerId(ln);
+      if (id === null) continue;
+      let ts = 0;
+      try { const o = JSON.parse(ln); ts = Number(o && o.timestamp) || 0; } catch (e) { ts = 0; }
+      // 无时间戳无法判定新鲜度 → 保守视为新鲜（宁可不弹这条噪音，也不误报"无记录"）
+      if (!ts || (now - ts) <= ttl) hit = id;
     }
-    const msg = r.message;
-    if (msg && typeof msg === 'object') {
-      if (typeof msg.error === 'string') texts.push(msg.error);
-      const mc = msg.content;
-      if (typeof mc === 'string') texts.push(mc);
-      else if (Array.isArray(mc)) texts.push(mc.map((x) => (x && x.text) || '').join(''));
-    }
-    if (typeof r.content === 'string') texts.push(r.content);
-    else if (Array.isArray(r.content)) texts.push(r.content.map((x) => (x && x.text) || '').join(''));
-    // 关键词允许下划线/连字符/空格分隔（如 input_length_too_long / input-length-too-long）
-    if (/input\s*[-_ ]*length\s+too\s+long|context\s*[-_ ]*length|too\s*[-_ ]*many\s*tokens|context\s*[-_ ]*window|maximum\s*context/i.test(texts.join('\n'))) {
-      const ts = Number(r.timestamp) || 0;
-      if (latestTs === null || ts > latestTs) latestTs = ts;
-    }
-  }
-  return latestTs;
-}
-function contextOverflowOmen(tsPath, n) {
-  return contextOverflowOmenTs(tsPath, n) !== null;
+    return hit;
+  } catch (e) { return null; }
 }
 // 主 transcript 末行是否为明确的终态错误（供 watcher / Stop 判定复用同一口径）。
 function terminalError(tsPath) {
@@ -1370,9 +1361,10 @@ function readTailRaw(tsPath) {
     return lines.length ? lines[lines.length - 1] : '';
   } catch (e) { return ''; }
 }
-// v2.62/compactionMode：读 transcript 文件【原始末 n 行】（不做 JSON.parse）。用于扫描末尾窗口内的
-// 压缩标记（append-only transcript 行数永不减少，旧 lineCount 检测方案失效）。n 行可能较长，故取末尾
+// v2.62：读 transcript 文件【原始末 n 行】（不做 JSON.parse）。用于扫描末尾窗口内的压缩标记
+// （append-only transcript 行数永不减少，旧 lineCount 检测方案失效）。n 行可能较长，故取末尾
 // 64KB 足以覆盖；返回按文件顺序（旧→新）的最后 n 条非空行。
+// v3.19.3：调用方仅剩 captureTranscShape（诊断快照）与 freshCompactionMarker（Stop 端单点豁免）。
 // v3.18（M14）：诊断日志不再存对话内容原文——transcript 末行改存「sha1 前 10 位 + 长度」指纹。
 // 同内容 → 同指纹，排查"末行是否变化"类问题仍然可用，但不再把助手回复片段明文落盘。
 function fpOfStr(s) {
@@ -1404,10 +1396,9 @@ function readTailRawLines(tsPath, n) {
     return lines.length > n ? lines.slice(-n) : lines;
   } catch (e) { return []; }
 }
-// v2.62/compactionMode：判断一条原始 transcript 行是否为"压缩标记"——
+// v2.62：判断一条原始 transcript 行是否为"压缩标记"——
 // 一条 role=user 的消息，内容以 <conversation_history_summary>（新格式）或 <cb_summary>（旧格式外包一层）开头。
 // 命中则返回该标记的稳定 id（uuid/timestamp 优先，缺失时退回内容前缀 hash），否则返回 null。
-// 稳定 id 用于跨轮 poll 识别"新出现的压缩标记"（同一压缩事件产生唯一 user 消息，id 不重复）。
 function compactionMarkerId(raw) {
   if (!raw || typeof raw !== 'string') return null;
   let obj;
@@ -3691,15 +3682,6 @@ function main() {
     // 仅 newTail/newAgent（真有新活动）才刷新；并给 busy 设独立绝对上限（默认 2min，测试可 env 缩短），
     // 纯 busy 无后续达到上限即兜底弹，绝不无限挂起。
     const WATCH_BUSY_MAX_MS = Number(process.env.WATCH_BUSY_MAX_MS) || (2 * 60 * 1000);
-    // v2.59/P0-1：transient unknown 宽限——transcript mtime 在此时长内更新过，视为正在写入/重写中（如
-    // Context Compaction 重写末行导致半写不可读），不进确认期、重置确认窗继续等，杜绝 compaction 期间
-    // 因 unknown 持续 >6s 被误判结束而提前弹窗（R1 回归）。只有转录确实停写（mtime 旧）的 unknown 才收口。
-    const WATCH_COMPACT_GRACE_MS = Number(process.env.WATCH_COMPACT_GRACE_MS) || (3 * 1000);
-    // v2.70：上下文超长前兆等待窗——检测到"input length too long"等前兆后，压缩（contextSummary）
-    // 启动期间 transcript 冻结，watcher 若按"末行冻结 3 帧"误判回合结束会提前弹窗。
-    // 此窗口内暂停稳定帧收口、继续轮询不弹窗；超过该时长仍无新内容则恢复正常收口，
-    // 避免无限等待（默认 120s 覆盖压缩最长耗时，测试可 env 缩短）。
-    const COMPRESSION_WAIT_MAX_MS = Number(process.env.COMPRESSION_WAIT_MAX_MS) || (120 * 1000);
     const WATCH_LOCK_TTL = 30 * 60 * 1000; // 锁失效时间
     // 启动即拿锁：R3（2026-08-23）stale lock 接管 + R4（2026-08-23）原子 acquire 消除 TOCTOU。
     // 旧逻辑只查 at<TTL 从不验证 pid 存活：残留锁 owner 已死 → 新 watcher 误判锁有效 → watchStarts=0
@@ -3846,99 +3828,17 @@ function main() {
     // v2.57（第一阶段修复）：unknown 计数日志——unknown 语义是"无法确定当前状态"，
     // 本阶段【不】用 unknown 超时当自动弹窗依据（误弹风险），但连续 unknown 需要可观测。
     let unknownStreak = 0;
-    let lastUnknownTs = 0;
     let lastTailRaw = ''; // v2.59/P0-1：上一次 poll 的 transcript 原始末行，用于识别"正在改写中"的 transient unknown
 
     let toastReason = null;     // v2.61/debug：触发弹窗的原因（break 时赋值，用于去重日志）
     let lastPollSnapshot = null; // v2.61/debug：最近一次 poll 的状态快照，供 idle-timeout 兜底日志使用
-    // v2.62/compactionMode：压缩标记追踪状态。
-    // - processedMarkers：已处理过的压缩标记 id 集合（仅用于观测 processedMarkerCount）。
-    // - compactionMode：一旦检测到压缩标记即置 true，整个 watcher 生命周期内保持（不重置回 false）。
-    // - lastMarkerId：上一轮 poll 检测到的最新压缩标记 id（null 表示尚未见过）。
-    const processedMarkers = new Set();
-    let compactionMode = false;
-    let lastMarkerId = null;
-    // v2.70：上下文超长前兆 → 压缩等待窗口状态。
-    // compressionPending=true：暂停稳定帧收口（继续轮询但不弹窗），直到 transcript 出现
-    // 新的 assistant 消息（非 incomplete，= 压缩完成模型继续输出）或等待超时才恢复收口。
-    // compressionWaitStart：进入等待窗口的时刻（超过 COMPRESSION_WAIT_MAX_MS 即恢复收口）。
-    let compressionPending = false;
-    let compressionWaitStart = 0;
-    // lastOmenTs：最近一次进入压缩等待窗口时"最新前兆行"的 timestamp。前兆检测仅当新前兆
-    // （timestamp 更大）才再次进入等待——防同一场停滞在超时/恢复后每轮重复触发、无限等待。
-    let lastOmenTs = null;
     while (Date.now() - lastActiveAt < WATCH_MAX_MS) {   // 空闲超时：主模型持续活跃则永不退出、绝不弹
-      // v2.62/compactionMode：每次 poll 开始时扫描 transcript 末尾窗口，识别压缩标记。
-      // 该客户端 transcript 为 append-only，行数永不减少，旧"行数减少>5 行"检测恒不触发、已失效。
-      // 真实 compaction 特征：一条 role=user 的消息，内容以 <conversation_history_summary>（新）或
-      // <cb_summary>（旧）开头。系统在压缩时把历史摘要作为一条 user 消息追加进 transcript。
+      // v3.19.3：原 compactionMode（v2.62）+ compressionPending（v2.70）状态机已整体删除。
+      // 全量日志复核：该判定在生产环境从未生效过一次（compactionMode=true 0 次、
+      // compression-omen/resumed/timeout 各 0 次、185 次 flush-watch 启动快照命中标记 0 次），
+      // 且压缩标记在 Stop 时刻早已滑出末尾 30 行窗口。压缩期噪音改由 Stop 端 no-token 分支
+      // 用 freshCompactionMarker() 单点豁免，详见该函数注释。
       const currentStats = getTranscriptStats(tsPath);
-      let compactionSuspected = false;
-      // 扫描末尾 30 行，取最新（最后命中）的压缩标记 id；无标记则 curMarkerId=null。
-      let curMarkerId = null;
-      const tailRawLines = readTailRawLines(tsPath, 30);
-      for (const ln of tailRawLines) {
-        const mid = compactionMarkerId(ln);
-        if (mid !== null) curMarkerId = mid; // 同窗口内多条时取最新一条
-      }
-      // 发现"新"压缩标记：当前最新标记非空且不同于上一轮记录的最新标记（已滑出窗口的 null 不视为新标记）。
-      if (curMarkerId !== null && curMarkerId !== lastMarkerId) {
-        if (lastMarkerId !== null) processedMarkers.add(lastMarkerId); // 旧标记已处理完，入集合观测
-        if (!compactionMode) {
-          // 首次进入 compaction：完整重置——清空稳定计数并刷新空闲/busy 计时，避免压缩期间误收口。
-          stableCount = 0;
-          lastStats = currentStats;
-          busySince = Date.now();
-          lastActiveAt = Date.now();
-          lastTailRaw = '';
-        }
-        compactionMode = true;
-        compactionSuspected = true;
-        lastMarkerId = curMarkerId;
-        sleep(WATCH_POLL_MS);
-        continue;
-      }
-      // v2.70：上下文超长前兆检测——模型返回 400 "input length too long" 等错误后，系统随即启动
-      // contextSummary 压缩，压缩期间 transcript 不写入、压缩标记未落盘，watcher 若按"末行冻结
-      // 3 帧"误判回合结束会提前弹窗。前兆命中 → 进入压缩等待窗口：清稳定帧、暂停收口、继续轮询。
-      // 窗口内每轮检查恢复条件：① transcript 出现新的 assistant 消息（非 incomplete）= 压缩完成
-      // 模型继续输出 → 恢复收口；② 超过 COMPRESSION_WAIT_MAX_MS 仍无新内容 → 恢复正常收口，
-      // 避免无限等待。
-      // 注意：仅"新前兆"（最新前兆行 timestamp 比上次处理过的大）才进入等待窗口——同一场停滞
-      // 的旧错误行在超时/恢复后仍停留在末尾，若每轮重触发会永远等下去（实测 bug）。
-      if (!compressionPending) {
-        const omenTs = contextOverflowOmenTs(tsPath, 5);
-        if (omenTs !== null && (lastOmenTs === null || omenTs > lastOmenTs)) {
-          compressionPending = true;
-          compressionWaitStart = Date.now();
-          lastOmenTs = omenTs;
-          stableCount = 0;
-          lastTailRaw = '';
-          busySince = 0;
-          lastActiveAt = Date.now();
-          compactionSuspected = true;
-          appendWatchDebug({ type: 'compression-omen', ts: Date.now(), sid: fSid, compressionPending: true, omenTs });
-        }
-      }
-      if (compressionPending) {
-        const r = lastTranscLine(tsPath);
-        const resumed = r && r.type === 'message' && r.role === 'assistant' && r.status !== 'incomplete';
-        if (resumed) {
-          // 压缩完成、模型已输出新的 assistant 消息 → 恢复正常收口（稳定帧从 0 重新累计）
-          compressionPending = false;
-          stableCount = 0;
-          appendWatchDebug({ type: 'compression-resumed', ts: Date.now(), sid: fSid });
-        } else if (Date.now() - compressionWaitStart > COMPRESSION_WAIT_MAX_MS) {
-          // 最长等待已过仍无新内容 → 恢复正常收口，交由下方稳定帧判定决定是否弹窗
-          compressionPending = false;
-          appendWatchDebug({ type: 'compression-timeout', ts: Date.now(), sid: fSid });
-        } else {
-          // 仍在压缩等待窗口：暂停本轮收口判定（不弹窗），继续轮询
-          sleep(WATCH_POLL_MS);
-          continue;
-        }
-      }
-      // 未发现新标记：compactionSuspected=false，compactionMode 保持不变（不重置），进入正常收口逻辑。
       lastStats = currentStats;
       let st = pollTail();
       // v2.57→v2.58：初态终态错误继承——coalesce 已标记 terminalError，首轮 poll 因末行被覆盖/尾行半写
@@ -3987,8 +3887,6 @@ function main() {
         lineCount: currentStats.lineCount, stableCount,
         st, hasNewTail: newTail, newAgent,
         pendingSubCount: pendingSub.length, interrupted, deadTeam,
-        compactionSuspected: compactionSuspected,
-        lastMarkerId, processedMarkerCount: processedMarkers.size, compactionMode,
         tailFingerprint: tailFingerprint(tsPath), // v3.18（M14）：原 readTailRaw().slice(0,80) 存原文，改指纹
         lastTailFingerprint: fpOfStr(lastTailRaw), // v3.18（M14）：原 lastTailRaw.slice(0,80) 存原文，改指纹
       };
@@ -4446,6 +4344,21 @@ function main() {
           const snap0 = loadSnapshot(sid) || {};
           saveSnapshot({ file: snap0.file || tsPath, stat: snap0.stat || null, lastUserMsgAt: snap0.lastUserMsgAt || 0, lastStopAt: Date.now() }, sid);
         } catch (e) { /* 快照写失败不影响弹窗 */ }
+        // v3.19.3：压缩期噪音豁免（单点判据，替代已删除的 compactionMode/compressionPending 状态机）。
+        //   实测场景（2026-09-12 07:31，同一现场 18 秒内 3 条）：上下文压缩期间客户端连续触发多次
+        //   Stop，每次本轮都无 usage → 连弹多条"本轮无 token 消耗记录"，纯噪音。
+        //   判据：transcript 末尾 30 行内存在「新鲜」压缩标记（10 分钟内）→ 静默跳过本次弹窗。
+        //   保留原快照推进（上面已写 lastStopAt），轮次边界行为与原来完全一致；
+        //   账本不受影响：incrementalRecord 已在本函数开头按水位线跑过，本分支只决定"弹不弹"。
+        const freshMarker0 = freshCompactionMarker(tsPath);
+        if (freshMarker0) {
+          appendCompactionLog('stop-no-token-compaction-skip', { sid, markerId: freshMarker0, aggStart: aggStart0 });
+          writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sid, sameRound: false, transcriptPath: tsPath,
+            stat: null, note: 'compaction-fresh-marker-skip-no-toast', source: 'transcript-empty-compaction',
+            payload: summarizePayload(payloadRaw) });
+          out({ hookSpecificOutput: {} });
+          return;
+        }
         showToast('本轮无 token 消耗记录', body0, 'no-token');
         out({ hookSpecificOutput: {} });
         return;
@@ -4734,7 +4647,7 @@ module.exports = {
   interruptedRowsAfter,
   incrementalRecord, loadLedgerWatermark, saveLedgerWatermark,
   estimateInterrupted, estimateInterruptedInc,
-  extractUsageFromRow, terminalErrorFromRow, terminalError, contextOverflowOmen,
+  extractUsageFromRow, terminalErrorFromRow, terminalError, freshCompactionMarker, compactionMarkerId,
   showToast, toastLineTagged,
   traceWallDurMs, withFileLock,
   loadPricing, autoRefreshPricing, addModelPrice, savePricing, normalizeModelName, saveDailyUsageRaw,

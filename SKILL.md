@@ -58,6 +58,8 @@ Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\
 
 ## 当前功能总览（v3.19.x · 2026-10-01，版本以 manifest.yaml 为准）
 
+> **v3.19.3 要点（2026-10-01）：压缩弹窗判定整体降级——删掉一套从未生效过的死机制，只留一个真正管用的单点豁免。** —— ①**取证**：全量复核 `token-tracker-toast.log`（1560 条）/ `token-tracker-compaction.log`（3006 条）——`compactionMode=true` 出现 **0 次**、`compression-omen/resumed/timeout` 各 **0 次**、185 次 `flush-watch-start` 快照命中压缩标记 **0 次**、1158 次 `stop-transcript` 仅 **6 次**命中（0.5%）。②**根因（三层）**：v3.01 把普通轮改为 Stop 端同步弹窗后**不再 spawn watcher**，而压缩判定只活在 flush watcher 内 → 占全部弹窗 **55%（862/1560）** 的 `plain-immediate` 路径完全绕过它；且压缩标记在**压缩完成瞬间**落盘，等 Stop 触发时 transcript 已追加成百上千行、标记早已滑出末尾 30 行窗口；语义上也错位——标记出现时压缩已结束、模型已恢复输出。③**认知纠偏（重要）**：压缩后弹出的窗口 **99% 是那一轮的正常结算弹窗**（实测 12 次压缩现场后 9 次弹窗，内容为真实用量：输入 4.9万~70万、耗时 46s~8m24s）——**压掉它就是丢数据**，不该抑制。④**真正该修的是压缩期噪音**：2026-09-12 07:31 一个现场 18 秒内连弹 3 条「本轮无 token 消耗记录」，而该分支在 Stop 路径上、原 watcher 判定同样够不着。⑤**处置**：删除 `compactionMode` / `compressionPending` 两套状态机（含每轮末尾 30 行扫描 + 每轮末尾 5 行的超长前兆扫描）+ 死函数 `contextOverflowOmenTs` / `contextOverflowOmen` + 死常量 `WATCH_COMPACT_GRACE_MS` / `COMPRESSION_WAIT_MAX_MS`；新增 `freshCompactionMarker()`（末尾 30 行内存在压缩标记**且**该标记行 timestamp 距今 ≤10 分钟，`COMPACTION_MARKER_TTL_MS` 可调）作为 Stop 端 `no-token` 分支的**单点豁免**——命中则静默跳过弹窗（落 `stop-no-token-compaction-skip`），`lastStopAt` 照常推进、账本不受影响。TTL 用于排除上一轮遗留的旧标记（实测标记可在末尾窗口停留很久）。⑥**顺带清理**：`compactionSuspected`（置 true 后立刻 `continue`，**结构性永远进不了日志**）/ `compactionMode` / `lastMarkerId` 三个误导性日志字段 + 零引用的 `lastUnknownTs` 一并删除。⑦**自测**：`selftest.js` 新增 T10 段 9 项（判据单测 + 源码零残留守卫 + 豁免分支位置守卫），**48 过 0 败**；另跑 3 组隔离端到端（新鲜标记→0 弹窗 / 无标记→照弹 / 1 小时旧标记→照弹，证明 TTL 未误杀），**14 过 0 败**；`--flush-delayed` 主循环冒烟正常收口。
+>
 > **v3.19.2 要点（2026-10-01 · 外部全量逐行重审 B1–B10）：账本正确性 + 消灭「两份实现靠注释同步」** —— ①**B1【高】水位线口径漂移导致账本静默重复记账**：`readTranscLinesFrom` 用「**已解析行数**」当水位线、却用「**原始换行符个数**」做字节偏移定位，两者只在"每行都能解析"时相等 → transcript 中途出现**空行或永久坏 JSON 行**时，水位线比真实偏移小 k，下一轮从偏早位置重读已计过的行、**再记一遍**（实测：10 行真实用量 1000/100，账本记成 **1100/110**，无 stderr 无告警；触发后自愈但多记的不回滚）。现水位线口径统一为**物理完整行数**（文件 `\n` 累计），空行/坏行不再造成漂移，半写尾行仍不计入。②**B5 + B3【中】复制实现彻底清理**：`backfill.js` 删除自带的价库合并镜像与 `findModel`/`normalizeModelName` 副本（镜像缺了并发半写重读、`tier_note` 传递等三处逻辑），改为在主脚本 `require` 前钉住 `CN_PRICE_DB_DIR` 后**直接复用 `tt.mergeLocalPriceDb` / `tt.findModel`**；主脚本内两份**零调用死副本** `parsePeakSchedule`（仍丢分钟的 N4 旧 bug）/ `isChineseHolidayBeijing`（时区口径与模块不一致）连同 exports 一并删除——"留着带旧 bug 的副本 + 详细正确注释"是最高级的误导。③**B8【低·口径】峰谷按 token 发生时刻判，不再按脚本运行时刻**：`calcCost` 新增可选 `tsMs`，取 `tsMs > stat.lastTs > 当下` 优先级；`incrementalRecord` 传入本批新行的最大时间戳 → 跨 12:00/18:00 边界的长轮不再整轮按"终点档"计价，与 `backfill`/`recalc-day` 的逐行口径收敛。④**B4【中】删掉 `peak_rules` 半截链路**：该字段是 TokenHub 原文**自由文本**（非机器可读的分厂商时段表），抓了、存了、**从不参与判定**（非 DeepSeek 厂商一律按 1× 计价）——`build_index.py` 停止生成、`mergeLocalPriceDb` 停止合并。⑤**B2**【中】`resolveWorkspaceLogFile` 改走探测出的数据根 `WB`（原先写死 `~/.workbuddy/logs`，数据根迁到 `~/.workbuddy-ai` 的用户「取消确认第二信号源」永久失效，且是 `WB_ROOT` 隔离泄漏）。⑥**B6/B7/B9/B10**【低】`aggregateTranscript` 的 `subModels` 补行级时间过滤（子代理被唤醒复用时旧行不再外溢到弹窗）；3 处 `agent-*.jsonl` 正则补 `i` 标志（全仓 11 处统一）；`estimateInterrupted` 的 `fromTs` 显式声明为 **epoch 毫秒**（此前 `estimateInterruptedInc` 把行数当时间戳传、过滤器空转）；`firstTs` 空集不再依赖 `Infinity` 传播。⑦**自测**：`selftest.js` 新增 T9 段 16 项（含 B1 端到端、B8 端到端到账本金额、B6 旧行不外溢），**39 过 0 败**。
 >
 > **v3.19 要点（2026-10-01）：全仓审计落地——①峰谷时段判定收敛为单一实现 `peak-rules.js`（主脚本 / `backfill.js` / `recalc-day.js` 共用；此前三份硬编码副本，官方一旦调时段，增量记账与回溯重算会判出不同峰谷、金额静默差一倍且无报错）；②`recalc-day.js` 写盘改为「写前备份 + `tmp`+`rename` 原子写」，读取端剥 BOM 并把损坏文件隔离为 `.corrupt-*`；③watcher 改增量读 transcript（此前每 2 秒全量 parse，大 trace 下开销显著；文件被截断/重写时自动重建缓存）；④`backfill.js` 不再继承旧账本的 `_instructions`（数据→指令通道保持关闭）；⑤`refresh-holidays.js` 加 15s 超时 + 原子写；⑥`recalc-day.js` 合并本地官方价库（重算不再把国内模型误判为无价）；⑦`deepseek-official.js` 原子写 `pricing.json`；⑧`maybeRefreshLocalDb` 去掉 `shell:true` 改数组 spawn。⑨v3.19.1 修复峰谷「静默失效」：官方 2026-09 改文案为倒装句导致时段解析一直失败、并把 `peak_schedule` 静默清成空串（下游回落默认值恰好正确，故毫无异常表现）——现改为句式无关解析 + 失败不覆盖 + toast `⚠时段` 告警。v3.18 安全修复要点（余额开关本地化 / 账本 BOM 防损坏 / 个人路径清除）详见 `CHANGELOG.md`。**
@@ -207,7 +209,8 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 
 ### 弹窗诊断日志
 - 每次弹窗时，代码**自动**向 `~/.workbuddy/token-tracker-toast.log` 追加一行 JSON 诊断记录（无需任何开关，默认开启）。
-- 记录内容包含：`ts`（时间）、`reason`（触发原因）、`sessionId`、`watchStartTime`（本次 watcher 启动时间）、`lineCount`、`stableCount`、`compactionSuspected`、`compactionMode`、`lastMarkerId`、`tailRawPrefix`、`lastTailRawPrefix`、`pendingSubCount`、`hasNewTail`、`traceFile`（当前处理的 trace 文件名，获取不到为 null）、`toastText`（弹窗真实文本前 200 字符）。
+- 记录内容包含：`ts`（时间）、`reason`（触发原因）、`sessionId`、`watchStartTime`（本次 watcher 启动时间）、`lineCount`、`stableCount`、`tailFingerprint`、`lastTailFingerprint`、`pendingSubCount`、`hasNewTail`、`traceFile`（当前处理的 trace 文件名，获取不到为 null）、`toastText`（弹窗真实文本前 200 字符）。
+  - v3.19.3 起删除了 `compactionSuspected` / `compactionMode` / `lastMarkerId` 三个字段：前者在原压缩状态机里结构性恒为 false/null（置 true 后立刻 continue，永远到不了日志），后两者从未被置 true——留着只会误导排查。
 - `reason` 取值：`busy-timeout` / `interrupted` / `deadTeam` / `stableCount>=3` / `idle-timeout` / `estimate` / `no-token` / `hook-fallback`。
 - 日志文件超过 5MB 会自动清空后重新追加，避免无限增长。
 - 写入失败（权限/磁盘问题）被 try-catch 吞掉，绝不影响弹窗主流程。
@@ -215,7 +218,7 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 ### 常见排查步骤
 1. 如果用户反馈"压缩上下文后仍然弹窗"或"漏弹"，直接打开 `~/.workbuddy/token-tracker-toast.log`。
 2. 搜索最近的记录，查看 `reason` 是 `stableCount>=3` 还是 `interrupted` 或其他。
-3. 查看该记录的 `compactionMode` / `lastMarkerId` / `tailRawPrefix`，判断触发时是否处于压缩上下文过渡态。
+3. 查看该记录的 `tailFingerprint` / `lastTailFingerprint`（末行指纹），判断触发时末行是否已连续多帧不变。
 4. 根据日志判断是判定逻辑问题还是数据源问题，不要凭记忆修改代码。
 
 ### 故障排查速查表
@@ -224,7 +227,8 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 |---|---|---|
 | 完全无弹窗 | `.stop-probe.json`（mtime 是否更新）、`token-tracker-toast.log`（是否存在） | 若 probe 未更新，说明 Stop hook 未触发或命令失败；若 toast.log 无记录，说明判定未收口 |
 | 弹窗延迟过长 | `token-tracker-toast.log` | 查看 `reason` 是否为 `stableCount>=3`，并看 `ts` 与 run 结束时间差 |
-| 压缩上下文后提前弹窗 | `token-tracker-toast.log` + transcript 尾部 | 查看 `compactionSuspected`/`compactionMode`/`lastMarkerId`，以及 `tailRawPrefix` 是否在弹窗前已连续多帧不变 |
+| 压缩上下文后提前弹窗 | `token-tracker-compaction.log` + transcript 尾部 | **v3.19.3 起判定已降级**：压缩状态机（compactionMode/compressionPending）经全量日志复核从未生效，已删除。现在只有一种压缩豁免——Stop 端 `no-token` 分支检测到「10 分钟内落盘的压缩标记」→ 静默跳过（落 `stop-no-token-compaction-skip`）。压缩后弹出的**正常轮结算窗**属预期行为，不再抑制 |
+| 压缩期间连弹多条「本轮无 token 消耗记录」 | `token-tracker-compaction.log` | 查 `stop-no-token-compaction-skip` 是否存在：存在说明豁免已生效；缺失则说明末尾 30 行未命中标记或标记已超 10 分钟 TTL（`COMPACTION_MARKER_TTL_MS` 可调） |
 | 弹窗内容异常（会话错乱） | `token-tracker-toast.log` + trace 文件 | 查看 `sessionId` 是否为空或与实际会话不一致；检查 trace 的 `sessionId` 字段 |
 | 账本数据未更新 | `daily-usage.json`（mtime）、`.ledger-watermark.json` | 若 mtime 停在某时间，说明 Stop 路径未执行；结合 probe 判断 |
 | 弹窗频繁重复 | `.ledger-watermark.json` + `token-tracker-toast.log` | 查看 watermark 去重是否生效，以及 toast.log 中同一 `reason` 是否反复出现 |
