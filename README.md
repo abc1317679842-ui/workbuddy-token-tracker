@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.18.4-blue)
+![Version](https://img.shields.io/badge/version-v3.19.0-blue)
 
 > 在每次回答后显示真实 **Token 消耗 / 耗时 / 费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -158,6 +158,7 @@ cp -r workbuddy-token-tracker ~/.workbuddy/skills/token-usage-tracker
 |---|---|
 | `token-tracker.js` | 主脚本：`--hook` 注入 / `--stop` 通知 / `--report` 账本（重算用 `recalc-day.js`，见下行） |
 | `refresh-prices.js` | 多源价格刷新（每天首次运行自动触发，也可手动跑） |
+| `peak-rules.js` | 峰谷时段判定的**唯一实现**：主脚本 / `backfill.js` / `recalc-day.js` 共用（v3.19.0 起，消除三份硬编码副本） |
 | `deepseek-official.js` | DeepSeek 官方定价抓取（被 refresh-prices 调用） |
 | `refresh-holidays.js` | 中国法定节假日双源刷新（峰谷计费用，手动运行） |
 | `fetch-cn-prices.py` | 国内厂商官网价抓取（Python 3 + requests，可选） |

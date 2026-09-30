@@ -57,8 +57,17 @@ function loadPricing() {
 }
 
 function savePricing(p) {
+  // v3.19.0（P8）：原子写（tmp + rename）——原先裸 writeFileSync，中断/并发会留半截 JSON
+  // （pricing.json 是重建链路的基础，半截文件会让下次启动走 repair 分支）
   fs.mkdirSync(path.dirname(PRICING), { recursive: true });
-  fs.writeFileSync(PRICING, JSON.stringify(p, null, 2) + '\n');
+  const tmp = PRICING + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(p, null, 2) + '\n');
+    fs.renameSync(tmp, PRICING);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch (e2) {}
+    throw e;
+  }
 }
 
 async function fetchHtml(url) {

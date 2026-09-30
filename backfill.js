@@ -26,6 +26,7 @@
 // - 水位线键假设 transcript 文件名 = session_id（WorkBuddy 实际落盘即如此）。
 
 const fs = require('fs');
+const peakRules = require('./peak-rules.js'); // v3.19.0（P1）：峰谷判定单一实现（原先这里硬编码 PEAK_RANGES，与官方动态时段脱节）
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
@@ -50,26 +51,10 @@ const WATERMARK = path.join(SKILL_DIR, '.ledger-watermark.json');
 const PROJECTS = path.join(WB, 'projects');
 
 const WRITE = process.argv.includes('--write');
-const PEAK_RANGES = [[9 * 60, 12 * 60], [14 * 60, 18 * 60]];
 
-let _holidays = null;
-function isChineseHoliday(bj) {
-  try {
-    if (_holidays === null) {
-      try { _holidays = JSON.parse(fs.readFileSync(HOLIDAYS, 'utf-8')); } catch (e) { _holidays = { years: {} }; }
-    }
-    const key = `${bj.getUTCFullYear()}-${String(bj.getUTCMonth() + 1).padStart(2, '0')}-${String(bj.getUTCDate()).padStart(2, '0')}`;
-    return ((_holidays.years || {})[String(bj.getUTCFullYear())] || []).indexOf(key) >= 0;
-  } catch (e) { return false; }
-}
 
 function isPeakBeijingTs(tsMs) {
-  const bj = new Date(tsMs + 8 * 3600 * 1000);
-  const dow = bj.getUTCDay();
-  if (dow === 0 || dow === 6) return false;
-  if (isChineseHoliday(bj)) return false;
-  const mins = bj.getUTCHours() * 60 + bj.getUTCMinutes();
-  return PEAK_RANGES.some(([a, b]) => mins >= a && mins < b);
+  return peakRules.isPeakAt(tsMs, _pricing, HOLIDAYS);
 }
 function beijingDate(tsMs) {
   const bj = new Date(tsMs + 8 * 3600 * 1000);
@@ -397,11 +382,11 @@ function main() {
     }
   }
 
-  // 组装新账本（保留旧 _instructions）
+  // 组装新账本（v3.19.0/P4：不再继承 _instructions——M3 已关闭"数据→指令"通道，旧账本残留字段
+  // 会被原样带进新账本，等于把通道又开回来）
   let oldDaily = {};
   try { oldDaily = JSON.parse(fs.readFileSync(DAILY, 'utf-8')); } catch (e) {}
   const newDaily = {};
-  if (oldDaily._instructions) newDaily._instructions = oldDaily._instructions;
   const dates = Object.keys(acc).sort();
   for (const date of dates) {
     const models = acc[date];

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.18.4 (2026-09-30)
+// token-usage-tracker v3.19.0 (2026-10-01)
 // v2.63：调试日志机制重构——废弃 TOKEN_TRACKER_DEBUG 环境变量开关 + poll 全量记录，改为「弹窗时自动记录」：
 //   每次 showToast 无条件向 ~/.workbuddy/token-tracker-toast.log 追加一行 JSON 诊断（原因/sessionId/行数/稳定计数/compaction 状态等）。
 // v2.62：compaction 检测由"行数减少>5"改为"扫描 transcript 末尾 30 行识别压缩标记（compactionMode 方案）"。
@@ -36,6 +36,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const peakRules = require('./peak-rules.js'); // v3.19.0（P1）：峰谷判定的单一实现，与 backfill/recalc-day 共用
 
 // v3.16（2026-09-28，外部用户 PR#2 要点采纳）：数据根智能探测。
 // 背景：较新版本 WorkBuddy 客户端可能把数据根迁移到 ~/.workbuddy-ai（~/.workbuddy 仅剩
@@ -2053,42 +2054,47 @@ function maybeRefreshLocalDb() {
     // 弹「选择打开方式」对话框（实测用户被弹）。exe 用绝对路径（resolvePython 解析）。
     resolvePython((exe) => {
       if (!exe) return; // 系统无 python：保留锁按退避节奏静默重试，弹窗⚠标注可见
-      const q = (p) => (/\s/.test(p) ? `"${p}"` : p);
-      const cmd = `${q(exe)} fetch-cn-prices.py && ${q(exe)} parse_tokenhub.py && ${q(exe)} build_index.py`;
-      // v2.82：捕获输出 + 超时保护。旧版 stdio:'ignore' 导致失败完全静默（用户只能看到
-      // ⚠价库M/D 却查不到原因）；网络 hang 时子进程永不退出 → 锁永久卡死不再重试。
-      const REFRESH_TIMEOUT_MS = 180000; // 实测约 12s，给足 3 分钟
-      let c;
-      let out = '';
-      try {
-        c = require('child_process').spawn(cmd, {
-          cwd: CN_PRICE_PIPELINE_DIR, shell: true, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+      // v3.19.0（P9）：改数组形式 spawn（exe 直传 + 脚本名作独立参数），去掉 shell: true 的字符串拼接——
+      // 旧实现只对空格加引号，路径含 & / | 等 cmd 元字符时可被解释执行（纵深防御缺口）。
+      const scripts = ['fetch-cn-prices.py', 'parse_tokenhub.py', 'build_index.py'];
+      const runAll = (idx) => new Promise((resolve) => {
+        if (idx >= scripts.length) return resolve({ code: 0, timedOut: false });
+        let c;
+        try {
+          c = require('child_process').spawn(exe, [scripts[idx]], {
+            cwd: CN_PRICE_PIPELINE_DIR, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+          });
+        } catch (e) { return resolve({ code: -1, timedOut: false, err: 'spawn 失败: ' + String(e.message).slice(0, 200) }); }
+        let timedOut = false;
+        const killTimer = setTimeout(() => {
+          timedOut = true;
+          try { c.kill('SIGKILL'); } catch (e) {}
+        }, REFRESH_TIMEOUT_MS);
+        try {
+          c.stdout && c.stdout.on('data', (b) => { if (out.length < 4000) out += String(b); });
+          c.stderr && c.stderr.on('data', (b) => { if (out.length < 4000) out += String(b); });
+        } catch (e) {}
+        c.on('exit', (code) => {
+          clearTimeout(killTimer);
+          if (code === 0 && !timedOut) return resolve(runAll(idx + 1));
+          resolve({ code, timedOut });
         });
-      } catch (e) {
-        return noteRefreshFailure(attempts + 1, 'spawn 失败: ' + String(e.message).slice(0, 200));
-      }
-      let timedOut = false;
-      const killTimer = setTimeout(() => {
-        timedOut = true;
-        try { c.kill('SIGKILL'); } catch (e) {}
-      }, REFRESH_TIMEOUT_MS);
-      try {
-        c.stdout && c.stdout.on('data', (b) => { if (out.length < 4000) out += String(b); });
-        c.stderr && c.stderr.on('data', (b) => { if (out.length < 4000) out += String(b); });
-      } catch (e) {}
-      c.on('exit', (code) => {
-        clearTimeout(killTimer);
-        if (code === 0) {
+        c.on('error', (e) => {
+          clearTimeout(killTimer);
+          resolve({ code: -1, timedOut: false, err: 'error: ' + String(e.message).slice(0, 200) });
+        });
+      });
+      let out = '';
+      const REFRESH_TIMEOUT_MS = 180000; // 实测约 12s，给足 3 分钟（单脚本上限）
+      runAll(0).then((r) => {
+        if (r.code === 0) {
           try { fs.unlinkSync(CN_PRICE_REFRESH_LOCK); } catch (e) {}
           try { fs.unlinkSync(CN_PRICE_REFRESH_ERR); } catch (e) {}
           return;
         }
-        noteRefreshFailure(attempts + 1, (timedOut ? `超时 ${REFRESH_TIMEOUT_MS}ms 被杀` : `exit=${code}`) + ' | ' + tail(out, 400));
-      });
-      c.on('error', (e) => {
-        clearTimeout(killTimer);
-        noteRefreshFailure(attempts + 1, 'error: ' + String(e.message).slice(0, 200));
-      });
+        const why = r.err ? r.err : ((r.timedOut ? `超时 ${REFRESH_TIMEOUT_MS}ms 被杀` : `exit=${r.code}`) + ' | ' + tail(out, 400));
+        noteRefreshFailure(attempts + 1, why);
+      }).catch((e) => noteRefreshFailure(attempts + 1, '异常: ' + String(e.message).slice(0, 200)));
     });
   } catch (e) { /* 静默：刷新失败沿用旧库，弹窗会有 ⚠价库 标注 */ }
 }
@@ -2456,35 +2462,9 @@ function isChineseHolidayBeijing(bjDate) {
 
 function isPeakHour(rules, now) {
   const t = now || new Date();
-  // v2.95：统一按**北京时间**判定峰谷，与 recalc-day.js 的 isPeakBeijing 口径一致。
-  //   原实现用机器本地时区（t.getDay()/getHours()），非 GMT+8 机器会与回填工具判定相悖。
-  //   换算：UTC = local + getTimezoneOffset()分钟；北京时间 = UTC + 8h。
-  //   GMT+8 机器下两者恒等 → **零行为变化**（已验算：offset=-480 时 bj 时刻 === t 时刻）。
-  const bj = new Date(t.getTime() + t.getTimezoneOffset() * 60000 + 8 * 3600 * 1000);
-  const day = bj.getDay();
-  const h = bj.getHours() + bj.getMinutes() / 60;
-  // v3.15：法定假日 → 全天低峰（DeepSeek 官方口径：峰时段不含中国法定假日）
-  if (isChineseHolidayBeijing(bj)) return false;
-  // 有官方规则 → 完全按官方来（通用跟随：官方改任何时段/周末规则都自动生效）
-  if (rules && typeof rules === 'object') {
-    const weekendOff = rules.weekend_off_peak === true || rules.weekend_off_peak === 'true';
-    if (weekendOff && (day === 0 || day === 6)) return false; // 官方声明周末统一低谷
-    const ranges = parsePeakSchedule(rules.peak_schedule);
-    if (ranges.length) {
-      for (const r of ranges) {
-        // 区间为小时数（0-24）；跨午夜区间（s>e）按 23:59 封顶处理简化（官方当前无跨午夜档）
-        if (r.e <= r.s) continue;
-        if (h >= r.s && h < r.e) return true;
-      }
-      return false;
-    }
-    // rules 存在但时段解析不出 → 回退内置默认（但保留周末开关）
-    if (day === 0 || day === 6) return false;
-    return (h >= 9 && h < 12) || (h >= 14 && h < 18);
-  }
-  // 无 rules → 内置默认（v2.59 周末低峰兜底）
-  if (day === 0 || day === 6) return false;
-  return (h >= 9 && h < 12) || (h >= 14 && h < 18);
+  // v3.19.0（P1）：判定逻辑抽到 peak-rules.js 单一实现——backfill/recalc-day 调用同一模块。
+  // 旧实现是三份复制（靠注释约束同步），官方改时段时只同步了假日、没同步时段 → 同一批数据金额差一倍。
+  return peakRules.isPeakAt(t.getTime(), { deepseek_rules: rules }, HOLIDAYS_FILE);
 }
 
 // cost = 未命中输入×输入价 + 命中输入×缓存价 + 输出×输出价（元），按当前时段取倍率
@@ -2892,6 +2872,8 @@ function showToast(line1, line2, reason, tsPath) {
   if (process.platform !== 'win32') return;
   // v2.34：line1 可能含真实换行符 \n（toastLine1 两行大字布局）。先 escapeXml 转义 &<>"'，
   // 再把 \n 转成 XML 实体 &#10;（若先转再 escapeXml，& 会被转成 &amp; 导致换行失效）
+  // v3.19.0（P7 核查结论）：下方 XML 由 **单引号字面量**（'...'）承载 —— 单引号内 $( ) 与反引号都不展开，
+  // 且 escapeXml 已把 ' 转成 &apos;（无法越狱）。故模型名即使含 $ 或反引号也不构成注入；此处无需额外转义。
   const l1 = escapeXml(String(line1 || '')).replace(/\n/g, '&#10;');
   const ps = [
     '[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null',
@@ -3463,6 +3445,12 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
   // 增量读：offset 起点为启动时文件大小（只认启动后的行，防历史取消误报）。
   const t0 = Date.now();
   let lastLines = -1, lastMtime = -1, lastChangeAt = t0;
+  // v3.19.0（P3）：增量读——缓存已解析行，每轮只解析新落盘的部分。
+  // 原先每 2 秒 readTranscLines() 全量读 + 全量 JSON.parse；本机存在 91MB transcript、watcher 最长活 3 小时，
+  // 长会话期间持续高 CPU/IO（incrementalRecord 早已用 readTranscLinesFrom，watcher 没跟上）。
+  let rowsCache = [];
+  let linesRead = 0;
+  let lastSize = 0; // v3.19.0（P3）：文件字节数回退 = 被截断/重写 → 缓存失效重建
   let logOffset = 0, logCancelTs = 0;
   try { if (logFile && fs.existsSync(logFile)) logOffset = fs.statSync(logFile).size; } catch (e) {}
   while (true) {
@@ -3475,9 +3463,22 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
       if (readCoalesce(sid)) return;                      // Stop 端已写合并文件，正常链路接管
       let st;
       try { st = fs.statSync(tsPath); } catch (e) { return; } // transcript 消失（会话被删）
-      const rows = readTranscLines(tsPath);
-      if (rows.length !== lastLines || st.mtimeMs !== lastMtime) {
-        lastLines = rows.length; lastMtime = st.mtimeMs; lastChangeAt = Date.now();
+      // v3.19.0（P3）：只解析新增行；文件被截断/替换（字节数回退）→ 清缓存下轮全量重建
+      if (st.size < lastSize) { rowsCache = []; linesRead = 0; }
+      lastSize = st.size;
+      try {
+        const r = readTranscLinesFrom(tsPath, linesRead);
+        if (r.totalLines < linesRead) {
+          linesRead = 0;
+          rowsCache = [];
+        } else {
+          if (r.rows && r.rows.length) rowsCache.push(...r.rows);
+          linesRead = r.totalLines;
+        }
+      } catch (e) { /* 本轮读取失败：沿用缓存，下轮重试 */ }
+      const rows = rowsCache;
+      if (linesRead !== lastLines || st.mtimeMs !== lastMtime) {
+        lastLines = linesRead; lastMtime = st.mtimeMs; lastChangeAt = Date.now();
       }
       // --- v2.91：扫工作区日志增量，匹配本会话取消请求 ---
       if (logFile && fs.existsSync(logFile)) {
@@ -4686,4 +4687,6 @@ module.exports = {
   getTranscriptStats, sidFromPath, ledgerKey,
   // v3.18.4（G2/G3）：护栏与抢救函数导出，selftest 可直接单测（不再只能靠 spawn，受限环境也能验）
   guardRebuildScale, salvageModelsFromText, dbStaleTag,
+  // v3.19.0（P6）：本地官方价库合并导出——recalc-day.js 复用它，避免"只读主库漏掉本地库"
+  mergeLocalPriceDb, isPeakHour, parsePeakSchedule,
 };

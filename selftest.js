@@ -29,7 +29,7 @@ function canSpawn() {
 }
 const SPAWN_OK = canSpawn();
 const SYNTAX_FILES = ['token-tracker.js', 'refresh-prices.js', 'deepseek-official.js', 'refresh-holidays.js',
-  'backfill.js', 'recalc-day.js', 'selftest.js'];
+  'backfill.js', 'recalc-day.js', 'peak-rules.js', 'selftest.js'];
 
 // ── T0：语法检查 ───────────────────────────────────────────────────────────
 for (const f of SYNTAX_FILES) {
@@ -42,7 +42,7 @@ for (const f of SYNTAX_FILES) {
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-selftest-'));
 const skillDir = path.join(tmp, 'skills', 'token-usage-tracker');
 fs.mkdirSync(skillDir, { recursive: true });
-for (const f of ['token-tracker.js', 'refresh-prices.js', 'deepseek-official.js', 'pricing.json', 'holidays.json']) {
+for (const f of ['token-tracker.js', 'refresh-prices.js', 'deepseek-official.js', 'pricing.json', 'holidays.json', 'peak-rules.js', 'recalc-day.js']) {
   fs.copyFileSync(path.join(SRC, f), path.join(skillDir, f));
 }
 // v3.18.4（G2）：隔离本地官方价库——autoDiscoverCnPriceDir 第②级会扫 ~/WorkBuddy/*/prices/index.json
@@ -138,6 +138,45 @@ else {
     try { fs.unlinkSync(bakPath); } catch (e) {}
   }
   if (savedEnv === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv;
+}
+
+// ── T7：v3.19.0 新增回归 ───────────────────────────────────────────────────
+// P1：峰谷口径统一——三处工具共用 peak-rules，且不得再有硬编码时段副本
+{
+  const src = (f) => fs.readFileSync(path.join(SRC, f), 'utf-8');
+  ok('T7-P1a backfill/recalc 不含硬编码峰谷范围声明', !/const PEAK_RANGES\s*=/.test(src('backfill.js')) && !/const PEAK_RANGES\s*=/.test(src('recalc-day.js')));
+  ok('T7-P1b backfill/recalc 均引用 peak-rules.js', /require\('\.\/peak-rules\.js'\)/.test(src('backfill.js')) && /require\('\.\/peak-rules\.js'\)/.test(src('recalc-day.js')));
+  const peak = require(path.join(SRC, 'peak-rules.js'));
+  const ttMod = require(path.join(skillDir, 'token-tracker.js'));
+  const rules = { weekend_off_peak: true, peak_schedule: '10:00-13:00,15:00-19:00' }; // 假设官方改版
+  const mk = (h, mi) => new Date(Date.UTC(2026, 8, 30, h - 8, mi, 0)); // 2026-09-30 周三
+  const expect = { '9:30': false, '10:30': true, '14:30': false, '15:30': true };
+  let bad = [];
+  for (const [k, want] of Object.entries(expect)) {
+    const [h, mi] = k.split(':').map(Number);
+    const a = peak.isPeakAt(mk(h, mi).getTime(), { deepseek_rules: rules }, path.join(skillDir, 'holidays.json'));
+    const b = ttMod.isPeakHour(rules, mk(h, mi));
+    if (a !== want || b !== want) bad.push(`${k}: module=${a} main=${b} want=${want}`);
+  }
+  ok('T7-P1c 共享模块与主脚本跟随官方动态时段（4/4）', bad.length === 0, bad.join('; '));
+}
+
+// P2：recalc-day 写盘三件套（需子进程；受限环境跳过）
+if (!SPAWN_OK) skip('T7-P2 recalc-day 写盘原子性/备份');
+else {
+  const d = { '2026-01-01': { models: { 'deepseek-v4-flash': { in: 1000000, cached: 0, out: 1000, cost: 0, hit: 0 } }, total: { cost: 0, in: 1000000, cached: 0, out: 1000 } } };
+  fs.writeFileSync(path.join(skillDir, 'daily-usage.json'), '\uFEFF' + JSON.stringify(d, null, 2)); // 带 BOM（P2 崩溃场景）
+  const r = spawnSync(NODE, [path.join(skillDir, 'recalc-day.js'), '2026-01-01'], { env, timeout: 60000, windowsHide: true, encoding: 'utf8' });
+  ok('T7-P2a BOM 账本不再崩溃', r.status === 0, `exit=${r.status} ${String(r.stderr || '').slice(0, 120)}`);
+  const parsed = (() => { try { return JSON.parse(fs.readFileSync(path.join(skillDir, 'daily-usage.json'), 'utf8')); } catch (e) { return null; } })();
+  ok('T7-P2b 写盘后账本仍可解析', Boolean(parsed && parsed['2026-01-01']));
+  ok('T7-P2c 写前已备份 .bak-recalc-*', fs.readdirSync(skillDir).some((f) => f.startsWith('daily-usage.json.bak-recalc-')));
+}
+
+// P4：backfill 不再继承 _instructions
+{
+  const src = fs.readFileSync(path.join(SRC, 'backfill.js'), 'utf-8');
+  ok('T7-P4 backfill 无 _instructions 继承', !/newDaily\._instructions/.test(src));
 }
 
 fs.rmSync(tmp, { recursive: true, force: true });

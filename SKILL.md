@@ -56,9 +56,9 @@ Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\
 
 **其他会让横幅消失的原因**（若上面无效，按此顺序排查）：专注助手/免打扰（含自动规则：全屏、游戏、投影时段）→ 该应用通知总开关 → 电量节能限制后台活动 → 全屏应用抑制横幅 → 系统时间/时区异常。这些都在「设置 → 系统 → 通知」里可核对；**只有"自定义 AppId"这一类（本技能）必须走上面的注册表法**。
 
-## 当前功能总览（v3.18.x · 2026-09-30，版本以 manifest.yaml 为准）
+## 当前功能总览（v3.19.x · 2026-10-01，版本以 manifest.yaml 为准）
 
-> **v3.18 要点（2026-09-30）：安全与数据卫生修复（外部审查报告落地）——①余额查询开关改读本地未入库 local-config.json（仓库分发版默认关，"默认零密钥联网"名实相符）；②DeepSeek key 不再经子进程命令行（改环境变量）；③SKILL.md 删除凭证/推送清单与越权口令（移入本地 PUSH-SOP.local.md）；④账本 BOM 防损坏（剥 BOM + 损坏只备份一次）；⑤账本不再内嵌"读取方指令"（数据→指令通道关闭）；⑥诊断日志对话片段改指纹；⑦价格库损坏拒绝覆盖式重建、USD 模糊匹配加歧义防护、CN 模型不再写矛盾 usd_* 参考价；⑧删除作者个人路径硬编码。历史版本要点详见 `CHANGELOG.md`。**
+> **v3.19 要点（2026-10-01）：全仓审计落地——①峰谷时段判定收敛为单一实现 `peak-rules.js`（主脚本 / `backfill.js` / `recalc-day.js` 共用；此前三份硬编码副本，官方一旦调时段，增量记账与回溯重算会判出不同峰谷、金额静默差一倍且无报错）；②`recalc-day.js` 写盘改为「写前备份 + `tmp`+`rename` 原子写」，读取端剥 BOM 并把损坏文件隔离为 `.corrupt-*`；③watcher 改增量读 transcript（此前每 2 秒全量 parse，大 trace 下开销显著；文件被截断/重写时自动重建缓存）；④`backfill.js` 不再继承旧账本的 `_instructions`（数据→指令通道保持关闭）；⑤`refresh-holidays.js` 加 15s 超时 + 原子写；⑥`recalc-day.js` 合并本地官方价库（重算不再把国内模型误判为无价）；⑦`deepseek-official.js` 原子写 `pricing.json`；⑧`maybeRefreshLocalDb` 去掉 `shell:true` 改数组 spawn。v3.18 安全修复要点（余额开关本地化 / 账本 BOM 防损坏 / 个人路径清除）详见 `CHANGELOG.md`。**
 
 > **⚠️ 强制（查询触发总纲）：所有统计查询必须调用 `--report` 命令并原样贴出脚本输出，禁止自行解析 JSON。** 无论用户问「今日消耗」「今天用了多少」「账本」「报告」「统计」「花费」还是历史某天，一律先跑 `node token-tracker.js --report`（或 `--report <日期>`），再把脚本打印的 Markdown 表格原文贴给用户；不得自行读取 `daily-usage.json`、不得自行汇总、不得转成列表/纯文本/代码块。详细规则见下方「查询触发规则（强制）」与「展示格式约束（强制）」。
 
@@ -233,6 +233,7 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 | 手动取消后不弹窗（v2.83+，v2.85 起实时补弹） | `token-tracker-toast.log`（搜 `cancelled-round-watch` / `cancelled-round-flush`）+ transcript 取消标记（`role=assistant`/`status=incomplete`/`error.message` = `Interrupted by user`） | v2.85 起每个新轮 hook spawn 轮级 watcher（`--round-watch`），取消标记收尾 + 8s 无新行即补弹，reason=`cancelled-round-watch`（有 usage）/`-est`（估算）/`-no-token`（无凭据）。若仍不弹：① 取消标记后直接跟 assistant 回复（续跑，设计内不弹）；② 轮已被结算（`lastStopAt ≥ roundStart`，防双弹退出）；③ 应用关闭时 watcher 被 Job Object 连带收割（失效边界，退回下一轮 hook 兜底 `cancelled-round-flush`） |
 | 未取消却弹「（手动取消）」（v3.08 修复的误判） | 该轮 transcript（搜 `Interrupted by user`）+ 取消标记那一行是否带 `skipRun=true` + 标记之后是否存在「正常完成」的 assistant 行 + `~/.workbuddy/<proj>/token-tracker/<sid>/snapshot.json` 的 `lastStopAt` | v3.08 起：① 标记行 `skipRun===true`（应用中止在飞请求/编辑重发分叉，非用户取消）→ 不算取消；② 标记之后任意位置存在 `role=assistant` 且 `status!=='incomplete'` 的完成行 → 该轮已继续完成，不算取消；③ no-token Stop 已推进 `lastStopAt`，`intrInfo.ts > lastStopAt` 不成立则兜底不触发。若仍误弹：核查标记行是否确为 `skipRun=true` 且其后有完成行——若是而仍误判，说明兜底 `intrInfo.ts > lastStopAt` 校验没挡住（lastStopAt 陈旧），检查 no-token 分支是否真的写了快照 |
 | 专家团金额疑似翻倍（双记） | `.ledger-watermark.json` 各会话水位线 + 账本模型 token | v2.82.2 起 incrementalRecord 整体加 `.ledger-watermark.json.lock` 水位线锁，watcher 与 Stop 并发只记一次；仍翻倍则查是否锁被异常跳过（stderr 有「水位线保持不推进」则下轮会补记） |
+| 当日弹窗金额与 `recalc-day.js` 重算结果对不上 | `peak-rules.js`（唯一口径）+ `pricing.json` 的 `deepseek_rules.peak_schedule` | v3.19.0 前主脚本 / `backfill.js` / `recalc-day.js` 各存一份峰谷硬编码——官方调时段后增量记账判低峰、回溯重算判高峰，**金额静默差一倍且无报错**。v3.19.0 起三处统一委托 `peak-rules.js`；若仍不一致，`grep -n "9, *12" *.js` 查是否残留旧副本 |
 
 > ⚠️ **hooks 命令铁律**：所有 hook 命令必须保持**纯净的 `node` 调用**（如 `node C:/.../token-tracker.js --stop`），**禁止使用 `cmd /c` 包装或环境变量前缀**（如 `cmd /c "set X=1 && node ..."`）。此类包装会被 WorkBuddy 判为无效 hook 配置（`Invalid hook config`），导致整个事件组（Stop / UserPromptSubmit）跳过、进程瞬间失败且无任何日志产物。调试日志已改为弹窗时自动记录，无需通过环境变量或命令前缀开启。
 

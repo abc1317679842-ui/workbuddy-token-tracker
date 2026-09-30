@@ -16,6 +16,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const peakRules = require('./peak-rules.js'); // v3.19.0（P1）：峰谷判定单一实现（原先硬编码时段，与官方动态时段脱节）
 
 // v3.16：数据根智能探测（与 token-tracker.js 同口径）：WB_ROOT > ~/.workbuddy-ai（新版客户端）> ~/.workbuddy
 function detectWorkBuddyRoot() {
@@ -33,32 +34,17 @@ const SKILL_DIR = path.join(WB, 'skills', 'token-usage-tracker');
 const DAILY = path.join(SKILL_DIR, 'daily-usage.json');
 const PRICING = path.join(SKILL_DIR, 'pricing.json');
 const TOAST_LOG = path.join(WB, 'token-tracker-toast.log');
+const HOLIDAYS = path.join(SKILL_DIR, 'holidays.json'); // v3.19.0：假日表传给 peak-rules（口径唯一）
 
-const PEAK_RANGES = [[9 * 60, 12 * 60], [14 * 60, 18 * 60]]; // 北京时间（分钟）
 
-// v3.15（2026-09-28）：中国法定假日表（与 token-tracker.js 的 isChineseHolidayBeijing 同源同口径）
-//   官方口径：峰时段「不含中国法定假日」→ 假日全天低峰。数据缺失时降级（不判假），不报错。
-const HOLIDAYS = path.join(SKILL_DIR, 'holidays.json');
-let _holidays = null;
-function isChineseHoliday(bjDate) {
-  try {
-    if (_holidays === null) {
-      try { _holidays = JSON.parse(fs.readFileSync(HOLIDAYS, 'utf-8')); } catch (e) { _holidays = { years: {} }; }
-    }
-    const y = bjDate.getUTCFullYear();
-    const key = `${y}-${String(bjDate.getUTCMonth() + 1).padStart(2, '0')}-${String(bjDate.getUTCDate()).padStart(2, '0')}`;
-    const arr = (_holidays.years || {})[String(y)] || [];
-    return arr.indexOf(key) >= 0;
-  } catch (e) { return false; }
-}
+// v3.19.0（P2/P6）：复用主脚本的原子写（saveDailyUsageRaw）与本地官方价库合并（mergeLocalPriceDb），
+// 不再自制写盘、不再漏合并本地库。显式对齐 WB_ROOT，保证子模块的路径口径与本工具一致。
+if (!process.env.WB_ROOT) process.env.WB_ROOT = WB;
+const tt = require(path.join(__dirname, 'token-tracker.js'));
 
-function isPeakBeijing(iso) {
-  const beijing = new Date(new Date(iso).getTime() + 8 * 3600 * 1000);
-  const dow = beijing.getUTCDay();
-  if (dow === 0 || dow === 6) return false;
-  if (isChineseHoliday(beijing)) return false; // v3.15：法定假日全天低峰（官方口径）
-  const mins = beijing.getUTCHours() * 60 + beijing.getUTCMinutes();
-  return PEAK_RANGES.some(([a, b]) => mins >= a && mins < b);
+
+function isPeakBeijing(iso, pricing) {
+  return peakRules.isPeakAt(new Date(iso).getTime(), pricing, HOLIDAYS);
 }
 
 // 读 toast 日志中某天某模型的轮次（只取「已结算」的记账行，避免与 watcher 补弹重复计数）
@@ -86,13 +72,36 @@ function costOf(m, inTok, cachedTok, outTok, mult) {
   return Math.round(c * 1e6) / 1e6;
 }
 
+// v3.19.0（P2）：BOM 剥离 + 损坏备份（与主脚本 H6 同口径）。原先裸 JSON.parse，
+// 账本带 BOM 或轻微损坏时直接抛异常崩溃（连备份都不留）。
+function loadJsonSafe(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf-8').replace(/^\uFEFF/, '')); }
+  catch (e) {
+    if (fs.existsSync(file)) { try { fs.copyFileSync(file, `${file}.corrupt-${Date.now()}`); } catch (e2) {} }
+    return null;
+  }
+}
+
+// v3.19.0（P2）：写前备份（保留最近 3 份），并把写盘交给主脚本导出的原子写。
+function backupDaily() {
+  try {
+    fs.copyFileSync(DAILY, `${DAILY}.bak-recalc-${Date.now()}`);
+    const baks = fs.readdirSync(SKILL_DIR).filter((f) => f.startsWith('daily-usage.json.bak-recalc-')).sort();
+    for (const f of baks.slice(0, Math.max(0, baks.length - 3))) { try { fs.unlinkSync(path.join(SKILL_DIR, f)); } catch (e) {} }
+  } catch (e) { /* 备份失败不阻塞（写盘本身仍是原子的） */ }
+}
+
 function main() {
   const argv = process.argv.slice(2);
   const date = argv[0] || new Date().toISOString().slice(0, 10);
   const onlyModel = argv[1] || '';
 
-  const daily = JSON.parse(fs.readFileSync(DAILY, 'utf-8'));
-  const pricing = JSON.parse(fs.readFileSync(PRICING, 'utf-8'));
+  const daily = loadJsonSafe(DAILY);
+  if (!daily) { console.error('账本读取失败（已备份为 .corrupt-*）；请检查 daily-usage.json'); process.exit(1); }
+  let pricing = loadJsonSafe(PRICING);
+  if (!pricing) { console.error('pricing.json 读取失败（已备份为 .corrupt-*）'); process.exit(1); }
+  // v3.19.0（P6）：合并本地官方价库——原先只读 pricing.json，只在本地库有价的国内模型被判"无价"跳过
+  try { pricing = tt.mergeLocalPriceDb(pricing); } catch (e) { /* 本地库不可用则沿用主库 */ }
   const day = daily[date];
   if (!day) { console.error(`账本中无 ${date} 记录`); process.exit(1); }
 
@@ -107,7 +116,7 @@ function main() {
     const hours = roundHoursOf(date, model);
     let peakRatio = null;
     if (hours) {
-      peakRatio = hours.filter(isPeakBeijing).length / hours.length;
+      peakRatio = hours.filter((iso) => isPeakBeijing(iso, pricing)).length / hours.length;
     } else if (m.peak_multiplier > 1) {
       peakRatio = null; // 无法判定 → 按空闲价（保守低估），并在报告中标注
     } else {
@@ -138,7 +147,10 @@ function main() {
   }
 
   day.total.cost = Math.round(dayTotal * 1e6) / 1e6;
-  fs.writeFileSync(DAILY, JSON.stringify(daily, null, 2) + '\n');
+  // v3.19.0（P2）：先备份，再走主脚本的原子写（tmp+rename）。原先直接 writeFileSync 覆盖，
+  // 写盘中断 = 全部历史账本损坏（唯一三样全无的写入路径）。
+  backupDaily();
+  if (!tt.saveDailyUsageRaw(daily)) { console.error('账本写入失败，原文件未改动'); process.exit(1); }
 
   console.log(`===== 回溯重算 ${date} =====`);
   if (!report.length) console.log('无需修正（各模型金额已一致）');

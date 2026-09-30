@@ -3,6 +3,20 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.19.0（2026-10-01）—— 全仓审计落地：峰谷口径统一 + 写盘安全 + watcher 增量读
+
+- **P1【中·高】** 峰谷口径分裂：主脚本读 `pricing.deepseek_rules.peak_schedule`（官方改版自动跟随），而 `backfill.js` / `recalc-day.js` 各自硬编码 `[[9,12],[14,18]]` → 官方一旦调时段，增量记账判低峰、回溯重算判高峰，**同一批数据金额差一倍且静默无报错**（v3.15 只同步了假日、没同步时段）。修复：新增 **`peak-rules.js`** 单一实现（时段 + 假日 + 周末口径全部收拢），三处全部委托调用；实测模拟官方改版 `10:00-13:00,15:00-19:00` 时 09:30/14:30 正确判低峰（旧硬编码会判高峰）
+- **P2【中】** `recalc-day.js` 是唯一「覆盖 `daily-usage.json` 却非原子、无锁、无备份」的写入路径，且 `JSON.parse` 无 try/catch（账本带 BOM 或轻微损坏即崩溃）。修复：写前备份（保留最近 3 份 `.bak-recalc-*`）+ 复用主脚本导出的 `saveDailyUsageRaw`（tmp+rename 原子写）+ 读取端 BOM 剥离与损坏备份（`.corrupt-*`）。实测：BOM 账本重算不再崩溃
+- **P3【中】** watcher 每 2 秒全量读 + 全量 `JSON.parse` transcript（本机存在 91 MB trace、watcher 最长活 3 小时；`incrementalRecord` 早已用增量读，watcher 没跟上）。修复：缓存已解析行 + 只解析新增行，文件被截断/重写（字节数回退）时自动重建缓存。实测：增量累积与全量读结果完全一致（41/41）
+- **P4【中低】** `backfill.js` 把旧账本的 `_instructions` 原样继承进新账本，等于把 M3 关闭的「数据→指令」通道又开回来。修复：停止继承
+- **P5【低】** `refresh-holidays.js` 网络请求无超时（网络 hang 时进程永久挂起）+ 写盘非原子。修复：`AbortController` 15s + tmp/rename 原子写
+- **P6【低】** `recalc-day.js` 不合并本地官方价库 → 只在本地库有价的国内模型被判「无价」跳过（重算不全）。修复：复用主脚本导出的 `mergeLocalPriceDb`
+- **P8【低】** `deepseek-official.js` 写 `pricing.json` 非原子。修复：tmp + rename
+- **P9【低】** `maybeRefreshLocalDb` 用 `shell: true` 拼字符串执行 Python 流水线（只对空格加引号，路径含 `&`/`|` 等 cmd 元字符时可被解释）。修复：改数组形式 `spawn(exe, [script])` 串行执行，去掉 shell
+- **P7【复核为误报】** 审计称 `showToast` 的文案「插进 PowerShell 双引号串」会被美元符号 / 反引号求值——实测该 XML 由**单引号字面量**承载（单引号内不展开），且 `escapeXml` 已把单引号转成实体无法越狱。代码未改，已加注释说明结论
+- **自测补口**：`selftest.js` 新增 T7 段（峰谷三处一致 + 无硬编码副本 + recalc 写盘原子性/备份 + backfill 无 `_instructions`），语法扫描扩到 8 个 JS
+- **版本**：三处统一 v3.19.0
+
 ## v3.18.4（2026-09-30）—— 第五轮复审：G1 判定口径 + G3 落盘 + G2 自测隔离
 
 - **G1【重要】**：v3.18.3 的护栏**判定口径不一致**——`rebuilt` 是 loadPricing() 的结果，内部已合并本地官方价库（实测本机 52 条），却拿它与"备份文件抢救出的条目数"比 `nOld > nNew`，在真实用户环境（有本地价库）下 100% 失效，且因新分支抢在体积告警之前，比 v3.18.2（能告警）**更差**。修复：

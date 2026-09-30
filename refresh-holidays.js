@@ -21,6 +21,7 @@ const DIR = __dirname;
 const OUT = path.join(DIR, 'holidays.json');
 const SRC_A = 'NateScarlet/holiday-cn';
 const SRC_B = 'HankAviator/china-holiday-calendar';
+const TIMEOUT_MS = 15000; // v3.19.0（P5）：单请求超时（与 deepseek-official 的 15s 同口径）
 
 // v3.18.1：token 只从环境变量读取（GH_TOKEN / GITHUB_TOKEN），不再读任何本地凭据文件。
 // 公开仓库无 token 也能读（受 GitHub 限流 60 次/小时，节假日刷新每天最多 1 次，够用）。
@@ -32,7 +33,13 @@ function ghToken() {
 async function ghJson(repo, p, tok) {
   const headers = { 'Accept': 'application/vnd.github+json', 'User-Agent': 'token-usage-tracker' };
   if (tok) headers['Authorization'] = 'Bearer ' + tok;
-  const res = await fetch(`https://api.github.com/repos/${repo}/contents/${p}`, { headers });
+  // v3.19.0（P5）：加超时——原先裸 fetch，网络 hang 会让进程永久挂起（手动跑卡终端）。
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(`https://api.github.com/repos/${repo}/contents/${p}`, { headers, signal: ctrl.signal });
+  } finally { clearTimeout(timer); }
   if (!res.ok) throw new Error(`HTTP ${res.status} @ ${repo}/${p}`);
   const j = await res.json();
   if (!j.content) throw new Error(`无 content @ ${repo}/${p}`);
@@ -103,13 +110,19 @@ async function fromB(y, tok) {
     console.log('  全年份均失败 → 不覆盖现有 holidays.json');
     process.exit(2);
   }
-  fs.writeFileSync(OUT, JSON.stringify({
+  // v3.19.0（P5）：原子写（tmp + rename），与其它写盘路径同口径（原先裸 writeFileSync，中断留半截 JSON）
+  const payload = JSON.stringify({
     updated_at: new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 19).replace('T', ' '),
     note: '只列「放假」日期；峰谷判定用它排除法定假日。双源交叉验证，不一致时取交集。',
     sources: { primary: SRC_A, verify: SRC_B },
     years: yearsMap,
     cross_check: cross,
-  }, null, 1), 'utf-8');
+  }, null, 1);
+  {
+    const tmp = OUT + '.tmp';
+    fs.writeFileSync(tmp, payload, 'utf-8');
+    fs.renameSync(tmp, OUT);
+  }
   console.log(`  已写入 ${OUT}`);
   console.log(`  覆盖年份: ${Object.keys(yearsMap).sort().join(', ')}`);
   if (fails.length) { console.log('  部分失败: ' + fails.join(' | ')); process.exitCode = 1; }
