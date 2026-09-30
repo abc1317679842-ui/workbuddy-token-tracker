@@ -179,6 +179,83 @@ else {
   ok('T7-P4 backfill 无 _instructions 继承', !/newDaily\._instructions/.test(src));
 }
 
+// ── T8：v3.19.1 新增回归（N1 峰谷静默失效 / N2 watcher IO / N3 告警去重 / N4 假日缓存） ──
+// 全部基于 require，不依赖 spawn，受限环境同样运行。
+{
+  const dso = require(path.join(SRC, 'deepseek-official.js'));
+
+  // N1-a～d：句式解析。官方 2026-09 改为倒装句，v3.19.0 的正则在此处失败且**把好数据清成空串**。
+  const NEW_SENTENCE = '空闲时段价格为高峰时段价格的一半。北京时间周一至周五（不含中国法定节假日）9:00 - 12:00、14:00 - 18:00 为高峰时段；其余时段，包括周末及中国法定节假日全天均为空闲时段。';
+  ok('T8-N1a 官方现行倒装句式可解析', dso.extractPeakSchedule(NEW_SENTENCE) === '9:00 - 12:00、14:00 - 18:00', String(dso.extractPeakSchedule(NEW_SENTENCE)));
+  ok('T8-N1b 旧句式仍兼容', dso.extractPeakSchedule('高峰时段为北京时间周一至周五 9:00 - 12:00、14:00 - 18:00（其余为空闲时段）') === '9:00 - 12:00、14:00 - 18:00');
+  ok('T8-N1c 无法识别 → null（不是空串）', dso.extractPeakSchedule('繁忙时段为北京时间 9:00 - 12:00') === null);
+  ok('T8-N1d 不变式：倒置 / 超范围 / 低谷对调式均不误判',
+    dso.extractPeakSchedule('高峰时段 18:00 - 9:00') === null
+    && dso.extractPeakSchedule('高峰时段 25:00 - 26:00') === null
+    && dso.extractPeakSchedule('9:00-12:00 为低谷时段，其余为高峰时段') === null);
+
+  // N1-e/f：**失败不得清空**（本次修复核心）
+  const p1 = { deepseek_rules: { peak_schedule: '9:00 - 12:00、14:00 - 18:00', weekend_off_peak: true } };
+  const act = dso.applyRules(p1, { peak_schedule: null, weekend_off_peak: true, effective_at: null }, '2026-10-01T00:00:00.000Z', 'x');
+  ok('T8-N1e ★解析失败保留旧规则（v3.19.0 会清成空串）',
+    act === 'error' && p1.deepseek_rules.peak_schedule === '9:00 - 12:00、14:00 - 18:00' && !!p1.deepseek_rules_error,
+    `act=${act} sched=${JSON.stringify(p1.deepseek_rules.peak_schedule)}`);
+  const p2 = {};
+  dso.applyRules(p2, { peak_schedule: '9:00 - 12:00', weekend_off_peak: true, effective_at: null }, '2026-10-01T00:00:00.000Z', 'x');
+  ok('T8-N1f 解析成功则覆盖并清除 error 标记', !p2.deepseek_rules_error && p2.deepseek_rules.peak_schedule === '9:00 - 12:00');
+
+  // N1-g/h：toast 可见告警（对齐 ⚠价库 模式）
+  const ttMod = require(path.join(skillDir, 'token-tracker.js'));
+  if (typeof ttMod.peakRuleTag === 'function') {
+    ok('T8-N1g ⚠时段 标签：error 与空串都显示',
+      ttMod.peakRuleTag({ deepseek_rules_error: {} }) === '⚠时段' && ttMod.peakRuleTag({ deepseek_rules: { peak_schedule: '' } }) === '⚠时段');
+    ok('T8-N1h 正常规则不显示标签', ttMod.peakRuleTag({ deepseek_rules: { peak_schedule: '9:00 - 12:00' } }) === '');
+  } else ok('T8-N1g peakRuleTag 已导出', false, '缺少导出');
+
+  // N2：watcher 未变化即跳过文件 IO
+  if (typeof ttMod.watchReadStep !== 'function') ok('T8-N2 watchReadStep 已导出', false);
+  else {
+    const fp = path.join(tmp, 'watch-transc.jsonl');
+    const mkRow = (i) => JSON.stringify({ type: 'assistant', message: { usage: { input_tokens: i, output_tokens: 1 } }, ts: i });
+    fs.writeFileSync(fp, [mkRow(1), mkRow(2), mkRow(3)].join('\n') + '\n');
+    const st = { rowsCache: [], linesRead: 0, lastSize: 0, lastReadSize: -1, lastReadMtime: -1 };
+    ttMod.watchReadStep(st, fp, fs.statSync(fp));
+    const firstLines = st.linesRead;
+    const origRead = fs.readFileSync; let reads = 0; const stFixed = fs.statSync(fp);
+    fs.readFileSync = function (...a) { reads++; return origRead.apply(this, a); };
+    for (let i = 0; i < 5; i++) ttMod.watchReadStep(st, fp, stFixed);
+    fs.readFileSync = origRead;
+    ok('T8-N2a ★文件未变的 5 轮轮询 readFileSync 调用 0 次', reads === 0 && firstLines === 3, `reads=${reads} lines=${firstLines}`);
+    fs.appendFileSync(fp, [mkRow(4), mkRow(5)].join('\n') + '\n');
+    ttMod.watchReadStep(st, fp, fs.statSync(fp));
+    const full = ttMod.parseTranscChunk(fs.readFileSync(fp, 'utf-8')).length;
+    ok('T8-N2b 追加后增量结果与全量解析等价', st.linesRead === full && st.rowsCache.length === full, `${st.linesRead}/${full}`);
+    fs.rmSync(fp, { force: true });
+  }
+
+  // N3：歧义告警去重（同一模型在多源回路各报一次）
+  const rp = require(path.join(SRC, 'refresh-prices.js'));
+  const idx = { 'a-kimi-x': { usdIn: 1, usdOut: 2 }, 'b-kimi-y': { usdIn: 3, usdOut: 4 } };
+  const beforeN3 = rp.AMBIG_WARNINGS.size;
+  rp.looseFind(idx, 'kimi', 'USD源', 'kimi-k3');
+  rp.looseFind(idx, 'kimi', 'USD源', 'kimi-k3');
+  ok('T8-N3 歧义告警去重（同内容两次只留 1 条）', rp.AMBIG_WARNINGS.size - beforeN3 === 1, `size+${rp.AMBIG_WARNINGS.size - beforeN3}`);
+
+  // N4：假日表 mtime 失效 + 时段分钟
+  const pk2 = require(path.join(SRC, 'peak-rules.js'));
+  const hp = path.join(tmp, 'holidays-mtime.json');
+  const tsN4 = Date.UTC(2026, 9, 1, 2, 0); // 北京时间 2026-10-01
+  fs.writeFileSync(hp, JSON.stringify({ years: { '2026': [] } }));
+  const hA = pk2.isHolidayBeijing(tsN4, hp);
+  fs.writeFileSync(hp, JSON.stringify({ years: { '2026': ['2026-10-01'] } }));
+  const tFuture = new Date(Date.now() + 5000); fs.utimesSync(hp, tFuture, tFuture);
+  const hB = pk2.isHolidayBeijing(tsN4, hp);
+  ok('T8-N4 假日表更新后同进程内立即重载（mtime 失效）', hA === false && hB === true, `${hA} → ${hB}`);
+  const rsN4 = pk2.parsePeakSchedule('9:30 - 12:30');
+  ok('T8-N4b 时段解析保留分钟', rsN4[0].s === 9.5 && rsN4[0].e === 12.5, JSON.stringify(rsN4));
+  fs.rmSync(hp, { force: true });
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log(`\n结果：${pass} 过 / ${fail} 败${skipped ? '（有跳过项：本环境禁止 node 子进程）' : ''}`);
 process.exit(fail ? 1 : 0);

@@ -154,13 +154,58 @@ function parseOfficial(html) {
   return out;
 }
 
+// v3.19.1（N1）：峰谷时段解析改为**句式无关 + 不变式校验**。
+// 原实现只有一条正则 `/高峰时段为北京时间…/`；官方 2026-09 把文案改成倒装句
+// 「北京时间周一至周五（不含中国法定节假日）9:00 - 12:00、14:00 - 18:00 为高峰时段」后
+// 匹配失败，且失败时**静默把 pricing.json 里的 peak_schedule 覆盖成空串**——下游回落默认值
+// 恰好等于官方当前时段，毫无异常表现，只在官方真调时段那天一次性算错钱（实测 9-30 那次刷新已发生）。
+const PEAK_PATTERNS = [
+  // ① 旧句式：「高峰时段为北京时间[周一至周五] 9:00 - 12:00、14:00 - 18:00（其余为空闲时段）」
+  /高峰时段为北京时间[^0-9]*([0-9:：，、,\s\-–—]+)/,
+  // ② 倒装句式（官方 2026-09 起）：「…9:00 - 12:00、14:00 - 18:00 为高峰时段」
+  //    间隔段排除「为」字：否则「9:00-12:00 为低谷时段，其余为高峰时段」会跨句错配后半段的「为高峰时段」
+  /(\d{1,2}[:：]\d{2}\s*[-–—~至到]\s*\d{1,2}[:：]\d{2}(?:\s*[、,，]\s*\d{1,2}[:：]\d{2}\s*[-–—~至到]\s*\d{1,2}[:：]\d{2})*)[^。；;为]{0,30}?为高峰时段/,
+];
+
+// 从文本片段提取时间区间 + 不变式校验（0 <= 起 < 止 <= 24），防「9月12日」之类误匹配
+function extractRanges(str) {
+  const out = [];
+  const re = /(\d{1,2})\s*[:：]\s*(\d{2})\s*[-–—~至到]\s*(\d{1,2})\s*[:：]\s*(\d{2})/g;
+  let m;
+  while ((m = re.exec(String(str || '')))) {
+    const s = Number(m[1]) + Number(m[2]) / 60;
+    const e = Number(m[3]) + Number(m[4]) / 60;
+    if (!(s >= 0 && s < e && e <= 24)) continue;
+    out.push({ s, e });
+  }
+  return out;
+}
+
+const fmtHM = (v) => `${Math.floor(v)}:${String(Math.round((v % 1) * 60)).padStart(2, '0')}`;
+const fmtRanges = (rs) => rs.map((r) => `${fmtHM(r.s)} - ${fmtHM(r.e)}`).join('、');
+
+// 返回归一化时段串（"9:00 - 12:00、14:00 - 18:00"）；**解析失败返回 null**（调用方保留旧值，绝不清空）
+function extractPeakSchedule(text) {
+  for (const re of PEAK_PATTERNS) {
+    const m = String(text || '').match(re);
+    if (!m) continue;
+    const rs = extractRanges(m[1]);
+    if (rs.length) return fmtRanges(rs);
+  }
+  // ③ 兜底：句式彻底变了也要能捞到——取「含高峰、不含空闲/低谷」句子内的时间区间。
+  //    排除「空闲/低谷」是防「9:00-12:00 为低谷时段，其余为高峰时段」这类对调式文案被反向误判。
+  for (const sent of String(text || '').split(/[。；;\n]/)) {
+    if (!/高峰/.test(sent) || /空闲|低谷/.test(sent)) continue;
+    const rs = extractRanges(sent);
+    if (rs.length) return fmtRanges(rs);
+  }
+  return null;
+}
+
 // 提取时段规则 + 周末低峰声明 + 生效时间（从页面文本）
 function parseRules(html) {
   const text = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
-  // 高峰时段文本（官方 8-23 后改为"周一至周五"前缀；旧版无前缀）：
-  //   "高峰时段为北京时间周一至周五 9:00 - 12:00、14:00 - 18:00（其余为空闲时段）"
-  //   "高峰时段为北京时间 9:00 - 12:00、14:00 - 18:00"
-  let peak = text.match(/高峰时段为北京时间[^0-9]*([0-9:，、,\s\-]+)/);
+  const peakSchedule = extractPeakSchedule(text);
   // 周末低峰规则存在性：
   //   新版：明确"周一至周五"为高峰时段（即周末空闲）；旧版：明确"周末...统一按照低谷时段价格"
   const weekend = /周一至周五/.test(text) || /周末[^。]{0,80}统一按照低谷时段价格/.test(text);
@@ -178,10 +223,53 @@ function parseRules(html) {
     }
   }
   return {
-    peak_schedule: peak ? peak[1].trim() : '',
+    peak_schedule: peakSchedule, // v3.19.1（N1）：null = 解析失败 → 调用方保留旧值 + 告警，绝不清空
     weekend_off_peak: weekend,
     effective_at: effectiveAt,
   };
+}
+
+// v3.19.1（N1）：把解析结果并入 pricing —— **解析失败不清空**是本次修复的核心，故抽为纯函数并导出单测。
+// 旧实现在解析失败时无条件写 `peak_schedule: ''`，把原本正确的时段覆盖掉；下游回落默认值，
+// 而默认值恰好等于官方当前时段 → 故障完全不可见（实测 9-30 那次刷新已发生，此前所有备份均非空）。
+// 返回 'error' | 'pending' | 'applied'，调用方据此输出 stderr 告警。
+function applyRules(pricing, rules, nowIso, officialUrl) {
+  const pending = pricing.deepseek_rules_pending;
+  if (pending && pending.effective_at && pending.effective_at <= nowIso) {
+    // pending 到期 → 提升为当前规则，清除 pending
+    pricing.deepseek_rules = { ...pending, applied_at: nowIso };
+    delete pricing.deepseek_rules_pending;
+  }
+  if (!rules.peak_schedule) {
+    // 解析失败 → 保留 pricing.json 既有规则，只落告警（宁可本次不更新，也不能把好数据弄坏）
+    pricing.deepseek_rules_error = {
+      at: nowIso,
+      reason: '峰谷时段文案解析失败（官方页句式可能已变更）',
+      url: officialUrl || null,
+    };
+    return 'error';
+  }
+  if (rules.effective_at && rules.effective_at > nowIso) {
+    // 官方预告未来生效 → 存 pending（新规则内容），当前规则不动
+    pricing.deepseek_rules_pending = {
+      peak_schedule: rules.peak_schedule,
+      weekend_off_peak: rules.weekend_off_peak,
+      effective_at: rules.effective_at,
+      fetched_at: nowIso,
+    };
+    delete pricing.deepseek_rules_error;
+    return 'pending';
+  }
+  // 立即生效或已生效 → 直接更新当前规则
+  pricing.deepseek_rules = {
+    peak_schedule: rules.peak_schedule,
+    weekend_off_peak: rules.weekend_off_peak,
+    effective_at: rules.effective_at,
+    updated_at: nowIso,
+  };
+  delete pricing.deepseek_rules_pending;
+  delete pricing.deepseek_rules_error;
+  return 'applied';
 }
 
 // 官方价 → 本地模型块（只填价格+峰谷，其他字段不动）
@@ -352,29 +440,8 @@ async function main() {
         //    - 否则 → 更新 deepseek_rules 为当前生效规则；
         //    - 已有 pending 且已到生效时间 → 提升为当前规则。
         const nowIso = new Date().toISOString();
-        const pending = pricing.deepseek_rules_pending;
-        if (pending && pending.effective_at && pending.effective_at <= nowIso) {
-          // pending 到期 → 提升为当前规则，清除 pending
-          pricing.deepseek_rules = { ...pending, applied_at: nowIso };
-          delete pricing.deepseek_rules_pending;
-        }
-        if (rules.effective_at && rules.effective_at > nowIso) {
-          // 官方预告未来生效 → 存 pending（新规则内容），当前规则不动
-          pricing.deepseek_rules_pending = {
-            peak_schedule: rules.peak_schedule,
-            weekend_off_peak: rules.weekend_off_peak,
-            effective_at: rules.effective_at,
-            fetched_at: nowIso,
-          };
-        } else {
-          // 立即生效或已生效 → 直接更新当前规则
-          pricing.deepseek_rules = {
-            peak_schedule: rules.peak_schedule,
-            weekend_off_peak: rules.weekend_off_peak,
-            effective_at: rules.effective_at,
-            updated_at: nowIso,
-          };
-          delete pricing.deepseek_rules_pending;
+        if (applyRules(pricing, rules, nowIso, OFFICIAL_URL) === 'error') {
+          process.stderr.write('[deepseek-official] ⚠️ 峰谷时段文案解析失败（页面句式可能已变更）→ 保留本地既有规则、未覆盖；请人工核对官方定价页\n');
         }
         // 4) 清理失败标记（成功即清除）
         delete pricing.last_refresh_error;
@@ -399,7 +466,12 @@ async function main() {
   process.exit(1);
 }
 
-main().catch((e) => {
-  process.stderr.write(`[deepseek-official] 异常: ${e.message}\n`);
-  process.exit(1);
-});
+// v3.19.1：导出纯函数供 selftest 直接单测（句式解析是 N1 的核心，必须能离线验证六个文案变体）
+module.exports = { parseRules, extractPeakSchedule, extractRanges, applyRules, PEAK_PATTERNS };
+
+if (require.main === module) {
+  main().catch((e) => {
+    process.stderr.write(`[deepseek-official] 异常: ${e.message}\n`);
+    process.exit(1);
+  });
+}

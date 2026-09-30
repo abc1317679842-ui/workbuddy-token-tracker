@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.19.0 (2026-10-01)
+// token-usage-tracker v3.19.1 (2026-10-01)
 // v2.63：调试日志机制重构——废弃 TOKEN_TRACKER_DEBUG 环境变量开关 + poll 全量记录，改为「弹窗时自动记录」：
 //   每次 showToast 无条件向 ~/.workbuddy/token-tracker-toast.log 追加一行 JSON 诊断（原因/sessionId/行数/稳定计数/compaction 状态等）。
 // v2.62：compaction 检测由"行数减少>5"改为"扫描 transcript 末尾 30 行识别压缩标记（compactionMode 方案）"。
@@ -2951,9 +2951,21 @@ function dbStaleTag(pricing) {
   return '';
 }
 
+// v3.19.1（N1）：峰谷时段解析失败 → toast 可见告警（对齐上方 dbStaleTag 的 ⚠价库 模式）。
+// 背景：官方改文案导致解析失败时，v3.19.0 会把 peak_schedule 覆盖成空串，下游静默回落默认时段，
+// 而默认时段恰好等于官方当前值 → 故障零可见性。现既不清空、又让用户看得见。
+// 触发：① 本次刷新解析失败落盘的 deepseek_rules_error；② peak_schedule 为空串（历史遗留坏值）。
+function peakRuleTag(pricing) {
+  if (!pricing) return '';
+  if (pricing.deepseek_rules_error) return '⚠时段';
+  const r = pricing.deepseek_rules;
+  if (r && typeof r === 'object' && !r.peak_schedule) return '⚠时段';
+  return '';
+}
+
 function periodNote(stat, pricing) {
   const base = periodPeakNote(stat, pricing);
-  const tag = dbStaleTag(pricing);
+  const tag = [dbStaleTag(pricing), peakRuleTag(pricing)].filter(Boolean).join(' ');
   if (!base) return tag;
   if (!tag) return base;
   return `${base} ${tag}`;
@@ -3430,6 +3442,31 @@ function ensureNewModelPricing(pricing, stat) {
 //   自动跳过，不会双弹（注意 showToast 去重是进程内存态，跨进程无效——防双弹必须靠结算推进）。
 //   静默判定同时看行数与 mtime（压缩重写不改行数但改 mtime）。
 //   与下一轮 hook 兜底的竞态：弹前最后一刻复核 snapshot（结算即退出）；残余窗口毫秒级。
+// v3.19.1（N2）：watcher 单轮读取（导出供 selftest 验证"未变化跳过 IO"与增量等价性）。
+// v3.19.0 把「解码 + JSON.parse」做成了增量，但 readTranscLinesFrom 第一行仍是 fs.readFileSync 全量
+// 读入整个 transcript（本机 91MB），每 2 秒一次、watcher 最长活 3 小时 → Buffer 分配/GC 压力不必要。
+// 现按 (size, mtimeMs) 双条件短路：两者都没动才跳过——压缩重写不改行数但必改 mtime，仍会被读到。
+// state: { rowsCache, linesRead, lastSize, lastReadSize, lastReadMtime }
+function watchReadStep(state, tsPath, st) {
+  if (st.size === state.lastReadSize && st.mtimeMs === state.lastReadMtime) {
+    return; // 文件未变化 → 沿用缓存，本轮不做任何文件 IO
+  }
+  state.lastReadSize = st.size;
+  state.lastReadMtime = st.mtimeMs;
+  if (st.size < state.lastSize) { state.rowsCache = []; state.linesRead = 0; } // 被截断/重写 → 缓存失效
+  state.lastSize = st.size;
+  try {
+    const r = readTranscLinesFrom(tsPath, state.linesRead);
+    if (r.totalLines < state.linesRead) {
+      state.linesRead = 0;
+      state.rowsCache = [];
+    } else {
+      if (r.rows && r.rows.length) state.rowsCache.push(...r.rows);
+      state.linesRead = r.totalLines;
+    }
+  } catch (e) { /* 本轮读取失败：沿用缓存，下轮重试 */ }
+}
+
 function roundWatchMain(sid, tsPath, roundStart, logFile) {
   const POLL_MS = Number(process.env.ROUND_WATCH_POLL_MS) || (2 * 1000);
   const QUIET_MS = Number(process.env.ROUND_WATCH_QUIET_MS) || (8 * 1000);
@@ -3448,9 +3485,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
   // v3.19.0（P3）：增量读——缓存已解析行，每轮只解析新落盘的部分。
   // 原先每 2 秒 readTranscLines() 全量读 + 全量 JSON.parse；本机存在 91MB transcript、watcher 最长活 3 小时，
   // 长会话期间持续高 CPU/IO（incrementalRecord 早已用 readTranscLinesFrom，watcher 没跟上）。
-  let rowsCache = [];
-  let linesRead = 0;
-  let lastSize = 0; // v3.19.0（P3）：文件字节数回退 = 被截断/重写 → 缓存失效重建
+  const watchState = { rowsCache: [], linesRead: 0, lastSize: 0, lastReadSize: -1, lastReadMtime: -1 };
   let logOffset = 0, logCancelTs = 0;
   try { if (logFile && fs.existsSync(logFile)) logOffset = fs.statSync(logFile).size; } catch (e) {}
   while (true) {
@@ -3463,20 +3498,9 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
       if (readCoalesce(sid)) return;                      // Stop 端已写合并文件，正常链路接管
       let st;
       try { st = fs.statSync(tsPath); } catch (e) { return; } // transcript 消失（会话被删）
-      // v3.19.0（P3）：只解析新增行；文件被截断/替换（字节数回退）→ 清缓存下轮全量重建
-      if (st.size < lastSize) { rowsCache = []; linesRead = 0; }
-      lastSize = st.size;
-      try {
-        const r = readTranscLinesFrom(tsPath, linesRead);
-        if (r.totalLines < linesRead) {
-          linesRead = 0;
-          rowsCache = [];
-        } else {
-          if (r.rows && r.rows.length) rowsCache.push(...r.rows);
-          linesRead = r.totalLines;
-        }
-      } catch (e) { /* 本轮读取失败：沿用缓存，下轮重试 */ }
-      const rows = rowsCache;
+      watchReadStep(watchState, tsPath, st);
+      const rows = watchState.rowsCache;
+      const linesRead = watchState.linesRead;
       if (linesRead !== lastLines || st.mtimeMs !== lastMtime) {
         lastLines = linesRead; lastMtime = st.mtimeMs; lastChangeAt = Date.now();
       }
@@ -4689,4 +4713,8 @@ module.exports = {
   guardRebuildScale, salvageModelsFromText, dbStaleTag,
   // v3.19.0（P6）：本地官方价库合并导出——recalc-day.js 复用它，避免"只读主库漏掉本地库"
   mergeLocalPriceDb, isPeakHour, parsePeakSchedule,
+  // v3.19.1（N1）：时段告警标签导出，selftest 直接单测（无法解析时 toast 必须可见）
+  peakRuleTag,
+  // v3.19.1（N2）：watcher 单轮读取导出，selftest 验证"未变化跳过 IO"与增量等价性
+  watchReadStep,
 };

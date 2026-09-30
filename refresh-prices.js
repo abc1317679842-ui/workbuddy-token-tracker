@@ -300,7 +300,9 @@ function parsePortkey(j) {
 //   ① 归一化精确相等 → 直接命中；
 //   ② 模糊匹配：双方归一化名都 ≥4 字符才参与，收集**全部**命中——
 //      唯一命中 → 采用；多个命中但价格一致 → 取首个（无害）；多个命中且价格不同 → 判歧义放弃并告警。
-const AMBIG_WARNINGS = [];
+// v3.19.1（N3）：Set 去重——同一模型会在多个 USD 源（openrouter/litellm/portkey…）各回路上各报一次，
+// 原数组 push 让真实 last_refresh_note 里同一条出现 2 次（实测 20 条里 10 组重复），纯冗余。
+const AMBIG_WARNINGS = new Set();
 function looseFind(index, localNorm, kind, forKey) {
   if (!index) return null;
   let hits = [];
@@ -315,7 +317,7 @@ function looseFind(index, localNorm, kind, forKey) {
   const priceSig = (v) => JSON.stringify([v.usdIn != null ? v.usdIn : v.in, v.usdOut != null ? v.usdOut : v.out]);
   const sigs = new Set(hits.map((k) => priceSig(index[k])));
   if (sigs.size === 1) return index[hits[0]];
-  AMBIG_WARNINGS.push(`${forKey}: ${kind} 模糊命中 ${hits.length} 个不同价候选(${hits.slice(0, 3).join(',')})，已放弃`);
+  AMBIG_WARNINGS.add(`${forKey}: ${kind} 模糊命中 ${hits.length} 个不同价候选(${hits.slice(0, 3).join(',')})，已放弃`);
   return null;
 }
 
@@ -596,7 +598,7 @@ async function main() {
     pricing.deepseek_refresh_error = `DeepSeek 官方定价抓取失败（${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}），DeepSeek 系价格沿用本地/聚合源价`;
     // 失败不阻塞整体刷新：其余模型照常更新
   }
-  pricing.last_refresh_note = `${new Date().toISOString()} 多源刷新：${noteParts.join(' | ')}；人民币主价更新 ${updatedMain} 个${autoConverted ? `，USD换算 ${autoConverted} 个` : ''}，USD参考 ${usdUpdated} 个，region 设定 ${regionSet} 个（汇率 ${rate}）${bigDiff.length ? `；⚠️峰谷模型价差>60%需核验：${bigDiff.join('、')}` : ''}${officialOk ? '；DeepSeek官方价✓' : '；DeepSeek官方价✗(回落聚合源)'}${AMBIG_WARNINGS.length ? `；⚠️模糊匹配歧义: ${AMBIG_WARNINGS.join('；')}` : ''}${auditWarnings.length ? `；⚠️价格一致性自检: ${auditWarnings.join('；')}` : ''}`;
+  pricing.last_refresh_note = `${new Date().toISOString()} 多源刷新：${noteParts.join(' | ')}；人民币主价更新 ${updatedMain} 个${autoConverted ? `，USD换算 ${autoConverted} 个` : ''}，USD参考 ${usdUpdated} 个，region 设定 ${regionSet} 个（汇率 ${rate}）${bigDiff.length ? `；⚠️峰谷模型价差>60%需核验：${bigDiff.join('、')}` : ''}${officialOk ? '；DeepSeek官方价✓' : '；DeepSeek官方价✗(回落聚合源)'}${AMBIG_WARNINGS.size ? `；⚠️模糊匹配歧义: ${[...AMBIG_WARNINGS].join('；')}` : ''}${auditWarnings.length ? `；⚠️价格一致性自检: ${auditWarnings.join('；')}` : ''}`;
 
   try { save(pricing); }
   catch (e) { process.stderr.write(`[refresh-prices] 写入失败: ${e.message}\n`); process.exit(1); }
@@ -613,4 +615,4 @@ if (require.main === module) {
 }
 
 // 供测试/外部复用（不影响脚本直接运行）
-module.exports = { save, load, todayStr, PRICING, usdFind, cnFind, looseFind, norm, median };
+module.exports = { save, load, todayStr, PRICING, usdFind, cnFind, looseFind, norm, median, AMBIG_WARNINGS };

@@ -17,13 +17,19 @@ const DEFAULT_RANGES = [{ s: 9, e: 12 }, { s: 14, e: 18 }]; // 官方当前口�
 
 let _holidaysCache = null;
 let _holidaysPathCache = null;
+let _holidaysMtimeCache = -1;
 
 function loadHolidays(holidaysPath) {
-  if (_holidaysCache !== null && _holidaysPathCache === holidaysPath) return _holidaysCache;
+  // v3.19.1（N4）：缓存加 mtime 校验。原先只在「路径变化」时失效 → 同一进程内（watcher 最长活 3 小时）
+  // refresh-holidays.js 更新了 holidays.json 也仍用旧表。假日表虽一年一更，但跨年/临时调休补录会漏。
+  let mtime = -1;
+  try { mtime = fs.statSync(holidaysPath).mtimeMs; } catch (e) { mtime = -1; } // 缺失/不可 stat → 不判假
+  if (_holidaysCache !== null && _holidaysPathCache === holidaysPath && _holidaysMtimeCache === mtime) return _holidaysCache;
   let h = { years: {} };
   try { h = JSON.parse(fs.readFileSync(holidaysPath, 'utf-8')); } catch (e) { h = { years: {} }; } // 缺失→不判假，绝不抛错
   _holidaysCache = h;
   _holidaysPathCache = holidaysPath;
+  _holidaysMtimeCache = mtime;
   return h;
 }
 
@@ -34,7 +40,10 @@ function parsePeakSchedule(sched) {
   for (const p of parts) {
     const m = p.match(/(\d{1,2}):?(\d{2})?\s*[-–—~至到]\s*(\d{1,2}):?(\d{2})?/);
     if (!m) continue;
-    const sH = Number(m[1]), eH = Number(m[3]);
+    // v3.19.1：保留分钟（判定侧 hm 本就是小数小时）。官方现给整点，但 deepseek-official 按原文归一化，
+    // 若官方改成 9:30 起，此处按整点处理会静默提前 30 分钟计高峰。
+    const sH = Number(m[1]) + (Number(m[2]) || 0) / 60;
+    const eH = Number(m[3]) + (Number(m[4]) || 0) / 60;
     if (isNaN(sH) || isNaN(eH)) continue;
     ranges.push({ s: sH, e: eH });
   }
