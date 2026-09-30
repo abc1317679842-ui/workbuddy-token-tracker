@@ -1,5 +1,19 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.21.0 (2026-10-01)
+// token-usage-tracker v3.22.0 (2026-10-01)
+// v3.22.0：**版本更新提示的检测点修准 + 覆盖盲区补齐**（用户质疑「检测点选的准不准？不准确会导致别人收不到更新」→ 实测后确认两处真缺陷）——
+//   ① **挂载点被早退分支绕过（真缺陷）**：v3.21.0 把提示挂在两个 `out()` 调用点上，而 `--hook` 路径有
+//      3 条早退分支（`trace 文件尚未完成写入` / `手动取消轮补弹` / …）走的是**另外的** `out()`，
+//      根本不经过挂载点 → 命中这些分支的那一轮**收不到提示**。
+//      修法：把追加逻辑**下沉到 `out()` 内部**、把检查提前到 `main()` 最开头算一次并缓存 →
+//      结构上不可能再被任何 `return` 绕过（新增早退分支也自动覆盖）。非 hook 模式输出**逐字节不变**。
+//   ② **检测点漏「有 tag 无 release」（真缺陷）**：v3.21.0 只查 `releases/latest`，若某次只打 tag
+//      不发 release（或反之），检测结果与事实不一致 → 漏报。修法：同时查 `git/matching-refs/tags/v`，
+//      **两者取版本号较大者**（宁可早报不可漏报）。两次请求合并在同一个子进程里完成。
+//   ③ **覆盖盲区：只配了 Stop、没配 UserPromptSubmit hook 的用户永远查不到**（注入通道根本不触发）。
+//      修法：Stop 端按「hook 是否活跃」判断——`lastHookAt` 超过 3 天没更新（或从未写入）= 该用户没配 hook
+//      → 改走 **toast 兜底**：弹窗前做一次同样的检查（7 天闸门/退避照旧），命中就在**弹窗第一行尾部**
+//      加 `｜⬆vX.Y.Z`。**放不下就整个丢弃**（绝不挤压模型名、绝不动第二行的耗时/今日/余额）。
+//      已配 hook 的用户 `lastHookAt` 每次提问都刷新 → **永远不会看到 toast 标记**，不产生打扰。
 // v3.21.0：**版本更新提示（每周一次，匿名只读）**——
 //   装了旧版的用户不会主动去仓库看更新 → 每 7 天在 `--hook` 路径匿名查一次
 //   `api.github.com/repos/<repo>/releases/latest`，有新版就向**模型**注入一行极短提示
@@ -3363,6 +3377,18 @@ function toastLine1(stat, modelShort, period, balTxt, todayTxt) {
   // 行1：模型名 + 时段标注（空格分隔，不占用时间位置）
   const periodTxt = period ? ` ${period}` : '';
   const line1 = `${head}${periodTxt}`;
+  // v3.22.0：版本更新标记（`⬆vX.Y.Z`）——**只有「本机没配 UserPromptSubmit hook」的用户会出现**
+  //   （updateTagForToast 内以 lastHookAt 判定；已配 hook 的永远走回答注入，这里恒为空串）。
+  //   空间规则：**整个标记放得下才加**，因此绝不会触发下面的「缩略模型名」逻辑、绝不动 line2。
+  //   放不下就整个丢弃——更新提示永远不许挤压真实数据。
+  let line1Out = line1;
+  try {
+    const upTag = updateTagForToast();
+    if (upTag) {
+      const cand = `${line1} ｜${upTag}`;
+      if (dispWidthTitle(cand) <= TOAST_ROW1_MAX_W) line1Out = cand;
+    }
+  } catch (e) { /* 标记失败不影响弹窗 */ }
   // 行2：耗时 时间 今日¥X 余额¥Y（耗时/时间永远行首，今日/余额顺序保持）
   const durTxt = `耗时 ${fmtDur(stat.durMs)}`;
   const parts2 = [durTxt];
@@ -3378,7 +3404,7 @@ function toastLine1(stat, modelShort, period, balTxt, todayTxt) {
   }
   // 行1 超宽守卫（v2.81 重写）：标注优先保住——缩略名字给标注留位；名字+标注都放不下才丢标注；
   // 耗时行（line2）任何情况不丢。TOAST_ROW1_MAX_W=45。
-  if (dispWidthTitle(line1) > TOAST_ROW1_MAX_W) {
+  if (dispWidthTitle(line1Out) > TOAST_ROW1_MAX_W) {
     if (periodTxt) {
       const budget = TOAST_ROW1_MAX_W - dispWidthTitle(periodTxt);
       if (budget >= 8 && dispWidthTitle(head) + dispWidthTitle(periodTxt) > TOAST_ROW1_MAX_W) {
@@ -3388,7 +3414,7 @@ function toastLine1(stat, modelShort, period, balTxt, todayTxt) {
     const headFit = dispWidthTitle(head) > TOAST_ROW1_MAX_W ? shrinkTitle(head, TOAST_ROW1_MAX_W) : head;
     return `${headFit}\n${line2}`;
   }
-  return `${line1}\n${line2}`;
+  return `${line1Out}\n${line2}`;
 }
 function toastLine2(stat, pricing) {
   const isLocal = isLocalModel(stat && stat.model);
@@ -3945,7 +3971,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.21.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章一致）
+const SKILL_VERSION = '3.22.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -3953,6 +3979,7 @@ const UPDATE_BACKOFF_MS = [3600 * 1000, 6 * 3600 * 1000, 24 * 3600 * 1000]; // �
 const UPDATE_MAX_FAILS = 3;                                  // 连败 3 次 → 本周期内不再重试
 const UPDATE_MAX_NOTIFY = 2;                                 // 同一新版本最多提示 2 次（避免反复打扰）
 const UPDATE_NOTIFY_GAP_MS = 24 * 3600 * 1000;               // 两次提示至少间隔 24h
+const HOOK_IDLE_MS = 3 * 24 * 3600 * 1000;                   // v3.22.0：hook 多久没动静就认为「没配 hook」→ 走 toast 兜底
 
 // 版本号**数值**比较：a>b→1，a<b→-1，相等→0。
 // ⚠️ 绝不能直接字符串比较——`'3.9.0' > '3.10.0'` 会判成 true（错）。
@@ -3988,21 +4015,35 @@ function saveUpdateState(s) {
   catch (e) { /* 写失败只影响下次判断，不影响本轮输出 */ }
 }
 
-// 同步子进程匿名查询 GitHub releases/latest（沿用 queryBalance 的子进程模式：主流程是同步的）。
-// 返回 tag 字符串（如 `v3.21.0`）；任何失败返回 null——不抛错、不写 stderr、不污染 stdout。
+// 同步子进程匿名查询「最新版本」（沿用 queryBalance 的子进程模式：主流程是同步的）。
+// v3.22.0：**同时查两个端点，取版本号较大者**——
+//   ① `releases/latest`（正式发布的最新 release）；② `git/matching-refs/tags/v`（全部 tag）。
+//   为什么必须两个都查：只查 ① 时，若某次「只打了 tag 没发 release」（或顺序颠倒），
+//   检测结果就与事实不一致 → **漏报**；只查 ② 则会把握手用的 prerelease 也算进来。
+//   两个结果取 max 是「宁可早报、不可漏报」的取向（本项目不使用 prerelease，故无副作用）。
+// 返回 `vX.Y.Z` 形态字符串；任一成功即返回，两个都失败返回 null——不抛错、不写 stderr、不污染 stdout。
 // 注意：不携带任何密钥、不发本地数据；请求头只声明 Accept 与 User-Agent（GitHub 要求 UA）。
 function queryLatestTag(timeoutMs) {
   const script = [
     '(async () => {',
+    `  const H = { 'Accept': 'application/vnd.github+json', 'User-Agent': 'workbuddy-token-tracker' };`,
+    `  const B = 'https://api.github.com/repos/${UPDATE_REPO}';`,
+    '  const parse = (s) => { const t = String(s == null ? "" : s).trim().replace(/^v/i, ""); if (!/^\\d+(\\.\\d+)*$/.test(t)) return null; return t.split(".").map((x) => parseInt(x, 10)); };',
+    '  const cmp = (a, b) => { const pa = parse(a), pb = parse(b); if (!pa || !pb) return 0;',
+    '    const n = Math.max(pa.length, pb.length); for (let i = 0; i < n; i++) { const x = pa[i] || 0, y = pb[i] || 0; if (x > y) return 1; if (x < y) return -1; } return 0; };',
+    '  const tags = [];',
     '  try {',
-    `    const res = await fetch('https://api.github.com/repos/${UPDATE_REPO}/releases/latest', {`,
-    `      headers: { 'Accept': 'application/vnd.github+json', 'User-Agent': 'workbuddy-token-tracker' } });`,
-    "    if (!res.ok) { console.error('HTTP ' + res.status); process.exit(2); }",
-    '    const j = await res.json();',
-    "    const t = (j && j.tag_name) || '';",
-    "    if (!t) { console.error('NO_TAG'); process.exit(3); }",
-    '    console.log(String(t));',
-    '  } catch (e) { console.error(String(e && e.message)); process.exit(1); }',
+    "    const r1 = await fetch(B + '/releases/latest', { headers: H });",
+    "    if (r1.ok) { const j = await r1.json(); if (j && j.tag_name) tags.push(String(j.tag_name)); }",
+    '  } catch (e) { /* 单端点失败不影响另一个 */ }',
+    '  try {',
+    "    const r2 = await fetch(B + '/git/matching-refs/tags/v', { headers: H });",
+    "    if (r2.ok) { const a = await r2.json(); if (Array.isArray(a)) for (const x of a) { const n = String((x && x.ref) || '').split('/').pop(); if (n) tags.push(n); } }",
+    '  } catch (e) { /* 同上 */ }',
+    '  if (!tags.length) { console.error("NO_TAG"); process.exit(3); }',
+    '  let best = tags[0];',
+    '  for (const t of tags) if (cmp(t, best) > 0) best = t;',
+    '  console.log(String(best));',
     '})();',
   ].join('\n');
   try {
@@ -4014,6 +4055,48 @@ function queryLatestTag(timeoutMs) {
   } catch (e) { return null; }
 }
 
+// 到点就查一次（7 天闸门 + 失败退避）。只改状态、不产生任何文案，hook / Stop 两条通道共用。
+// 返回 true = 本次真的发起了查询（无论成败）。
+function maybeFetchLatest(st, now) {
+  const due = !st.lastCheckAt || (now - Number(st.lastCheckAt) >= UPDATE_INTERVAL_MS);
+  const backoffOk = !st.nextRetryAt || now >= Number(st.nextRetryAt);
+  if (!due || !backoffOk) return false;
+  const tag = queryLatestTag(5000);
+  if (tag) {
+    st.latestVersion = String(tag).replace(/^v/i, '');
+    st.lastCheckAt = now; st.failCount = 0; st.nextRetryAt = 0;
+  } else {
+    // 失败静默：不打扰用户，只记退避（1h → 6h → 1d；连败 3 次本周期内不再试）
+    const fc = (Number(st.failCount) || 0) + 1;
+    st.failCount = fc;
+    st.nextRetryAt = now + (fc >= UPDATE_MAX_FAILS
+      ? UPDATE_INTERVAL_MS
+      : UPDATE_BACKOFF_MS[Math.min(fc - 1, UPDATE_BACKOFF_MS.length - 1)]);
+    if (!st.lastCheckAt) st.lastCheckAt = now; // 首次即失败也要落时间，避免每轮重试
+  }
+  return true;
+}
+
+// 提示节流闸门（两条通道共用同一套计数）：命中则"消费"一次并返回 true。
+// 规则：同一版本最多 UPDATE_MAX_NOTIFY 次、两次之间至少隔 UPDATE_NOTIFY_GAP_MS。
+function claimNotify(st, latest, now) {
+  if (!latest || cmpVersion(latest, SKILL_VERSION) <= 0) return false;
+  const same = st.notifiedVersion === latest;
+  const cnt = same ? (Number(st.notifyCount) || 0) : 0;
+  const lastAt = same ? (Number(st.lastNotifyAt) || 0) : 0;
+  if (cnt >= UPDATE_MAX_NOTIFY) return false;
+  if (same && lastAt && now - lastAt < UPDATE_NOTIFY_GAP_MS) return false;
+  st.notifiedVersion = latest; st.notifyCount = cnt + 1; st.lastNotifyAt = now;
+  return true;
+}
+
+// UserPromptSubmit hook 是否在跑：`lastHookAt` 每次 --hook 都会刷新。
+// 超过 HOOK_IDLE_MS 没刷新（或从未写过）= 该用户没配 hook → 注入通道不可达，改走 toast 兜底。
+function hookIdle(now, st) {
+  const t = Number(st && st.lastHookAt) || 0;
+  return !t || now - t >= HOOK_IDLE_MS;
+}
+
 // 版本更新提示（**仅 `--hook` 调用**）：命中则返回一行极短注入文案，否则返回 ''。
 // 注入文案刻意**不含任何升级步骤**（升级方法只写在 SKILL.md），也不含任何用户数据。
 function updateNotice(nowMs) {
@@ -4021,43 +4104,57 @@ function updateNotice(nowMs) {
     if (!(ENABLE_NETWORK && ENABLE_UPDATE_CHECK)) return '';
     const now = nowMs || Date.now();
     const st = loadUpdateState();
-    let latest = st.latestVersion || '';
-    const dueCheck = !st.lastCheckAt || (now - Number(st.lastCheckAt) >= UPDATE_INTERVAL_MS);
-    const backoffOk = !st.nextRetryAt || now >= Number(st.nextRetryAt);
-    if (dueCheck && backoffOk) {
-      const tag = queryLatestTag(5000);
-      if (tag) {
-        latest = String(tag).replace(/^v/i, '');
-        st.latestVersion = latest; st.lastCheckAt = now; st.failCount = 0; st.nextRetryAt = 0;
-        saveUpdateState(st);
-      } else {
-        // 失败静默：不打扰用户，只记退避（1h → 6h → 1d；连败 3 次本周期内不再试）
-        const fc = (Number(st.failCount) || 0) + 1;
-        st.failCount = fc;
-        st.nextRetryAt = now + (fc >= UPDATE_MAX_FAILS
-          ? UPDATE_INTERVAL_MS
-          : UPDATE_BACKOFF_MS[Math.min(fc - 1, UPDATE_BACKOFF_MS.length - 1)]);
-        if (!st.lastCheckAt) st.lastCheckAt = now; // 首次即失败也要落时间，避免每轮重试
-        saveUpdateState(st);
-        return '';
-      }
-    }
-    if (!latest || cmpVersion(latest, SKILL_VERSION) <= 0) return ''; // 已是最新 → 静默
-    // 提示节流：同一版本最多 UPDATE_MAX_NOTIFY 次，两次之间至少隔 UPDATE_NOTIFY_GAP_MS
-    const sameVer = st.notifiedVersion === latest;
-    const cnt = sameVer ? (Number(st.notifyCount) || 0) : 0;
-    const lastAt = sameVer ? (Number(st.lastNotifyAt) || 0) : 0;
-    if (cnt >= UPDATE_MAX_NOTIFY) return '';
-    if (sameVer && lastAt && now - lastAt < UPDATE_NOTIFY_GAP_MS) return '';
-    st.notifiedVersion = latest; st.notifyCount = cnt + 1; st.lastNotifyAt = now;
+    st.lastHookAt = now;               // v3.22.0：标记「hook 通道活着」→ Stop 端据此决定是否兜底
+    maybeFetchLatest(st, now);
+    saveUpdateState(st);               // 无论是否到检查点，都要把 lastHookAt 落盘
+    if (!claimNotify(st, st.latestVersion || '', now)) return '';
     saveUpdateState(st);
-    return `[技能更新] 有新版 v${latest}，回复末尾提一句即可，勿展开`;
+    return `[技能更新] 有新版 v${st.latestVersion}，回复末尾提一句即可，勿展开`;
   } catch (e) { return ''; } // 任何异常都不该影响记账/注入主流程
+}
+
+// toast 兜底标记（v3.22.0）：**只给「没配 UserPromptSubmit hook」的用户用**，返回 `⬆vX.Y.Z` 或 ''。
+// 每个进程只计算一次（模块级缓存）——一次 Stop 可能格式化多次 toastLine1，不能重复消费计数。
+let gUpTag = null;
+function updateTagForToast(nowMs) {
+  if (gUpTag !== null) return gUpTag;
+  gUpTag = '';
+  try {
+    if (!(ENABLE_NETWORK && ENABLE_UPDATE_CHECK)) return gUpTag;
+    const now = nowMs || Date.now();
+    const st = loadUpdateState();
+    if (!hookIdle(now, st)) return gUpTag; // hook 在跑 → 由回答里提示，toast 绝不打扰
+    if (!claimNotify(st, st.latestVersion || '', now)) return gUpTag;
+    saveUpdateState(st);
+    gUpTag = `⬆v${st.latestVersion}`;
+  } catch (e) { /* 标记失败不影响弹窗主流程 */ }
+  return gUpTag;
+}
+
+// Stop 端预检查（v3.22.0）：仅在「hook 通道不可达」时替它查一次，否则纯浪费。
+// 调用点在 main() 最开头（asStop 分支）——**在弹窗之前**，这样同一轮的弹窗就能带上标记。
+function maybeFetchLatestForStop(nowMs) {
+  try {
+    if (!(ENABLE_NETWORK && ENABLE_UPDATE_CHECK)) return;
+    const now = nowMs || Date.now();
+    const st = loadUpdateState();
+    if (!hookIdle(now, st)) return; // hook 在跑：检查由 hook 端负责
+    if (maybeFetchLatest(st, now)) saveUpdateState(st);
+  } catch (e) { /* 预检查失败静默 */ }
 }
 
 function main() {
   const asHook = process.argv.includes('--hook');
   const asStop = process.argv.includes('--stop');
+  // v3.22.0：版本更新提示**在 main() 最开头算一次并缓存**，追加动作下沉到 out()。
+  //   为什么提前：v3.21.0 挂在两个 out() 调用点上，被 --hook 的 3 条早退分支绕过
+  //   （`trace 文件尚未完成写入` / 手动取消轮补弹 / …）→ 命中这些分支的那一轮**收不到提示**。
+  //   下沉到 out() 之后，只要这一轮有任何 hook 输出就必然带上，**结构上不可能被 return 绕过**。
+  //   代价：早退分支也会触发一次检查（7 天一次、实测约 1s），可接受。
+  const upNote = asHook ? updateNotice() : '';
+  // v3.22.0：Stop 端兜底预检查——只给「没配 UserPromptSubmit hook」的用户跑（hookIdle 判定），
+  //   放在**弹窗之前**，这样同一轮的弹窗就能带上 `⬆vX.Y.Z` 标记（不必等下一轮）。
+  if (asStop) maybeFetchLatestForStop();
   // v2.39：--report [all|<date>] —— 打印每日账本（今天分模型明细+合计；历史天同样明细+合计）。
   // v2.39.1：--report summary [all|<date>] —— 只输出总合计（一行/天），让助手/用户只读最下面那行总数。
   // 纯文本输出，不影响 hooks 流程；无参=今天，all=全部天，也可指定日期。
@@ -4475,18 +4572,19 @@ function main() {
   try { const hp = JSON.parse(payloadRaw); sid = String(hp.session_id || ''); hookCwd = String(hp.cwd || ''); } catch (e) { /* payload 非 JSON 或无 session 字段 */ }
 
   // 输出统一走 stdout；hook 场景输出 Claude-Code 风格 JSON
+  // v3.22.0：版本更新提示的追加**下沉到 out() 内部**——`--hook` 的每一条输出（含各条早退分支）
+  //   都会自动带上提示，不存在"忘了在某条分支上挂"的可能。非 hook 模式 payload 原样输出，
+  //   与旧版**逐字节相同**（upNote 为 '' 时 `payload === hookOut`）。
   const out = (hookOut) => {
-    process.stdout.write(asHook || asStop ? JSON.stringify(hookOut) : hookOut);
+    let payload = hookOut;
+    if (asHook && upNote) {
+      const hs = payload && payload.hookSpecificOutput;
+      const prev = hs ? hs.additionalContext : (typeof payload === 'string' ? payload : '');
+      payload = { hookSpecificOutput: Object.assign({}, hs || {}, { additionalContext: prev ? `${prev}\n${upNote}` : upNote }) };
+    }
+    process.stdout.write(asHook || asStop ? JSON.stringify(payload) : payload);
   };
   const plain = (msg) => (asHook ? { hookSpecificOutput: { additionalContext: msg } } : msg);
-  // v3.21.0：版本更新提示的唯一挂载点（仅 --hook 生效；非 hook 模式原样返回）。
-  // 放在最末尾而不是 --stop：弹窗路径要立刻弹 toast，联网会把弹窗推迟。
-  // 空串时与旧版输出**逐字节相同**（`up ? msg + '\n' + up : msg`）。
-  const withUpdate = (msg) => {
-    if (!asHook) return msg;
-    const up = updateNotice();
-    return up ? `${msg}\n${up}` : msg;
-  };
 
   // v2.25：pricing 提前加载（transcript 数据源分支同样需要）
   let pricing = loadPricing();
@@ -4861,7 +4959,7 @@ function main() {
       const inProgress3 = prevStart3 > 0 && prevStop3 < prevStart3;
       saveSnapshot({ file: '', stat: null, lastUserMsgAt: inProgress3 ? prevStart3 : Date.now(), lastStopAt: psnap3.lastStopAt || 0 }, sid);
     }
-    out(plain(withUpdate('暂无 trace 数据（可能尚未发生模型调用）')));
+    out(plain('暂无 trace 数据（可能尚未发生模型调用）'));
     return;
   }
 
@@ -5091,8 +5189,8 @@ function main() {
   const nmNote = ensureNewModelPricing(pricing, shown).note;
   const line = lineFor(shown, sameRound, modelShort);
 
-  // v3.21.0：版本更新提示（仅 --hook，最新版本 & 提示节流见 updateNotice）。
-  out(plain(withUpdate(nmNote ? `${line}\n${nmNote}` : line)));
+  // v3.22.0：版本更新提示由 out() 统一追加（见 main() 开头），此处保持旧版表达式不变。
+  out(plain(nmNote ? `${line}\n${nmNote}` : line));
 }
 
 // v2.39：被 require 时不执行 main()（hooks/手动仍走 node token-tracker.js，main 正常跑）；
@@ -5127,6 +5225,8 @@ module.exports = {
   // v3.19.1（N2）：watcher 单轮读取导出，selftest 验证"未变化跳过 IO"与增量等价性
   watchReadStep,
   // v3.21.0：版本更新检查（selftest 直接单测版本比较/闸门/节流/退避，不必真联网）
+  // v3.22.0：新增 Stop 端兜底链路（hookIdle / claimNotify / maybeFetchLatest / updateTagForToast）
   updateNotice, cmpVersion, loadUpdateState, saveUpdateState, queryLatestTag,
-  SKILL_VERSION, UPDATE_CHECK_FILE, UPDATE_INTERVAL_MS, UPDATE_MAX_NOTIFY, UPDATE_NOTIFY_GAP_MS,
+  updateTagForToast, maybeFetchLatest, maybeFetchLatestForStop, claimNotify, hookIdle,
+  SKILL_VERSION, UPDATE_CHECK_FILE, UPDATE_INTERVAL_MS, UPDATE_MAX_NOTIFY, UPDATE_NOTIFY_GAP_MS, HOOK_IDLE_MS,
 };

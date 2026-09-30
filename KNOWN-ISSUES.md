@@ -1,13 +1,16 @@
 # Known Issues（已知未修问题）
 
-> 本文件是公开的已知问题记录（v3.18.2 建立，v3.18.3 修正）。此前的审计细节文档因含本机路径
-> 信息未入库，这里以脱敏形式保留"当前存活"问题的根因与触发条件，便于第三方复审与贡献者
-> 了解现状。行号随版本漂移，引用以 v3.18.3 的 `token-tracker.js` 为准（函数名为主锚点）。
+> 本文件是公开的已知问题记录（v3.18.2 建立、v3.18.3 修正、**v3.22.0 复核行号**）。此前的审计细节
+> 文档因含本机路径信息未入库，这里以脱敏形式保留"当前存活"问题的根因与触发条件，便于第三方
+> 复审与贡献者了解现状。
+>
+> ⚠️ **行号会随版本漂移，引用一律以「函数名」为主锚点**。文中行号按 **v3.22.0 的 `token-tracker.js`**
+> 标注，仅供快速定位；换了版本请先 `grep -n "<函数名>" token-tracker.js` 重新定位。
 > 修复进展见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 已修复（避免重复排查）
 
-- **陈旧锁漏弹 / 双 watcher TOCTOU**：已于 2026-08-23 修复——锁获取改 `openSync('wx')` 原子建锁（消除 check-then-act 竞态）+ pid 探活接管（`process.kill(pid,0)`，ESRCH 判死才接管），见 `token-tracker.js` watcher 内的 `acquireWatchLock`（v3.18.4 约 L3658-3720；注：`withFileLock` 是 L414 的通用账本锁，勿混淆）。
+- **陈旧锁漏弹 / 双 watcher TOCTOU**：已于 2026-08-23 修复——锁获取改 `openSync('wx')` 原子建锁（消除 check-then-act 竞态）+ pid 探活接管（`process.kill(pid,0)`，ESRCH 判死才接管），见 `token-tracker.js` watcher 内的 `acquireWatchLock`（v3.22.0 约 L4234；注：`withFileLock` 是另一处通用账本锁（v3.22.0 为 L463），勿混淆）。
 
 ## KI-1 静默间隙误判（premature popup）—— 存活
 

@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.21.0-blue)
+![Version](https://img.shields.io/badge/version-v3.22.0-blue)
 
 > 在每次回答后显示 **Token 消耗 / 耗时 / 折算费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -17,6 +17,30 @@
 **简单说：不在 WorkBuddy 桌面端使用，本技能没有意义。** 请确认你的环境再安装。
 
 > ⛔ **本项目不经 npm 分发**（无 `package.json`）。npm 上的同名包 `token-usage-tracker` 与本项目**无关**（曾有恶意包记录），请勿 `npm i token-usage-tracker`——唯一安装方式是从本仓库下载拷入技能目录。
+
+## ⚠️ 统计范围声明（**看数据前必读**）
+
+**本技能统计的是「WorkBuddy 落盘了的消耗」，不是「你账上被扣的全部消耗」。** 两者会不一致，尤其是下面几种情况：
+
+| 情况 | 本技能显示什么 | 实际扣费 |
+|---|---|---|
+| **模型长时间思考时你手动停止 / 被中断** | 平台**不落盘**这部分的 usage → 本技能只能用估算填补，弹窗会标注 **`（估算）`** | ⚠️ **服务商那边已真实计费**，WorkBuddy 的积分消耗记录里也有 |
+| **内置积分模式**（走客户端自带额度） | 只有 token 与折算金额 | 真实扣的是积分 / 额度，本技能**读不到**扣减明细 |
+| **在 WorkBuddy 之外用同一个 API key 发起的调用** | 完全不统计 | 会计费 |
+| **应用 / 进程异常终止，trace 来不及落盘** | 那一段可能缺失 | 会计费 |
+
+### 关于「估算」——它是估算，不是实测
+
+模型长时间思考时你点了停止，这轮思考**已经用掉 token 且已被计费**，但平台不会把这段的 usage 写进本地文件。本技能在这条路径上做的是**估算**：
+
+- **输入侧**：往前找最近一次有 usage 的调用，**拿它的输入量当本轮输入量的近似**（同一会话上下文连续，量级接近）；
+- **输出侧**：按本地记到的思考文本长度粗算（中文约 1.5 字/token，其他字符约 4 字符/token）。
+
+**这个数字与真实计费不是一回事**：思考过程本身可能就没完整落盘（被截断），所以**通常偏低**。看到弹窗标注 `（估算）` 时，请当量级参考，不要当账单。
+
+> **要对账，请以你的 API 服务商账单 / WorkBuddy 积分消耗记录为准。**
+>
+> 正常跑完的轮次里，`输入 / 输出 / 缓存命中 / 总 token` 四列全部来自平台自己落盘的 usage 记录，是**真实值**——这部分可以直接信。
 
 ## ⚠️ 金额口径声明（**看数据前必读**）
 
@@ -40,7 +64,7 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 - 内置模型模式只显示「积分」，不显示 token；
 - 自有 API（BYOK，自定义模型）模式也不展示 token。
 
-但平台在每次模型调用**整轮结束后**，都会把真实用量落盘（`~/.workbuddy/traces/<pid>/trace_*.json` 及会话 transcript 的 `providerData.usage`）。本技能把这些**平台自己记录的账**读出来，让你每轮都能看到真实消耗——不是估算，不是推算。
+但平台在每次模型调用**整轮结束后**，都会把真实用量落盘（`~/.workbuddy/traces/<pid>/trace_*.json` 及会话 transcript 的 `providerData.usage`）。本技能把这些**平台自己记录的账**读出来，让你每轮都能看到真实消耗——正常跑完的轮次是实测值，**不是估算、不是推算**（例外与边界见上方「统计范围声明」）。
 
 ## 核心功能
 
@@ -53,14 +77,14 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 | 📤 **CSV 导出**（v3.20.0） | `--report week --csv` / `--report all --csv` / `--report 2026-09-30 --csv` → 落盘到 `exports/report-<范围>-<时间戳>.csv`（**逐日 × 逐模型**明细 + `ALL` 合计行，可在 Excel 里自行透视）。带 **UTF-8 BOM**，中文列头不乱码；命令只回一行路径，不把几十行数据灌进对话 |
 | 📈 **消耗外推**（v3.20.0） | `--report forecast` → 今日 token 速率外推 + 近 7 日实测均值对照。**只推 token，不推金额**（金额本身是折算值，再外推一次只会制造"这个月要花多少钱"的错觉）；样本不足 2 天时拒绝计算 |
 | 🧾 **轮次明细留档**（v3.20.0） | 每轮向 `rounds/rounds-YYYY-MM.jsonl` 追加一条：分模型 token 明细、耗时、主/子代理模型、子代理数、来源标记，以及**自动从本轮首条用户消息提取的可读标签**——用来回答「哪一轮异常大 / 子代理占了多少」这类每日账本答不了的问题。写入点选在记账唯一入口（账本确认落盘之后），所以同轮重复 Stop **不会重复落档**；保留最近 6 个月，过期的由 `--report` 顺带清理 |
-| 🔔 **版本更新提示**（v3.21.0） | 每 **7 天**匿名查一次 GitHub 的 `releases/latest`（只读、零密钥、不带任何本地数据），发现新版本时**由模型在回答末尾提一句**（如「本技能有新版本，可更新」）——**不占 toast 空间**，也不反复打扰：同一版本最多提示 2 次、两次至少隔 24h。检查在用户提问时（`--hook`）触发，不在弹窗路径上，不会拖慢通知；失败**静默退避**（1h→6h→1d，连败 3 次当周不再试）。升级方法见下方「如何升级」。⚠️ 该功能**帮不了已装旧版的用户**——检查逻辑在被安装的那份代码里，只从本版起生效 |
+| 🔔 **版本更新提示**（v3.21.0 起，v3.22.0 补覆盖） | 每 **7 天**匿名查一次仓库版本（只读、零密钥、不带任何本地数据），发现新版本时**由模型在回答末尾提一句**（如「本技能有新版本，可更新」）——**不占 toast 空间**，也不反复打扰：同一版本最多提示 2 次、两次至少隔 24h。**检测点同时查两处并取较大版本**：`releases/latest` + 全部 tag（`git/matching-refs/tags/v`）——只查 release 时，万一某次「只打了 tag 没发 release」就会漏报。失败**静默退避**（1h→6h→1d，连败 3 次当周不再试）。**只配了 Stop、没配 `UserPromptSubmit` hook 的用户**走弹窗兜底：弹窗第一行尾部加一个 `｜⬆v3.22.0`（**放不下就整个不显示**，绝不挤压模型名与耗时/今日/余额）；已配 hook 的用户**永远不会**看到这个标记。升级方法见下方「如何升级」。⚠️ 该功能**帮不了已安装旧版的用户**——检查逻辑在被安装的那份代码里，只从 v3.21.0 起生效 |
 | 🧠 **专家团全量聚合** | WorkBuddy 专家团（多个子代理并行 + 主理人汇总）的全部模型调用，一次性聚合成整轮真实消耗——**平台不把子代理调用落盘 traces，本技能直接从主会话 + `subagents/*.jsonl` transcript 读取**，跑完一个专家团弹**一条**整轮汇总，不会弹 N 次 |
 | 🧩 **异步子代理识别** | 专家团子代理是异步 spawn，文件比 Agent 调用晚落盘——检测主会话是否有 `Agent`/`TeamCreate` 等团队活动，未落盘也能判定"这是专家团"→ 走合并延迟弹，不误判为普通轮 |
 | 🛡️ **中途插话守卫** | 专家团运行中你插话不会把统计起点刷晚（`lastStopAt` 轮次边界守卫）——整轮消耗不丢 |
 | 🔒 **快照防串会话** | 多会话并发时 snapshot 按 session_id 隔离、用本会话 transcript 路径标记，不把别的会话的数据串进来；**自动清理**（保留最近 30 天 / 最多 50 个，当前会话永不清） |
 | 💰 **余额显示** | 仅自定义 API 的 DeepSeek 官方模型：调用官方 `GET /user/balance` 接口（Bearer 认证，无需网页登录）在 toast 显示 `余额¥2.77`；**默认关闭（见下方联网开关）**，开启后检测到余额变化才显示；15 秒缓存保实时又不重复请求 |
 | 💰 **费用估算** | 内置主流模型**人民币官方价**（元/百万 tokens，来源见下「本地官方价格库」）；支持高峰/夜间时段倍率（见下「时段价格标注」）；不足 ¥0.01 显示 `¥<0.01` |
-| ⏰ **时段价格标注** | 行1 显示时段策略：DeepSeek 原厂系高峰 → **`高峰双倍`**；声明了 `night_discount` 的模型夜间 → **`夜间X折`**。⚠️ **时段策略无公开 API 数据源，需手动维护**（厂商时段政策变动时，请在 `pricing.json` 中提示模型更新 `peak_multiplier`/`night_discount`/`peak_hours`/`night_hours` 字段，代码自动读取） |
+| ⏰ **时段价格标注** | 行1 显示时段策略：DeepSeek 原厂系高峰 → **`高峰双倍`**；声明了 `night_discount` 的模型夜间 → **`夜间X折`**。**DeepSeek 原厂时段「自动跟随官方」**——`pricing.json` 顶层的 `deepseek_rules.peak_schedule` 由 `deepseek-official.js` 每日从官方定价页抓取，官方改时段/取消周末低峰本地自动同步；解析失败**保留旧值**并亮 `⚠时段`（绝不静默清空），无规则时回落内置默认（9:00–12:00 / 14:00–18:00，周末全天低峰）。**其他厂商**的峰谷/夜间折扣没有可程序化读取的数据源，仍需人工在 `pricing.json` 该模型条目上维护 `peak_multiplier`（高峰倍率）与 `night_discount`（夜间系数）+ 可选的 `night_hours=[起,止]`（覆盖默认夜间窗口 00:00–08:00）。⚠️ **没有 `peak_hours` 这个字段**——高峰时段只来自 `deepseek_rules.peak_schedule` 或内置默认，别去改一个不存在的键 |
 | 🆕 **新模型自动补录** | 检测到未收录模型**立即联网**补录：先查国内源 llmabacus（人民币价，`region=CN`），再回退 OpenRouter（USD×汇率，`region=US`）；查不到则提示用搜索技能人工核验官方定价页 |
 | 🔄 **每日价格自动刷新** | 每天首次运行自动拉 **5 个价格源**（国内 2：llmabacus / llm-prices-cn；国外 3：OpenRouter / LiteLLM / Portkey），按模型 `region` 区分国内外定价（CN 用国内人民币价、US 用三 USD 源中位数×汇率）；**当天已刷新则不再联网**；全源失败 toast 显示「价⚠️」并保留上次价格 |
 | 🔗 **官方价跨 key 接管**（v3.07） | 官方现行 API ID 与本地 key 不同名时（如本地 `deepseek-v4.1-flash` ↔ 官方 `deepseek-flash`），按官方页「模型版本」行自动对齐识别为同一模型：**官方价强制覆盖手动补录价**、解除 `manual`/`lock` 冻结、绑定 `alias_of` 并写 `_manual_audit` 留痕；聚合源刷新也不会再覆盖官方价 |
@@ -91,15 +115,16 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 
 ## 🔌 联网功能与开关（v2.30 起）
 
-本脚本有 4 处会联网，均在 `token-tracker.js` **顶部**用常量开关单独控制：
+本脚本有 **4 个可单独开关**的联网功能，均在 `token-tracker.js` **顶部**用常量开关控制；另有 **1 条每日自动调起的本地价库 Python 流水线**，它**只受总开关 `ENABLE_NETWORK` 约束**（不受 `ENABLE_PRICE_REFRESH` 管——关掉价格刷新，流水线照跑），单独列出以免误解：
 
 | 开关常量 | 默认值 | 联网功能 | 请求目标 | 是否携带密钥 |
 |---|---|---|---|---|
-| `ENABLE_NETWORK` | `true` | **总开关**——`false` 时 `token-tracker.js` **自身**的所有联网功能一律跳过（含分开关）。注意：兄弟脚本（`refresh-prices.js`/`deepseek-official.js`）只认 `WB_NO_NET=1`；`refresh-holidays.js` 与 Python 流水线无开关（仅手动运行时联网） | — | — |
+| `ENABLE_NETWORK` | `true` | **总开关**——`false` 时 `token-tracker.js` **自身**的所有联网功能一律跳过（含 4 个分开关，**也包括每日自动调起的本地价库 Python 流水线**，见 `loadPricing` → `maybeRefreshLocalDb`）。注意：兄弟脚本（`refresh-prices.js`/`deepseek-official.js`）只认 `WB_NO_NET=1` 环境变量；`refresh-holidays.js` 无任何开关、**也不会被自动调用**（只在你手动运行时联网） | — | — |
+| *(非开关项)* 本地价库 Python 流水线 | 只认总开关 | `fetch-cn-prices.py` → `parse_tokenhub.py` → `build_index.py`，由 `loadPricing()` **每日首次调用时自动后台调起**（`~12s`，非阻塞；每天成功一次即不再跑，失败按 3/10/30/60 分钟退避、当日满 5 次熔断）。`ENABLE_PRICE_REFRESH=false` **不会**关掉它 | `llmabacus` / 各厂商官网 / 腾讯云 TokenHub 文档页 | 否 |
 | `ENABLE_BALANCE_QUERY` | **`false`** | 余额查询 | 仅 `https://api.deepseek.com/user/balance` | ⚠️ **是**（DeepSeek API key） |
 | `ENABLE_PRICE_REFRESH` | `true` | 每日价格自动刷新 | **5 个公开价格源**：llmabacus（`llmabacus.com/api/prices`）、llm-prices-cn（GitHub raw）、OpenRouter（`openrouter.ai/api/v1/models`）、LiteLLM（GitHub raw）、Portkey（`configs.portkey.ai/pricing/<provider>.json`） | 否 |
 | `ENABLE_MODEL_LOOKUP` | `true` | 新模型价格自动补录 | 同上（llmabacus 优先，OpenRouter 兜底） | 否 |
-| `ENABLE_UPDATE_CHECK` | `true` | 版本更新检查（**每 7 天最多 1 次**，仅在提问时触发） | 仅 `https://api.github.com/repos/abc1317679842-ui/workbuddy-token-tracker/releases/latest` | 否 |
+| `ENABLE_UPDATE_CHECK` | `true` | 版本更新检查（**每 7 天最多 1 次**） | 仅 `https://api.github.com/repos/abc1317679842-ui/workbuddy-token-tracker` 的 `releases/latest` 与 `git/matching-refs/tags/v`（两个端点取较大版本） | 否 |
 
 **默认配置 = 零密钥联网**：唯一携带 API key 的请求（余额查询）默认关闭；其余联网均为**公开价格源、无需任何密钥**，失败自动降级为本地价，不影响统计与 toast。
 

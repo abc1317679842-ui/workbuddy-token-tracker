@@ -659,8 +659,10 @@ else {
     /function recordUsage\(stat, pricing, byModel, tsMs, meta\)/.test(mainSrc));
 }
 
-// ── T12（v3.21.0）：版本更新提示（版本比较 / 闸门 / 节流 / 退避 / 仅 hook 挂载） ────
-// 全部离线：把 `.update-check.json` 预置成「闸门闭合」状态，updateNotice 就不会发网络请求。
+// ── T12（v3.21.0 建立 / v3.22.0 扩充）：版本更新提示 ──────────────────────────────
+// 覆盖：版本比较（含畸形 tag）/ 闸门 / 节流 / 退避 / 状态容错 / 双端点检测点 /
+//       挂载点下沉 out() 的源码守卫 / hookIdle 与 toast 兜底 / 版本号四处一致。
+// 全部离线：把 `.update-check.json` 预置成「闸门闭合」状态，就不会发网络请求。
 {
   const src = (f) => fs.readFileSync(path.join(SRC, f), 'utf-8');
   const ttMod = require(path.join(skillDir, 'token-tracker.js'));
@@ -671,9 +673,12 @@ else {
   const now = Date.now();
 
   // a：新增函数/常量已导出
-  const ex12 = ['updateNotice', 'cmpVersion', 'loadUpdateState', 'saveUpdateState', 'queryLatestTag'];
-  ok('T12-a 版本检查函数已全部导出',
-    ex12.every((n) => typeof ttMod[n] === 'function') && typeof ttMod.SKILL_VERSION === 'string',
+  const ex12 = ['updateNotice', 'cmpVersion', 'loadUpdateState', 'saveUpdateState', 'queryLatestTag',
+    'updateTagForToast', 'maybeFetchLatest', 'maybeFetchLatestForStop', 'claimNotify', 'hookIdle'];
+  ok('T12-a 版本检查函数/常量已全部导出',
+    ex12.every((n) => typeof ttMod[n] === 'function')
+      && typeof ttMod.SKILL_VERSION === 'string'
+      && typeof ttMod.HOOK_IDLE_MS === 'number' && ttMod.HOOK_IDLE_MS === 3 * 24 * 3600 * 1000,
     ex12.filter((n) => typeof ttMod[n] !== 'function').join(','));
 
   // b：版本号**数值**比较（直接字符串比较会把 '3.9.0' > '3.10.0' 判成 true）
@@ -706,7 +711,7 @@ else {
   put({ lastCheckAt: now, latestVersion: ttMod.SKILL_VERSION });
   ok('T12-e1 远端 == 本地 → 静默', ttMod.updateNotice() === '');
   put({ lastCheckAt: now, latestVersion: '3.9.0' });
-  ok('T12-e2 远端低于本地（3.9.0 < 3.21.0）→ 静默', ttMod.updateNotice() === '');
+  ok('T12-e2 远端低于本地（3.9.0 < 当前版本）→ 静默', ttMod.updateNotice() === '');
 
   // f：退避未到 → 静默且不联网（nextRetryAt 在未来）
   put({ failCount: 1, nextRetryAt: now + 3600000 });
@@ -718,14 +723,67 @@ else {
   fs.rmSync(UF, { force: true });
   ok('T12-g2 状态文件缺失 → 返回空状态不抛错', JSON.stringify(ttMod.loadUpdateState()) === '{}');
 
-  // h：源码级守卫 —— 挂载点必须在 asHook 上，且 --stop 路径不碰它
-  ok('T12-h1 ★挂载点只对 asHook 生效（withUpdate 内 `if (!asHook) return msg;`）',
-    /const withUpdate = \(msg\) => \{\s*if \(!asHook\) return msg;/.test(mainSrc));
-  ok('T12-h2 updateNotice 仅被 withUpdate 调用一处（未散落在 --stop / 弹窗路径）',
-    (mainSrc.match(/updateNotice\(\)/g) || []).length === 1);
-  ok('T12-h3 联网仍受总开关约束（ENABLE_NETWORK && ENABLE_UPDATE_CHECK）',
-    /if \(!\(ENABLE_NETWORK && ENABLE_UPDATE_CHECK\)\) return ''/.test(mainSrc));
-  ok('T12-h4 .gitignore 已排除 .update-check.json', /^\.update-check\.json$/m.test(src('.gitignore')));
+  // h：源码级守卫（v3.22.0 重写）—— 追加逻辑必须**下沉在 out() 内部**，
+  //    因为 v3.21.0 把它挂在两个 out() 调用点上，会被 --hook 的 3 条早退分支 return 绕过。
+  ok('T12-h1 ★v3.21.0 的 withUpdate 包装函数已彻底删除（挂在调用点上就会被 return 绕过）',
+    mainSrc.indexOf('withUpdate') < 0, '仍存在 withUpdate');
+  ok('T12-h2 ★追加逻辑下沉到 out() 内部（`if (asHook && upNote)` 夹在 out 定义体与 stdout.write 之间）', (() => {
+    const i0 = mainSrc.indexOf('const out = (hookOut) => {');
+    const i1 = mainSrc.indexOf('if (asHook && upNote)', i0);
+    const i2 = mainSrc.indexOf('process.stdout.write(asHook || asStop', i0);
+    return i0 > 0 && i1 > i0 && i2 > i1;
+  })());
+  ok('T12-h3 ★upNote 在 main() 开头只算一次，且位于 out() 定义之前（保证任何早退分支都带得上）', (() => {
+    const iUp = mainSrc.indexOf("const upNote = asHook ? updateNotice() : '';");
+    const iOut = mainSrc.indexOf('const out = (hookOut) => {');
+    return iUp > 0 && iOut > 0 && iUp < iOut;
+  })());
+  ok('T12-h4 Stop 端兜底预检查在弹窗之前触发（`if (asStop) maybeFetchLatestForStop();`）',
+    /if \(asStop\) maybeFetchLatestForStop\(\);/.test(mainSrc));
+  ok('T12-h5 ★检测点双端点：queryLatestTag 同时查 releases/latest 与 git/matching-refs/tags/v',
+    mainSrc.indexOf("'/releases/latest'") >= 0 && mainSrc.indexOf("'/git/matching-refs/tags/v'") >= 0);
+  ok('T12-h6 ★两端点结果取版本号较大者（内联 cmp + `if (cmp(t, best) > 0) best = t;`）',
+    /const cmp = \(a, b\) => \{/.test(mainSrc) && /if \(cmp\(t, best\) > 0\) best = t;/.test(mainSrc));
+  ok('T12-h7 联网仍受总开关约束（ENABLE_NETWORK && ENABLE_UPDATE_CHECK 出现在 3 条通道函数里）',
+    (mainSrc.match(/ENABLE_NETWORK && ENABLE_UPDATE_CHECK/g) || []).length >= 3);
+  ok('T12-h8 .gitignore 已排除 .update-check.json', /^\.update-check\.json$/m.test(src('.gitignore')));
+
+  // p：v3.22.0 新增纯函数（全部离线——闸门/退避未到即不发起网络请求）
+  ok('T12-p1 hookIdle：无 lastHookAt（从没跑过 --hook）→ true', ttMod.hookIdle(now, {}) === true);
+  ok('T12-p2 hookIdle：lastHookAt 刚刷新 → false', ttMod.hookIdle(now, { lastHookAt: now }) === false);
+  ok('T12-p3 ★hookIdle 边界：正好 3 天 → true（≥ HOOK_IDLE_MS 即判定为「没配 hook」）',
+    ttMod.hookIdle(now, { lastHookAt: now - ttMod.HOOK_IDLE_MS }) === true);
+  ok('T12-p4 hookIdle：阈值内 1 小时 → false（还没到）',
+    ttMod.hookIdle(now, { lastHookAt: now - ttMod.HOOK_IDLE_MS + 3600000 }) === false);
+
+  ok('T12-p5 claimNotify：远端不高于本地 → false',
+    ttMod.claimNotify({}, ttMod.SKILL_VERSION, now) === false && ttMod.claimNotify({}, '3.9.0', now) === false);
+  const cs = {};
+  ok('T12-p6 ★claimNotify：首次命中 → true 并写入 notifiedVersion / notifyCount / lastNotifyAt',
+    ttMod.claimNotify(cs, '9.9.9', now) === true && cs.notifiedVersion === '9.9.9' && cs.notifyCount === 1 && cs.lastNotifyAt === now);
+  ok('T12-p7 ★同版本 24h 内第二次 → false（节流生效）', ttMod.claimNotify(cs, '9.9.9', now + 3600000) === false);
+  ok('T12-p8 同版本满 24h 后 → true（允许再提示一次）', ttMod.claimNotify(cs, '9.9.9', now + 24 * 3600 * 1000) === true);
+  ok('T12-p9 ★达到上限 2 次后彻底静默', ttMod.claimNotify(cs, '9.9.9', now + 48 * 3600 * 1000) === false && cs.notifyCount === 2);
+  ok('T12-p10 claimNotify：换新版本 → 计数重置（新版本重新给 2 次机会）',
+    ttMod.claimNotify(cs, '9.9.10', now) === true && cs.notifyCount === 1);
+
+  ok('T12-p11 maybeFetchLatest：闸门未到（lastCheckAt=now）→ false 且不联网',
+    ttMod.maybeFetchLatest({ lastCheckAt: now }, now) === false);
+  ok('T12-p12 maybeFetchLatest：退避未到（nextRetryAt 在未来）→ false 且不联网',
+    ttMod.maybeFetchLatest({ lastCheckAt: 0, nextRetryAt: now + 3600000 }, now) === false);
+
+  // q：toast 兜底标记（模块级缓存 → 只测一次 + 缓存行为；反向分支由源码守卫覆盖）
+  put({ lastCheckAt: now, latestVersion: '9.9.9', failCount: 0, nextRetryAt: 0 }); // 无 lastHookAt → hookIdle=true
+  const tag1 = ttMod.updateTagForToast(now);
+  ok('T12-q1 ★没配 hook（无 lastHookAt）→ toast 兜底标记产出 `⬆v9.9.9`', tag1 === '⬆v9.9.9', JSON.stringify(tag1));
+  ok('T12-q2 同进程重复调用返回缓存（一次 Stop 会格式化多次 toastLine1，不能重复消费计数）',
+    ttMod.updateTagForToast(now + 99999) === tag1);
+  ok('T12-q3 ★源码守卫：updateTagForToast 内先判 hookIdle、再 claimNotify（hook 活着 → 永不产出标记）', (() => {
+    const i = mainSrc.indexOf('function updateTagForToast');
+    const body = mainSrc.slice(i, mainSrc.indexOf('function maybeFetchLatestForStop', i));
+    return body.indexOf('if (!hookIdle(now, st)) return gUpTag;') > 0
+      && body.indexOf('claimNotify(st') > body.indexOf('hookIdle(now, st)');
+  })());
 
   // i：版本号四处一致（防漂移：源码常量 / manifest / README 徽章 / CHANGELOG 顶部条目）
   const v = ttMod.SKILL_VERSION;
