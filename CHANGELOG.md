@@ -22,6 +22,11 @@
 
 - 本机 selftest **125 过 / 0 败**；CI 复跑（本版推送自动触发）结果见 Actions 页。
 
+### 四、CI 后续修正（同版本内运维补充）
+
+- **触发列表收窄为 `[main]`**：最初配 `[master, main]`，而推送脚本每次双分支同步推（同 tree 镜像）→ 每个 commit 跑两遍 CI（runs 成对出现）。master 是历史遗留分支，default_branch 是 main——只挂 main 省一半 runner，状态也不再成对混乱。master 分支保留不删（删除属不可逆操作，待定）。
+- **已知覆盖缺口（记录在案，暂不处理）**：T3 R4「损坏 → 重建成功 → stderr 告警」路径在 CI 因 `WB_NO_NET=1` 明示跳过，但**本机 selftest 每次仍真实验证**——并非零覆盖。若未来要 CI 级覆盖，可加每周一次的联网定时 job（允许真联网跑一遍），flaky 风险与 runner 成本换来的增量有限，暂不做。
+
 ---
 
 ## v3.23.2（2026-10-01）—— 首个 CI（GitHub Actions selftest）+ KI-2 漏弹上限 30min → 5min
