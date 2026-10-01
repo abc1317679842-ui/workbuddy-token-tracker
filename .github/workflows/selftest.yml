@@ -8,8 +8,8 @@ name: selftest
 on:
   push:
     branches: [main]
-    # 只挂 main（default_branch）：每次推送 master+main 双镜像会导致每个 commit 跑两遍 CI。
-    # master 是历史遗留分支，与 main 同 tree 同步推送——挂 main 一个就够，省一半 runner。
+    # 只挂 main（default_branch）：历史上每次推送 master+main 双镜像会让每个 commit 跑两遍 CI。
+    # v3.23.4：master 镜像分支已删除（单分支），双跑问题从源头消失。
 
 jobs:
   selftest:
