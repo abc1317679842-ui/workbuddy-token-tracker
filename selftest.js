@@ -961,6 +961,71 @@ else {
   }
 }
 
+// ===== T16：KI-5 截断恢复（水位重置 + 时间戳去重，v3.25.0）=====
+{
+  // ⚠必须 require tmp 副本（skillDir）而非 SRC：副本实例的模块级路径（账本/水位线）才指向 tmp。
+  // v3.25.0 教训：曾用 require(SRC)——require 时 WB_ROOT 已恢复 → 实例路径指向真实技能目录，
+  // 测试数据直接写进真实账本（已修复并清理）。同进程缓存命中，与其他 T 段共用实例。
+  const mod16 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  if (!mod16) skip('T16 KI-5 行为验证（主模块加载失败）');
+  else {
+    const T16 = path.join(tmp, 'projects', 'ki5');
+    fs.mkdirSync(path.join(T16, 's1', 'subagents'), { recursive: true });
+    const tp16 = path.join(T16, 's1.jsonl');
+    const T0 = 1727827200000; // 真实量级 epoch ms（防行数/时间戳量纲混淆回归）
+    let seq16 = 0;
+    const mkRow16 = (ts, input, output) => {
+      const i = seq16++;
+      return JSON.stringify({ type: 'assistant', id: 'm' + i, timestamp: ts,
+        providerData: { model: 'ki5-model', messageId: 'mid-' + i, usage: { input_tokens: input, output_tokens: output } } });
+    };
+    const wmFile16 = path.join(tmp, 'skills', 'token-usage-tracker', '.ledger-watermark.json');
+    const dailyFile16 = path.join(tmp, 'skills', 'token-usage-tracker', 'daily-usage.json');
+    const readLedgerIn16 = () => {
+      try {
+        const d = JSON.parse(fs.readFileSync(dailyFile16, 'utf-8'));
+        for (const day of Object.values(d)) {
+          const m = day && day.models && day.models['ki5-model'];
+          if (m) return m.in || 0;
+        }
+      } catch (e) {}
+      return 0;
+    };
+    const readWm16 = () => JSON.parse(fs.readFileSync(wmFile16, 'utf-8'));
+    // a1：压缩恢复只计新账（重复计会是 600）
+    fs.writeFileSync(wmFile16, JSON.stringify({ s1: { main: 8, subs: {}, lastTs: T0 + 70000 } }));
+    fs.writeFileSync(tp16, [0,1,2,3,4,5,6,7,8,9].map((i) => mkRow16(T0 + i * 10000, 100, 10)).slice(4).join('\n') + '\n');
+    mod16.incrementalRecord(tp16, 's1');
+    ok('T16-a1 ★transcript 压缩截断 → 水位重置+时间戳去重恢复记账（只计新行，不重复计已记账行）',
+      readLedgerIn16() === 200 && readWm16().s1.main === 6 && readWm16().s1.lastTs === T0 + 90000);
+    // a2：无 lastTs 的旧水位线 → 冻结不重记（无过滤重置 = 无条件重复计费）
+    fs.writeFileSync(path.join(T16, 's2.jsonl'), [0,1,2].map((i) => mkRow16(T0 + i * 10000, 30, 3)).join('\n') + '\n');
+    fs.writeFileSync(wmFile16, JSON.stringify({ s2: { main: 5, subs: {} } }));
+    const beforeA2 = readLedgerIn16();
+    mod16.incrementalRecord(path.join(T16, 's2.jsonl'), 's2');
+    ok('T16-a2 ★旧水位线（无 lastTs 判据）→ 宁可保持冻结也不无过滤重置（防重复计费）',
+      readLedgerIn16() === beforeA2 && readWm16().s2.main === 5);
+    // b1：子代理对称恢复（判据 = 各文件独立的 subTs[f]，不是主文件 lastTs）
+    fs.writeFileSync(wmFile16, JSON.stringify({ s1: { main: 6, subs: { 'agent-a.jsonl': 4 }, lastTs: T0 + 90000, subTs: { 'agent-a.jsonl': T0 + 30000 } } }));
+    const beforeB1 = readLedgerIn16();
+    seq16 = 100;
+    fs.writeFileSync(path.join(T16, 's1', 'subagents', 'agent-a.jsonl'),
+      [0,1,2,3,4].map((i) => mkRow16(T0 + i * 10000, 40, 4)).slice(2).join('\n') + '\n');
+    mod16.incrementalRecord(tp16, 's1');
+    ok('T16-b1 ★子代理 transcript 压缩截断 → 按 subTs[f] 对称恢复（各文件独立判据）',
+      readLedgerIn16() === beforeB1 + 40 && readWm16().s1.subs['agent-a.jsonl'] === 3);
+    // c1：truncated 标志（正常路径无此字段，旧调用方零影响）
+    const rT16 = mod16.readTranscLinesFrom(path.join(T16, 's2.jsonl'), 5);
+    const rN16 = mod16.readTranscLinesFrom(path.join(T16, 's2.jsonl'), 0);
+    ok('T16-c1 ★readTranscLinesFrom 截断分支显式返回 truncated:true（正常路径无此字段）',
+      rT16.truncated === true && rT16.totalLines === 5 && rN16.truncated === undefined);
+    // c2：backfill 水位线合并保真 lastTs/subTs（丢弃 = --write 后截断恢复退化为冻结）
+    const bf16 = fs.readFileSync(path.join(SRC, 'backfill.js'), 'utf8').replace(/\r\n/g, '\n');
+    ok('T16-c2 ★backfill 水位线合并保真 lastTs/subTs（判据字段不得在合并时丢失）',
+      /lastTs: Math\.max\(o\.lastTs \|\| 0, v\.lastTs \|\| 0\)/.test(bf16) && /subTs: Object\.assign\(\{\}, o\.subTs \|\| \{\}/.test(bf16));
+  }
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
 // v3.24.0（审计⑤）：skip 数显式化 —— 「138 全绿」曾掩盖 26 条端到端用例全部 SKIP 的事实
 // （SPAWN_OK=false 的沙箱环境里绿 ≠ 真跑过）。结果行带 skip 数；**有跳过时退出码 = 2**

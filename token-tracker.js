@@ -1,5 +1,25 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.24.1 (2026-10-02)
+// token-usage-tracker v3.25.0 (2026-10-02)
+// v3.25.0：**KI-5 落地 —— transcript 截断恢复（水位重置 + 时间戳去重），水位线不再永久冻结** ——
+//   v3.22.2 起「行数 < 水位线 = 平台压缩过历史」只做告警（v3.24.0 补 ⚠账缺），水位线本身仍冻结
+//   → 该会话之后的所有消耗**永久静默少计**。本版恢复记账，核心三件：
+//   ① 持久化「已消费 max ts」判据：水位线 entry 新增 lastTs（主文件）/ subTs[f]（各子代理文件
+//      独立——不能用主 lastTs，主文件 ts 通常更新，会把子代理未记账行误过滤）。与水位线同一
+//      entry、同一次 saveLedgerWatermark 落盘 → 记账失败两者同退，天然一致。
+//   ② 截断恢复：readTranscLinesFrom 显式返回 truncated:true（正常路径无此字段，旧调用方零影响）；
+//      incrementalRecord 检测到 truncated 且有判据 → 从 0 重读全部完整行，perModelFromRows /
+//      estimateInterrupted 按 fromTs=lastTs 过滤（两函数本就内建时间戳过滤，零新机制）——
+//      ts<=lastTs 已记账跳过、ts>lastTs 从未记账计入，水位线一次推进到重写后实际行数，重读只一轮。
+//      中断补偿在重置场景改用 estimateInterrupted(rows,0,fromTs)（estimateInterruptedInc 的
+//      全量回退分支按行数差推起点，对重置语义不成立）。
+//   ③ 防重复计费底线：lastTs 缺失（旧版本水位线升级而来）→ 无判据**宁可保持冻结也不重置**。
+//      已知盲区（注释声明）：写入晚但 ts 回填早于 lastTs 的未记账行会被过滤——单行损失换
+//      「新消耗全部恢复记账」。写入中读到半文件误判 truncated → ts 过滤保证无账务错误，仅多一次全量读。
+//   ④ backfill 水位线合并保真 lastTs/subTs（丢弃 = --write 后截断恢复退化为冻结）。
+//   ⑤ selftest 新增 T16 段 5 项 → 154 过 / 0 败 / 16 跳过；独立夹具 12 项全过（主/子代理恢复、
+//      正常增量回归、无判据冻结、truncated 标志）。
+//   教训（T16 首版踩坑）：selftest 里 require(SRC) 而非 tmp 副本（skillDir）→ 实例模块级路径指向
+//   真实技能目录 → 测试数据写进真实账本（已清理并修复，T16 注释留档）。
 // v3.24.1：**v3.24.0 发布后自审修正（3 条发现：1 必修 + 1 收紧 + 1 确认可接受）** ——
 //   ① ★截断告警 stderr 文案误导（必修）：v3.24.0 的截断告警尾句写「可手动跑 node backfill.js
 //      重算修复」——但 backfill 是**全量重建替换**（newDaily 完全由重放结果组装、不继承旧账本），
@@ -1108,7 +1128,10 @@ function readTranscLinesFrom(tsPath, fromLine) {
           process.stderr.write(`[token-tracker] ⚠ transcript 完整行数少于水位线 ${start}（历史被压缩/重写），水位线已冻结 → 之后的消耗将静默少计。已被压缩的行本地不可恢复（见 KNOWN-ISSUES KI-5）；**不要跑 backfill --write**——它是全量重建替换，会把压缩窗口外的历史账一并抹掉\n`);
         }
       } catch (e2) { /* 旗标写失败不影响记账主流程 */ }
-      return { rows: [], totalLines: start };
+      // v3.25.0（KI-5）：显式告知调用方「这是截断」——调用方 incrementalRecord 据此走
+      // 截断恢复分支（水位重置 + 时间戳去重重读）。正常「无新行」路径 totalLines >= start
+      // 且 truncated 为 undefined，语义可区分（旧返回值形状完全兼容，多一个字段）。
+      return { rows: [], totalLines: start, truncated: true };
     }
     off = nl + 1;
   }
@@ -3063,6 +3086,13 @@ function incrementalRecord(tsPath, sid, meta) {
   const bumpTs = (rows) => {
     for (const r of rows) { const t = Number(r && r.timestamp); if (Number.isFinite(t) && t > peakTs) peakTs = t; }
   };
+  // v3.25.0（KI-5）：各文件独立的「已消费 max ts」收集（peakTs 是主+子代理混用的计价时刻，不能挪用）。
+  const maxTsOf = (rows) => {
+    let m = 0;
+    for (const r of rows) { const t = Number(r && r.timestamp); if (Number.isFinite(t) && t > m) m = t; }
+    return m;
+  };
+  let mainMaxTs = 0;
   // 1. 主 transcript 新行（行数水位线，单调递增，slice 可靠）
   // v2.68 修复1：先算出"候选新水位线"，记账成功后再落；失败则保持旧值，下轮重扫重记。
   // v2.68 修复2：候选值取 Math.max —— transcript 可能被截断（Context Compaction 覆盖重写、
@@ -3070,15 +3100,42 @@ function incrementalRecord(tsPath, sid, meta) {
   // 之后文件重新长到原长度时会把已记过的行再记一遍 = 重复计费。水位线只许前进不许后退。
   // v2.69 性能：只读 + 只解析"水位线之后的新行"。
   // 统计口径完全不变：rows 等价于旧实现的 mainRows.slice(entry.main)，totalLines 等价于 mainRows.length。
-  const { rows: mainRows, totalLines } = readTranscLinesFrom(tsPath, entry.main || 0);
-  const nextMain = Math.max(entry.main || 0, totalLines);
-  if (totalLines > entry.main) {
+  // v3.25.0（KI-5）：截断恢复 —— truncated 时水位线不再永久冻结。
+  // 恢复语义：从 0 重读重写后文件的**全部完整行**，perModelFromRows / estimateInterrupted 按
+  // fromTs = entry.lastTs 过滤（ts <= lastTs 的行已记过账，跳过；ts > lastTs 的行从未记账，计入）。
+  // 判据成立的前提：transcript 行按时间追加写入 → 已记账行的 ts 全部 <= lastTs（lastTs 即历史 max）。
+  // 已知盲区（可接受）：写入晚、但 ts 回填早于 lastTs 的未记账行会被过滤丢失——单行损失且有告警，
+  // 换取「重置后新消耗恢复记账」这一定收益（否则从冻结点起**所有**消耗永久静默少计）。
+  // lastTs 缺失（旧版本水位线升级而来）→ 无去重判据，**宁可保持冻结也不重置**（无过滤重置 = 无条件重复计费）。
+  // nextMain 一次推进到重写后文件实际行数 → 之后恢复正常增量，重读只发生一轮。
+  let { rows: mainRows, totalLines, truncated } = readTranscLinesFrom(tsPath, entry.main || 0);
+  let nextMain = Math.max(entry.main || 0, totalLines);
+  let fromTsMain = 0; // 正常路径恒 0（perModelFromRows 不过滤），行为与旧版逐字节一致
+  if (truncated && (entry.main || 0) > 0) {
+    const lastTs = Number(entry.lastTs) || 0;
+    if (lastTs > 0) {
+      const full = readTranscLinesFrom(tsPath, 0);
+      mainRows = full.rows;
+      fromTsMain = lastTs;
+      nextMain = full.totalLines;
+      process.stderr.write(`[token-tracker] ⚠ transcript 曾被压缩重写（水位线 ${entry.main} > 完整行数），已按时间戳去重重置水位线到 ${nextMain}：新消耗恢复记账；被压缩的历史差额不可恢复（见 KNOWN-ISSUES KI-5）\n`);
+    }
+  }
+  if (totalLines > entry.main || fromTsMain > 0) {
     bumpTs(mainRows);
-    merge(perModelFromRows(mainRows, 0));
-    merge(estimateInterruptedInc(tsPath, mainRows)); // v2.52：中断补偿
+    mainMaxTs = maxTsOf(mainRows); // v3.25.0（KI-5）：本批 max ts → 写侧持久化为截断恢复判据
+    merge(perModelFromRows(mainRows, fromTsMain));
+    // v3.25.0（KI-5）：重置场景不能用 estimateInterruptedInc —— 其全量回退分支按「行数差」推起点
+    // （full.length - rows.length），对重置语义不成立（两侧都= M → 起点 0 → 已记账行全部重估重复）。
+    // 改用同量纲 estimateInterrupted(mainRows, 0, fromTsMain)：fromTs 过滤已记账行（该函数内建支持）。
+    if (fromTsMain > 0) merge(estimateInterrupted(mainRows, 0, fromTsMain));
+    else merge(estimateInterruptedInc(tsPath, mainRows)); // v2.52：中断补偿
   }
   // 2. 各子代理文件新行
+  // v3.25.0（KI-5）：子代理文件同样会被 compaction 截断重写 → 对称恢复。判据用**各文件自己的**
+  // subTs[f]（不能用主文件 lastTs：主文件通常更新、ts 更大，会把子代理未记账的行误过滤掉）。
   const nextSubs = {};
+  const subMaxTs = {}; // v3.25.0（KI-5）：各子代理文件本批 max ts（写侧持久化为去重判据）
   const subDir = subagentsDirFromTranscript(tsPath);
   if (fs.existsSync(subDir)) {
     try {
@@ -3087,14 +3144,28 @@ function incrementalRecord(tsPath, sid, meta) {
         const fp = path.join(subDir, f);
         // v2.69 性能：与主 transcript 同口径，只解析水位线之后的新行
         const start = entry.subs[f] || 0;
-        const { rows: subRows, totalLines: subTotal } = readTranscLinesFrom(fp, start);
-        if (subTotal > start) {
+        let { rows: subRows, totalLines: subTotal, truncated: subTrunc } = readTranscLinesFrom(fp, start);
+        let nextSubVal = Math.max(start, subTotal);
+        let fromTsSub = 0;
+        if (subTrunc && start > 0) {
+          const sLast = Number((entry.subTs || {})[f]) || 0;
+          if (sLast > 0) {
+            const full = readTranscLinesFrom(fp, 0);
+            subRows = full.rows;
+            fromTsSub = sLast;
+            nextSubVal = full.totalLines;
+            process.stderr.write(`[token-tracker] ⚠ 子代理 ${f} 曾被压缩重写（水位线 ${start}），已按时间戳去重重置到 ${nextSubVal}（KI-5）\n`);
+          }
+        }
+        if (subTotal > start || fromTsSub > 0) {
           bumpTs(subRows);
-          merge(perModelFromRows(subRows, 0));
-          merge(estimateInterruptedInc(fp, subRows)); // v2.53：子代理被中断思考也估算
+          subMaxTs[f] = maxTsOf(subRows); // v3.25.0（KI-5）
+          merge(perModelFromRows(subRows, fromTsSub));
+          if (fromTsSub > 0) merge(estimateInterrupted(subRows, 0, fromTsSub));
+          else merge(estimateInterruptedInc(fp, subRows)); // v2.53：子代理被中断思考也估算
         }
         // 修复2：子代理水位线同样只许前进（子代理 transcript 也会被 compaction 截断重写）
-        nextSubs[f] = Math.max(entry.subs[f] || 0, subTotal);
+        nextSubs[f] = nextSubVal;
       }
     } catch (e) { /* 忽略 */ }
   }
@@ -3111,6 +3182,16 @@ function incrementalRecord(tsPath, sid, meta) {
   // 4. 记账成功 → 推进水位线
   entry.main = nextMain;
   for (const f of Object.keys(nextSubs)) entry.subs[f] = nextSubs[f];
+  // v3.25.0（KI-5）：持久化各文件「已消费最大时间戳」——截断恢复（水位重置 + 时间戳去重）的判据。
+  // 与水位线同一 entry 对象、同一次 saveLedgerWatermark 落盘 → 记账失败时两者同退，天然一致。
+  // 数学安全：重置场景 rows 为全量行，但已记账行 ts 全部 <= lastTs → max(全量) = max(新行) 或 lastTs，不越界。
+  if (mainMaxTs > (Number(entry.lastTs) || 0)) entry.lastTs = mainMaxTs;
+  if (Object.keys(subMaxTs).length) {
+    entry.subTs = entry.subTs || {};
+    for (const [f, t] of Object.entries(subMaxTs)) {
+      if (t > (Number(entry.subTs[f]) || 0)) entry.subTs[f] = t;
+    }
+  }
   saveLedgerWatermark(wm);
   }, { ttl: 300000, retries: 30, retryDelay: 100 }); // v2.82.1：水位线锁；拿不到锁 → 本轮跳过，下轮补记
 }
@@ -4179,7 +4260,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.24.1'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.25.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

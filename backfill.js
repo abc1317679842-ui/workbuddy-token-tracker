@@ -307,6 +307,10 @@ function main() {
     mergedWm[k] = {
       main: Math.max(o.main || 0, v.main),
       subs: Object.assign({}, o.subs, v.subs),
+      // v3.25.0（KI-5）：保真截断恢复判据（backfill 的 v 无这些字段，Math.max 兜底继承旧值）。
+      // 若在此处丢弃 lastTs/subTs，--write 后截断恢复退化为「保持冻结」（旧水位线无判据）。
+      lastTs: Math.max(o.lastTs || 0, v.lastTs || 0),
+      subTs: Object.assign({}, o.subTs || {}, v.subTs || {}),
     };
     for (const [sf, n] of Object.entries(mergedWm[k].subs)) {
       // v3.24.0（级联⑥）：修复恒等 no-op —— 原式 `Math.max(n, (v.subs && v.subs[sf]) || n || 0)`
