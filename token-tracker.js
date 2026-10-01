@@ -1,5 +1,17 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.24.0 (2026-10-02)
+// token-usage-tracker v3.24.1 (2026-10-02)
+// v3.24.1：**v3.24.0 发布后自审修正（3 条发现：1 必修 + 1 收紧 + 1 确认可接受）** ——
+//   ① ★截断告警 stderr 文案误导（必修）：v3.24.0 的截断告警尾句写「可手动跑 node backfill.js
+//      重算修复」——但 backfill 是**全量重建替换**（newDaily 完全由重放结果组装、不继承旧账本），
+//      transcript 压缩场景下重放只扫到近期窗口，--write 会把**压缩窗口外的历史账一并抹掉**。
+//      改：文案明确「被压缩的行本地不可恢复 + 不要跑 backfill --write」；KNOWN-ISSUES KI-5
+//      补「历史不可恢复」层（⚠账缺 的意义正是提示这个不可恢复的缺口）。
+//   ② loadDailyUsage 错误分类收紧：删死代码 ENOENT 判断（上方已 return）；`!e.code`（未知异常
+//      如 TypeError）从「解析类 → 改名 .corrupt」改归「读失败 → 不动原文件」——文件可能是好的，
+//      不动才 fail-safe，与「读取类错误不毁账本」的版本主张对齐。现语义：仅 SyntaxError 才改名。
+//   ③ ⚠账缺旗标无主动清除：确认可接受——7 天自过期是刻意设计；①修正后 backfill 不再是修复
+//      路径，旗标持续到过期反而合理。
+//   其余 v3.24.0 改动段（alive0 / recalc 保留原额 / 假日空年 / TOCTOU / toastLine2）逐段复查无新问题。
 // v3.24.0：**R8/R9 全量审计落地（13 条级联链修复 + 连锁反应测试两级全绿）** ——
 //   ① 级联② hy3 补录 shipped pricing.json + toast 新增「⚠未计价」标注：hy3 是 WorkBuddy
 //      子代理默认模型，shipped 价库连本机 pricing.json 都没有 → 纯净环境子代理金额静默 = 0。
@@ -1093,7 +1105,7 @@ function readTranscLinesFrom(tsPath, fromLine) {
           const tf = TRANSC_TRUNCATED_FILE + '.tmp-' + process.pid;
           fs.writeFileSync(tf, JSON.stringify({ at: Date.now(), path: tsPath, watermark: start }));
           fs.renameSync(tf, TRANSC_TRUNCATED_FILE);
-          process.stderr.write(`[token-tracker] ⚠ transcript 完整行数少于水位线 ${start}（历史被压缩/重写），水位线已冻结 → 之后的消耗将静默少计。可手动跑 node backfill.js 重算修复\n`);
+          process.stderr.write(`[token-tracker] ⚠ transcript 完整行数少于水位线 ${start}（历史被压缩/重写），水位线已冻结 → 之后的消耗将静默少计。已被压缩的行本地不可恢复（见 KNOWN-ISSUES KI-5）；**不要跑 backfill --write**——它是全量重建替换，会把压缩窗口外的历史账一并抹掉\n`);
         }
       } catch (e2) { /* 旗标写失败不影响记账主流程 */ }
       return { rows: [], totalLines: start };
@@ -2795,10 +2807,12 @@ function loadDailyUsage() {
     // v3.24.0（级联③）：**区分「文件真损坏」与「瞬时读失败」** —— 原先所有非 ENOENT 错误一律
     // 把账本改名 .corrupt-<ts>。EACCES / EBUSY / EIO 这类**文件本身完好**的瞬时占用（杀毒扫描、
     // 同步盘锁定）也会触发改名 → "一次瞬时文件占用 = 历史账本永久消失"。
-    // 现在只有 JSON 解析失败（SyntaxError，文件内容真坏）才隔离改名；读失败 → 原文件原位不动，
-    // gDailyCorrupt 照样置 true 阻止本轮用空账本写回（防覆盖逻辑不变），stderr 告警后下次重试。
-    const isParseError = e instanceof SyntaxError || !e.code || e.code === 'ENOENT';
-    if (!isParseError && e.code !== 'ENOENT') {
+    // v3.24.1（自审收紧）：只有 JSON 解析失败（SyntaxError，文件内容真坏）才隔离改名；
+    // **其余一律不动原文件**——包括未知异常（无 code，如 TypeError）：文件可能是好的，
+    // 按「读失败」处理才 fail-safe（原先 `!e.code` 被归入解析类 → 未知异常也会改名，与主张相悖）。
+    // 读失败 → 原文件原位不动，gDailyCorrupt 照样置 true 阻止本轮用空账本写回（防覆盖不变），下次重试。
+    const isParseError = e instanceof SyntaxError;
+    if (!isParseError) {
       gDailyCorrupt = true;
       process.stderr.write(`[token-tracker] 账本读取失败（${e.code || e.message}）——文件未改动，本轮不写回，下次重试\n`);
       return {};
@@ -4165,7 +4179,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.24.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.24.1'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
