@@ -1,5 +1,11 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.23.2 (2026-10-01)
+// token-usage-tracker v3.23.3 (2026-10-01)
+// v3.23.3：**CI 首跑抓出的 M7 守卫时序修复（deepseek-official.js）** —— CI（windows-latest）首跑 T4 红：
+//   「pricing 损坏拒绝覆盖」守卫原来放在 fetch 成功之后、写盘之前——WB_NO_NET=1 时重试循环先烧完再 exit(1)，
+//   守卫永远到不了（重试总时长还撞了测试 60s 超时 → exit=null SIGTERM）。修复：守卫提前到 main() 开头，
+//   损坏时**不发起任何网络请求**直接 exit(2)——语义本来就是「拒绝覆盖式重建」，先联网再拒绝是本末倒置。
+//   selftest T3 R4 在 WB_NO_NET=1 时改 skip（断网重建走失败分支，断言前提不成立）。
+//   本机 125 过 / 0 败；CI 复跑验证见 Actions。
 // v3.23.2：**首个 CI（GitHub Actions selftest）+ KI-2 漏弹上限 30min → 5min** ——
 //   ① `.github/workflows/selftest.yml`：push 到 master/main 时在 windows-latest 上裸跑 `node selftest.js`
 //      （零依赖、WB_NO_NET=1 禁真联网；selftest 内部自设 TOKEN_TRACKER_NO_TOAST/WB_ROOT 隔离）。
@@ -4015,7 +4021,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.23.2'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.23.3'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

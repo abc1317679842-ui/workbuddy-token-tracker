@@ -298,6 +298,16 @@ async function main() {
   const args = process.argv.slice(2);
   const RAW = args.includes('--raw');
 
+  // v3.23.2：M7 守卫提前到联网之前——pricing.json 损坏时根本不该发起网络请求。
+  // 旧实现先 fetch 成功、写盘前才拒绝：断网/WB_NO_NET 环境下重试循环先烧完再 exit(1)，
+  // 守卫永远到不了（CI selftest T4 首跑抓出）。RAW 模式只解析输出不写库，维持不检查。
+  if (!RAW) {
+    if (!loadPricing() && fs.existsSync(PRICING)) {
+      process.stderr.write('FAIL_REASON=pricing.json 存在但损坏，deepseek-official 拒绝覆盖式重建（请人工修复后重试）\n');
+      process.exit(2);
+    }
+  }
+
   let lastErr = null;
   for (let attempt = 0; attempt <= RETRIES; attempt++) {
     if (attempt > 0) {
@@ -315,13 +325,7 @@ async function main() {
         // 会用官方极简清单（只有 DeepSeek 系）覆盖整个价格库——lock/人工核验价/_manual_audit/
         // _lookedup_models 与全部其他厂商模型被静默清空。宁可本次失败，也不能静默降级。
         let pricing = loadPricing();
-        if (!pricing) {
-          if (fs.existsSync(PRICING)) {
-            process.stderr.write('FAIL_REASON=pricing.json 存在但损坏，deepseek-official 拒绝覆盖式重建（请人工修复后重试）\n');
-            process.exit(2);
-          }
-          pricing = { models: {} }; // 首次运行（文件不存在）：允许从零建档
-        }
+        if (!pricing) pricing = { models: {} }; // 首次运行（文件不存在）允许从零建档；损坏场景已被 main 开头的守卫拦截
         const officialSet = new Set(parsed.models);
         // 1) 官方有的模型：新增或更新价格
         parsed.models.forEach((mkey, i) => {

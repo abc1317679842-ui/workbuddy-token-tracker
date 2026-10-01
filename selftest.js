@@ -87,7 +87,8 @@ else {
     try { JSON.parse(fs.readFileSync(path.join(skillDir, 'pricing.json'), 'utf8')); return true; } catch (e) { return false; }
   })());
   const rebuilt = (() => { try { return JSON.parse(fs.readFileSync(path.join(skillDir, 'pricing.json'), 'utf8')); } catch (e) { return null; } })();
-  if (rebuilt) ok('T3 R4 护栏告警进 stderr（⚠价库）', String(r.stderr || '').indexOf('⚠价库') >= 0, String(r.stderr || '').slice(0, 140));
+  if (process.env.WB_NO_NET === '1') console.log('  – T3 R4 告警断言：WB_NO_NET=1 断网环境重建走失败分支，前提不成立，已跳过（CI）');
+  else if (rebuilt) ok('T3 R4 护栏告警进 stderr（⚠价库）', String(r.stderr || '').indexOf('⚠价库') >= 0, String(r.stderr || '').slice(0, 140));
   else console.log('  – T3 R4 告警断言：重建未完成（离线/受限），已跳过');
 }
 
