@@ -59,6 +59,11 @@ function loadPricing() {
 function savePricing(p) {
   // v3.19.0（P8）：原子写（tmp + rename）——原先裸 writeFileSync，中断/并发会留半截 JSON
   // （pricing.json 是重建链路的基础，半截文件会让下次启动走 repair 分支）
+  // v3.23.5 已知边界（审计 #9，记录不修）：本函数**不持 `.pricing.lock`**，而 refresh-prices.js 的
+  // save() 持锁，两者还共用同一个 tmp 名 `pricing.json.tmp`。正常链路是 refresh-prices.js 用
+  // spawnSync **串行**调用本脚本，不会撞；只有手动并行跑两个脚本才可能互相覆盖 tmp。
+  // 不修的理由：跨进程锁目前在 token-tracker.js / refresh-prices.js 各有一份同构实现（已是两份复制），
+  // 再往本文件复制第三份会加剧「同一原则多处漂移」——真正该做的是抽共享模块（已记入 KNOWN-ISSUES）。
   fs.mkdirSync(path.dirname(PRICING), { recursive: true });
   const tmp = PRICING + '.tmp';
   try {

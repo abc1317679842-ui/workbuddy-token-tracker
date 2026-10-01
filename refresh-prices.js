@@ -472,7 +472,7 @@ async function main() {
     }
   }
 
-  let updatedMain = 0, autoConverted = 0, usdUpdated = 0, regionSet = 0, bigDiff = [];
+  let updatedMain = 0, autoConverted = 0, usdUpdated = 0, regionSet = 0, bigDiff = [], lockKept = 0;
 
   for (const key of Object.keys(models)) {
     const m = models[key];
@@ -547,6 +547,11 @@ async function main() {
         }
       }
       // 非估算模型且国内源无 → 保留本地人工/官方价
+    } else if (m.lock === true) {
+      // v3.23.5：CN 分支早就有 lock 保护，US 分支漏了——人工/官方 lock 的模型一旦被 region 判定
+      // 划成国外（llmabacus 的 vendors country 每次刷新都会重设 region），刷新会把 lock 价冲掉，
+      // 还会打上 auto_converted=true，把「官方价」的语义改成「估算价」。补齐这一分支。
+      lockKept++;
     } else {
       // 国外模型：人民币主价 = USD 源 × 汇率（国外定价）
       if (usdIn != null && usdOut != null) {
@@ -598,12 +603,12 @@ async function main() {
     pricing.deepseek_refresh_error = `DeepSeek 官方定价抓取失败（${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}），DeepSeek 系价格沿用本地/聚合源价`;
     // 失败不阻塞整体刷新：其余模型照常更新
   }
-  pricing.last_refresh_note = `${new Date().toISOString()} 多源刷新：${noteParts.join(' | ')}；人民币主价更新 ${updatedMain} 个${autoConverted ? `，USD换算 ${autoConverted} 个` : ''}，USD参考 ${usdUpdated} 个，region 设定 ${regionSet} 个（汇率 ${rate}）${bigDiff.length ? `；⚠️峰谷模型价差>60%需核验：${bigDiff.join('、')}` : ''}${officialOk ? '；DeepSeek官方价✓' : '；DeepSeek官方价✗(回落聚合源)'}${AMBIG_WARNINGS.size ? `；⚠️模糊匹配歧义: ${[...AMBIG_WARNINGS].join('；')}` : ''}${auditWarnings.length ? `；⚠️价格一致性自检: ${auditWarnings.join('；')}` : ''}`;
+  pricing.last_refresh_note = `${new Date().toISOString()} 多源刷新：${noteParts.join(' | ')}；人民币主价更新 ${updatedMain} 个${autoConverted ? `，USD换算 ${autoConverted} 个` : ''}，USD参考 ${usdUpdated} 个，region 设定 ${regionSet} 个${lockKept ? `，lock 价保留 ${lockKept} 个` : ''}（汇率 ${rate}）${bigDiff.length ? `；⚠️峰谷模型价差>60%需核验：${bigDiff.join('、')}` : ''}${officialOk ? '；DeepSeek官方价✓' : '；DeepSeek官方价✗(回落聚合源)'}${AMBIG_WARNINGS.size ? `；⚠️模糊匹配歧义: ${[...AMBIG_WARNINGS].join('；')}` : ''}${auditWarnings.length ? `；⚠️价格一致性自检: ${auditWarnings.join('；')}` : ''}`;
 
   try { save(pricing); }
   catch (e) { process.stderr.write(`[refresh-prices] 写入失败: ${e.message}\n`); process.exit(1); }
 
-  console.log(`[refresh-prices] 多源刷新完成：date=${today}，源成功 ${okCount}/${Object.keys(SOURCES).length}(国内${cnOk ? '✓' : '✗'} 国外${usdOk ? '✓' : '✗'})，人民币主价 ${updatedMain} 个，USD换算 ${autoConverted} 个，USD参考 ${usdUpdated} 个，region ${regionSet} 个${bigDiff.length ? `，⚠️价差大：${bigDiff.join('、')}` : ''}`);
+  console.log(`[refresh-prices] 多源刷新完成：date=${today}，源成功 ${okCount}/${Object.keys(SOURCES).length}(国内${cnOk ? '✓' : '✗'} 国外${usdOk ? '✓' : '✗'})，人民币主价 ${updatedMain} 个，USD换算 ${autoConverted} 个，USD参考 ${usdUpdated} 个，region ${regionSet} 个${lockKept ? `，lock 价保留 ${lockKept} 个` : ''}${bigDiff.length ? `，⚠️价差大：${bigDiff.join('、')}` : ''}`);
 }
 
 // 仅当以 `node refresh-prices.js` 直接运行时才执行主流程；被 require 时不自动跑（避免测试/复用触发联网刷新）

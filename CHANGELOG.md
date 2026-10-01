@@ -3,6 +3,52 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.23.5（2026-10-02）—— 口径一致性 + 一处真·静默失效（第七轮审计 E/C 面落地）
+
+> 主题是**「同一个原则，在 A 脚本里做对了、在 B 脚本里没跟上」**。不是作者水平问题，是一个人维护 11 个脚本时新写的那部分自然跟不上最早那部分的严谨度。本版修掉 4 条 + 记录 1 条（#9 不修，理由见下）。
+
+### 一、★内外层 timeout 打架（本版最值钱的一条，审计未列出）
+
+- **现象**：自动刷新是 `execFileSync(refresh-prices.js, { timeout: 60000 })`，而 `refresh-prices.js` 内部 `spawnSync(deepseek-official.js, { timeout: 120000 })`（含 2 次重试 × 60s 间隔）。**外层 60s 先到点，把整个刷新进程杀掉** → 内层重试机制**从未真正生效过**，DeepSeek 官方价只有首轮就成功才拿得到。
+- **为什么是高危**：这条在**每天都会走到的路径**上，不是边界条件；失败时只打一行 stderr 后沿用旧价，用户完全无感（静默）。且它是同步阻塞、挂在 `--hook`（用户提交提问）路径。
+- **修法**：自动路径显式传 `DS_RETRIES=0` → 内层只跑一次（单次 `TIMEOUT_MS` 15s，总耗时 ≪ 60s），失败沿用旧价、次日再试；**手动跑 `node refresh-prices.js` 仍保留重试**（后台场景不在乎时长）。
+- **顺带结案（审计"待确认"项）**：核对 README / `docs/pricing-refresh.md`，文档写的是「**同步调用** `refresh-prices.js`」「刷新子进程超时为 60 秒」——**文档准确，无误**。README 里那句「后台非阻塞约 12s」指的是**本地官方价库 Python 流水线**（`maybeRefreshLocalDb` 用 spawn 不等，确实非阻塞），是另一条链路。
+
+### 二、recalc-day.js 两处口径漂移（同一文件、同一根因）
+
+- **① 查价入口不统一**：`(pricing.models || {})[model]` 裸查字典 → 改走主脚本 `tt.findModel(pricing, model, 'price')`（归一化 + 边界匹配 + 别名）。原先模型名与价库键差一个后缀就取不到价，**与 backfill 同天算出两个金额且无任何报错**（backfill 早就用 findModel 了）。
+- **② 峰谷倍率缺省值不一致**：`Number(m.peak_multiplier || 1)` 一律缺省 1 → 对齐主脚本 `calcCost`（deepseek 系缺省 **2**、其余 1）。原先 deepseek 条目若缺 `peak_multiplier` 字段，**回溯重算会比主链路整整少算一倍**。
+  - 实测作用域：当前 5 个 deepseek 条目**都显式写了 2**，所以今天算不错 —— 修的是隐患，不是现行 bug。
+
+### 三、refresh-prices.js 国外模型（US）分支漏 lock 保护
+
+- CN 分支早有 `else if (m.lock === true)` 保留本地人工/官方价，**US 分支没有**：一旦 region 判定（每次刷新都会按 llmabacus 的 vendors country 重设）把某个 lock 模型划成国外，官方/人工价会被 USD×汇率冲掉，还会被打上 `auto_converted = true`（把「官方价」的语义改成「估算价」）。已补齐，并在刷新 note / 日志里输出「lock 价保留 N 个」让行为可见。
+- 实测作用域：当前 6 个 `lock:true` 条目**全是 `region: CN`、US 条目数为 0** → 当前影响 0，属潜在风险。
+
+### 四、`.coalesce-*.lock` 残留锁加 prune（KI-3 副产物）
+
+- watcher 被宿主 job object 收割时来不及释放锁 → 每个被收割的 watcher 留一个 `.coalesce-<sid>.json.lock`。**实测本机 4 个（9/05~10/01），owner 进程全部已死** —— 这同时印证 KI-3 在这台机器上真实发生过至少 4 次。
+- 死锁不会造成漏弹（`withFileLock` 有 pid 存活探测 + TTL 兜底），但它们是**唯一没有清理上限的运行时产物**（快照 50 个/30 天、轮次明细 6 个月、账本备份 3 份都有上限）。新增 `cleanupCoalesceLocks()`：7 天 / 30 个，当前会话锁永不清；挂在 `saveSnapshot` 里顺手执行。
+
+### 五、审计 #9（两脚本共用 tmp、只有一个持锁）——记录不修
+
+`deepseek-official.js` 的 `savePricing()` 不持 `.pricing.lock`，而 `refresh-prices.js` 的 `save()` 持锁，两者还共用同一个 `pricing.json.tmp`。正常链路是 `spawnSync` **串行**调用，不会撞；只有手动并行跑两个脚本才可能互相覆盖 tmp。
+**不修的理由**：跨进程锁目前在 `token-tracker.js` / `refresh-prices.js` 各有一份同构实现（已是两份复制），再往第三个文件复制一份会**加剧**「同一原则多处漂移」这个真正的病根。已在 `deepseek-official.js` 写明边界 + KNOWN-ISSUES 立项，正解是抽共享模块。
+
+### 六、防回归：selftest 新增 T14 段 7 项
+
+| 断言 | 类型 | 守什么 |
+|---|---|---|
+| T14-a1 | 源码 | recalc 查价必须走 findModel（不得裸查字典） |
+| T14-a2 | 源码 | recalc 与主脚本 calcCost 的 `peak_multiplier` 缺省口径一致 |
+| T14-b1 | 源码 | refresh-prices US 分支必须检查 `m.lock` |
+| T14-c1 | 源码 | 自动刷新路径必须传 `DS_RETRIES=0` |
+| T14-d1 | 源码 | coalesce 残留锁必须有 prune |
+| **T14-a3** | **行为** | 同一模型名：裸字典取不到价、findModel 取得到（证明原先会静默漏价） |
+| **T14-d2** | **行为** | 残留锁清理：过期锁删、当天锁留、当前会话锁即使过期也留 |
+
+**selftest 138 过 / 0 败**（v3.23.4 为 131 + T14 新增 7）。
+
 ## v3.23.4（2026-10-02）—— 价格流水线两处硬伤：requests 硬依赖 + 全局关闭 TLS 校验
 
 > 第三轮审计换切面（**安全 / 计费正确性 / 错误吞没**）挑出的 P1、P2。两者都指向同一件事：**抓的是"直接写进 pricing.json、决定每轮计费金额"的厂商价格**，这条链路上任何"崩掉"或"可被篡改"都不是小问题。

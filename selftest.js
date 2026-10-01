@@ -855,6 +855,71 @@ else {
     has('fetch-cn-prices.py', /def decode_body/) && has('parse_tokenhub.py', /def decode_body/));
 }
 
+// ── T14：口径一致性守卫（v3.23.5：同一个原则在 A 脚本做对了、在 B 脚本没跟上的漂移）─────────────
+{
+  const srcOf = (f) => fs.readFileSync(path.join(SRC, f), 'utf8');
+  // 源码守卫必须先剥注释：这里的注释里会引用"改之前的写法"做说明（本轮正是因此误判一次）
+  const stripComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n').map((l) => l.replace(/(^|\s)\/\/.*$/, '$1')).join('\n');
+  const recalc = srcOf('recalc-day.js');
+  const recalcCode = stripComments(recalc);
+  const refresh = srcOf('refresh-prices.js');
+  const main = srcOf('token-tracker.js');
+  // a：查价入口必须统一（recalc 不得裸查字典）
+  ok('T14-a1 ★recalc-day.js 查价必须走 findModel（不得裸查 pricing.models[model]）',
+    /findModel\(/.test(recalcCode) && !/\(pricing\.models \|\| \{\}\)\[model\]/.test(recalcCode));
+  // b：峰谷倍率缺省必须与主脚本 calcCost 同口径（deepseek 系 2 / 其余 1）
+  const recalcDef = /typeof m\.peak_multiplier === 'number' \? m\.peak_multiplier : \(isDeepSeek \? 2 : 1\)/.test(recalc);
+  const mainDef = /isDeepSeek \? \(typeof m\.peak_multiplier === 'number' \? m\.peak_multiplier : 2\)/.test(main);
+  ok('T14-a2 ★recalc-day.js 与主脚本 calcCost 的 peak_multiplier 缺省口径一致（deepseek=2 / 其余=1）',
+    recalcDef && mainDef);
+  // c：US 分支必须也有 lock 保护（CN 分支早有）
+  ok('T14-b1 ★refresh-prices.js 国外模型（US）分支必须检查 m.lock（CN 分支已有）',
+    /else if \(m\.lock === true\)/.test(refresh) && refresh.indexOf('else if (m.lock === true)') < refresh.indexOf('// 国外模型：人民币主价'));
+  // d：内外层 timeout 不得打架——自动刷新路径必须关掉内层重试
+  ok('T14-c1 ★自动刷新路径传 DS_RETRIES=0（否则内层 120s 重试撞外层 60s timeout，重试永远跑不完）',
+    /DS_RETRIES: '0'/.test(main));
+  // e：coalesce 残留锁必须有 prune
+  ok('T14-d1 coalesce 残留锁有 prune（watcher 被收割留下的死锁不得无限增长）',
+    /function cleanupCoalesceLocks/.test(main) && /cleanupCoalesceLocks\(sid\)/.test(main));
+
+  // ── 行为验证（源码守卫只能证明"写了"，这里证明"真的起作用"）─────────────────────────
+  const tt2 = (() => {
+    try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; }
+  })();
+  // a3：findModel 能命中、裸字典命中不了 —— 证明「recalc 原先会静默漏价」不是理论风险
+  if (!tt2) skip('T14-a3 findModel 归一化命中（裸字典不命中）');
+  else {
+    const p = { models: { 'DeepSeek-V4-Flash': { input_price: 1, output_price: 2 } } };
+    const bare = p.models['deepseek-v4-flash'];              // 裸字典：大小写不同 → 取不到
+    const viaFn = tt2.findModel(p, 'deepseek-v4-flash', 'price');
+    ok('T14-a3 ★同一模型名：裸字典取不到价、findModel 取得到（证明 recalc 原先会静默漏价）',
+      bare === undefined && !!(viaFn && viaFn.m && viaFn.m.input_price === 1));
+  }
+  // d2：残留锁清理 —— 旧锁删除、新锁保留、当前会话锁绝不动
+  if (!tt2 || typeof tt2.cleanupCoalesceLocks !== 'function') skip('T14-d2 cleanupCoalesceLocks 行为');
+  else {
+    const snapDir = path.join(skillDir); // SNAP_DIR = WB/skills/token-usage-tracker，隔离环境即此
+    const mk = (name, ageDays) => {
+      const fp = path.join(snapDir, name);
+      fs.writeFileSync(fp, '{}');
+      const t = Date.now() - ageDays * 24 * 3600 * 1000;
+      fs.utimesSync(fp, new Date(t), new Date(t));
+      return fp;
+    };
+    const old1 = mk('.coalesce-old1.json.lock', 30);   // 远超 7 天 → 删
+    const old2 = mk('.coalesce-old2.json.lock', 10);   // 超 7 天 → 删
+    const fresh = mk('.coalesce-fresh.json.lock', 0);  // 今天的 → 保留
+    const cur = mk('.coalesce-cursid.json.lock', 30);  // 当前 sid → 即使过期也保留
+    tt2.cleanupCoalesceLocks('cursid');
+    const has = (p) => fs.existsSync(p);
+    ok('T14-d2 ★残留锁清理：过期锁被删、当天锁保留、当前会话锁即使过期也保留',
+      !has(old1) && !has(old2) && has(fresh) && has(cur),
+      `old1=${has(old1)} old2=${has(old2)} fresh=${has(fresh)} cur=${has(cur)}`);
+    for (const p of [old1, old2, fresh, cur]) { try { fs.unlinkSync(p); } catch (e) {} }
+  }
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log(`\n结果：${pass} 过 / ${fail} 败${skipped ? '（有跳过项：本环境禁止 node 子进程）' : ''}`);
 process.exit(fail ? 1 : 0);

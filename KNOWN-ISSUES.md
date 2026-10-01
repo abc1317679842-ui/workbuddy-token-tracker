@@ -33,6 +33,14 @@
 - **现象**：特定宿主环境（v3.06/v3.09 变更记录有载）下 detached watcher 被宿主进程收割，导致 Stop 后弹窗流程根本不启动。
 - **根因**：宿主对 detached 子进程的生命周期管理，非本技能代码可控。
 - **缓解**：手动模式 / --hook 注入不依赖 watcher，不受影响。
+- **v3.23.5 副产物已处理**：被收割的 watcher 来不及释放锁 → 技能目录留下 `.coalesce-<sid>.json.lock` 死锁。实测本机累积 4 个、owner 进程全部已死（这本身是 KI-3 真实发生的证据）。死锁**不会造成漏弹**（`withFileLock` 有 pid 探活 + TTL），但此前是唯一没有清理上限的运行时产物 → 新增 `cleanupCoalesceLocks()`（7 天 / 30 个，当前会话锁永不清）。
+
+## KI-4 跨进程锁实现三处复制 + tmp 名共用（v3.23.5 记录，未修）
+
+- **现象**：`token-tracker.js` 与 `refresh-prices.js` 各有一份**同构但独立**的跨进程文件锁实现（`withFileLock` / `withPricingLock`），而 `deepseek-official.js` 的 `savePricing()` **完全不持锁**，却与 `refresh-prices.js` 的 `save()` 共用同一个临时文件名 `pricing.json.tmp`。
+- **触发条件**：正常链路是 `refresh-prices.js` 用 `spawnSync` **串行**调用 `deepseek-official.js`，不会撞；**只有手动并行跑这两个脚本**才可能互相覆盖 tmp。
+- **为什么不顺手加锁**：再复制第三份锁实现会**加剧**病根（同一原则多处漂移）。正解是抽一个共享模块（锁 + 原子写 + tmp 命名），三处统一调用——改动面较大，单独立项。
+- **当前影响**：仅手动并行场景；自动/正常使用路径不受影响。
 
 ## 其他已知限制
 

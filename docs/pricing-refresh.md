@@ -6,6 +6,7 @@
 ## 每日刷新策略（用户要求"当天第一次打开软件/第一次回答才搜，当天搜过就不搜"）
 
 - **触发点（v2.65 起收敛）**：**仅 `--hook`（用户提交提问时）**才检查 `pricing.json` 的 `date`，**过期才**同步调用 `refresh-prices.js` 联网刷新；`--stop` 路径**不再**做全量刷新（此前会在 Stop 时联网，阻塞弹窗）。判定仍是「当天已刷新则直接跳过、不联网」。手动运行 `node refresh-prices.js`（加 `--force` 可强制）随时可刷。**v2.66 补充**：`pricing.json` 缺失或损坏时会自动尝试重建；刷新子进程超时为 60 秒。
+- **v3.23.5（内外层 timeout 打架修复）**：这里的 60 秒是**外层**（`execFileSync` 同步阻塞，发生在用户提交提问时）。而 `refresh-prices.js` 内部 `spawnSync(deepseek-official.js)` 的 timeout 是 120 秒（含 2 次重试 × 60 秒间隔）——**外层先到点把整个刷新杀掉，内层重试从未生效过**。修复：自动路径显式传 `DS_RETRIES=0`（内层只跑一次，单次 15 秒，总耗时远小于 60 秒），失败即沿用旧价、次日再试；**手动跑 `node refresh-prices.js` 不受影响，仍保留重试**（后台场景不在乎时长）。
 - **多源 + 国内外区分（v2.2，2026-08-14）**：并行拉 **5 源**——
   - 国内 2 个：llmabacus（`llmabacus.com/api/prices`，**主**，每日自动核价、人民币、含 vendors country）、llm-prices-cn（`raw.githubusercontent.com/szp2005/llm-prices-cn/main/prices.json`，**备份**，llmabacus 每日镜像）；
   - 国外 3 个：OpenRouter（USD，接近实时）、LiteLLM `model_prices_and_context_window.json`（USD，1-3 天滞后）、Portkey `configs.portkey.ai/pricing/<provider>.json`（USD，美分/token）；

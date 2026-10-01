@@ -110,7 +110,11 @@ function main() {
 
   for (const [model, stat] of Object.entries(day.models || {})) {
     if (onlyModel && model !== onlyModel) { dayTotal += stat.cost || 0; continue; }
-    const m = (pricing.models || {})[model];
+    // v3.23.5：查价改走主脚本的 findModel（归一化 + 边界匹配 + 别名），与 backfill / 主链路同口径。
+    // 原先裸查字典 `(pricing.models || {})[model]` —— 账本里的模型名与价库键差一个后缀/别名就取不到价，
+    // 表现为「同一天 backfill 算得出金额、recalc 算不出」，且没有任何报错。
+    const hit = tt.findModel(pricing, model, 'price');
+    const m = hit ? hit.m : null;
     if (!m || typeof m.input_price !== 'number') { dayTotal += stat.cost || 0; continue; }
 
     const hours = roundHoursOf(date, model);
@@ -128,7 +132,10 @@ function main() {
     if (peakRatio === null) {
       cost = base; // 单时段不明 → 全部按空闲（保守）
     } else {
-      const peakMult = Number(m.peak_multiplier || 1);
+      // v3.23.5：缺省值与主脚本 calcCost（token-tracker.js L2599）对齐——DeepSeek 系缺省 2，其余缺省 1。
+      // 原先一律 `|| 1`：deepseek 条目若缺 peak_multiplier 字段，回溯重算会比主链路**整整少算一倍**，且不报错。
+      const isDeepSeek = /(^|[\/\-_])deepseek/i.test(String(model || ''));
+      const peakMult = typeof m.peak_multiplier === 'number' ? m.peak_multiplier : (isDeepSeek ? 2 : 1);
       // 加权：高峰部分按 peak_multiplier，其余按 1
       const ratio = Math.min(1, Math.max(0, peakRatio));
       cost = costOf(m, stat.in, stat.cached, stat.out, 1 + (peakMult - 1) * ratio);

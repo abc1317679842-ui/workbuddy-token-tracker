@@ -1,5 +1,23 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.23.4 (2026-10-02)
+// token-usage-tracker v3.23.5 (2026-10-02)
+// v3.23.5：**口径一致性 + 一处真·静默失效（第七轮审计 E/C 面落地）** ——
+//   ① ★内外层 timeout 打架（新发现，本版最值钱的一条）：自动刷新是 `execFileSync(refresh-prices.js,
+//      timeout 60000)`，而 refresh-prices.js 内部 `spawnSync(deepseek-official.js, timeout 120000)`
+//      （含 2 次重试 × 60s 间隔）→ **外层 60s 先到点把整个刷新杀掉，内层重试从未真正生效过**，
+//      DeepSeek 官方价只有首轮就成功才拿得到，失败时只打一行 stderr 沿用旧价（静默）。
+//      该调用还是同步阻塞、挂在 --hook（用户提问）路径。修复：自动路径显式 `DS_RETRIES=0`
+//      （内层只跑一次，单次 15s ≪ 60s），失败沿用旧价次日再试；手动跑 refresh-prices.js 仍保留重试。
+//   ② recalc-day.js 查价从裸字典 `(pricing.models||{})[model]` 改走主脚本 `findModel`
+//      （归一化 + 边界匹配 + 别名）——原先模型名差一个后缀就取不到价，与 backfill 同天算出两个金额。
+//   ③ recalc-day.js 峰谷倍率缺省值与主脚本 calcCost 对齐（deepseek 系 2 / 其余 1）；
+//      原先一律缺省 1，deepseek 条目缺 peak_multiplier 时会比主链路整整少算一倍。
+//   ④ refresh-prices.js 国外模型（US）分支补 `m.lock` 保护 —— CN 分支早有、US 分支漏了，
+//      region 判定一旦把 lock 模型划成国外，官方/人工价会被冲掉并被打上 auto_converted=true。
+//   ⑤ `.coalesce-*.lock` 残留锁加 prune（KI-3 副产物：watcher 被宿主收割留下的死锁，
+//      实测本机 4 个；此前是唯一没有清理上限的运行时产物）。规则照抄 snapshot（7 天 / 30 个）。
+//   ⑥ 审计 #9（两脚本共用 pricing.json.tmp 而只有一个持锁）**记录不修**：跨进程锁已有两份同构复制，
+//      再复制第三份会加剧漂移；已在 deepseek-official.js 注释写明边界 + KNOWN-ISSUES 立项。
+//   ⑦ selftest 新增 T14 段 7 项（5 源码守卫 + 2 行为验证）→ 138 过 / 0 败。
 // v3.23.4：**价格流水线两处硬伤修复（requests 硬依赖 + 全局关闭 TLS 校验）** ——
 //   ① P1：`fetch-cn-prices.py` / `parse_tokenhub.py` 顶层硬 `import requests`，而本机受管裸解释器
 //      `binaries/python/versions/3.13.12` 根本没有 requests（实测 ModuleNotFoundError）——
@@ -1918,6 +1936,7 @@ function saveSnapshot(snap, sid) {
     // v2.36：快照清理——.snapshot-*.json 按会话隔离且无清理会无限积累。
     // 规则：保留最近 30 天，且最多保留 50 个（当前 sid 永远保留）。每次写入顺手清理，开销可忽略。
     cleanupSnapshots(sid);
+    cleanupCoalesceLocks(sid); // v3.23.5：同批清理被收割 watcher 留下的死锁
   } catch (e) {
     // 快照写失败不阻断主输出，但按 C2 要求必须在 stderr 暴露，不静默
     process.stderr.write(`[token-tracker] 快照写入失败: ${e.message}\n`);
@@ -1925,6 +1944,43 @@ function saveSnapshot(snap, sid) {
 }
 
 // v2.36：清理历史会话快照（.snapshot-*.json）。保留规则：最近 30 天 + 最多 50 个 + 当前 sid 永不清。
+// v3.23.5：coalesce 残留锁清理（KI-3 副产物）。
+// watcher 被宿主 job object 收割时来不及释放锁 → 每个被收割的 watcher 在技能目录留一个
+// `.coalesce-<sid>.json.lock`。实测本机 9/05~10/01 累积 4 个、owner 进程全部已死。
+// 这些死锁不会造成漏弹（withFileLock 有 pid 存活探测 + TTL），但它们是**唯一没有 prune 的
+// 运行时产物**（快照 50 个/30 天、明细 6 个月、账本备份 3 份都有上限）。规则照抄快照清理。
+function cleanupCoalesceLocks(curSid) {
+  try {
+    const now = Date.now();
+    const cutoff = now - 7 * 24 * 3600 * 1000; // 锁的生命周期以分钟计，7 天已远远过期
+    const files = fs.readdirSync(SNAP_DIR)
+      .filter((f) => /^\.coalesce-.*\.lock$/.test(f))
+      .map((f) => {
+        const full = path.join(SNAP_DIR, f);
+        try { return { name: f, full, mtime: fs.statSync(full).mtimeMs }; }
+        catch (e) { return null; }
+      })
+      .filter(Boolean);
+    if (files.length === 0) return;
+    files.sort((a, b) => b.mtime - a.mtime);
+    // 当前会话的锁正在使用中，永不清理
+    const keepName = curSid ? `.coalesce-${String(curSid).replace(/[^a-zA-Z0-9_-]/g, '')}.json.lock` : '';
+    let deleted = 0;
+    for (let i = 30; i < files.length; i++) { // 数量上限 30 个
+      if (files[i].name === keepName) continue;
+      try { fs.unlinkSync(files[i].full); deleted++; } catch (e) { /* 忽略 */ }
+    }
+    for (const f of files) { // 时间上限 7 天
+      if (f.mtime >= cutoff) continue;
+      if (f.name === keepName) continue;
+      try { fs.unlinkSync(f.full); deleted++; } catch (e) { /* 忽略 */ }
+    }
+    if (deleted > 0) {
+      process.stderr.write(`[token-tracker] 已清理 ${deleted} 个残留 coalesce 锁（watcher 被收割留下的死锁）\n`);
+    }
+  } catch (e) { /* 清理失败不影响主流程 */ }
+}
+
 function cleanupSnapshots(curSid) {
   try {
     const now = Date.now();
@@ -2407,8 +2463,15 @@ function autoRefreshPricing(pricing) {
     return pricing;
   }
   try {
+    // v3.23.5：**内外层 timeout 打架修复** —— refresh-prices.js 内部 spawnSync(deepseek-official.js)
+    // 的 timeout 是 120s（含 2 次重试 × 60s 间隔），而这里外层 execFileSync 只有 60s
+    // → 外层先到点把整个刷新杀掉，内层重试机制**从未真正生效过**（DeepSeek 官方价只有首轮成功才拿得到）。
+    // 且这里是同步阻塞（挂在 --hook 用户提问路径），让它干等 60s 重试 = 用户提问卡一分钟。
+    // 处置：自动路径显式 DS_RETRIES=0 → 内层只跑一次（单次 TIMEOUT_MS=15s，总耗时 ≪ 60s），
+    // 失败即沿用旧价、次日再试；手动 `node refresh-prices.js` 不受影响，仍保留重试（后台场景不在乎时长）。
     require('child_process').execFileSync(process.execPath, [script], {
-      timeout: 60000, stdio: 'pipe', windowsHide: true, env: Object.assign({}, process.env, { WB_ROOT: WB }),
+      timeout: 60000, stdio: 'pipe', windowsHide: true,
+      env: Object.assign({}, process.env, { WB_ROOT: WB, DS_RETRIES: '0' }),
     });
     return loadPricing(); // 刷新成功 → 重新读取（含新 date）
   } catch (e) {
@@ -4035,7 +4098,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.23.4'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.23.5'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -5297,5 +5360,7 @@ module.exports = {
   // v3.22.0：新增 Stop 端兜底链路（hookIdle / claimNotify / maybeFetchLatest / updateTagForToast）
   updateNotice, cmpVersion, loadUpdateState, saveUpdateState, queryLatestTag,
   updateTagForToast, maybeFetchLatest, maybeFetchLatestForStop, claimNotify, hookIdle,
+  // v3.23.5：残留锁清理导出（KI-3 副产物；selftest 可直接单测"删旧留新、当前会话锁不动"）
+  cleanupCoalesceLocks, coalescePath,
   SKILL_VERSION, UPDATE_CHECK_FILE, UPDATE_INTERVAL_MS, UPDATE_MAX_NOTIFY, UPDATE_NOTIFY_GAP_MS, HOOK_IDLE_MS,
 };
