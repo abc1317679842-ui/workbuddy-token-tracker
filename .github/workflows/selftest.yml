@@ -1,0 +1,23 @@
+# selftest CI（v3.23.2 起）：每次 push 自动在干净的 Windows runner 上跑全套离线自测。
+# 用 windows-latest：selftest 的 watcher/toast/PowerShell 相关断言依赖 Windows 行为。
+# 零依赖：不装任何包，正好验证「零依赖单文件」这个卖点没被悄悄破坏。
+# WB_NO_NET=1：refresh-prices / deepseek-official 读它，模拟断网，CI 里禁止真联网。
+# 注：selftest 内部已自设 TOKEN_TRACKER_NO_TOAST=1 + WB_ROOT=os.tmpdir() 隔离，不碰真实账本。
+name: selftest
+
+on:
+  push:
+    branches: [master, main]
+
+jobs:
+  selftest:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Run selftest (offline, isolated)
+        run: node selftest.js
+        env:
+          WB_NO_NET: '1'
