@@ -1,5 +1,18 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.25.0 (2026-10-02)
+// token-usage-tracker v3.26.0 (2026-10-02)
+// v3.26.0：**KI-6 弹窗层三件套（⑧⑨）+ 连锁自审双修正** ——
+//   ⑧ 混合模型轮弹窗金额改为**分模型计价求和**（与账本/轮次明细同口径）：aggregateTranscLines
+//      同循环产出分模型明细（与总量同一 seen 去重），aggregateTranscript 合并主+子明细，
+//      toastLine2 逐模型 calcCost（带各自 lastTs 峰谷时刻）——本地模型免费跳过、纯本地「本地·免费」、
+//      部分模型无价 → 部分和 +「⚠未计价」、旧形状（无 models）回退旧口径。
+//   ⑨ 补弹链路死亡检测（防团队轮双弹屏/subCount 陈旧）：Stop 拆分弹后「绝不推进 lastStopAt」
+//      + watcher 被收割（KI-3）→ 起点永久停旧轮、窗口重叠。hook 端检测 coalesce 残留超时
+//      （默认 10min，WB_TEAM_SPLIT_STALE_MS 可调）且子代理静止 → 宣告结算：清残留 + 双推进。
+//   ★自审修正1（连锁测试 b1 实测抓出）：⑨ 结算分支写入的 lastStopAt 被下方整文件覆盖打回旧值
+//      → 下轮 inProgress 恒真 → 起点再刷新（正是 ⑨ 要防的形态）。改 stopAtH 变量贯穿。
+//   ★自审修正2（逐段复审抓出）：被中断估算并入弹窗聚合的 3 处（Stop 正常轮 / round-watch
+//      取消轮 / hook 取消轮兜底）漏并分模型明细 → 弹窗金额漏估算段（账本含估算）。
+//      新增 mergeEstIntoModels 三处统一调用。
 // v3.25.0：**KI-5 落地 —— transcript 截断恢复（水位重置 + 时间戳去重），水位线不再永久冻结** ——
 //   v3.22.2 起「行数 < 水位线 = 平台压缩过历史」只做告警（v3.24.0 补 ⚠账缺），水位线本身仍冻结
 //   → 该会话之后的所有消耗**永久静默少计**。本版恢复记账，核心三件：
@@ -1156,6 +1169,7 @@ function aggregateTranscLines(rows, fromTs) {
   //   现改为：疑似漂移时**主动留痕**（仅在下面严格条件下触发），让"算错"变成"有据可查"。
   let missWithPd = 0;
   let firstTs = null, lastTs = 0, model = '', count = 0;
+  const models = {}; // v3.26.0（KI-6 ⑧）：分模型明细（{name:{in,out,cached,total,lastTs}}）
   for (const r of rows) {
     const ts = r.timestamp;
     if (!(typeof ts === 'number') || ts <= fromTs) continue;
@@ -1175,6 +1189,12 @@ function aggregateTranscLines(rows, fromTs) {
     if (firstTs === null || ts < firstTs) firstTs = ts;
     if (ts > lastTs) lastTs = ts;
     if (!model) model = pd.model || pd.requestModelId || 'unknown'; // v2.82.2：模型名缺失 → 'unknown' 诚实标注（旧为 ''，弹窗显示空白且无法追查）
+    // v3.26.0（KI-6 ⑧）：同循环顺手产出**分模型明细**（与总量同一 seen 去重、同一口径）——
+    // toastLine2 据此做分模型计价求和（混合模型轮不再整轮按单一主导价折算）。lastTs 供峰谷判定。
+    const mkName = normalizeModelName(pd.model || pd.requestModelId || 'unknown');
+    const mb = models[mkName] || (models[mkName] = { in: 0, out: 0, cached: 0, total: 0, lastTs: 0 });
+    mb.in += u.in; mb.out += u.out; mb.cached += u.cached; mb.total += u.in + u.out;
+    if (ts > mb.lastTs) mb.lastTs = ts;
     count++;
   }
   if (!count) {
@@ -1188,7 +1208,21 @@ function aggregateTranscLines(rows, fromTs) {
     }
     return null;
   }
-  return { in: inSum, out: outSum, cached: cachedSum, total: inSum + outSum, durMs: Math.max(0, lastTs - (firstTs || lastTs)), model, firstTs, lastTs, count, reasoning: reasoningSum };
+  return { in: inSum, out: outSum, cached: cachedSum, total: inSum + outSum, durMs: Math.max(0, lastTs - (firstTs || lastTs)), model, firstTs, lastTs, count, reasoning: reasoningSum, models };
+}
+
+// v3.26.0（KI-6 ⑧ 自审修正）：被中断估算并入弹窗聚合时必须**同步并入分模型明细**——
+//   否则 toastLine2 分模型计价只算完整调用段、漏掉估算段金额，而账本（incrementalRecord）
+//   含估算 → 弹窗与账本再次口径分裂（正是 ⑧ 要消灭的形态）。估算桶形状与 models 桶一致
+//   （{name:{in,out,cached,total}}，无 lastTs → 补 0，计价按非高峰兜底口径，与估算本身的估算性质一致）。
+function mergeEstIntoModels(agg, estByModel) {
+  if (!agg || !estByModel) return;
+  if (!agg.models || typeof agg.models !== 'object') agg.models = {};
+  for (const [n, b] of Object.entries(estByModel)) {
+    if (!b || typeof b !== 'object') continue;
+    const t = agg.models[n] || (agg.models[n] = { in: 0, out: 0, cached: 0, total: 0, lastTs: 0 });
+    t.in += b.in || 0; t.out += b.out || 0; t.cached += b.cached || 0; t.total += b.total || 0;
+  }
 }
 
 // v2.69：estimateInterrupted 的增量版包装（只改解析范围，不改统计口径）。
@@ -1453,6 +1487,17 @@ function aggregateTranscript(tsPath, roundStartMs) {
     teamActive: hasTeamActivity(tsPath, roundStartMs),
   };
   res.total = res.in + res.out;
+  // v3.26.0（KI-6 ⑧）：合并主+子代理的分模型明细 → toastLine2 分模型计价（与账本同口径）。
+  // 旧缺陷：混合模型轮 toast 金额 = 全部 tokens 按 model 字段（子代理优先）单一价折算。
+  res.models = {};
+  for (const part of [main, sub]) {
+    if (!part || !part.models) continue;
+    for (const [n, b] of Object.entries(part.models)) {
+      const t = res.models[n] || (res.models[n] = { in: 0, out: 0, cached: 0, total: 0, lastTs: 0 });
+      t.in += b.in; t.out += b.out; t.cached += b.cached; t.total += b.total;
+      if (b.lastTs > t.lastTs) t.lastTs = b.lastTs;
+    }
+  }
   // v3.19.2（B10）：显式处理"两个 firstTs 都为空"——原 Math.min(...[]) = Infinity，
   //   durMs = Math.max(0, lastTs - Infinity) = 0。当前不可达（上方已保证 main/sub 至少一个非空
   //   且 firstTs 恒为真实 epoch ms），属防御性写法，结果与旧行为一致但不再依赖 Infinity 传播。
@@ -3692,8 +3737,34 @@ function toastLine1(stat, modelShort, period, balTxt, todayTxt) {
 }
 function toastLine2(stat, pricing) {
   const isLocal = isLocalModel(stat && stat.model);
-  const costVal = isLocal ? null : calcCost(stat, pricing);
-  const cost = isLocal ? '本地·免费' : (fmtCost(costVal) || '未收录');
+  // v3.26.0（KI-6 ⑧）：混合模型轮**分模型计价求和**（与账本/轮次明细同口径）——
+  // 旧口径 = 全部 tokens 按 stat.model（子代理优先）单一价折算，混合轮金额失真且与账本对不上。
+  // 规则：① models 明细存在 → 逐模型 calcCost（带各自 lastTs 峰谷时刻；本地模型免费跳过）；
+  //       ② 部分模型无价 → 金额 = 已知部分和 +「⚠未计价」标注（不再静默）；
+  //       ③ 全部无价 / 无明细（旧 coalesce 残留的 agg）→ 回退旧口径（行为不变）；
+  //       ④ 本地/云端混合 → 本地段免费跳过、金额 = 云端段；**纯本地**才显示「本地·免费」。
+  let costVal = null;
+  let partUnknown = false;
+  const modelsObj = (stat && stat.models && typeof stat.models === 'object') ? stat.models : null;
+  let cloudCount = 0;
+  if (modelsObj && Object.keys(modelsObj).length > 0) {
+    let sum = 0, known = 0, unknown = 0;
+    for (const [n, b] of Object.entries(modelsObj)) {
+      if (!b || typeof b !== 'object') continue;
+      if (isLocalModel(n)) continue; // 本地模型免费，不进计价也不算「未知」
+      cloudCount++;
+      const c = calcCost({ model: n, in: b.in || 0, out: b.out || 0, cached: b.cached || 0, lastTs: b.lastTs }, pricing);
+      if (c != null) { sum += c; known++; } else unknown++;
+    }
+    if (cloudCount > 0) {
+      if (known > 0) { costVal = sum; partUnknown = unknown > 0; }
+      else { costVal = calcCost(stat, pricing); partUnknown = true; } // 云端全无价 → 回退旧口径并明示缺口
+    } // cloudCount===0 → 全本地，costVal 保持 null（下方 allLocal 走「本地·免费」）
+  } else {
+    costVal = calcCost(stat, pricing);
+  }
+  const allLocal = isLocal && cloudCount === 0; // 顶层本地且无云端参与（顶层本地但混合云端 → 显示云端金额）
+  const cost = allLocal ? '本地·免费' : (fmtCost(costVal) || '未收录');
   const input = (stat && stat.in) || 0;
   const cached = (stat && stat.cached) || 0;
   // 缓存占比精确到两位小数（如 99.12%）；无输入数据则不显示缓存段
@@ -3711,7 +3782,8 @@ function toastLine2(stat, pricing) {
   // v3.24.0（级联②）：该模型在价库里找不到 → 金额显示「未收录」，但那不够醒目（报告实测：
   // 纯净环境无本地价库时 hy3 等子代理模型金额静默=0，用户毫无感知）。补「⚠未计价」标注，
   // 对齐 价⚠️/官价⚠️ 模式。只在确实有 token 消耗时标注（空轮不标）。
-  if (pricing && !isLocal && costVal == null && ((stat && stat.in) || (stat && stat.out))) {
+  // v3.26.0（KI-6 ⑧）：分模型计价时「部分模型无价」同样标注（partUnknown）——金额是部分和，必须明示缺口。
+  if ((pricing && !isLocal && costVal == null && ((stat && stat.in) || (stat && stat.out))) || partUnknown) {
     line += '｜⚠未计价';
   }
   // v3.24.0（级联①）：transcript 被平台压缩/重写导致水位线冻结 → 之后的消耗静默少计。
@@ -4177,6 +4249,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
             const estOutC = estNamesC.reduce((s, n) => s + estByModelC[n].out, 0);
             const estCachedC = estNamesC.reduce((s, n) => s + estByModelC[n].cached, 0);
             aggC.in += estInC; aggC.out += estOutC; aggC.cached += estCachedC; aggC.total += estInC + estOutC;
+            mergeEstIntoModels(aggC, estByModelC); // v3.26.0（⑧ 自审修正）：估算段并入分模型明细
           }
           const durC = Math.max(0, cancelTs - roundStart);
           aggC.durMs = aggC.durMs || durC;
@@ -4260,7 +4333,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.25.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.26.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -4971,6 +5044,7 @@ function main() {
           const estOut0 = estNames0.reduce((s, n) => s + estByModel0[n].out, 0);
           const estCached0 = estNames0.reduce((s, n) => s + estByModel0[n].cached, 0);
           agg.in += estIn0; agg.out += estOut0; agg.cached += estCached0; agg.total += estIn0 + estOut0;
+          mergeEstIntoModels(agg, estByModel0); // v3.26.0（⑧ 自审修正）：估算段并入分模型明细
         }
         // v2.82.1：耗时统一口径——改用 traceWallDurMs()（latest trace endedAt − 用户提交时刻）。
         // v2.74 的「单 trace 文件 startedAt→endedAt」在长任务（多 trace 分段落盘）下只算到
@@ -5431,6 +5505,7 @@ function main() {
               const estOutC = estNamesC.reduce((s, n) => s + estByModelC[n].out, 0);
               const estCachedC = estNamesC.reduce((s, n) => s + estByModelC[n].cached, 0);
               aggC.in += estInC; aggC.out += estOutC; aggC.cached += estCachedC; aggC.total += estInC + estOutC;
+              mergeEstIntoModels(aggC, estByModelC); // v3.26.0（⑧ 自审修正）：估算段并入分模型明细
             }
             const durC = Math.max(0, intrInfo.ts - roundStartH); // 取消时刻 - 轮起点 = 被取消轮墙钟时长
             aggC.durMs = aggC.durMs || durC;
@@ -5466,9 +5541,43 @@ function main() {
     const psnap2 = loadSnapshot(sid) || {};
     const prevStart = psnap2.lastUserMsgAt || 0;
     const prevStop = psnap2.lastStopAt || 0;
-    const inProgress = prevStart > 0 && prevStop < prevStart; // 上一轮未结束（专家团进行中）
+    // v3.26.0（KI-6 ⑨ 自审修正）：结算分支推进的 lastStopAt 必须存活到下方 L5543 的**整文件覆盖**。
+    //   缺陷：结算分支 saveSnapshot({…, lastStopAt: nowH}) 后，L5543 又用 `psnap2.lastStopAt || 0`
+    //   （结算前的旧值，全新会话恒 0）整文件重写快照 → 刚推进的 lastStopAt 被打回 →
+    //   下轮 hook 的 inProgress 仍真 → 起点再次刷新 → 本轮开头 token 漏聚合（正是 ⑨ 要防的形态）。
+    //   连锁测试 b1 实测复现：结算告警/起点推进/coalesce 清除都对，唯 lastStopAt=0。
+    let stopAtH = prevStop;
+    const inProgress0 = prevStart > 0 && prevStop < prevStart; // 上一轮未结束（专家团进行中）
     const nowH = Date.now();
-    saveSnapshot({ file: hookFile, stat, lastUserMsgAt: inProgress ? prevStart : nowH, lastStopAt: psnap2.lastStopAt || 0 }, sid);
+    let inProgress = inProgress0;
+    let startH = nowH;
+    // v3.26.0（KI-6 ⑨）：**补弹链路死亡检测** —— 团队轮拆分弹（team-main-first）后「绝不推进
+    // lastStopAt」（v3.12.1），轮次边界由 watcher 出口/hook 兜底推进。watcher 被宿主收割（KI-3）时
+    // 两者都到不了 → lastStopAt 永不推进 → inProgress 恒真 → 起点**永久停在旧轮** → 下一轮聚合
+    // 窗口含上轮全部 tokens（审计实证：03:35 toast 355万 与 03:29 轮 136万 窗口重叠；两轮 subCount
+    // 均记 131，按正确窗口应 139/8）= 双弹屏 + subCount 陈旧。
+    // 判「链路已死」（双条件，保守）：① coalesce 写入时间距今 > STALE_MS（默认 10min；正常补弹
+    //    = 6s 确认窗 + idle 检测，分钟级完成）；② 子代理文件已静止（真在跑不误判）。
+    // 动作：清残留 coalesce + **lastUserMsgAt 与 lastStopAt 一并推进到 now**（只推起点不推 lastStopAt
+    // 的话，下轮 hook 的 inProgress 仍真 → 起点再次刷新 → 本轮开头 token 漏聚合；lastStopAt=now 后
+    // 下轮正常，且同轮 Stop 的 aggStart0=max(lastStopAt, roundStart0)=now，口径仍正确）。
+    if (inProgress && tsPathH) {
+      try {
+        const cInfo9 = readCoalesceInfo(sid);
+        const coalAt9 = Number(cInfo9 && cInfo9.at) || 0;
+        const staleMs9 = Number(process.env.WB_TEAM_SPLIT_STALE_MS) || 600000;
+        if (coalAt9 > 0 && nowH - coalAt9 > staleMs9 && !hasSubagentsRecentlyActive(tsPathH, SUBAGENT_IDLE_MS)) {
+          clearCoalesce(sid);
+          saveSnapshot({ file: hookFile, stat, lastUserMsgAt: nowH, lastStopAt: nowH }, sid);
+          stopAtH = nowH; // v3.26.0（⑨ 自审修正）：同步给下方 L5543（否则被旧值覆盖回退）
+          inProgress = false;
+          startH = nowH;
+          process.stderr.write(`[token-tracker] ⚠ 检测到团队轮补弹链路已死亡（coalesce 残留 ${Math.round((nowH - coalAt9) / 60000)} 分钟且子代理已静止），已宣告结算并刷新轮起点（KI-6 ⑨，防双弹屏）\n`);
+          try { appendCompactionLog('hook-stale-coalesce-settled', { sid, coalAt: coalAt9, ageMs: nowH - coalAt9 }); } catch (e9) {}
+        }
+      } catch (e9) { /* 检测失败保持原行为 */ }
+    }
+    saveSnapshot({ file: hookFile, stat, lastUserMsgAt: inProgress ? prevStart : startH, lastStopAt: stopAtH }, sid);
     // v2.85/v2.89：全新轮（上一轮已结算）→ 为本轮 spawn 轮级取消 watcher。
     // v2.89 补记：v2.85 的这个调用点在后续编辑中丢失（测试直接调 --round-watch 入口、未覆盖
     // spawn 链路 → 6 项回放全 PASS 仍漏检），真实取消自 09-03 起全部退化为下一轮 hook 兜底。
@@ -5534,6 +5643,7 @@ module.exports = {
   updateNotice, cmpVersion, loadUpdateState, saveUpdateState, queryLatestTag,
   updateTagForToast, maybeFetchLatest, maybeFetchLatestForStop, claimNotify, hookIdle,
   toastLine2, TRANSC_TRUNCATED_FILE, // v3.24.0：弹窗标注（⚠未计价/⚠账缺）行为测试用
+  mergeEstIntoModels, // v3.26.0（KI-6 ⑧）：估算段并入分模型明细（selftest 单测）
   // v3.23.5：残留锁清理导出（KI-3 副产物；selftest 可直接单测"删旧留新、当前会话锁不动"）
   cleanupCoalesceLocks, coalescePath,
   SKILL_VERSION, UPDATE_CHECK_FILE, UPDATE_INTERVAL_MS, UPDATE_MAX_NOTIFY, UPDATE_NOTIFY_GAP_MS, HOOK_IDLE_MS,

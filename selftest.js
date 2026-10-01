@@ -1026,6 +1026,125 @@ else {
   }
 }
 
+// ===== T17：KI-6 弹窗层三件套（⑧分模型计价 / ⑨补弹链路死亡检测，v3.26.0）=====
+{
+  // ⑧ 行为测试（require skillDir 副本实例——模块级路径由 require 时的 WB_ROOT 决定，见 T16 教训）
+  const mod17 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  if (!mod17) skip('T17 KI-6 行为验证（主模块加载失败）');
+  else {
+    const T17 = path.join(tmp, 'projects', 'ki6');
+    fs.mkdirSync(path.join(T17, 's1', 'subagents'), { recursive: true });
+    const tp17 = path.join(T17, 's1.jsonl');
+    const T0 = 1727827200000;
+    let seq17 = 0;
+    const mkRow17 = (ts, model, input, output) => {
+      const i = seq17++;
+      return JSON.stringify({ type: 'assistant', id: 'm' + i, timestamp: ts,
+        providerData: { model, messageId: 'mid-' + i, usage: { input_tokens: input, output_tokens: output } } });
+    };
+    fs.writeFileSync(tp17, [mkRow17(T0 + 1000, 'glm-5.3-flash', 100, 10), mkRow17(T0 + 2000, 'expensive-m', 200, 20)].join('\n') + '\n');
+    fs.writeFileSync(path.join(T17, 's1', 'subagents', 'agent-a.jsonl'), mkRow17(T0 + 3000, 'hy3', 400, 40) + '\n');
+    const agg17 = mod17.aggregateTranscript(tp17, 0);
+    ok('T17-a1 ★混合轮产出分模型明细（主2模型+子代理1模型，与总量同 seen 去重）',
+      agg17 && agg17.models && Object.keys(agg17.models).length === 3
+      && agg17.models['glm-5.3-flash'].in === 100 && agg17.models['expensive-m'].in === 200 && agg17.models['hy3'].in === 400);
+    ok('T17-a2 每模型 bucket 含 lastTs（峰谷判定依据）', agg17.models['hy3'].lastTs === T0 + 3000);
+    // 分模型计价：expensive 段按 expensive 价折算（旧口径 = 全部按主导模型价 → 0.10）
+    const pricing17 = { models: {
+      'glm-5.3-flash': { name: 'glm-5.3-flash', input_price: 1, output_price: 4, cached_price: 0.25, region: 'CN' },
+      'hy3': { name: 'hy3', input_price: 1, output_price: 4, cached_price: 0.25, region: 'CN' },
+      'expensive-m': { name: 'expensive-m', input_price: 100, output_price: 400, region: 'CN' },
+    } };
+    const l2a = mod17.toastLine2(agg17, pricing17);
+    const expectA = (200 / 1e6 * 100 + 20 / 1e6 * 400) + (100 / 1e6 * 1 + 10 / 1e6 * 4) + (400 / 1e6 * 1 + 40 / 1e6 * 4);
+    const gotA = l2a.match(/¥([\d.]+)/) ? parseFloat(l2a.match(/¥([\d.]+)/)[1]) : null;
+    ok('T17-a3 ★弹窗金额 = 分模型计价求和（与账本同口径；旧口径会按单一主导价失真）',
+      gotA != null && Math.abs(gotA - expectA) < 0.011, `got=${gotA} expect≈${expectA.toFixed(3)}`);
+    // 部分模型无价 → ⚠未计价（金额是部分和，必须明示缺口）
+    const aggP = { in: 300, out: 30, cached: 0, model: 'expensive-m',
+      models: { 'glm-5.3-flash': { in: 100, out: 10, cached: 0, total: 110, lastTs: T0 }, 'no-price-m': { in: 200, out: 20, cached: 0, total: 220, lastTs: T0 } } };
+    ok('T17-a4 ★部分模型无价 → ⚠未计价标注（不再静默）', mod17.toastLine2(aggP, pricing17).indexOf('⚠未计价') >= 0);
+    // 旧形状（无 models，如 coalesce 残留 agg）→ 回退旧口径，不崩、有金额、无误标
+    const aggOld = { in: 300, out: 30, cached: 0, model: 'expensive-m' };
+    const l2old = mod17.toastLine2(aggOld, pricing17);
+    ok('T17-a5 旧形状回退旧口径（不崩、有金额、无 ⚠未计价）', /¥[\d.]+/.test(l2old) && l2old.indexOf('⚠未计价') < 0);
+    // 本地/云端混合 → 本地段免费、金额 = 云端段；纯本地 → 「本地·免费」
+    const aggMix = { in: 300, out: 30, cached: 0, model: 'custom-local:qwen3.5-9b',
+      models: { 'custom-local:qwen3.5-9b': { in: 100, out: 10, cached: 0, total: 110, lastTs: T0 }, 'glm-5.3-flash': { in: 200, out: 20, cached: 0, total: 220, lastTs: T0 } } };
+    const l2mix = mod17.toastLine2(aggMix, pricing17);
+    const expMix = 200 / 1e6 * 1 + 20 / 1e6 * 4;
+    const gotMix = l2mix.match(/¥<?([\d.]+)/) ? parseFloat(l2mix.match(/¥<?([\d.]+)/)[1]) : null;
+    ok('T17-a6 本地+云混合 → 金额=云端段（本地段免费跳过）', gotMix != null && Math.abs(gotMix - expMix) < 0.011, `got=${gotMix}`);
+    const aggLocal = { in: 300, out: 30, cached: 0, model: 'custom-local:qwen3.5-9b',
+      models: { 'custom-local:qwen3.5-9b': { in: 300, out: 30, cached: 0, total: 330, lastTs: T0 } } };
+    const l2loc = mod17.toastLine2(aggLocal, pricing17);
+    ok('T17-a7 纯本地 → 「本地·免费」', l2loc.indexOf('本地·免费') >= 0 && l2loc.indexOf('¥') < 0);
+    // ★正常路径零变化守卫：单模型轮分模型计价 == 旧口径 calcCost(stat)
+    const tp1m = path.join(T17, 's2.jsonl');
+    fs.writeFileSync(tp1m, [mkRow17(T0 + 1000, 'glm-5.3-flash', 300, 30), mkRow17(T0 + 2000, 'glm-5.3-flash', 50, 5)].join('\n') + '\n');
+    const agg1m = mod17.aggregateTranscript(tp1m, 0);
+    const got1m = parseFloat(mod17.toastLine2(agg1m, pricing17).match(/¥<?([\d.]+)/)[1]);
+    const ref1m = mod17.calcCost(agg1m, pricing17);
+    ok('T17-a8 ★单模型轮金额与旧口径逐位一致（正常路径零变化）',
+      got1m != null && ref1m != null && Math.abs(got1m - ref1m) < 0.011, `got=${got1m} ref=${ref1m}`);
+    // a9：估算段并入分模型明细（3 处弹窗合并点共用 helper；漏并 = 弹窗金额漏估算段、与账本口径分裂）
+    const aggE = { in: 100, out: 10, cached: 0, total: 110, model: 'glm-5.3-flash',
+      models: { 'glm-5.3-flash': { in: 100, out: 10, cached: 0, total: 110, lastTs: T0 } } };
+    mod17.mergeEstIntoModels(aggE, { 'expensive-m': { in: 200, out: 20, cached: 0, total: 220 } });
+    const gotE = parseFloat(mod17.toastLine2(aggE, pricing17).match(/¥([\d.]+)/)[1]);
+    const expE = (100 / 1e6 * 1 + 10 / 1e6 * 4) + (200 / 1e6 * 100 + 20 / 1e6 * 400);
+    ok('T17-a9 ★被中断估算并入分模型明细（弹窗金额含估算段，与账本同口径）',
+      aggE.models['expensive-m'] && aggE.models['expensive-m'].in === 200 && gotE != null && Math.abs(gotE - expE) < 0.011,
+      `got=${gotE} expect≈${expE.toFixed(3)}`);
+    // a10：无 models 字段的旧聚合 → helper 自动建桶（不崩）
+    const aggE2 = { in: 5, out: 1, cached: 0, total: 6, model: 'x' };
+    mod17.mergeEstIntoModels(aggE2, { x: { in: 5, out: 1, cached: 0, total: 6 } });
+    ok('T17-a10 旧形状聚合并入估算不崩（自动建 models 桶）', aggE2.models && aggE2.models.x && aggE2.models.x.in === 5);
+  }
+  // ⑨ 源码守卫（**行级剥注释**——注释里的 `/*.jsonl` glob 会被朴素块注释剥离误当 `/*` 开头、
+  // 跨行吞掉真实代码（本版实测吞掉 1 处调用 → 守卫假红），故不跨行匹配）
+  {
+    const src17 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n')
+      .split('\n')
+      .map((l) => l.replace(/(^|\s)\/\/.*$/, '').replace(/\/\*[^*]*\*\//g, ''))
+      .join('\n');
+    ok('T17-b1 ★⑨结算分支推进的 stopAtH 必须存活到最终快照写入（L5543 整文件覆盖曾把它打回旧值）',
+      /stopAtH = nowH;/.test(src17) && /lastStopAt: stopAtH/.test(src17));
+    ok('T17-b2 ★旧缺陷写法不得回归（lastStopAt: psnap2.lastStopAt || 0）',
+      !/lastStopAt: psnap2\.lastStopAt \|\| 0/.test(src17));
+    ok('T17-b3 死亡检测阈值 env 可调（WB_TEAM_SPLIT_STALE_MS）', /WB_TEAM_SPLIT_STALE_MS/.test(src17));
+    ok('T17-b4 ★估算并入分模型明细：helper 定义 + 3 个弹窗合并点全部调用（漏一处 = 该路径弹窗金额漏估算段）',
+      (src17.match(/mergeEstIntoModels\(/g) || []).length >= 4);
+  }
+  // ⑨ 端到端（spawn）：残留 coalesce 超时 + 子代理静止 → 结算推进双时间戳。沙箱 SPAWN_OK=false 时跳过，CI 真跑。
+  if (!SPAWN_OK) skip('T17-c1 ⑨端到端（需要 node 子进程）');
+  else {
+    const SID17 = 't17e2e';
+    const proj17 = path.join(tmp, 'projects', 'ki6e2e');
+    const tpE = path.join(proj17, SID17 + '.jsonl');
+    fs.mkdirSync(proj17, { recursive: true });
+    fs.writeFileSync(tpE, JSON.stringify({ type: 'user', timestamp: Date.now() - 30 * 60000, message: { role: 'user', content: 'hi' } }) + '\n');
+    fs.writeFileSync(path.join(skillDir, '.snapshot-' + SID17 + '.json'),
+      JSON.stringify({ file: tpE, stat: null, lastUserMsgAt: Date.now() - 30 * 60000, lastStopAt: 0 }));
+    fs.writeFileSync(path.join(skillDir, '.coalesce-' + SID17 + '.json'), JSON.stringify({ at: Date.now() - 11 * 60000 }));
+    fs.mkdirSync(path.join(tmp, 'traces', SID17), { recursive: true });
+    fs.writeFileSync(path.join(tmp, 'traces', SID17, 'trace_x.json'),
+      JSON.stringify({ trace: { sessionId: SID17, totalTokens: 50, modelInfo: { totalInputTokens: 30, totalOutputTokens: 20 } } }));
+    const payloadE = JSON.stringify({ session_id: SID17, transcript_path: tpE, cwd: proj17 });
+    const r17 = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'],
+      { input: payloadE, env: Object.assign({}, env, { ENABLE_UPDATE_CHECK: '0' }), timeout: 30000, windowsHide: true, encoding: 'utf8' });
+    const snapE = (() => { try { return JSON.parse(fs.readFileSync(path.join(skillDir, '.snapshot-' + SID17 + '.json'), 'utf-8')); } catch (e) { return null; } })();
+    const coalGone = !fs.existsSync(path.join(skillDir, '.coalesce-' + SID17 + '.json'));
+    const T1E = Date.now() - 30 * 60000;
+    ok('T17-c1 ★⑨端到端：残留 coalesce 超时 → 结算（coalesce 清除 + lastUserMsgAt/lastStopAt 双推进）',
+      r17.status === 0 && coalGone && snapE && snapE.lastUserMsgAt > T1E && snapE.lastStopAt > T1E
+      && Math.abs(snapE.lastStopAt - snapE.lastUserMsgAt) < 5000,
+      `exit=${r17.status} coalGone=${coalGone} snap=${snapE ? JSON.stringify({ u: snapE.lastUserMsgAt, s: snapE.lastStopAt }) : 'null'}`);
+    ok('T17-c2 ⑨端到端：stderr 有结算告警', (r17.stderr || '').indexOf('补弹链路已死亡') >= 0);
+    try { fs.unlinkSync(path.join(skillDir, '.snapshot-' + SID17 + '.json')); } catch (e) {}
+  }
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
 // v3.24.0（审计⑤）：skip 数显式化 —— 「138 全绿」曾掩盖 26 条端到端用例全部 SKIP 的事实
 // （SPAWN_OK=false 的沙箱环境里绿 ≠ 真跑过）。结果行带 skip 数；**有跳过时退出码 = 2**
