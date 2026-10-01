@@ -858,8 +858,10 @@ else {
 // ── T14：口径一致性守卫（v3.23.5：同一个原则在 A 脚本做对了、在 B 脚本没跟上的漂移）─────────────
 {
   const srcOf = (f) => fs.readFileSync(path.join(SRC, f), 'utf8');
-  // 源码守卫必须先剥注释：这里的注释里会引用"改之前的写法"做说明（本轮正是因此误判一次）
-  const stripComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '')
+  // 源码守卫必须先剥注释：注释里会引用"改之前的写法"做说明（本轮正是因此误判一次）。
+  // 必须先统一行尾为 \n：Windows 上 git checkout 默认 core.autocrlf=true，文件是 CRLF，
+  // 行尾残留的 \r 会让 `//…$` 这类按行剥注释的正则失效（CI 首跑 T14-a1 红的根因，本机 LF 不复现）。
+  const stripComments = (s) => s.replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//g, '')
     .split('\n').map((l) => l.replace(/(^|\s)\/\/.*$/, '$1')).join('\n');
   const recalc = srcOf('recalc-day.js');
   const recalcCode = stripComments(recalc);
