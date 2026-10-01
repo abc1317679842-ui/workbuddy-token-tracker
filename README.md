@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.23.3-blue)
+![Version](https://img.shields.io/badge/version-v3.23.4-blue)
 
 > 在每次回答后显示 **Token 消耗 / 耗时 / 折算费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -111,7 +111,8 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 - **峰谷**：DeepSeek 高峰×2（9:00–12:00 / 14:00–18:00 工作日、周末全天空闲）；其他模型峰谷按官方页比例换算，非整数倍时自动标注「需人工核验」。
 - **环境要求**：需要 **Python 3**（自动探测：`CN_PYTHON` 环境变量 → WorkBuddy 自带 python → 系统 `python`/`python3`）+ 网络。无 python 时静默跳过刷新，弹窗会亮 `⚠价库` 提示，不影响计费。
 - **可配置**：`CN_PRICE_DB_DIR`（本地库目录，默认价格库项目 `prices/`）、`CN_PRICE_PIPELINE_DIR`（流水线脚本目录）、`CN_PYTHON`（python 可执行文件路径）。流水线脚本：`fetch-cn-prices.py` + `parse_tokenhub.py` + `build_index.py`（每日手动跑一次即等价于自动刷新）。
-- **流水线脚本已随仓库开源（v3.16.1）**：`fetch-cn-prices.py`（MiniMax/阶跃/智谱/Kimi 官方页直抓 + DeepSeek 读 lock 价）、`parse_tokenhub.py`（腾讯云 TokenHub 文档页解析，混元峰谷/分档）、`build_index.py`（合并去重 + lock 权威覆盖 + 单厂商失败沿用防僵尸）。依赖：`requests`（`pip install requests`），Python 3。三个脚本与本技能同目录放置即可被自动发现；抓到的 `prices/index.json` 放在 `CN_PRICE_DB_DIR` 指向的目录。
+- **流水线脚本已随仓库开源（v3.16.1）**：`fetch-cn-prices.py`（MiniMax/阶跃/智谱/Kimi 官方页直抓 + DeepSeek 读 lock 价）、`parse_tokenhub.py`（腾讯云 TokenHub 文档页解析，混元峰谷/分档）、`build_index.py`（合并去重 + lock 权威覆盖 + 单厂商失败沿用防僵尸）。依赖：**仅 Python 3**（v3.23.4 起 `requests` 降为可选——缺失时自动回退脚本内置的 urllib 实现，无需 `pip install requests`）。三个脚本与本技能同目录放置即可被自动发现；抓到的 `prices/index.json` 放在 `CN_PRICE_DB_DIR` 指向的目录。
+- **安全（v3.23.4）**：抓取一律走 **TLS 严格证书校验**（价格直接决定计费金额）。仅当你的网络是 MITM 企业代理/自签证书、确需降级时，设环境变量 `CN_PRICES_INSECURE_TLS=1`，脚本会打印一行 `[WARN]` 提示（不会静默关闭）。
 
 ## 🔌 联网功能与开关（v2.30 起）
 
@@ -300,7 +301,7 @@ cp -r workbuddy-token-tracker ~/.workbuddy/skills/token-usage-tracker
 | `peak-rules.js` | 峰谷时段判定的**唯一实现**：主脚本 / `backfill.js` / `recalc-day.js` 共用（v3.19.0 起，消除三份硬编码副本） |
 | `deepseek-official.js` | DeepSeek 官方定价抓取（被 refresh-prices 调用） |
 | `refresh-holidays.js` | 中国法定节假日双源刷新（峰谷计费用，手动运行） |
-| `fetch-cn-prices.py` | 国内厂商官网价抓取（Python 3 + requests，可选） |
+| `fetch-cn-prices.py` | 国内厂商官网价抓取（Python 3；`requests` 可选，缺失自动回退 urllib） |
 | `parse_tokenhub.py` / `build_index.py` | 本地官方价库解析/建索引（可选） |
 | `pricing.json` / `holidays.json` | 价格库 / 节假日数据（技能目录内） |
 | `recalc-day.js` / `backfill.js` | 账本维护工具（指定日重算 / 历史回填） |

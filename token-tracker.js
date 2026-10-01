@@ -1,5 +1,19 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.23.3 (2026-10-01)
+// token-usage-tracker v3.23.4 (2026-10-02)
+// v3.23.4：**价格流水线两处硬伤修复（requests 硬依赖 + 全局关闭 TLS 校验）** ——
+//   ① P1：`fetch-cn-prices.py` / `parse_tokenhub.py` 顶层硬 `import requests`，而本机受管裸解释器
+//      `binaries/python/versions/3.13.12` 根本没有 requests（实测 ModuleNotFoundError）——
+//      一旦解析不到带 requests 的 venv（`resolvePython` pass 1 兜底），整条流水线进文件即崩。
+//      修：requests 降级为**可选**，新增 `http_get()`，缺失时回退脚本自己已有的 urllib 实现
+//      （顺带补 `decode_body()`：腾讯云文档页无视 `Accept-Encoding: identity`、永远回 gzip，
+//      不解压会拿到二进制垃圾 → 解析「0 个模型」却毫无报错，属最坏的静默失败）。
+//      实测：裸解释器从 ImportError → 47 个模型 / TokenHub 4 个模型，与 venv 结果完全一致。
+//   ② P2：`ssl.check_hostname=False` + `verify_mode=CERT_NONE` 全局关闭证书校验，而抓的是
+//      **直接写进 pricing.json、决定每轮计费金额**的厂商价格 —— 中间人改一次价，账本金额跟着错且无告警。
+//      修：恢复严格校验（实测四家官方页严格校验均 200、字节数与关校验时一致，关闭毫无收益）；
+//      企业代理/自签证书环境保留显式降级开关 `CN_PRICES_INSECURE_TLS=1`，且必须打 [WARN]（禁静默）。
+//   ③ selftest 新增 T13 段 6 项守卫（禁无条件关 TLS / 降级必须带警告 / requests 禁顶层硬 import /
+//      必须有 urllib 回退 / http_get 入口 / decode_body 存在），防回归。
 // v3.23.3：**CI 首跑抓出的 M7 守卫时序修复（deepseek-official.js）** —— CI（windows-latest）首跑 T4 红：
 //   「pricing 损坏拒绝覆盖」守卫原来放在 fetch 成功之后、写盘之前——WB_NO_NET=1 时重试循环先烧完再 exit(1)，
 //   守卫永远到不了（重试总时长还撞了测试 60s 超时 → exit=null SIGTERM）。修复：守卫提前到 main() 开头，
@@ -4021,7 +4035,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.23.3'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.23.4'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

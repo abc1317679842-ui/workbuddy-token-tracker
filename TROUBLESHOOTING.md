@@ -35,7 +35,8 @@
 | 弹窗内容异常（会话错乱） | `token-tracker-toast.log` + trace 文件 | 查看 `sessionId` 是否为空或与实际会话不一致；检查 trace 的 `sessionId` 字段 |
 | 账本数据未更新 | `daily-usage.json`（mtime）、`.ledger-watermark.json` | 若 mtime 停在某时间，说明 Stop 路径未执行；结合 probe 判断 |
 | 弹窗频繁重复 | `.ledger-watermark.json` + `token-tracker-toast.log` | 查看 watermark 去重是否生效，以及 toast.log 中同一 `reason` 是否反复出现 |
-| 弹窗提示「⚠价库8/31」/ 价库不刷新 | `WorkBuddy\2026-08-30-22-25-15\prices\.refresh.lock`（失败会常驻）+ `.refresh.error`（v2.82 起失败留档）+ `binaries/python/envs/default`（venv 是否有 requests） | 刷新失败首查 `.refresh.error` 内容；「python 环境」问题查 resolvePython 是否命中 venv（v2.82 根修：候选表必须含 venv 路径） |
+| 弹窗提示「⚠价库8/31」/ 价库不刷新 | `WorkBuddy\2026-08-30-22-25-15\prices\.refresh.lock`（失败会常驻）+ `.refresh.error`（v2.82 起失败留档）+ `binaries/python/envs/default`（venv 是否有 requests） | 刷新失败首查 `.refresh.error` 内容；「python 环境」问题查 resolvePython 是否命中 venv（v2.82 根修：候选表必须含 venv 路径）。**v3.23.4 起 requests 已非必需**：无 requests 的解释器会自动回退 urllib，不再一进文件就 ImportError；若看到 `pip install brotli` 提示，说明站点用了 br 压缩 |
+| 抓取报证书错误（SSL/CERTIFICATE_VERIFY_FAILED） | 抓取 stderr + 是否处于企业 MITM 代理环境 | v3.23.4 起默认**严格校验**（价格影响计费，不允许中间人改价）。确认是自家代理/自签证书后，才设 `CN_PRICES_INSECURE_TLS=1` 降级（会打 `[WARN]`）；**不要**改代码把校验关掉 |
 | 弹窗耗时与 WorkBuddy 显示差很多 | 本轮 trace 文件数量（`~/.workbuddy/traces/<pid>/` 同窗口几个 trace） | 长任务会分多个 trace 文件，v2.74 单文件口径只算最后一段（11:27 显示 4:22）；v2.82.1 起 = 最新 trace endedAt − 用户提交时刻（roundStart0），差 ≤1s |
 | 新模型计费明显不对 / 显示 unknown | `pricing.json` 对应条目 + `daily-usage.json` 模型名 | v2.82.2 起 findModel 为单向边界匹配：`glm-5.3-air` 不会撞 `glm-5` 的价；模型名缺失（`unknown`）只记 token 不记钱——若出现 unknown 条目，说明 transcript 的 `providerData.model` 缺失 |
 | 已下线模型（`retired: true`）仍按旧价计费 | `pricing.json` 该条目的 `retired` 与 `price_source` | **设计行为（v3.19.1 起明确写入文档）**：官方下线后仍保留最后已知官方价，供历史账本回溯；`findModel`/`calcCost` **不检查 `retired`** → 若该模型仍被调用则按留存旧价计费，且因官方已不再给价、该条目永不再更新、也不告警。要停用请显式删除条目或手工接管价格 |

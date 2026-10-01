@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-国内厂商官方人民币价抓取器（v0.3，2026-09-28）
+国内厂商官方人民币价抓取器（v0.4，2026-10-02）
+- v0.4：requests 降为可选依赖（缺失自动回退 urllib 的 fetch()，无 requests 的机器不再 ImportError 整条崩）；
+  TLS 恢复严格证书校验（价格影响计费；确需降级设 CN_PRICES_INSECURE_TLS=1，会打警告）
 - v0.3：阶跃列序修正(输入未命中/输入命中/输出)；step-5-preview 白名单；MiniMax 专用解析
   (改版页补齐 M3/M2.x 共 9 模型)；Kimi 域名迁移 platform.kimi.com + k3 多列行取末 3 位
 - v0.2：智谱切官方文档站 docs.bigmodel.cn（弃控制台 SPA bundle 通道）
@@ -25,15 +27,26 @@ import re
 import ssl
 import sys
 import time
+import gzip
+import zlib
 import datetime
 import urllib.request
-import requests
+try:
+    import requests  # 可选依赖：全脚本只有 Kimi 文档页用到；缺失时 http_get() 自动回退 urllib
+except ImportError:
+    requests = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(HERE, 'prices')
+# v3.23.4：抓到的价格会写进 pricing.json、直接决定每轮计费金额 —— 不再无条件关闭证书校验。
+# 实测四家官方页（智谱 / Kimi / 阶跃 / MiniMax）在严格校验下均 200 且字节数一致，
+# 关闭校验既无收益，又留下「中间人改一次价格、账本金额跟着错且无告警」的漏洞。
+# 企业代理 / 自签证书环境确需降级时显式设 CN_PRICES_INSECURE_TLS=1（会打一行警告，不静默）。
 CTX = ssl.create_default_context()
-CTX.check_hostname = False
-CTX.verify_mode = ssl.CERT_NONE
+if os.environ.get('CN_PRICES_INSECURE_TLS') == '1':
+    CTX.check_hostname = False
+    CTX.verify_mode = ssl.CERT_NONE
+    sys.stderr.write('[WARN] CN_PRICES_INSECURE_TLS=1：已关闭 TLS 证书校验，抓取到的价格可被中间人篡改\n')
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
 TIMEOUT = 30
 
@@ -96,9 +109,38 @@ VENDORS = {
 HEADER_WORDS = ('模型', '价格', '计费', '说明', '备注', '单位', '输入价格', '输出价格', 'token')
 
 
+def decode_body(raw, encoding):
+    """按 Content-Encoding 解压（requests 自动做，urllib 不会）。
+    不解压会拿到二进制垃圾 → 解析出「0 个模型」却毫无报错，是最坏的一类静默失败。"""
+    enc = (encoding or '').lower()
+    if enc == 'gzip':
+        return gzip.decompress(raw).decode('utf-8', 'replace')
+    if enc == 'deflate':
+        try:
+            return zlib.decompress(raw).decode('utf-8', 'replace')
+        except zlib.error:
+            return zlib.decompress(raw, -zlib.MAX_WBITS).decode('utf-8', 'replace')
+    if enc == 'br':
+        try:
+            import brotli
+            return brotli.decompress(raw).decode('utf-8', 'replace')
+        except ImportError:
+            raise RuntimeError('服务端返回 br 编码且本机无 brotli：pip install brotli（或安装 requests）')
+    return raw.decode('utf-8', 'replace')
+
+
 def fetch(url, timeout=TIMEOUT):
     req = urllib.request.Request(url, headers={'User-Agent': UA})
-    return urllib.request.urlopen(req, timeout=timeout, context=CTX).read().decode('utf-8', 'replace')
+    resp = urllib.request.urlopen(req, timeout=timeout, context=CTX)
+    return decode_body(resp.read(), resp.headers.get('Content-Encoding'))
+
+
+def http_get(url, timeout=TIMEOUT):
+    """GET 取回文本：有 requests 就用它（自动跟随 301），没有就回退上面的 urllib 实现。
+    v3.23.4：requests 从「硬依赖」降级为「可选」——没有它的机器上整条流水线不再因 ImportError 崩掉。"""
+    if requests is not None:
+        return requests.get(url, headers={'User-Agent': UA}, timeout=timeout).text
+    return fetch(url, timeout)
 
 
 def strip_tags(s):
@@ -334,7 +376,7 @@ def parse_kimi():
     base = 'https://platform.kimi.com/docs/pricing/'
     for pg in KIMI_PAGES:
         try:
-            t = requests.get(base + pg + '.md', headers={'User-Agent': UA}, timeout=20).text
+            t = http_get(base + pg + '.md', 20)
         except Exception as e:
             print('[WARN] kimi %s: %s' % (pg, repr(e)[:80]))
             continue

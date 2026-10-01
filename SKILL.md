@@ -10,7 +10,8 @@ type: skill
 - **仅适配 WorkBuddy / CodeBuddy 桌面端（Windows 10/11）**：本技能的数据源是客户端落盘的 `~/.workbuddy/traces/<pid>/trace_*.json`（每轮模型调用结束自动生成）+ 客户端 hooks 挂载点——**其他 AI 工具/平台（Claude Code、Cursor、ChatGPT 桌面版、其他 OpenClaw 客户端等）没有这套机制，装上也不会工作**，请勿在其他环境安装。
 - **Windows 10/11**：系统通知（toast）仅 Windows 支持；macOS/Linux 可正常手动使用（方式 A），但不弹通知。
 - **Node.js ≥ 20**：脚本零依赖单文件，无需 npm install。
-- **Python 3 + `requests`**（可选）：国内厂商官方价格库流水线（`fetch-cn-prices.py` 等 3 个脚本）需要；缺失时该功能降级为聚合源价并持续弹 `⚠价库缺失` 提示，token 统计与 toast 不受影响。
+- **Python 3**（可选）：国内厂商官方价格库流水线（`fetch-cn-prices.py` 等 3 个脚本）需要。v3.23.4 起 **`requests` 不再需要**（缺失时自动回退脚本内置的 urllib 实现）；完全无 python 时该功能降级为聚合源价并持续弹 `⚠价库缺失` 提示，token 统计与 toast 不受影响。
+- **价格抓取走严格 TLS 校验**（v3.23.4）：抓的是直接决定计费金额的价格，不允许中间人改价；除非用户明确要求，不要设 `CN_PRICES_INSECURE_TLS=1`（设了会打 `[WARN]`，不会静默）。
 
 ## 📦 按需加载的旁支文件（默认不要读）
 

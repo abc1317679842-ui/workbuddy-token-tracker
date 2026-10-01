@@ -1,13 +1,19 @@
 """解析腾讯云大模型服务平台 TokenHub「模型价格」文档页。
 源：https://cloud.tencent.com/document/product/1823/130055
 该页服务端渲染 + gzip，requests 可直接抓取（无需浏览器）。
+v3.23.4：requests 降为可选依赖（缺失时 fetch() 自动回退 urllib，显式要求 identity 编码避免 gzip）；
+TLS 证书一律严格校验，不再全局关闭（价格影响计费）。
 
 产出：广州地域「在线推理-语言模型」价表的结构化记录，含：
   - 模型名 / 归一化 api 名 / 品牌 / 是否原厂直供(自营 or 转售)
   - 分档 tiers：type=peak(峰谷:空闲/高峰) 或 length(输入长度分档) 或 base
   - 每档 输入/输出/缓存命中 单价（元/百万 tokens）
 """
-import re, json, requests
+import os, re, json, ssl, gzip, zlib, urllib.request
+try:
+    import requests  # 可选依赖：缺失时 fetch() 自动回退 urllib（本页服务端渲染，不需要 requests 的任何特性）
+except ImportError:
+    requests = None
 
 URL = 'https://cloud.tencent.com/document/product/1823/130055'
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
@@ -45,8 +51,44 @@ BRAND_MAP = {
 }
 
 
+def ssl_context():
+    """严格校验为默认；仅当显式设 CN_PRICES_INSECURE_TLS=1 才降级（打警告，不静默）。"""
+    ctx = ssl.create_default_context()
+    if os.environ.get('CN_PRICES_INSECURE_TLS') == '1':
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        import sys
+        sys.stderr.write('[WARN] CN_PRICES_INSECURE_TLS=1：已关闭 TLS 证书校验，抓取到的价格可被中间人篡改\n')
+    return ctx
+
+
+def decode_body(raw, encoding):
+    """按 Content-Encoding 解压（requests 自动做，urllib 不会）。
+    实测腾讯云文档页无视 Accept-Encoding: identity、永远回 gzip —— 不解压会拿到二进制垃圾，
+    解析结果「0 个模型」却没有任何报错，属于最坏的一类静默失败。"""
+    enc = (encoding or '').lower()
+    if enc == 'gzip':
+        return gzip.decompress(raw).decode('utf-8', 'replace')
+    if enc == 'deflate':
+        try:
+            return zlib.decompress(raw).decode('utf-8', 'replace')
+        except zlib.error:
+            return zlib.decompress(raw, -zlib.MAX_WBITS).decode('utf-8', 'replace')
+    if enc == 'br':
+        try:
+            import brotli
+            return brotli.decompress(raw).decode('utf-8', 'replace')
+        except ImportError:
+            raise RuntimeError('服务端返回 br 编码且本机无 brotli：pip install brotli（或安装 requests）')
+    return raw.decode('utf-8', 'replace')
+
+
 def fetch():
-    return requests.get(URL, headers={'User-Agent': UA}, timeout=30).text
+    if requests is not None:
+        return requests.get(URL, headers={'User-Agent': UA}, timeout=30).text
+    req = urllib.request.Request(URL, headers={'User-Agent': UA})
+    resp = urllib.request.urlopen(req, timeout=30, context=ssl_context())
+    return decode_body(resp.read(), resp.headers.get('Content-Encoding'))
 
 
 def cells_of_row(seg):

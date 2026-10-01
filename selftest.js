@@ -829,6 +829,32 @@ else {
   fs.rmSync(UF, { force: true });
 }
 
+// ── T13：Python 流水线守卫（v3.23.4：抓的是"决定计费金额"的价格数据，安全 + 依赖两条红线）─────
+{
+  const pyFiles = fs.readdirSync(SRC).filter((f) => f.endsWith('.py'));
+  const pySrc = (f) => fs.readFileSync(path.join(SRC, f), 'utf8');
+  const has = (f, re) => re.test(pySrc(f));
+  // a：TLS —— 允许"显式开关降级"，绝不允许无条件关闭校验
+  const insecure = pyFiles.filter((f) => has(f, /CERT_NONE|check_hostname\s*=\s*False/) && !has(f, /CN_PRICES_INSECURE_TLS/));
+  ok('T13-a1 ★无 .py 无条件关闭 TLS 校验（关校验必须由 CN_PRICES_INSECURE_TLS 显式开启）',
+    insecure.length === 0, insecure.join(', ') || '全部合规');
+  const silentDowngrade = pyFiles.filter((f) => has(f, /CN_PRICES_INSECURE_TLS/) && !has(f, /\[WARN\]/));
+  ok('T13-a2 降级开关必须带 [WARN] 输出（不允许静默关校验）',
+    silentDowngrade.length === 0, silentDowngrade.join(', ') || '全部合规');
+  // b：requests 必须是可选依赖
+  const hardImport = pyFiles.filter((f) => has(f, /^import[^\n]*\brequests\b/m));
+  ok('T13-b1 ★requests 不得是顶层硬 import（须包在 try/except 里，缺失时回退 urllib）',
+    hardImport.length === 0, hardImport.join(', ') || '全部合规');
+  const noFallback = pyFiles.filter((f) => has(f, /\brequests\b/) && !has(f, /urllib\.request/));
+  ok('T13-b2 用到 requests 的脚本必须同时具备 urllib 回退实现',
+    noFallback.length === 0, noFallback.join(', ') || '全部合规');
+  ok('T13-b3 fetch-cn-prices.py 提供 http_get() 统一入口（有 requests 用它，没有走 urllib）',
+    has('fetch-cn-prices.py', /def http_get/));
+  // c：编码 —— 服务端无视 Accept-Encoding 直接回 gzip 的页面（实测腾讯云文档页），不解压 = 静默 0 模型
+  ok('T13-c1 ★两个抓取脚本都能按 Content-Encoding 解压（否则拿到二进制垃圾、解析 0 模型且无报错）',
+    has('fetch-cn-prices.py', /def decode_body/) && has('parse_tokenhub.py', /def decode_body/));
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log(`\n结果：${pass} 过 / ${fail} 败${skipped ? '（有跳过项：本环境禁止 node 子进程）' : ''}`);
 process.exit(fail ? 1 : 0);

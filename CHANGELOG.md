@@ -3,6 +3,35 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.23.4（2026-10-02）—— 价格流水线两处硬伤：requests 硬依赖 + 全局关闭 TLS 校验
+
+> 第三轮审计换切面（**安全 / 计费正确性 / 错误吞没**）挑出的 P1、P2。两者都指向同一件事：**抓的是"直接写进 pricing.json、决定每轮计费金额"的厂商价格**，这条链路上任何"崩掉"或"可被篡改"都不是小问题。
+
+### 一、P1｜`requests` 从硬依赖降为可选（无 requests 的机器上整条流水线不再 ImportError 崩）
+- **实测缺陷**：`fetch-cn-prices.py:30` 与 `parse_tokenhub.py:10` 都是**顶层硬 import**。本机受管裸解释器 `binaries/python/versions/3.13.12` 根本没有 requests → `python fetch-cn-prices.py` 一进来就 `ModuleNotFoundError`。
+- **范围修正（审计原文"流水线必然崩"需收窄）**：`resolvePython`（v2.82 起）会先按 `import requests` 探测、优先命中带 requests 的 venv（`binaries/python/envs/default`，实测有 requests 2.34.2），**只有所有候选都没有 requests 时**才降级 pass 1（裸解释器）→ 那时才必崩。所以本机当前是好的，但任何没有 venv / 没有 requests 的机器都是坏的，且失败表现只是弹窗 `⚠价库缺失`，用户根本猜不到是缺 pip 包。
+- **修法**：`try: import requests except ImportError: requests = None`；新增统一入口 `http_get()`（有 requests 用它，没有就用脚本自带的 urllib `fetch()`）。`parse_tokenhub.py` 同理改 `fetch()`。
+- **连带修（比 P1 本身更隐蔽）**：腾讯云文档页**无视 `Accept-Encoding: identity`、永远回 gzip**，urllib 不会自动解压 → 拿到二进制垃圾 → 解析出「0 个模型」且**毫无报错**（最坏的一类静默失败）。新增 `decode_body()` 按 `Content-Encoding` 解压（gzip/deflate/br）。
+- **实测**：裸解释器从 `ImportError` → **47 个模型 + TokenHub 4 个模型**；与 venv 路径结果**完全一致**。文档里 `pip install requests` 前置条件已删除。
+
+### 二、P2｜恢复 TLS 严格证书校验（价格可被篡改 → 金额跟着错且无告警）
+- **原状**：`fetch-cn-prices.py` 全局 `check_hostname = False` + `verify_mode = ssl.CERT_NONE`。中间人改一次价格，账本金额就跟着错，**没有任何告警**。
+- **修复成本为零的证据**：实测四家官方页（智谱 / Kimi / 阶跃 / MiniMax）在严格校验下**全部 200、响应字节数与关校验时逐字节一致** —— 关闭校验零收益，只留风险。
+- **修法**：恢复 `ssl.create_default_context()` 默认值；保留企业代理/自签证书环境的**显式**降级开关 `CN_PRICES_INSECURE_TLS=1`，且**必须打一行 `[WARN]`**（禁静默关闭）。
+
+### 三、防回归守卫（selftest T13 段，6 项）
+`T13-a1` 无 .py 无条件关闭 TLS（关校验必须由 `CN_PRICES_INSECURE_TLS` 显式开启）／`a2` 降级开关必带 `[WARN]`／`b1` requests 不得顶层硬 import／`b2` 用 requests 的脚本必须有 urllib 回退／`b3` `http_get()` 入口存在／`c1` 两脚本都有 `decode_body()`。
+
+### 四、复核通过项（本切面未发现问题，记录备查）
+- **toast 无注入风险**：`escapeXml` 把 `'` 转 `&apos;` 后才插进 PowerShell **单引号字面量**（单引号内 `$( )` 与反引号均不展开）；`execFileSync` 数组传参、无 shell、timeout 10s + windowsHide。
+- **错误吞没干净**：23 处空 catch 全为清理类（`unlink tmp` / `mkdir` / stale lock）或有下游兜底；无关键错误被静默吞掉。
+- **计费口径严谨**：`calcCost` 峰谷按 **token 实际发生时刻**判（`tsMs > stat.lastTs > 当下`），不是脚本运行时刻；模型名为空 / `unknown` / 本地模型一律不记价；in/cached/out 三侧均有非负钳制。
+
+### 五、验证
+- selftest **131 过 / 0 败**（v3.23.3 为 125 + T13 新增 6）。
+- 真实联网矩阵：{裸解释器无 requests, venv 有 requests} × {fetch-cn-prices, parse_tokenhub} → **4/4 通过且结果一致**（47 + 4 个模型）。
+- 严格 SSL：4 个官方页 200，与关校验字节数一致。
+
 ## v3.23.3（2026-10-01）—— CI 首跑抓出的 M7 守卫时序修复（deepseek-official.js）
 
 > CI（windows-latest）首跑红了 2 条：T4 M7（exit=null）+ T3 R4（stderr 无告警）。逐条定位后确认是 **1 个真代码缺陷 + 1 个断言前提问题**——这正是 CI 的价值：这两条在本机从未暴露过。
