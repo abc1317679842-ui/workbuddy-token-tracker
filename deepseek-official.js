@@ -307,8 +307,11 @@ async function main() {
   // 旧实现先 fetch 成功、写盘前才拒绝：断网/WB_NO_NET 环境下重试循环先烧完再 exit(1)，
   // 守卫永远到不了（CI selftest T4 首跑抓出）。RAW 模式只解析输出不写库，维持不检查。
   if (!RAW) {
-    if (!loadPricing() && fs.existsSync(PRICING)) {
-      process.stderr.write('FAIL_REASON=pricing.json 存在但损坏，deepseek-official 拒绝覆盖式重建（请人工修复后重试）\n');
+    // v3.24.0：守卫补「缺 models 字段」形态 —— 原先只查 JSON 可否解析，`{}`（合法 JSON 但无
+    // models）会放行 → 循环里 pricing.models[mkey] 抛 TypeError，被外层 catch 误报成网络失败。
+    const _cur = loadPricing();
+    if (fs.existsSync(PRICING) && (!_cur || !_cur.models || typeof _cur.models !== 'object')) {
+      process.stderr.write('FAIL_REASON=pricing.json 存在但损坏（JSON 不可解析或缺 models 字段），deepseek-official 拒绝覆盖式重建（请人工修复后重试）\n');
       process.exit(2);
     }
   }
@@ -330,7 +333,15 @@ async function main() {
         // 会用官方极简清单（只有 DeepSeek 系）覆盖整个价格库——lock/人工核验价/_manual_audit/
         // _lookedup_models 与全部其他厂商模型被静默清空。宁可本次失败，也不能静默降级。
         let pricing = loadPricing();
-        if (!pricing) pricing = { models: {} }; // 首次运行（文件不存在）允许从零建档；损坏场景已被 main 开头的守卫拦截
+        // v3.24.0：写盘前二次读取也走同一守卫（堵 TOCTOU：main 开头检查后文件被换坏的情形）
+        if (!pricing) {
+          if (fs.existsSync(PRICING)) {
+            process.stderr.write('FAIL_REASON=写入前二次读取 pricing.json 失败（损坏），deepseek-official 拒绝覆盖\n');
+            process.exit(2);
+          }
+          pricing = { models: {} }; // 首次运行（文件不存在）允许从零建档
+        }
+        if (!pricing.models || typeof pricing.models !== 'object') pricing.models = {};
         const officialSet = new Set(parsed.models);
         // 1) 官方有的模型：新增或更新价格
         parsed.models.forEach((mkey, i) => {

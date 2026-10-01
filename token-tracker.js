@@ -1,5 +1,25 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.23.5 (2026-10-02)
+// token-usage-tracker v3.24.0 (2026-10-02)
+// v3.24.0：**R8/R9 全量审计落地（13 条级联链修复 + 连锁反应测试两级全绿）** ——
+//   ① 级联② hy3 补录 shipped pricing.json + toast 新增「⚠未计价」标注：hy3 是 WorkBuddy
+//      子代理默认模型，shipped 价库连本机 pricing.json 都没有 → 纯净环境子代理金额静默 = 0。
+//      ⚠未计价条件 = !isLocal && cost==null && (in||out)，对齐既有 价⚠️/官价⚠️ 标注模式。
+//   ② 级联① transcript 截断告警 + 「⚠账缺」标注：完整行数 < 水位线 = 平台压缩过历史，
+//      「不推进等恢复」成死代码（水位线永久冻结）→ 落旗标（.transcript-truncated.json，
+//      24h 节流）+ toast 标注；水位重置深修立项 KI-5。
+//   ③ 级联③ loadDailyUsage 错误分类：原先所有非 ENOENT 错误一律改名 .corrupt-<ts>，
+//      EACCES/EBUSY 等读取类错误也会毁账本 → 只有解析类错误才改名；读取失败不写回、下轮重试。
+//   ④ 级联④ recalc 保留已有金额 + 缺省日期改本地时区：峰谷占比未知时不再按空闲 ×1
+//      改写已有金额（口径改写）；¥0 欠账才按空闲价补记；UTC 凌晨跨天错位修正。
+//   ⑤ 级联⑩ watcher 锁 TTL 过期分支补 pid 探活：v3.23.2 TTL 30min→5min 把「活 watcher
+//      被抢锁 → 双弹窗」窗口放大 6 倍 → owner 存活（EPERM 视为存活）不抢锁。
+//   ⑥ 其余防御补齐：fmtCost NaN/负价挡板、hitRate 钳制 [0,100]、dayTotalOf null 条目
+//      跳过（级联⑪ --report 全线崩）、dbStaleTag(null)、refresh-holidays 空年守卫（级联 B1）、
+//      backfill 子水位 max 语义修复（级联 B3，原写法恒等 no-op 可回退）、
+//      deepseek-official 缺 models 字段守卫 + 写盘前 TOCTOU 二次读取（级联 D）。
+//   ⑦ selftest 新增 T15 段 10 项 → 149 过 / 0 败 / 16 跳过（exit 2 = 全过有跳过，新语义）；
+//      连锁反应测试两级全绿（函数级 chain-test + 子进程级 chain-sub 8 项）。
+//   未修立项：KI-5（截断水位深修）、KI-6（弹窗层三件套：⑧混合模型单条计价 / ⑨团队轮三件套 / ⑬同模型拆分弹）。
 // v3.23.5：**口径一致性 + 一处真·静默失效（第七轮审计 E/C 面落地）** ——
 //   ① ★内外层 timeout 打架（新发现，本版最值钱的一条）：自动刷新是 `execFileSync(refresh-prices.js,
 //      timeout 60000)`，而 refresh-prices.js 内部 `spawnSync(deepseek-official.js, timeout 120000)`
@@ -480,6 +500,7 @@ const DAILY_USAGE_FILE = path.join(WB, 'skills', 'token-usage-tracker', 'daily-u
 // 都能给 AI 下指令（数据→指令通道），且 --report 会把它原样打印进用户界面。展示约定只保留在
 // SKILL.md；历史账本里已存在的 _instructions 由 normalizeDailyUsage 继续剥离，下次写盘自然消失。
 const LEDGER_WATERMARK_FILE = path.join(WB, 'skills', 'token-usage-tracker', '.ledger-watermark.json'); // v2.50：增量记账水位线（{sid:{main:已记账主transcript行数, subs:{子代理文件名:已记账行数}}}）
+const TRANSC_TRUNCATED_FILE = path.join(WB, 'skills', 'token-usage-tracker', '.transcript-truncated.json'); // v3.24.0：级联①截断告警旗标（{at, path, watermark}；toast 显示 ⚠账缺）
 const BALANCE_TTL_MS = 15 * 1000; // 余额缓存 15 秒（v2.18 从 60s 压短：用户要求实时，接口实测 300ms 级；正常轮询间隔 >15s 即每轮拿实时数，15s 内连发才复用）
 // 积分/自定义 API 模式识别（v2.10）：官方文档证实内置模型列表就有 deepseek-v4-flash（与自定义 id 同名），
 // trace/hook payload/transcript 无模式标记，进程级探测（tasklist/wmic/netstat）被本机安全策略禁用——
@@ -1060,7 +1081,23 @@ function readTranscLinesFrom(tsPath, fromLine) {
   let off = 0;
   for (let i = 0; i < start; i++) {
     const nl = buf.indexOf(0x0a, off);
-    if (nl === -1) return { rows: [], totalLines: start }; // 文件被截断（完整行数 < 水位线）→ 不推进
+    if (nl === -1) {
+      // v3.24.0（级联①）：文件完整行数 < 水位线 = 平台**压缩/重写**过历史（重写后的文件不会
+      // 恢复到原长度）→「不推进等恢复」成了死代码：水位线永久冻结，之后所有消耗**永久静默少计**。
+      // 深修（水位重置 + 按时间戳去重重读）涉及记账核心时序，另行立项（KNOWN-ISSUES KI-5）；
+      // 此处先让故障**可见**：落旗标文件，toast 显示「⚠账缺」（24h 节流，不刷屏）。
+      try {
+        let last = 0;
+        try { last = JSON.parse(fs.readFileSync(TRANSC_TRUNCATED_FILE, 'utf-8')).at || 0; } catch (e2) {}
+        if (Date.now() - last > 24 * 3600 * 1000) {
+          const tf = TRANSC_TRUNCATED_FILE + '.tmp-' + process.pid;
+          fs.writeFileSync(tf, JSON.stringify({ at: Date.now(), path: tsPath, watermark: start }));
+          fs.renameSync(tf, TRANSC_TRUNCATED_FILE);
+          process.stderr.write(`[token-tracker] ⚠ transcript 完整行数少于水位线 ${start}（历史被压缩/重写），水位线已冻结 → 之后的消耗将静默少计。可手动跑 node backfill.js 重算修复\n`);
+        }
+      } catch (e2) { /* 旗标写失败不影响记账主流程 */ }
+      return { rows: [], totalLines: start };
+    }
     off = nl + 1;
   }
   // 只解析完整行：最后一个 '\n' 之后是半写行，留给下一轮
@@ -2687,7 +2724,8 @@ function calcCost(stat, pricing, tsMs) {
 }
 
 function fmtCost(cost) {
-  if (cost == null) return null;
+  if (cost == null || !Number.isFinite(cost)) return null; // v3.24.0：NaN 也返回 null（原只挡 null → NaN 会直出「¥NaN」上 toast）
+  if (cost < 0) return null; // v3.24.0：负价不合常理（上游有非负钳制，这里是 toast 侧最后一道闸）
   if (cost < 0.005) return '¥<0.01';
   return '¥' + cost.toFixed(2);
 }
@@ -2705,11 +2743,14 @@ function fmtCost(cost) {
 function hitRate(inTok, cachedTok) {
   const denom = inTok || 0;
   if (!(denom > 0)) return 0;
-  return Math.round((cachedTok / denom) * 10000) / 100; // 保留两位小数
+  // v3.24.0：钳制到 [0,100] —— 脏数据（cached>in，如平台重传）会显示 ">100%" 报表
+  const v = Math.round((cachedTok / denom) * 10000) / 100;
+  return Math.min(100, Math.max(0, v));
 }
 function dayTotalOf(models) {
   const t = { in: 0, out: 0, cached: 0, total: 0, cost: 0 };
   for (const m of Object.values(models || {})) {
+    if (!m || typeof m !== 'object') continue; // v3.24.0（级联⑪）：账本一条 null 条目曾让 --report/区间/CSV/外推全线 TypeError
     t.in += m.in || 0; t.out += m.out || 0; t.cached += m.cached || 0; t.total += m.total || 0;
     t.cost += m.cost || 0;
   }
@@ -2749,6 +2790,17 @@ function loadDailyUsage() {
       //   因文件已被本轮重命名为 .corrupt-<ts> 而走 ENOENT 分支 → 标志被清 → recordUsage 不再跳过
       //   → 用空账本写回，历史累计丢失（而日志仍声称"本轮不写回覆盖"，与实际行为矛盾）。
       //   现在标志只由"成功解析"来清除，损坏状态在本进程内保持，确保跳过写入生效。
+      return {};
+    }
+    // v3.24.0（级联③）：**区分「文件真损坏」与「瞬时读失败」** —— 原先所有非 ENOENT 错误一律
+    // 把账本改名 .corrupt-<ts>。EACCES / EBUSY / EIO 这类**文件本身完好**的瞬时占用（杀毒扫描、
+    // 同步盘锁定）也会触发改名 → "一次瞬时文件占用 = 历史账本永久消失"。
+    // 现在只有 JSON 解析失败（SyntaxError，文件内容真坏）才隔离改名；读失败 → 原文件原位不动，
+    // gDailyCorrupt 照样置 true 阻止本轮用空账本写回（防覆盖逻辑不变），stderr 告警后下次重试。
+    const isParseError = e instanceof SyntaxError || !e.code || e.code === 'ENOENT';
+    if (!isParseError && e.code !== 'ENOENT') {
+      gDailyCorrupt = true;
+      process.stderr.write(`[token-tracker] 账本读取失败（${e.code || e.message}）——文件未改动，本轮不写回，下次重试\n`);
       return {};
     }
     // 损坏文件：重命名为 .corrupt-<时间戳> 备份（保留历史数据），本轮禁止写回空对象以免覆盖。
@@ -3382,7 +3434,7 @@ function dispWidthTitle(s) {
 //   库文件缺失（合并失败）     → ⚠价库缺失
 //   今天已更新正常             → 空串（弹窗与原来一字不差）
 function dbStaleTag(pricing) {
-  if (!pricing) return '';
+  if (!pricing) return '⚠价库'; // v3.24.0（弹窗专项）：价库整个没加载进来是最缺价的场景，原返回 '' 零告警
   if (pricing._shrink_note) return '⚠价库缩水'; // v3.18.3（F1）：损坏重建缩水告警进 toast，不只 stderr
   const ldb = pricing.local_db;
   if (!ldb) return '⚠价库缺失';
@@ -3545,7 +3597,8 @@ function toastLine1(stat, modelShort, period, balTxt, todayTxt) {
 }
 function toastLine2(stat, pricing) {
   const isLocal = isLocalModel(stat && stat.model);
-  const cost = isLocal ? '本地·免费' : (fmtCost(calcCost(stat, pricing)) || '未收录');
+  const costVal = isLocal ? null : calcCost(stat, pricing);
+  const cost = isLocal ? '本地·免费' : (fmtCost(costVal) || '未收录');
   const input = (stat && stat.in) || 0;
   const cached = (stat && stat.cached) || 0;
   // 缓存占比精确到两位小数（如 99.12%）；无输入数据则不显示缓存段
@@ -3560,6 +3613,20 @@ function toastLine2(stat, pricing) {
   if (pricing && pricing.deepseek_refresh_error) {
     line += '｜官价⚠️';
   }
+  // v3.24.0（级联②）：该模型在价库里找不到 → 金额显示「未收录」，但那不够醒目（报告实测：
+  // 纯净环境无本地价库时 hy3 等子代理模型金额静默=0，用户毫无感知）。补「⚠未计价」标注，
+  // 对齐 价⚠️/官价⚠️ 模式。只在确实有 token 消耗时标注（空轮不标）。
+  if (pricing && !isLocal && costVal == null && ((stat && stat.in) || (stat && stat.out))) {
+    line += '｜⚠未计价';
+  }
+  // v3.24.0（级联①）：transcript 被平台压缩/重写导致水位线冻结 → 之后的消耗静默少计。
+  // 旗标由 readTranscLinesFrom 落盘（24h 节流），这里让用户在弹窗里看得见。7 天后自动失效。
+  try {
+    const tf = JSON.parse(fs.readFileSync(TRANSC_TRUNCATED_FILE, 'utf-8'));
+    if (tf && tf.at && Date.now() - tf.at < 7 * 24 * 3600 * 1000) {
+      line += '｜⚠账缺';
+    }
+  } catch (e2) { /* 无旗标 = 正常 */ }
   // 宽度保护：超宽丢缓存占比，保住价格与核心数字（高峰标注已移至行1，行2 不再有溢出风险）
   if (dispWidth(line) > TOAST_LINE_MAX_W) {
     line = line.replace(ratioTxt, '');
@@ -4098,7 +4165,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.23.5'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.24.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -4379,7 +4446,18 @@ function main() {
       try { mine = JSON.parse(fs.readFileSync(lockPath, 'utf-8')); } catch (e) { mine = null; }
       const fresh = mine && (Date.now() - (mine.at || 0) < WATCH_LOCK_TTL);
       if (!fresh) {
-        // TTL 过期 → 锁失效，安全接管：删旧锁后重新原子建锁
+        // v3.24.0（级联⑩）：TTL 过期分支**补 pid 探活** —— 原先不看 pid 直接抢锁，而 v3.23.2 把
+        // TTL 30min→5min 后这个洞被放大 6 倍：owner 是**活着的长任务 watcher**（运行 >5min）时
+        // 新 Stop 会删它的锁另起 watcher → 双 watcher 双弹窗。
+        // 正确语义：owner 活着 → 它负责本会话的弹窗，不抢（不是漏弹）；owner 死了 → 才接管。
+        // 与下方"ESRCH 判死才动"同一口径（EPERM 视为存活，保守）。
+        const pid0 = mine && Number(mine.pid);
+        if (pid0 && pid0 > 0 && Number.isFinite(pid0)) {
+          let alive0 = false;
+          try { process.kill(pid0, 0); alive0 = true; } catch (e0) { alive0 = e0.code !== 'ESRCH'; }
+          if (alive0) return false; // owner 仍在跑（锁只是超时）→ 交给它
+        }
+        // TTL 过期且 owner 已死（或无 pid）→ 锁失效，安全接管：删旧锁后重新原子建锁
         try { fs.unlinkSync(lockPath); } catch (e) {}
         try {
           const fd = fs.openSync(lockPath, 'wx');
@@ -5360,6 +5438,7 @@ module.exports = {
   // v3.22.0：新增 Stop 端兜底链路（hookIdle / claimNotify / maybeFetchLatest / updateTagForToast）
   updateNotice, cmpVersion, loadUpdateState, saveUpdateState, queryLatestTag,
   updateTagForToast, maybeFetchLatest, maybeFetchLatestForStop, claimNotify, hookIdle,
+  toastLine2, TRANSC_TRUNCATED_FILE, // v3.24.0：弹窗标注（⚠未计价/⚠账缺）行为测试用
   // v3.23.5：残留锁清理导出（KI-3 副产物；selftest 可直接单测"删旧留新、当前会话锁不动"）
   cleanupCoalesceLocks, coalescePath,
   SKILL_VERSION, UPDATE_CHECK_FILE, UPDATE_INTERVAL_MS, UPDATE_MAX_NOTIFY, UPDATE_NOTIFY_GAP_MS, HOOK_IDLE_MS,

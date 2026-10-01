@@ -4,6 +4,10 @@
 // 用途：新模型价格补录之后，把当天曾按「未收录」记成 ¥0 的历史数据，按现价 + 峰谷重算。
 //      没有这个工具时，补录只能让「之后的消耗」计上价，当天之前的部分永远是 0，账本失真。
 //
+// v3.24.0 行为变更（级联④）：**峰谷占比拿不到时不再改写已有金额** ——
+//   原账 > 0 → 保留原额（报告不列，避免把历史金额悄悄改写成空闲口径）；
+//   原账 = 0 → 按空闲价补记（本工具的核心用途：¥0 欠账补价，低估可接受且报告会标注）。
+//
 // 用法：
 //   node recalc-day.js                  → 重算今天（全部有价模型）
 //   node recalc-day.js 2026-09-10       → 重算指定日期
@@ -93,7 +97,10 @@ function backupDaily() {
 
 function main() {
   const argv = process.argv.slice(2);
-  const date = argv[0] || new Date().toISOString().slice(0, 10);
+  // v3.24.0：缺省日期用**本地**日期（原 `toISOString()` 是 UTC —— 北京 00:00~08:00 之间跑，
+  // 会把"今天"算成前一天：账本里没有那天的记录 → "账本中无 X 记录"，或重算了错误的一天）。
+  const _n = new Date();
+  const date = argv[0] || `${_n.getFullYear()}-${String(_n.getMonth() + 1).padStart(2, '0')}-${String(_n.getDate()).padStart(2, '0')}`;
   const onlyModel = argv[1] || '';
 
   const daily = loadJsonSafe(DAILY);
@@ -121,8 +128,8 @@ function main() {
     let peakRatio = null;
     if (hours) {
       peakRatio = hours.filter((iso) => isPeakBeijing(iso, pricing)).length / hours.length;
-    } else if (m.peak_multiplier > 1) {
-      peakRatio = null; // 无法判定 → 按空闲价（保守低估），并在报告中标注
+    } else if ((typeof m.peak_multiplier === 'number' && m.peak_multiplier > 1) || /(^|[\/\-_])deepseek/i.test(String(model || ''))) {
+      peakRatio = null; // 有峰谷价但拿不到轮次时间 → 占比未知
     } else {
       peakRatio = 0;
     }
@@ -130,7 +137,13 @@ function main() {
     const base = costOf(m, stat.in, stat.cached, stat.out, 1);
     let cost;
     if (peakRatio === null) {
-      cost = base; // 单时段不明 → 全部按空闲（保守）
+      // v3.24.0（级联④，补 v3.23.5 的另一半）：峰谷占比未知时**不得瞎改已有金额**。
+      // 原实现一律按空闲 ×1 重写 —— 对已有账（按 token 实际发生时刻记的，含高峰 ×2 部分）
+      // 是口径改写：任何一次 recalc 都会把历史金额悄悄改小。现在分两种情况：
+      //   原账 > 0 → 保留原额不动（只在报告标注"时段未知"）；
+      //   原账 = 0 → 是"当时未收录"的历史欠账，按空闲价补上（低估可接受，且这正是本工具存在的目的）。
+      if (Number(stat.cost || 0) > 0) { dayTotal += stat.cost; continue; }
+      cost = base; // ¥0 欠账 → 按空闲价补记
     } else {
       // v3.23.5：缺省值与主脚本 calcCost（token-tracker.js L2599）对齐——DeepSeek 系缺省 2，其余缺省 1。
       // 原先一律 `|| 1`：deepseek 条目若缺 peak_multiplier 字段，回溯重算会比主链路**整整少算一倍**，且不报错。

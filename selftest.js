@@ -12,13 +12,13 @@ const { spawnSync } = require('child_process');
 
 const SRC = __dirname;
 const NODE = process.execPath;
-let pass = 0, fail = 0, skipped = false;
+let pass = 0, fail = 0, skipped = false, skipCount = 0;
 
 function ok(name, cond, extra) {
   if (cond) { pass++; console.log(`  ✓ ${name}`); }
   else { fail++; console.error(`  ✗ ${name}${extra ? ' —— ' + extra : ''}`); }
 }
-function skip(name) { skipped = true; console.log(`  – ${name}（跳过：本环境禁止 node 子进程）`); }
+function skip(name) { skipCount++; skipped = true; console.log(`  – ${name}（跳过：本环境禁止 node 子进程）`); }
 
 // 环境能力探测：部分沙箱禁止 node→node 子进程（spawnSync 报 EBUSY）。只有需 spawn 的用例受影响。
 function canSpawn() {
@@ -920,8 +920,50 @@ else {
       `old1=${has(old1)} old2=${has(old2)} fresh=${has(fresh)} cur=${has(cur)}`);
     for (const p of [old1, old2, fresh, cur]) { try { fs.unlinkSync(p); } catch (e) {} }
   }
+
+  // ── T15：v3.24.0 修复守卫（R8/R9 审计 13 条级联链择要）─────────────────────────
+  // a：数据层 —— shipped 价库必须有 hy3（子代理默认模型，缺价 = 纯净环境金额静默 0）
+  const pricingJson = JSON.parse(fs.readFileSync(path.join(SRC, 'pricing.json'), 'utf8'));
+  ok('T15-a1 ★shipped pricing.json 必须收录 hy3（子代理默认模型）',
+    !!(pricingJson.models && pricingJson.models.hy3 && pricingJson.models.hy3.input_price > 0));
+  ok('T15-a2 ★缺价模型 toast 有「⚠未计价」标注（对齐 价⚠️/官价⚠️ 模式）',
+    /⚠未计价/.test(main));
+  ok('T15-a3 ★transcript 截断（行数<水位线）必须落旗标 + toast「⚠账缺」',
+    main.indexOf('TRANSC_TRUNCATED_FILE') > 0 && /⚠账缺/.test(main));
+  // b：错误处理 —— 瞬时读失败（EACCES/EBUSY）不得把账本改名 .corrupt
+  const lduStart = main.indexOf('function loadDailyUsage');
+  const lduCode = stripComments(main.slice(lduStart, main.indexOf('\nfunction ', lduStart + 10)));
+  ok('T15-b1 ★loadDailyUsage 区分解析错误与读取失败（后者不动原文件）',
+    /isParseError/.test(lduCode) && lduCode.indexOf('isParseError') < lduCode.indexOf('.corrupt-'));
+  ok('T15-b2 ★watcher 锁 TTL 过期分支必须先探活 owner（防抢活 watcher → 双弹窗）',
+    /alive0/.test(main));
+  // c：口径 —— 假日空年拒绝写入；backfill 子水位不回退；recalc 不改写已有金额
+  const holSrc = fs.readFileSync(path.join(SRC, 'refresh-holidays.js'), 'utf8');
+  ok('T15-c1 ★refresh-holidays 空年（0 天）拒绝写入（真实世界不可能 → 判定源异常）',
+    /判定为源异常/.test(holSrc) || /空年守卫/.test(holSrc));
+  const bfSrc = fs.readFileSync(path.join(SRC, 'backfill.js'), 'utf8').replace(/\r\n/g, '\n')
+    .split('\n').map((l) => l.replace(/(^|\s)\/\/.*$/, '$1')).join('\n');
+  ok('T15-c2 ★backfill 子水位合并 = 新旧取大（旧 no-op 表达式已删）',
+    /Math\.max\(n, o\.subs\[sf\] \|\| 0\)/.test(bfSrc) && !/v\.subs\[sf\]\) \|\| n \|\| 0/.test(bfSrc));
+  const rcSrc = fs.readFileSync(path.join(SRC, 'recalc-day.js'), 'utf8').replace(/\r\n/g, '\n')
+    .split('\n').map((l) => l.replace(/(^|\s)\/\/.*$/, '$1')).join('\n');
+  ok('T15-c3 ★recalc 峰谷占比未知时不得改写已有金额（原账>0 → 保留原额）',
+    /dayTotal \+= stat\.cost; continue;/.test(rcSrc));
+  // d：行为验证（直接调主脚本导出函数）
+  if (!tt2) skip('T15-d 行为验证（fmtCost/hitRate/dbStaleTag）');
+  else {
+    ok('T15-d1 ★fmtCost(NaN) → null（NaN 曾直出「¥NaN」上 toast）',
+      tt2.fmtCost(NaN) === null && tt2.fmtCost(-1) === null && tt2.fmtCost(1.234) === '¥1.23');
+    ok('T15-d2 ★hitRate 钳制到 [0,100]（cached>in 脏数据曾显示 ">100%"）',
+      tt2.hitRate(100, 150) === 100 && tt2.hitRate(100, 30) === 30 && tt2.hitRate(0, 30) === 0);
+    ok('T15-d3 ★dbStaleTag(null) → 「⚠价库」（价库没加载 = 最缺价场景，曾零告警）',
+      tt2.dbStaleTag(null) === '⚠价库');
+  }
 }
 
 fs.rmSync(tmp, { recursive: true, force: true });
-console.log(`\n结果：${pass} 过 / ${fail} 败${skipped ? '（有跳过项：本环境禁止 node 子进程）' : ''}`);
-process.exit(fail ? 1 : 0);
+// v3.24.0（审计⑤）：skip 数显式化 —— 「138 全绿」曾掩盖 26 条端到端用例全部 SKIP 的事实
+// （SPAWN_OK=false 的沙箱环境里绿 ≠ 真跑过）。结果行带 skip 数；**有跳过时退出码 = 2**
+// （0=全过、1=有失败、2=全过但有跳过），CI（SPAWN_OK=true、无跳过）不受影响。
+console.log(`\n结果：${pass} 过 / ${fail} 败 / ${skipCount} 跳过${skipped ? '（受限环境：需要 node 子进程的用例未真跑）' : ''}`);
+process.exit(fail ? 1 : (skipCount > 0 ? 2 : 0));

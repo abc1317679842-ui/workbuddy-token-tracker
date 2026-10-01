@@ -309,7 +309,11 @@ function main() {
       subs: Object.assign({}, o.subs, v.subs),
     };
     for (const [sf, n] of Object.entries(mergedWm[k].subs)) {
-      mergedWm[k].subs[sf] = Math.max(n, (v.subs && v.subs[sf]) || n || 0);
+      // v3.24.0（级联⑥）：修复恒等 no-op —— 原式 `Math.max(n, (v.subs && v.subs[sf]) || n || 0)`
+      // 在 sf 来自 v.subs（新值）时：n === v.subs[sf] → 恒等 max(n,n)=n，**旧值 o.subs[sf] 被完全忽略**
+      // → 回填范围小于已有水位时（旧账已读到 1000 行、本次回填只到 500），合并结果回退到 500
+      // → 下次正常记账从 500 行重读 → 子代理部分双计。正确语义就是新旧取大。
+      mergedWm[k].subs[sf] = Math.max(n, o.subs[sf] || 0);
     }
   }
 

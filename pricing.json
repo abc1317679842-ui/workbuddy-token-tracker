@@ -182,6 +182,16 @@
       "region": "CN",
       "lock": true,
       "tier_note": "控制台页 5折活动(至09-09)已过期但页面未恢复原价；按官方文档站现行原价 0.8/2.8/0.23 lock"
+    },
+    "hy3": {
+      "name": "hy3",
+      "peak_multiplier": 1,
+      "region": "CN",
+      "input_price": 1.0,
+      "output_price": 4.0,
+      "cached_price": 0.25,
+      "price_source": "腾讯混元官方（与本地价库 prices/index.json 一致；v3.24.0 补录——shipped 库缺 hy3 导致纯净环境子代理金额静默=0）",
+      "tier_note": "混元3（hy3）：WorkBuddy/CodeBuddy 子代理默认模型，缺价会让所有子代理轮次金额=0"
     }
   },
   "last_source": "multi-source",

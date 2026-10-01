@@ -88,6 +88,14 @@ async function fromB(y, tok) {
       adopt = a || b.offDays; // 单源可用 → 采用
       agree = null;
     }
+    // v3.24.0（级联⑦）：**空年守卫** —— 中国每年法定假日 ≥11 天（另有调休上班日），全年 0 天
+    // 只可能是"源返回了空内容"（页面改版 / API 空响应 / 字段改名），不是真实数据。
+    // 原先 `a || b.offDays` 里 [] 是 truthy、空数组照写 → 2027 年被抓成 0 天后，假日判定按
+    // "全年工作日"处理：假日按 2× 计费（高估）+ 调休周六按周末低峰（少计），**双向静默**。
+    if (!adopt || adopt.length === 0) {
+      console.log(`  ⚠ ${y}: 解析结果为 0 天（真实世界不可能，判定为源异常）→ 保留旧数据`);
+      continue;
+    }
     yearsMap[String(y)] = adopt;
     cross[String(y)] = {
       agree,
