@@ -1,5 +1,11 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.23.0 (2026-10-01)
+// token-usage-tracker v3.23.1 (2026-10-01)
+// v3.23.1：**README「真实输出示例」排版修正：代码块 → 真表格渲染（纯文档排版修正，代码零改动）** ——
+//   用户反馈示例表格在 GitHub 上「排版根本不整齐、错位的」。排查：仓库与本地逐字节一致（上传无损）；
+//   根因是 ①②③ 段把 --report 的 markdown 表格包进了 ``` 代码块 —— GitHub 不渲染代码块里的表格语法，
+//   而脚本原始输出不做列宽补齐 → 等宽显示整表错位。修法（用户要求「能成表格的成表格」）：
+//   ①②③/⑥ 改真 Markdown 表格（GitHub 自动对齐，===== 标题移进段标题）、④ 外推改无序列表、⑤ 单行路径保留代码块。
+//   全仓 8 个 md 扫描「代码块内嵌表格」，除 README（已修）外零命中。数字仍是 2026-10-01 真实输出未加工。
 // v3.23.0：**SKILL.md 瘦身 76.2 KB → 42.4 KB，排障/边缘内容改为按需加载（纯文档重构，代码逻辑零改动）** ——
 //   起因（用户原话）：「这个技能字符占据了多少？算是很超标吗？需要精简吗？哪些可以挪出去、
 //   哪些可以挪到其他地方启用？」——实测：SKILL.md 77,999B（76.2 KB）/ ≈18,401 token / 406 行，
@@ -4001,7 +4007,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.23.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.23.1'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
