@@ -1,5 +1,13 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.23.1 (2026-10-01)
+// token-usage-tracker v3.23.2 (2026-10-01)
+// v3.23.2：**首个 CI（GitHub Actions selftest）+ KI-2 漏弹上限 30min → 5min** ——
+//   ① `.github/workflows/selftest.yml`：push 到 master/main 时在 windows-latest 上裸跑 `node selftest.js`
+//      （零依赖、WB_NO_NET=1 禁真联网；selftest 内部自设 TOKEN_TRACKER_NO_TOAST/WB_ROOT 隔离）。
+//      最大增量：T12-j（--hook 端到端注入断言）在本机沙箱因 EBUSY 每次 SKIP、从未真跑，CI 上首次真验证。
+//   ② KI-2：`WATCH_LOCK_TTL` 30min → 5min（watcher 崩溃后死锁的漏弹上限砍 6 倍）；
+//      不做「锁里写进程启动时间对比」——node 无跨进程查启动时间的纯 API，Windows 只能 PowerShell/wmic，沙箱禁。
+//      KNOWN-ISSUES KI-2 条目改标「已缓解」。
+//   评审未采纳（记录在案）：grep 断言渐进换导出单测（顺手做，不开版本）；拆巨石单文件（不拆）。
 // v3.23.1：**README「真实输出示例」排版修正：代码块 → 真表格渲染（纯文档排版修正，代码零改动）** ——
 //   用户反馈示例表格在 GitHub 上「排版根本不整齐、错位的」。排查：仓库与本地逐字节一致（上传无损）；
 //   根因是 ①②③ 段把 --report 的 markdown 表格包进了 ``` 代码块 —— GitHub 不渲染代码块里的表格语法，
@@ -4007,7 +4015,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.23.1'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.23.2'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -4257,7 +4265,12 @@ function main() {
     // 仅 newTail/newAgent（真有新活动）才刷新；并给 busy 设独立绝对上限（默认 2min，测试可 env 缩短），
     // 纯 busy 无后续达到上限即兜底弹，绝不无限挂起。
     const WATCH_BUSY_MAX_MS = Number(process.env.WATCH_BUSY_MAX_MS) || (2 * 60 * 1000);
-    const WATCH_LOCK_TTL = 30 * 60 * 1000; // 锁失效时间
+    // WATCH_LOCK_TTL 5min（v3.23.2 从 30min 收紧）：这是「owner 崩溃后死锁」的漏弹上限。
+    // 30min 的代价大于收益——owner 崩溃后 30min 内所有 Stop 都不弹（KI-2）；
+    // 收紧到 5min 后误接管风险仅限「新 watcher 比旧 owner 晚启动且旧 owner 仍在跑」的场景，
+    // 而接管条件本来就保守（ESRCH 判死才动 + 原子 wx 建锁），误接管最坏结果是多弹一次，比漏弹 25 分钟好。
+    // 不做「锁里写进程启动时间对比」：node 无跨进程查启动时间的纯 API，Windows 上只能 PowerShell/wmic——沙箱禁。
+    const WATCH_LOCK_TTL = 5 * 60 * 1000; // 锁失效时间（v3.23.2: 30min → 5min）
     // 启动即拿锁：R3（2026-08-23）stale lock 接管 + R4（2026-08-23）原子 acquire 消除 TOCTOU。
     // 旧逻辑只查 at<TTL 从不验证 pid 存活：残留锁 owner 已死 → 新 watcher 误判锁有效 → watchStarts=0
     // 漏弹（B 类 Missing，repro_r3_lock.js 已确认）。且仅 readFileSync→writeFileSync 非原子 → 并发
