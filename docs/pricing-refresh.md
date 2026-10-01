@@ -16,6 +16,13 @@
 - **人工权威核验（兜底）**：**每日首次对话时**，若发现自动刷新覆盖的国内源价格与厂商官方定价页有出入（尤其峰谷模型如 DeepSeek 的基准价口径），按数据源清单核对官方定价页后修正 `pricing.json`。自动刷新的 `last_refresh_note` 会在峰谷模型价差 >60% 时提示人工核验。
 - **价格源清单（已全部接入自动刷新）**：**llmabacus.com/api/prices**（国内人民币主源，每日自动核价，szp2005/llm-prices-cn 的上游，含 vendors country/currency）、**llm-prices-cn**（国内人民币备份源，每日镜像同步）、OpenRouter API（USD，接近实时）、LiteLLM `model_prices_and_context_window.json`（USD，社区 PR 1-3 天滞后）、Portkey `https://configs.portkey.ai/pricing/<provider>.json`（USD，美分/token，SaaS 即时）、厂商官方定价页（权威，兜底人工核验）。国内网页参考（不可程序化）：51token.com / jingxialai.com / tokenbijia.com。
 
+## Python 抓取流水线（v3.23.4 起）
+
+- **`requests` 是可选依赖，不是前置条件**：`fetch-cn-prices.py` / `parse_tokenhub.py` 都写成 `try: import requests / except ImportError: requests = None`，缺失时自动回退脚本内置的 urllib 实现（`http_get()` / `fetch()`）。文档里的 `pip install requests` 已删除——不再需要。
+  - 背景：`resolvePython`（v2.82 起）两轮探测，第一轮按 `import requests` 命中带依赖的 venv（`binaries/python/envs/default`），全灭才降级裸解释器（通常无 requests）。**以前**降级后脚本一进文件就 `ModuleNotFoundError`，表现为弹窗 `⚠价库缺失`（用户根本猜不到是缺 pip 包）。
+- **urllib 回退必须自己解压**：urllib 不会自动解压 `Content-Encoding`，且**腾讯云文档页实测无视 `Accept-Encoding: identity`、永远回 gzip** → 不解压就拿到二进制垃圾 → 解析出「0 个模型」且**毫无报错**。两个脚本都有 `decode_body()` 处理 gzip / deflate / br。
+- **TLS 严格校验（默认）**：抓的是直接决定计费金额的价格，默认 `ssl.create_default_context()`。确需降级（MITM 企业代理 / 自签证书）时设环境变量 `CN_PRICES_INSECURE_TLS=1`，脚本会打一行 `[WARN]`（不静默）。**不要改代码把校验关掉**。
+
 ## 时段折扣数据（2026-08-05 搜索核验）
 
 目前仅 **DeepSeek 原厂系**有峰谷定价（V4 起推出，工作日北京时间 9-12/14-18 高峰，所有计费项 ×2，含缓存价；原因=算力挤兑削峰填谷；2025 年的「夜间错峰优惠」已被高峰溢价模式取代）。智谱 GLM / MiniMax / Kimi / 混元均为统一定价无峰谷；小米 MiMo 是 2026-05 永久降价 99%（非时段折扣）。
