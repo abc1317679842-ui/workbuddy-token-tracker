@@ -45,6 +45,9 @@ function detectWorkBuddyRoot() {
 }
 const WB = process.env.WB_ROOT || detectWorkBuddyRoot();
 const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
+// v3.31.0（P1-14）：只用于**探测**别家是否持锁（本脚本不持锁，见 savePricing 注释）。
+// 锁名本身与 token-tracker.js / refresh-prices.js 共用，**绝不能改**（改了就失去互斥意义）。
+const PRICING_LOCK_FILE = path.join(WB, 'skills', 'token-usage-tracker', '.pricing.lock');
 const OFFICIAL_URL = process.env.DS_OFFICIAL_URL || 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing'; // 可覆盖（代理/镜像/测试）
 const TIMEOUT_MS = 15000;
 const RETRIES = Number(process.env.DS_RETRIES || 2);      // 首次 + 重试次数
@@ -56,16 +59,41 @@ function loadPricing() {
   catch (e) { return null; }
 }
 
+// v3.31.0（P1-14）：写 pricing.json 前探测 `.pricing.lock` 是否正被其它**存活**进程持有。
+// 只告警、不等待、不阻断：本脚本正常由 refresh-prices.js spawnSync 串行调用（那时锁是空闲的），
+// 真被持有说明 token-tracker.js 的 addModelPrice / 手动跑的 refresh-prices 正在写，
+// 而本脚本无锁写入存在 lost update 风险——必须留痕而不是静默。
+// 任何探测失败一律静默返回：告警绝不能影响主流程（stdout 还得保持纯 JSON 给调用方 parse）。
+function warnIfPricingLocked() {
+  try {
+    if (!fs.existsSync(PRICING_LOCK_FILE)) return;
+    let o = null;
+    try { o = JSON.parse(fs.readFileSync(PRICING_LOCK_FILE, 'utf-8')); } catch (e) { return; }
+    const pid = o && Number(o.pid);
+    if (!pid || pid <= 0 || pid === process.pid) return;
+    let alive = true;
+    try { process.kill(pid, 0); } catch (e) { if (e.code === 'ESRCH') alive = false; }
+    if (!alive) return;
+    process.stderr.write(`[deepseek-official] ⚠ .pricing.lock 正被进程 ${pid} 持有：本脚本不持锁写 pricing.json，存在并发覆盖风险（请避免与其它价格脚本并行运行）\n`);
+  } catch (e) { /* 探测失败静默 */ }
+}
+
 function savePricing(p) {
   // v3.19.0（P8）：原子写（tmp + rename）——原先裸 writeFileSync，中断/并发会留半截 JSON
   // （pricing.json 是重建链路的基础，半截文件会让下次启动走 repair 分支）
   // v3.23.5 已知边界（审计 #9，记录不修）：本函数**不持 `.pricing.lock`**，而 refresh-prices.js 的
-  // save() 持锁，两者还共用同一个 tmp 名 `pricing.json.tmp`。正常链路是 refresh-prices.js 用
-  // spawnSync **串行**调用本脚本，不会撞；只有手动并行跑两个脚本才可能互相覆盖 tmp。
-  // 不修的理由：跨进程锁目前在 token-tracker.js / refresh-prices.js 各有一份同构实现（已是两份复制），
-  // 再往本文件复制第三份会加剧「同一原则多处漂移」——真正该做的是抽共享模块（已记入 KNOWN-ISSUES）。
+  // save() 持锁。不修的理由：跨进程锁目前在 token-tracker.js / refresh-prices.js 各有一份同构实现
+  // （已是两份复制），再往本文件复制第三份会加剧「同一原则多处漂移」——真正该做的是抽共享模块
+  // （已记入 KNOWN-ISSUES）。
+  // v3.31.0（P1-14）：**tmp 名不再与 refresh-prices.js 共用**。旧实现两边都写 `pricing.json.tmp`，
+  // 手动并行跑会互相覆盖 tmp：A 写完 tmp 还没 rename，B 把自己的内容写进同一个 tmp 再 rename，
+  // A 随后 rename 同一路径 → 一方整份覆写另一方。现改为本脚本专用的 `.pricing.json.ds.tmp`。
+  // 【兼容性】tmp 是**各自私有**的中间文件（写完立即 rename 走），改名不影响任何跨版本协同：
+  // 新版 deepseek-official + 旧版 refresh-prices（仍用 .pricing.json.tmp）互不干扰，反而正是修的目标；
+  // 锁名 `.pricing.lock` 一字未动（它与 token-tracker.js 共用，改了会破坏互斥）。
   fs.mkdirSync(path.dirname(PRICING), { recursive: true });
-  const tmp = PRICING + '.tmp';
+  warnIfPricingLocked();
+  const tmp = PRICING + '.ds.tmp';
   try {
     fs.writeFileSync(tmp, JSON.stringify(p, null, 2) + '\n');
     fs.renameSync(tmp, PRICING);
@@ -132,12 +160,29 @@ function parseOfficial(html) {
   if (versions.length !== n) versions = [];
   out.versions = versions;
 
+  // v3.31.0（P0-4）：列对齐校验。旧实现 `vals.length >= n ? vals.slice(0, n) : null`
+  // **只校验"数字个数 ≥ 模型列数"，不校验列对齐**：官方页在价格列**之前**插入/重排一列 →
+  // 行内数字个数 > n → 取前 n 个即整体错位，而且**不报错**。作者在 :115-118 注释里记载的正是
+  // 这次静默事故（漏收 deepseek-v4.1-flash → v4-pro 拿到 v4.1 的价、vision-exp 拿到 v4-pro 的价）。
+  // 现改为：数字个数必须**恰好等于**模型列数 n。
+  //   · === n  → 原样返回（与旧行为逐字节一致，正常路径零变化）；
+  //   · >  n   → 判「列错位嫌疑」并返回 null（旧实现在这里静默 slice，是 P0-4 的全部危害）；
+  //   · <  n   → 返回 null（旧行为一致）。
+  // 返回 null 的后果链：parseOfficial 抛「价格解析不完整」→ 本脚本非零退出、**不写 pricing.json**
+  // → refresh-prices.js 回落聚合源并写 deepseek_refresh_error（用户可见）。
+  // 取舍：**宁可本次不更新，也不能把错位价当"deepseek官方"权威价落盘**——落盘后它带
+  // price_source='deepseek官方'，没人会怀疑，还会被 recalc-day.js 拿去重算整段历史账本。
+  const grabMismatch = []; // 列错位证据（只用于错误信息，便于人工一眼看出是插入列还是重排）
   const grab = (tr, baseIdx) => {
     const c = cellText(tr);
     // 行内形如：| 高峰时段 | 0.10元 | 0.30元 | 0.10元 |
     const nums = c.map((s) => { const m = s.match(/^(\d+(?:\.\d+)?)/); return m ? Number(m[1]) : NaN; });
     const vals = nums.filter((v) => !isNaN(v));
-    return vals.length >= n ? vals.slice(0, n) : null;
+    if (vals.length > n) {
+      grabMismatch.push(`${String(c[0] || '?').slice(0, 24)}: 行内数字 ${vals.length} 个 > 模型列 ${n} 个（旧实现会静默取前 ${n} 个 → 整体错位）`);
+      return null;
+    }
+    return vals.length === n ? vals : null;
   };
 
   const prices = { cached: { off: null, peak: null }, uncached: { off: null, peak: null }, output: { off: null, peak: null } };
@@ -153,7 +198,9 @@ function parseOfficial(html) {
   }
 
   if (!prices.cached.off || !prices.cached.peak || !prices.uncached.off || !prices.uncached.peak || !prices.output.off || !prices.output.peak) {
-    throw new Error(`官方页价格解析不完整: ${JSON.stringify(prices)}`);
+    // v3.31.0（P0-4）：把列错位证据带进错误信息——否则人工只看到"解析不完整"，
+    // 猜不出是官方页改版插列，还是少了一行。
+    throw new Error(`官方页价格解析不完整: ${JSON.stringify(prices)}${grabMismatch.length ? `；列错位嫌疑（已按 P0-4 拒绝采信）: ${grabMismatch.join('；')}` : ''}`);
   }
   out.prices = prices;
   return out;

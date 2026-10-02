@@ -37,7 +37,15 @@ local-config.json
 .env
 
 # 本地诊断/审计文档（含个人路径，禁止入库）
-docs/
+# v3.31.0：原来是 `docs/` 整目录忽略，但仓库里确实有 3 个**公开** docs（docs/balance.md /
+#   docs/pricing-refresh.md / docs/windows-notification.md，推送白名单内），整目录忽略会让本地
+#   git 永远看不出这 3 个文件与上游的差异。现改为「忽略整个目录内容 + 显式放行这 3 个公开文件」，
+#   其余私有审计文档（含个人路径）仍然被屏蔽。
+#   注意：必须写 `docs/*` 而不是 `docs/` —— 父目录本身被忽略时，下面的 `!` 例外**不生效**。
+docs/*
+!docs/balance.md
+!docs/pricing-refresh.md
+!docs/windows-notification.md
 # 模型已查列表（本地运行时，不入库）
 .lookedup-models.json
 

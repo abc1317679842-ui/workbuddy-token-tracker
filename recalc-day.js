@@ -51,19 +51,55 @@ function isPeakBeijing(iso, pricing) {
   return peakRules.isPeakAt(new Date(iso).getTime(), pricing, HOLIDAYS);
 }
 
+// toast 行1 形如「<模型名>[ 时段标注][｜⚠无公开价][（子代理 X）]」——模型名永远在最前
+//   （主脚本 toastLine1：head=模型显示名，其后依次拼空格时段标注 / ｜标签 / 全角括号子代理段）。
+//   取首段得到模型名；后面那些是**标注**，不是模型名的一部分。
+function toastHeadModel(text) {
+  return String(text || '').split('\n')[0].split(/[\s（｜]/)[0].trim();
+}
+
+// 两个名字是否同一个模型（大小写/首尾空格/连续空格差异视为同一个；口径同主脚本）
+function sameModelName(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  try { return tt.normalizeModelName(a) === tt.normalizeModelName(b); } catch (e) { return false; }
+}
+
+// v3.31.0（审计 P1-15 真缺陷侧）：**一行 toast 只能归属一个模型** —— 整名优先，前缀兜底时取最长者。
+//   动机：toast 日志里模型显示名互为前缀（`hy4-preview` ↔ `hy4-preview-xxx`）时，旧实现
+//   `toastText.startsWith(model)` 让**两个模型都拿到同一批轮次** → 高峰占比被对方的轮次拉偏 →
+//   该模型的峰谷倍率 `1 + (peakMult-1)×占比` 整体偏移，回算金额偏离当日主链路且零报错。
+//   （注意串的是**峰谷占比**，不是单价：查价在 L132 早已走主脚本 findModel，两键各自精确命中。）
+function roundOwner(head, allModels) {
+  if (!head || !allModels || !allModels.length) return null;
+  for (const m of allModels) if (sameModelName(head, m)) return m; // ① 整名（各自归各家）
+  let best = null;                                                 // ② 前缀兜底取最长
+  for (const m of allModels) {
+    if (!head.startsWith(m)) continue;
+    if (!best || m.length > best.length) best = m;
+  }
+  return best;
+}
+
 // 读 toast 日志中某天某模型的轮次（只取「已结算」的记账行，避免与 watcher 补弹重复计数）
-function roundHoursOf(date, model) {
+function roundHoursOf(date, model, allModels) {
   let raw = '';
   try { raw = fs.readFileSync(TOAST_LOG, 'utf-8'); } catch (e) { return null; }
   const rows = [];
+  let contested = 0;   // 本模型按旧前缀口径会多算的轮次数（已被本修复排除）
+  let ownerName = '';  // 抢走这些轮次的模型名
   for (const line of raw.split('\n')) {
     if (!line.includes(date)) continue;
     let d;
     try { d = JSON.parse(line); } catch (e) { continue; }
-    const tt = String(d.toastText || '');
-    if (!tt.startsWith(model)) continue;
     if (!d.ts || !d.ts.startsWith(date)) continue;
-    rows.push(d.ts);
+    const head = toastHeadModel(d.toastText);
+    const owner = roundOwner(head, allModels);
+    if (owner === model) rows.push(d.ts);
+    else if (owner && !sameModelName(owner, model) && String(head).startsWith(model)) { contested++; ownerName = owner; }
+  }
+  if (contested) {
+    process.stderr.write(`[recalc-day] ⚠ ${model}: toast 日志有 ${contested} 条轮次同属更长的模型名 ${ownerName}（互为前缀），已按最长名归属、不再并入本模型的高峰占比（旧实现会两边都算 → 回算金额偏离当日）\n`);
   }
   return rows.length ? rows : null;
 }
@@ -115,7 +151,8 @@ function main() {
   // v3.29.0（S-2 补漏）：锁外预热 roundHoursOf —— 它是本工具里唯一的重 I/O（每次调用都整份读 toast 日志）。
   //   锁内重算时优先查缓存，只对缓存里没有的模型（并发新出现的）才现场调用，账本锁持有时间基本不增加。
   const hoursCache = new Map();
-  for (const model of Object.keys(day.models || {})) hoursCache.set(model, roundHoursOf(date, model));
+  const allModels = Object.keys(day.models || {}); // v3.31.0（P1-15）：轮次归属要按「当天全部模型」仲裁归属
+  for (const model of allModels) hoursCache.set(model, roundHoursOf(date, model, allModels));
 
   // v3.29.0（S-2 补漏）：把「重算一天」抽成函数，逻辑逐字搬自原 L115-175（findModel/峰谷/no_price/costOf 一律不动）。
   //   基准改为**传入的 dayObj**：锁内传入的是 cur[date] 现值（不再是锁外旧快照），
@@ -134,7 +171,9 @@ function main() {
       if (!m || typeof m.input_price !== 'number') { dayTotal += stat.cost || 0; continue; }
 
       // v3.29.0（S-2 补漏）：优先用锁外预热缓存；并发新出现的模型（不在缓存里）才现场读 toast。
-      const hours = hoursCache.has(model) ? hoursCache.get(model) : roundHoursOf(date, model);
+      // v3.31.0（P1-15）：并发新出现的模型不在 allModels 里 → 补进候选表，否则它自己的轮次会被仲裁给别的模型
+      const cands = allModels.includes(model) ? allModels : allModels.concat([model]);
+      const hours = hoursCache.has(model) ? hoursCache.get(model) : roundHoursOf(date, model, cands);
       let peakRatio = null;
       if (hours) {
         peakRatio = hours.filter((iso) => isPeakBeijing(iso, pricing)).length / hours.length;

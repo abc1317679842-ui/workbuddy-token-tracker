@@ -21,8 +21,37 @@
 //      node refresh-holidays.js 2027        # 指定年份
 const fs = require('fs');
 const path = require('path');
-const DIR = __dirname;
-const OUT = path.join(DIR, 'holidays.json');
+const os = require('os');
+
+// v3.31.0（审计 P1-16）：写盘路径必须与**读取方同一解析**，消除「潜在分裂」。
+//   读取方（token-tracker.js HOLIDAYS_FILE / recalc-day.js:41 / backfill.js:49）一律用
+//   `<WB>/skills/token-usage-tracker/holidays.json`（WB = WB_ROOT > 数据根探测）。
+//   本文件原先写 `__dirname/holidays.json`：本机安装目录恰好就是那个路径 → 两者同文件、不受影响；
+//   但安装目录一旦 ≠ 该路径（手动拷贝/自定义技能根），写入者与读取者就分叉 → 两边峰谷各用一张假日表。
+//   这里改为按读取方口径解析；解析不到目录时才退回 __dirname（兜底，保证总能落盘）。
+function detectWorkBuddyRoot() { // 与 token-tracker.js / recalc-day.js 同序
+  const h = os.homedir();
+  const cands = [path.join(h, '.workbuddy-ai'), path.join(h, '.workbuddy')];
+  for (const c of cands) {
+    try {
+      if (fs.existsSync(path.join(c, 'traces')) || fs.existsSync(path.join(c, 'settings.json'))) return c;
+    } catch (e) { /* 单个候选探测失败不影响下一个 */ }
+  }
+  return path.join(h, '.workbuddy');
+}
+function resolveOutPath() {
+  const WB = process.env.WB_ROOT || detectWorkBuddyRoot();
+  const skillsRoot = path.join(WB, 'skills', 'token-usage-tracker');
+  try {
+    if (fs.existsSync(skillsRoot)) return path.join(skillsRoot, 'holidays.json');
+  } catch (e) { /* stat 失败 → 走 __dirname 兜底 */ }
+  const fallback = path.join(__dirname, 'holidays.json');
+  if (fallback !== path.join(skillsRoot, 'holidays.json')) {
+    process.stderr.write(`[refresh-holidays] ⚠ 未按读取方口径找到技能目录 ${skillsRoot} → 退回 ${fallback}（若读取方在此之外, 两处假日表会分叉, 峰谷判定双边不一致）\n`);
+  }
+  return fallback;
+}
+const OUT = resolveOutPath(); // v3.31.0 之前：path.join(__dirname, 'holidays.json')
 const SRC_A = 'NateScarlet/holiday-cn';
 const SRC_B = 'HankAviator/china-holiday-calendar';
 const TIMEOUT_MS = 15000; // v3.19.0（P5）：单请求超时（与 deepseek-official 的 15s 同口径）
@@ -145,15 +174,37 @@ if (require.main === module) (async () => {
     }
   }
 
-  if (ok === 0 && Object.keys(old.years || {}).length) {
-    console.log('  全年份均失败 → 不覆盖现有 holidays.json');
+  const missingYears = years.filter((y) => !(yearsMap[String(y)] || []).length);
+  // v3.31.0（审计 P0-6 核心红线）：**一次都没刷到 → 绝不写盘**（原守卫仅在「已有有效旧数据」时才跳过写盘；
+  //   首跑/旧文件损坏时 old.years 为空 → 条件不成立 → 照样把 `{years:{}}` 空骨架写进 holidays.json。
+  //   空骨架的后果是**全年静默双向错**：真假日不判低峰（按高峰 ×2 多算）+ 调休上班日按周末低峰（少算），
+  //   而文件「存在且语法合法」，下游完全看不出假日表不可信）。
+  if (ok === 0) {
+    const hadOld = Object.keys(old.years || {}).length > 0;
+    if (!hadOld) {
+      process.stderr.write(`[refresh-holidays] ✗ 全部年份均刷新失败 → **不写盘**（首跑失败写空骨架会让全年法定假日都不判假，峰谷全年双向错且无提示）\n`);
+    } else {
+      // 已有数据：写入毫无收益（内容=旧内容），且可能把有效数据换成空 → 同样不写
+      process.stderr.write(`[refresh-holidays] ✗ 全部年份均刷新失败 → 现有 holidays.json 保持不动\n`);
+    }
+    if (fails.length) process.stderr.write(`[refresh-holidays]   失败明细: ${fails.join(' | ')}\n`);
     process.exit(2);
+  }
+  // v3.31.0（P0-6 可见性）：目标年份里仍有缺数据的年 → **逐一告警**（原实现对「某一年没抓到」零提示；
+  //   该年会退化为「全年非假日」：真假日按高峰多算、调休上班日按周末少算）。
+  if (missingYears.length) {
+    process.stderr.write(`[refresh-holidays] ⚠ 以下年份没有可用假日数据: ${missingYears.join(', ')}\n`);
+    process.stderr.write(`[refresh-holidays]   这些年份全部日期按「非假日」判定 ⟶ 真假日按高峰 ×2（多算）、调休上班日按周末低峰（少算）；请修复网络/数据源后重跑本脚本\n`);
   }
   // v3.19.0（P5）：原子写（tmp + rename），与其它写盘路径同口径（原先裸 writeFileSync，中断留半截 JSON）
   const payload = JSON.stringify({
     updated_at: new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 19).replace('T', ' '),
     note: '只列「放假」日期；峰谷判定用它排除法定假日。双源交叉验证，不一致时取交集。',
     sources: { primary: SRC_A, verify: SRC_B },
+    // v3.31.0（P0-6）：缺数据的年份标记——文件自身必须能说明「哪些年不可信」，
+    //   供人工排查与后续下游（弹窗/报表）消费；`_stale:true` 时本表不代表真实法定假日全集。
+    _stale: missingYears.length > 0,
+    stale_years: missingYears,
     years: yearsMap,
     cross_check: cross,
     // v3.29.0（C-5）：两源差异清单（按年；两源一致时为空数组）。字段结构见文件头注释。

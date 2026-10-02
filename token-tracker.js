@@ -1,5 +1,27 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.30.0 (2026-10-02)
+// token-usage-tracker v3.31.0 (2026-10-03)
+// v3.31.0：**第二轮审计（2026-10-02 深夜）静默错价/口径分裂集中修复** ——
+//   ① 峰谷判定时刻两出口分裂（最严重）：账本 recordUsage 对 byModel 每个模型都用**同一个**
+//      批级 peakTs 判峰谷，弹窗却按各模型**自己的** lastTs 判 → 跨 12:00/18:00 边界的混合轮
+//      （含 DeepSeek ×2）"同一批 token 弹窗 ¥2.00 / 账本 ¥4.00"且零提示 → 弹窗也改用批级 ts
+//      （各模型 lastTs 取 max；单模型轮 = 原值，零行为变化）。
+//   ② 未收录模型三出口口径：账本留痕 unpriced（价库没收录 vs 厂商没公布价是两回事、处置不同），
+//      单日表/summary/区间/CSV 四个出口统一显示「未收录」+ 尾注告警，不再读成"免费"；
+//      summary 同时补齐 no_price 告警（此前是三出口里唯一既无告警又打 ¥0.00 的）。
+//   ③ isLocalModel 短名误伤：双向子串保留（登记全名/调用短名互变各有真实场景），但 **≥5 字符**
+//      才参与——否则本地挂 `qwen` 这类短名时，`qwen-max` 等云端模型会被判免费且零标记。
+//   ④ 价格管线 sanity（refresh-prices.js）：主价落盘前数量级/骤变体检（超界或 ≥3× → 保留旧值 +
+//      stderr + `_price_audit.warnings`，形状 `<key>: 说明` 可被 ⚠价核验 点名命中）；写盘前
+//      `.pricing.json.bak` 单份备份；deepseek-official grab() 列对齐校验（数字数 > 模型列数 →
+//      判错位嫌疑返 null，不再静默 slice——官方页插列即整体错位的事故作者注释里就记过一次）；
+//      tmp 名两脚本分离 + deepseek-official 写前锁探测。
+//   ⑤ recalc-day 轮次归属整名优先（互为前缀的模型名不再互相吞轮次）；refresh-holidays 首跑
+//      全失败**不写盘**（空骨架会让全年峰谷双向错）+ `_stale` 年份标记。
+//   ⑥ 缓存价未知（cached_price 缺失按 0 计，缓存占比 ~97% 时金额低估 45%~86%）在账本留痕
+//      cached_price_unknown + 弹窗行1 挂「⚠缓存价未知」，与「无公开价」分开、不整段藏金额。
+//   不修项：P1-10（transcript 重写 size ≥ 旧值的重复弹窗残余窗口——无副作用修法不存在，
+//   记 KNOWN-ISSUES）；P0-1（审计机制描述有误，实为字典序比较且账本键全为本工具写入的 ISO）。
+//   完整条目见 CHANGELOG.md。
 // v3.30.0：**弹窗行2 三处真因修正（用户 2026-10-02 弹窗截图反馈）** ——
 //   ① 价核验标签**永久误报**：A-8 把 `last_refresh_note`（刷新操作流水账，历史 ⚠️ 条目永久驻留）
 //      当触发源之一 → 每一条弹窗都挂「⚠价核验」，用户："明明有价格，为什么又在报价核验？"
@@ -2781,7 +2803,16 @@ function isLocalModel(name) {
   const n = String(name || '').toLowerCase();
   if (n.includes('custom-local') || n.includes('localhost') || n.includes('127.0.0.1')) return true;
   for (const lm of localModelNames()) {
-    if (n === lm || n.includes(lm) || lm.includes(n)) return true;
+    // v3.31.0（缺陷C）：双向子串**保留**——两侧各有真实场景（models.json 登记全名
+    //   `lmstudio-community/qwen3.5-9b` ↔ 实际调用名 `qwen3.5-9b`，正反方向都可能需要）。
+    //   真正的病灶是**短名**：lm 很短（如 `qwen`/`glm`）时，任何含这个短串的**云端**模型
+    //   （`qwen-max` / `glm-5.3-flash`）都会被判成本地免费 → calcCost 返回 null → 三个出口全
+    //   ¥0.00 且连 unpriced 标记都不打（isLocalModel 先拦截）→ 云端模型被静默当成免费。
+    //   修法：**精确匹配永远放行；双向子串要求 lm ≥5 字符**。取 5 的理由：最常见的危险短名
+    //   （`qwen`/`glm`/`gpt`）都 ≤4 被挡住；真实本地登记名（LM Studio 场景）几乎都 ≥5
+    //   （`glm-4`/`qwen3.5`），不会被误挡。本机 models.json 无本地模型 → 改动零行为变化。
+    if (n === lm) return true;
+    if (lm.length >= 5 && (n.includes(lm) || lm.includes(n))) return true;
   }
   return false;
 }
@@ -3062,6 +3093,33 @@ function addModelUsage(day, model, stat, pricing, tsMs) {
     // 价库已补上真实单价 → 清标记，下轮起金额正常计入（recalc 回填后由 recalc-day 清，见 recalc 侧）
     delete m.no_price; delete m.no_price_note;
   }
+  // v3.31.0（P1-7）：**缓存价未知**是与「无公开价」不同的另一种低估——模型有真实单价、金额也算得出来，
+  //   只是厂商没公布缓存命中价 → calcCost(:2854) 对 cached_price=null 取 0 → 缓存 token 被"免单"。
+  //   本机缓存命中 ~97%（金额 ≈ 缓存价×缓存量），这一项缺失实测让总额偏差 45%~86%。
+  //   处理口径与 no_price 完全一致：**不改写金额**（不凭空造缓存价），只在账本条目上留痕，
+  //   让 --report / --report <区间> / CSV / toast 能把"合计偏低"讲到用户眼前。
+  if (pricing && pricing.models && pricing.models[name]
+      && pricing.models[name].cached_price_unknown === true) {
+    m.cached_price_unknown = true;
+    m.cached_price_unknown_note = '厂商未公布缓存命中价，缓存 token 按 0 元计 → 金额偏低';
+  } else if (m.cached_price_unknown) {
+    // 人工补上 cached_price 后自动失效（recalc-day.js 回算同理）
+    delete m.cached_price_unknown; delete m.cached_price_unknown_note;
+  }
+  // v3.31.0（缺陷B）：**未收录**模型（pricing.json 里压根没有这个模型 → calcCost 返回 null）单独留痕 unpriced。
+  //   与 no_price（厂商未公布单价）**刻意分成两个标记**——成因不同、用户处置也不同：
+  //     no_price = 厂商没公布单价，等公布后跑 recalc；unpriced = 我们自己没收录，得先补录单价。
+  //   此前只有 no_price 有标记，`cost == null`（未收录）走到这里**什么标记都不打** →
+  //   账本表 / summary / CSV 三个出口一律输出 ¥0.00 且无告警，"算不出"被读成"免费"，
+  //   而同一轮的 toast 侧早已显示「未收录｜⚠未计价」→ 同一份数据两个出口口径不一致。
+  //   **本地模型必须排除**：它 cost 恒为 null 是既定正确行为（本地不计费），打"未收录"就是误报。
+  if (cost == null && !isLocalModel(name) && !m.no_price) {
+    m.unpriced = true;
+    m.unpriced_note = '价库未收录该模型（无单价可折算）'; // 供 --report 表格与后续排查
+  } else if (m.unpriced) {
+    // 补录单价后（刷新价库 / recalc 回填）→ 清标记，下轮起金额正常计入
+    delete m.unpriced; delete m.unpriced_note;
+  }
   day.total = dayTotalOf(day.models);
 }
 // 统一记账入口：byModel（transcript 按模型分桶）优先；否则按 stat.model 单桶。
@@ -3316,7 +3374,11 @@ function formatUsageRow(s, bold) {
   // v3.27.0：no_price 条目（厂商未公布按 token 单价）金额列显示「无公开价」而不是 ¥0.00——
   //   ¥0.00 会被读成"这天这个模型免费"，而真相是"厂商没发布价、这笔钱算不出来"，
   //   直接导致读者以为当日合计是完整的。合计行不标（合计本来就只是已知部分和，另有行尾提示）。
-  const costCell = s.no_price ? '无公开价' : (s.cost > 0 ? fmtCost(s.cost) : '¥0.00');
+  // v3.31.0（缺陷B）：unpriced（价库**未收录**该模型 → calcCost 返回 null）同理显示「未收录」——
+  //   它与 no_price（厂商未公布单价）是两种成因、两种处置，措辞**刻意不同**，用户一眼能分：
+  //     「无公开价」= 等厂商公布；「未收录」= 我们没这模型，先把单价补进 pricing.json。
+  //   两标记由 addModelUsage 互斥写入，这里先判 unpriced 只是为了兜底顺序确定。
+  const costCell = s.unpriced ? '未收录' : (s.no_price ? '无公开价' : (s.cost > 0 ? fmtCost(s.cost) : '¥0.00'));
   return `| ${f(s.label)} | ${f(fmt(s.in))} | ${f(fmt(s.out))} | ${f(fmt(s.cached))} | ${f(hit)} | ${f(fmt(s.total))} | ${f(costCell)} |`;
 }
 // ===== v3.20.0：--report 区间 / CSV / 外推 =====
@@ -3351,7 +3413,20 @@ function parseReportRange(arg) {
 //   total 保持累加（不重算 in+out），以便与「逐日 total 相加」严格可对账。
 function aggregateRangeModels(d, from, to) {
   const models = {};
-  const dates = Object.keys(d || {}).filter((k) => k >= from && k <= to).sort();
+  const allKeys = Object.keys(d || {});
+  const dates = allKeys.filter((k) => k >= from && k <= to).sort();
+  // v3.31.0（P0-1 复核结论）：这里**不是**正则匹配日期，而是字典序字符串比较 `k >= from && k <= to`。
+  //   后果：非 ISO 键会被静默排除——'/' 是 0x2F > '-' 0x2D，故 '2026/10/02' 恒 > '2026-10-02'
+  //   （落在区间内也取不到，且越往后越排不上）；'20261002' 同理（index 4 的 '1' > '-'）。
+  //   **但不改它**：账本键由本工具自己写 —— todayStr() / daysAgoStr() / monthStartStr() 恒产出 ISO，
+  //   唯一的非 ISO 来源是人工手改 daily-usage.json，概率极低；而"模糊识别日期"会把
+  //   `2026-W40` / `2026-10-2`（少补零）这类键的解释权交给猜，收益 < 引入新口径的风险。
+  //   改为**低成本告警**：一旦真出现就把话说到 stderr + 报表行尾，不再"凭空消失且无人知晓"。
+  const nonIsoKeys = allKeys.filter((k) => !/^\d{4}-\d{2}-\d{2}$/.test(k) && /^\D*\d{4}\D?\d{2}\D?\d{2}\D*$/.test(k));
+  if (nonIsoKeys.length) {
+    process.stderr.write(`[token-tracker] ⚠ 账本存在 ${nonIsoKeys.length} 个非 ISO 日期键（${nonIsoKeys.slice(0, 5).join('、')}）`
+      + `——区间聚合按字典序比较日期，这些天不会进入区间报表/CSV。请把键名改为 YYYY-MM-DD\n`);
+  }
   let days = 0;
   for (const date of dates) {
     const day = d[date];
@@ -3364,6 +3439,11 @@ function aggregateRangeModels(d, from, to) {
       // v3.27.0：区间聚合透传 no_price（任一天有标记即整段标记）——否则区间表会把无公开价
       // 模型的金额显示成 ¥0.00，与单日表口径不一致（同一份数据两个入口显示不同 = 新的不一致源）。
       if (m.no_price) t.no_price = true;
+      // v3.31.0（P1-7）：缓存价未知同口径透传（任一天有 → 整段标记），否则区间表会比单日表多一份静默低估
+      if (m.cached_price_unknown) t.cached_price_unknown = true;
+      // v3.31.0（缺陷B）：unpriced 同口径透传（任一天有 → 整段标记）。漏了它，区间表会把
+      //   未收录模型显示成 ¥0.00 且零告警——formatUsageRow 虽为单日/区间共用，但标记在聚合时丢了。
+      if (m.unpriced) t.unpriced = true;
     }
   }
   for (const t of Object.values(models)) t.hit = hitRate(t.in, t.cached);
@@ -3373,7 +3453,7 @@ function aggregateRangeModels(d, from, to) {
     total.total += m.total; total.cost += m.cost;
   }
   total.hit = hitRate(total.in, total.cached);
-  return { models, total, days, dates };
+  return { models, total, days, dates, nonIsoKeys };
 }
 // 区间汇总表（一行/模型 + 合计行）。列结构与 reportTxt 完全一致。
 function reportRangeTxt(from, to) {
@@ -3398,6 +3478,27 @@ function reportRangeTxt(from, to) {
       + `→ 上面的合计金额**偏低**，只含有价部分；厂商公布单价后补录并跑 recalc-day.js 可回算`);
     lines.push('');
   }
+  // v3.31.0（缺陷B）：区间内未收录模型同口径告警（与单日表/summary 措辞同构，只把"本日"换"本区间"；
+  //   recalc 不带日期——区间是多天，让 recalc-day.js 自己逐天回算）。
+  const upRange = names.filter((n) => agg.models[n] && agg.models[n].unpriced);
+  if (upRange.length) {
+    lines.push(`⚠ 本区间 ${upRange.length} 个模型未收录单价（${upRange.join('、')}）`
+      + `→ 上面的合计金额**偏低**，只含有价部分；把单价补进 pricing.json 后跑 recalc-day.js 可回算`);
+    lines.push('');
+  }
+  // v3.31.0（P1-7）：缓存价未知 → 合计偏低（与"无公开价"是两种不同的低估，必须分别说清楚）
+  const ncRange = names.filter((n) => agg.models[n] && agg.models[n].cached_price_unknown && !agg.models[n].no_price);
+  if (ncRange.length) {
+    lines.push(`⚠ 本区间 ${ncRange.length} 个模型缺缓存价（${ncRange.join('、')}）`
+      + `→ 缓存 token 按 0 元计，合计金额**偏低**（缓存命中率越高偏得越多）；补上 cached_price 后跑 recalc-day.js 可回算`);
+    lines.push('');
+  }
+  // v3.31.0（P0-1）：账本混进非 ISO 日期键 → 那些天在本区间是**被静默排除**的，必须让用户知道
+  if (agg.nonIsoKeys && agg.nonIsoKeys.length) {
+    lines.push(`⚠ 账本含 ${agg.nonIsoKeys.length} 个非 ISO 日期键（${agg.nonIsoKeys.slice(0, 5).join('、')}）`
+      + `——区间聚合按字典序比较日期，这些天的记录未计入上表；请把 daily-usage.json 的键名改为 YYYY-MM-DD`);
+    lines.push('');
+  }
   lines.push('口径：金额按 pricing.json 的 API 单价折算（缓存价 / 峰谷倍数已计入），**不是真实扣费**；');
   lines.push('      本技能只读 WorkBuddy 落盘的 token 用量，与客户端自带积分/额度之间不存在换算关系。');
   return lines.join('\n');
@@ -3418,7 +3519,12 @@ function exportReportCsv(range) {
     for (const n of Object.keys(day.models || {}).sort()) {
       const m = day.models[n] || {};
       const hit = (m.hit != null ? m.hit : hitRate(m.in || 0, m.cached || 0)).toFixed(2);
-      rows.push([date, cell(n), m.in || 0, m.out || 0, m.cached || 0, hit, m.total || 0, (m.cost || 0).toFixed(6)].join(','));
+      // v3.31.0（缺陷B）：金额格不再是"全是数字"——未收录 / 无公开价的模型写 ASCII 标记，
+      //   否则 Excel 里看到 0.000000 会当成"这笔免费"，与 --report 表的「未收录 / 无公开价」口径分裂。
+      //   **刻意不新增列**：表头一变就会破坏既有 CSV 消费者，也会让"全有价账本输出一字不差"这条红线失效；
+      //   改成只在这两类异常行里替换金额格的写法后，正常行仍严格是 %.6f 数字，零噪音成立。
+      const costCell = m.unpriced ? 'unpriced' : (m.no_price ? 'no_price' : (m.cost || 0).toFixed(6));
+      rows.push([date, cell(n), m.in || 0, m.out || 0, m.cached || 0, hit, m.total || 0, costCell].join(','));
     }
   }
   rows.push(['ALL', '__TOTAL__', agg.total.in, agg.total.out, agg.total.cached,
@@ -3526,6 +3632,14 @@ function reportTxt(arg) {
       lines.push(`⚠ 本日 ${noPriceNames.length} 个模型无公开价（${noPriceNames.join('、')}）`
         + `→ 上面的合计金额**偏低**，只含有价部分；厂商公布单价后补录并跑 recalc-day.js ${date} 可回算`);
     }
+    // v3.31.0（缺陷B）：未收录模型（价库里没有 → 金额算不出来）同样明示合计偏低。
+    //   措辞沿用上面 no_price 那套口径风格（本日 N 个模型…→ 合计偏低…跑 recalc-day.js 可回算），
+    //   但**成因与处置刻意写清区别**：未收录 = 我们没这模型，得先把单价补进 pricing.json（不是等厂商）。
+    const unpricedNames = names.filter((n) => models[n] && models[n].unpriced);
+    if (unpricedNames.length) {
+      lines.push(`⚠ 本日 ${unpricedNames.length} 个模型未收录单价（${unpricedNames.join('、')}）`
+        + `→ 上面的合计金额**偏低**，只含有价部分；把单价补进 pricing.json 后跑 recalc-day.js ${date} 可回算`);
+    }
     // v3.18（M3 修复）：删除 v2.58 引入的「【读取方指令】」提示行——SKILL.md 要求 AI"原样贴出
     // --report 输出"，而该行自带"请勿包含本行"，两者矛盾；且"数据输出里嵌给 AI 的指令"本身就是
     // 指令注入面。展示约定只保留在 SKILL.md（展示格式约束节）。
@@ -3548,9 +3662,29 @@ function reportSummaryTxt(arg) {
   for (const date of targets) {
     const day = d[date];
     if (!day) { lines.push(`${date}  （无记录）`); continue; }
-    const total = day.total || dayTotalOf(day.models || {});
+    const models = day.models || {};
+    const total = day.total || dayTotalOf(models);
     const tag = date === today ? '（今天）' : '';
     lines.push(`${date}${tag}  输入 ${fmt(total.in)} / 输出 ${fmt(total.out)} / 缓存 ${fmt(total.cached)} / 总 ${fmt(total.total)} tokens ｜ ${total.cost > 0 ? fmtCost(total.cost) : '¥0.00'}`);
+    // v3.31.0（P1-8 修正）：与单日表 reportTxt / 区间表 reportRangeTxt **同口径**——本日含无公开价模型时
+    //   明示合计偏低。此前 summary 是三个出口里唯一一个**既无告警、又直接打 ¥0.00** 的：
+    //   "厂商没公布价、这笔钱算不出来"被读成"这天免费"，而 summary 恰恰是"快速看花了多少"的默认入口，
+    //   误导性比明细表更强（明细表至少还有「无公开价」单元格可看）。
+    //   措辞与 reportTxt 单日行**逐字一致**（只把日期换成 ${date}），不发明第三套口径；
+    //   合计金额本身照常显示（与 reportTxt 合计行一致：合计只含已知部分，偏低由本行提示，不改写数字）。
+    const npNames = Object.keys(models).sort().filter((n) => models[n] && models[n].no_price);
+    if (npNames.length) {
+      lines.push(`⚠ 本日 ${npNames.length} 个模型无公开价（${npNames.join('、')}）`
+        + `→ 上面的合计金额**偏低**，只含有价部分；厂商公布单价后补录并跑 recalc-day.js ${date} 可回算`);
+    }
+    // v3.31.0（缺陷B）：未收录模型同样告警——summary 是最容易被当成"今天花了多少"的默认入口，
+    //   金额算不出来却打 ¥1.64（只含有价部分）而不说一句，比明细表更容易被读成完整金额。
+    //   措辞与 reportTxt 单日行逐字一致，与 no_price 那条只差"未收录单价 / 把单价补进 pricing.json"。
+    const upNames = Object.keys(models).sort().filter((n) => models[n] && models[n].unpriced);
+    if (upNames.length) {
+      lines.push(`⚠ 本日 ${upNames.length} 个模型未收录单价（${upNames.join('、')}）`
+        + `→ 上面的合计金额**偏低**，只含有价部分；把单价补进 pricing.json 后跑 recalc-day.js ${date} 可回算`);
+    }
   }
   return lines.join('\n');
 }
@@ -3655,9 +3789,25 @@ function dispWidth(s) {
 //   - 本次含中文混排 46u（2:1 模型）实测溢出 → 反推标题大字下中文实际 ≈2.5 半角单位，
 //     2:1 模型每中文字低估 0.5u，多字累积导致判定"放得下"实际已溢出
 //   → 行1 必须用此保守模型，不能复用 dispWidth（那是正文小字 2:1 模型，行1/行2 极限本就不同）
+// v3.31.0（P1-9 修正）：补 emoji 分支——v3.30.0 只修了 dispWidth（正文小字），行1 这个**独立宽度模型**
+//   漏了同一个分支，于是 `｜⚠无公开价`、`⬆vX.Y.Z`、`⚠价库M/D` 里的 ⚠(U+26A0) / ⬆(U+2B06) 仍按 1u 计，
+//   而 Windows 通知里它们按 **emoji 呈现**渲染 → 每出现一个低估 4u（标题模型应记 5u，见下）→
+//   守卫放行、渲染层被系统裁掉行尾标签（与 v3.30.0 F-3 同一病症，行1 未根治）。
+//   宽度取 5u 的推导（**不能照抄 dispWidth 的 4u**，那是另一把尺子）：
+//     ① 本函数 CJK 记 2.5u，dispWidth 记 2u —— 依据见上方 v2.33 实测（纯半角 47u 不换行/48u 换行、
+//        含中文混排 46u 溢出 → 反推标题大字下 1 汉字 ≈ 2.5 半角单位）；
+//     ② dispWidth 里 emoji(4u) = 2 × CJK(2u)，即「1 个 emoji ≈ 2 个汉字」这一**实测比例**两把尺子共用；
+//     ③ 按同一比例换算到本模型：emoji = 2 × 2.5 = **5u**（≈ 2 个标题汉字）。
+//   方向安全性：只把估宽调**大** → 守卫更保守（更早缩模型名 / 更早丢行尾标签），**不会**放宽到溢出，
+//   因此不存在「改完反而溢出」的风险。
+//   复用上方 EMOJI_WIDE_RE / EMOJI_VS_RE（已带 `u` 标志并用 \u{} 写星平面——不加 `u` 时 \u1F000 会被拆成
+//   \u1F00 + `0` 与 `-` 拼成吃掉整个 ASCII 区的畸形区间这个老坑，v3.30.0 已踩过一次）；
+//   本函数原有的 CJK 正则是**不带 u 标志**的 BMP 范围，那一个是安全的，保持不动。
 function dispWidthTitle(s) {
   let w = 0;
   for (const ch of String(s || '')) {
+    if (EMOJI_VS_RE.test(ch)) continue;                   // 变体选择符零宽（⚠️ = U+26A0 U+FE0F）
+    if (EMOJI_WIDE_RE.test(ch)) { w += 5; continue; }     // 标题大字下 emoji ≈ 2 个汉字 = 5u
     w += /[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]/.test(ch) ? 2.5 : 1;
   }
   return w;
@@ -3920,11 +4070,32 @@ function anyNoPublicPrice(stat, pricing) {
   }
   return isUnpub(stat.model);
 }
+// v3.31.0（P1-7）：本轮是否有「已收录、但厂商未公布**缓存命中价**」的参与方。
+//   与 unpublished 的区别至关重要：这类模型输入输出单价都是真的、钱也算得出来，
+//   缺的只是 cached_price → calcCost(:2854) 把它按 0 计 → 缓存占比 ~97% 时金额偏低 45%~86%（审计 §六）。
+//   旧代码对此**零提示**：用户看到的 ¥ 数字比真实值小一大截，却没有任何信号提示"这个数偏低"。
+//   刻意**不**并入 anyNoPublicPrice —— 那会触发 toastLine2 的 hideCost（整段不显示金额），
+//   把"有价但偏低"说成"算不出来"，反而丢信息。它只应该点亮行1 这一个标注。
+function anyCachePriceUnknown(stat, pricing) {
+  if (!stat || !pricing || !pricing.models) return false;
+  const isUnk = (n) => {
+    const m = pricing.models[n];
+    return !!(m && m.cached_price_unknown === true && m.pricing_status !== 'unpublished');
+  };
+  if (stat.models && typeof stat.models === 'object') {
+    for (const n of Object.keys(stat.models)) if (isUnk(n)) return true;
+  }
+  return isUnk(stat.model);
+}
 // v3.27.0：行1 用的标注文本（用户 2026-10-02 指定放行1 模型名右侧，那里有空位）。
 //   有 token 消耗才标（空轮不标）；行1 放不下时由 toastLine1 的超宽守卫丢弃，绝不挤掉数据。
+// v3.31.0：缓存价未知 → 降级挂「⚠缓存价未知」；两种缺陷同时存在时只显示更严重的「无公开价」
+//   （那时金额整段算不出来，标注必须优先给最严重的一条）。
 function noPriceTag1(stat, pricing) {
-  if (!anyNoPublicPrice(stat, pricing)) return '';
-  return ((stat && stat.in) || (stat && stat.out)) ? '｜⚠无公开价' : '';
+  if (anyNoPublicPrice(stat, pricing)) return ((stat && stat.in) || (stat && stat.out)) ? '｜⚠无公开价' : '';
+  // 只有**真有缓存命中**时才会因缺缓存价而低估 —— 无缓存命中的轮标了纯属噪音
+  if (anyCachePriceUnknown(stat, pricing)) return Number(stat && stat.cached) > 0 ? '｜⚠缓存价未知' : '';
+  return '';
 }
 function toastLine2(stat, pricing) {
   // v3.30.0（F-2）：本函数内部对 stat 的取值风格本就是"半防御"（model 用 `stat &&`、in/out 直接点），
@@ -3934,7 +4105,7 @@ function toastLine2(stat, pricing) {
   const anyNoPrice = anyNoPublicPrice(stat, pricing);
   // v3.26.0（KI-6 ⑧）：混合模型轮**分模型计价求和**（与账本/轮次明细同口径）——
   // 旧口径 = 全部 tokens 按 stat.model（子代理优先）单一价折算，混合轮金额失真且与账本对不上。
-  // 规则：① models 明细存在 → 逐模型 calcCost（带各自 lastTs 峰谷时刻；本地模型免费跳过）；
+  // 规则：① models 明细存在 → 逐模型 calcCost（v3.31.0 起统一用**批级**峰谷时刻，与账本同口径）；
   //       ② 部分模型无价 → 金额 = 已知部分和 +「⚠未计价」标注（不再静默）；
   //       ③ 全部无价 / 无明细（旧 coalesce 残留的 agg）→ 回退旧口径（行为不变）；
   //       ④ 本地/云端混合 → 本地段免费跳过、金额 = 云端段；**纯本地**才显示「本地·免费」。
@@ -3944,11 +4115,23 @@ function toastLine2(stat, pricing) {
   let cloudCount = 0;
   if (modelsObj && Object.keys(modelsObj).length > 0) {
     let sum = 0, known = 0, unknown = 0;
+    // v3.31.0（峰谷口径统一 A）：**弹窗与账本必须用同一个峰谷判定时刻**。
+    //   账本侧 recordUsage(:3312 附近) 对 byModel 里**每个模型**都传同一个批级 tsMs
+    //   （= 主+子代理全部行取 max 的 peakTs，见 :3222-3298 的 bumpTs）；弹窗旧实现却按
+    //   各模型**自己的** lastTs 判峰谷（:4080）→ 跨 12:00/18:00 峰谷边界的混合轮
+    //   （含 DeepSeek 系，×2）会出现"同一批 token：弹窗 ¥2.00 / 账本 ¥4.00"，差整倍且零提示。
+    //   修法：弹窗也用批级 ts（各模型 lastTs 的最大值 ≈ 账本 peakTs；两者仅在"批内最后一条
+    //   是无 usage 行"的毫秒级场景可不同，时段判定不受影响）。单模型轮 max = 原值 → 零行为变化。
+    let batchTs = 0;
+    for (const b0 of Object.values(modelsObj)) {
+      const t0 = Number(b0 && b0.lastTs);
+      if (Number.isFinite(t0) && t0 > batchTs) batchTs = t0;
+    }
     for (const [n, b] of Object.entries(modelsObj)) {
       if (!b || typeof b !== 'object') continue;
       if (isLocalModel(n)) continue; // 本地模型免费，不进计价也不算「未知」
       cloudCount++;
-      const c = calcCost({ model: n, in: b.in || 0, out: b.out || 0, cached: b.cached || 0, lastTs: b.lastTs }, pricing);
+      const c = calcCost({ model: n, in: b.in || 0, out: b.out || 0, cached: b.cached || 0, lastTs: batchTs }, pricing);
       if (c != null) { sum += c; known++; } else unknown++;
     }
     if (cloudCount > 0) {
@@ -4248,11 +4431,33 @@ function lookupCnPrice(modelName, timeoutMs) {
 
 // 把新模型补入 pricing.json（v2.31 区分国内外：region='CN' 直接人民币价；region='US' USD×汇率换算）
 // 修复6：pricing 原子写（无锁，由调用方负责加锁）。写临时文件成功后 rename 覆盖，写失败保留原文件。
-function savePricingAtomic(pricing) {
+// v3.31.0（P1-11）：新增可选第二参 mergeKeys —— **锁内重新读盘**。
+//   背景：本函数的调用点全都套在 PRICING_LOCK_FILE 里，但「加锁」与「不整份覆写」是两件事——
+//   若把此刻内存里的整份 pricing 直接覆写磁盘，同一把锁释放后由他人（refresh-prices.js）
+//   刚落盘的价格更新会被**整份吃掉**（写串行 ≠ 读改写安全）。addModelPrice(:4332) 早就有这层保护，
+//   ensureNewModelPricing 的「国内外源均无」分支与 rememberNoPublicPrice 漏了同一层。
+//   语义：传数组时以**磁盘**为准，只把 mergeKeys 列出的模型条目从 pricing 合并进磁盘版本；
+//   磁盘读不出来（首次 / 损坏）才退回整份 pricing——与旧行为一致。
+function savePricingAtomic(pricing, mergeKeys) {
   const tmp = PRICING + '.tmp';
   try {
     fs.mkdirSync(path.dirname(PRICING), { recursive: true });
-    fs.writeFileSync(tmp, JSON.stringify(pricing, null, 2) + '\n');
+    let out = pricing;
+    if (Array.isArray(mergeKeys)) {
+      let base = null;
+      try { base = JSON.parse(fs.readFileSync(PRICING, 'utf-8')); } catch (e) { base = null; }
+      if (base && base.models && typeof base.models === 'object') {
+        // 磁盘侧的本地官方库残留同样剥掉，保持「合并条目不入库」的原约定
+        const clean = stripLocalDbEntries(base);
+        for (const k of mergeKeys) {
+          const src = pricing && pricing.models ? pricing.models[k] : undefined;
+          if (src && typeof src === 'object') clean.models[k] = src;
+        }
+        if (pricing && pricing.usd_cny_rate != null && clean.usd_cny_rate == null) clean.usd_cny_rate = pricing.usd_cny_rate;
+        out = clean;
+      }
+    }
+    fs.writeFileSync(tmp, JSON.stringify(out, null, 2) + '\n');
     fs.renameSync(tmp, PRICING);
     return true;
   } catch (e) {
@@ -4299,6 +4504,15 @@ function addModelPrice(pricing, modelName, ref, region) {
     m.auto_converted = true;
     m.note = '新模型自动补录（USD×汇率估算，待人工核验官方价；缓存价缺失按 0 计；时段策略默认无峰谷，如厂商有高峰/夜间折扣需搜索核验后补 peak_multiplier/night_discount 字段）';
   }
+  // v3.31.0（P1-7）：缓存价缺失 → **保留"按 0 计"的金额行为不变**，但必须把"这份数据不可信"写进价库。
+  //   为什么仍然不补估价：v2.82.1 刻意删掉"输入价×10%"是因为各厂商实际缓存价 3%~25% 不等，
+  //   瞎估等于用错价替换缺价——金额从"确定偏低"变成"看着可信但错了"，更难发现（当时的决策是对的）。
+  //   不补价不等于可以不出声：本机缓存命中 ~97%，金额 ≈ 缓存价×缓存量（审计 §六）→
+  //   cached_price 缺失时输入费近乎整段丢掉，**实测偏差 45%~86%，而用户此前看不到任何提示**。
+  //   故这里落 cached_price_unknown:true —— 金额仍按 0 计（不凭空造价），但价库、账本、toast、报表
+  //   四个出口都能据此显示"缓存价未知 → 合计偏低"。人工补上 cached_price 后本标记应一并删除，
+  //   recalc-day.js 回算时才能算准（届时 addModelUsage 也会自动清掉账本上的影子标记）。
+  if (!(typeof m.cached_price === 'number' && Number.isFinite(m.cached_price))) m.cached_price_unknown = true;
   pricing.models[name] = m; // 内存侧即时更新（供本进程 findModel 命中）
   // 修复6：加锁 + 锁内重新读盘合并，避免与 refresh-prices.js 并发读改写丢失更新
   const res = withFileLock(PRICING_LOCK_FILE, () => {
@@ -4362,8 +4576,12 @@ function ensureNewModelPricing(pricing, stat) {
     rememberLookedup(name);
     // 修复6：加锁写，避免与 refresh-prices.js 并发覆盖。
     // v2.80：内存 pricing 含本地官方库合并条目（只属于 index.json），写盘前剥离，防止两源互相覆盖/膨胀
+    // v3.31.0（P1-11）：本分支**没有改动任何价格条目**（已查列表已迁 sidecar，见上），
+    //   过去却把整份内存 pricing 覆写回磁盘 → 抢锁释放后他人刚落盘的价格被吃掉 →
+    //   下轮 findModel 又命中不到 → 再走一遍补录联网，**写放大 + 丢更新**。
+    //   现改 savePricingAtomic(persist, [])：锁内以**磁盘**为准重新合并，空串数组 = 一个条目都不改写。
     const persist = stripLocalDbEntries(pricing);
-    const lr = withFileLock(PRICING_LOCK_FILE, () => savePricingAtomic(persist), { ttl: 300000, retries: 50, retryDelay: 100 });
+    const lr = withFileLock(PRICING_LOCK_FILE, () => savePricingAtomic(persist, []), { ttl: 300000, retries: 50, retryDelay: 100 });
     if (lr.skipped) process.stderr.write(`[token-tracker] 已查列表写入跳过（被其他进程持锁）\n`);
     return { status: 'not-found', note: `⚠️ 新模型 ${stat.model} 国内外价格源均未收录，请搜索厂商官方定价页人工补录` };
   }
@@ -4390,8 +4608,10 @@ function rememberNoPublicPrice(pricing, modelName) {
   });
   m.pricing_status = 'unpublished'; // 已存在条目时确保标记（可能是旧版误写的 0 元条目）
   m.input_price = 0; m.output_price = 0;
+  // v3.31.0（P1-11）：本分支只改了这一个条目 → 锁内重读合并时**只合并它**，避免整份覆写
+  //   吃掉 refresh-prices.js 并发落盘的其它价格（与 NOT_FOUND 分支同源，见 savePricingAtomic 注释）。
   const persist = stripLocalDbEntries(pricing);
-  const lr = withFileLock(PRICING_LOCK_FILE, () => savePricingAtomic(persist), { ttl: 300000, retries: 50, retryDelay: 100 });
+  const lr = withFileLock(PRICING_LOCK_FILE, () => savePricingAtomic(persist, [key]), { ttl: 300000, retries: 50, retryDelay: 100 });
   if (lr.skipped) process.stderr.write(`[token-tracker] 无公开价标记写入跳过（被其他进程持锁）\n`);
   return {
     status: 'no-public-price',
@@ -4613,7 +4833,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.30.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.31.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

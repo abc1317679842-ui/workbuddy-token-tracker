@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.30.0-blue)
+![Version](https://img.shields.io/badge/version-v3.31.0-blue)
 
 > 在每次回答后显示 **Token 消耗 / 耗时 / 折算费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -350,6 +350,7 @@ cp -r workbuddy-token-tracker ~/.workbuddy/skills/token-usage-tracker
 | `peak-rules.js` | 峰谷时段判定的**唯一实现**：主脚本 / `backfill.js` / `recalc-day.js` 共用（v3.19.0 起，消除三份硬编码副本） |
 | `deepseek-official.js` | DeepSeek 官方定价抓取（被 refresh-prices 调用） |
 | `refresh-holidays.js` | 中国法定节假日双源刷新（峰谷计费用，手动运行）。两源不一致时**取交集**（保守）并在 **stderr 逐日告警**（列出仅 A / 仅 B 认定的假日）；差异按年落 `holidays.json` 的 `cross_check_diff.<年份>.only_a / .only_b` |
+| `peak-rules.js` | 峰谷时段判定的**唯一实现**（主脚本 / `recalc-day.js` / `backfill.js` 共用，避免三处硬编码口径分裂） |
 | `fetch-cn-prices.py` | 国内厂商官网价抓取（Python 3；`requests` 可选，缺失自动回退 urllib） |
 | `parse_tokenhub.py` / `build_index.py` | 本地官方价库解析/建索引（可选） |
 | `pricing.json` / `holidays.json` | 价格库 / 节假日数据（技能目录内） |

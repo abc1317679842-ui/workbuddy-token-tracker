@@ -237,6 +237,22 @@ function save(p, opts) {
       // v3.24（F2·缺陷4）：锁内重读磁盘并逐 key 归并（必须在锁内，否则归并读与 rename 之间仍有窗口）
       p = mergeWithDisk(p, opts.changedKeys, opts.deletedKeys);
     }
+    // v3.31.0（P1-13）：写盘前把**当前** pricing.json 复制成唯一一份 `.pricing.json.bak`
+    // （对比：账本 saveDailyUsageRaw、水位线 saveLedgerWatermark 都有备份，唯独价库没有——
+    //  唯一的回滚点是"上次成功抓取的内存快照"，下次刷新即被覆盖）。
+    // · 只保留**一份**、不带日期：回滚只需要"上一版"，滚动备份会无限增长（滚雪球）。
+    // · 备份失败**绝不阻断主流程**（备份是兜底，主流程是更新价库）→ 整段 try/catch，只 stderr。
+    // · errorOnly 路径不备份：那条路径只贴错误标记、不动价格，没有可回滚的内容。
+    // · 已知边界：deepseek-official.js 在本脚本之前已写过一次 pricing.json（官方价对齐），
+    //   故本备份是"官方价已合并、聚合源未合并"的中间态；官方抓取失败/断网时它才是刷新前原值。
+    //   要修得彻底需把官方抓取也纳入同一份备份，代价是再复制一份跨进程锁实现（见 P1-14 取舍）。
+    if (!(opts && opts.errorOnly)) {
+      try {
+        if (fs.existsSync(PRICING)) fs.copyFileSync(PRICING, PRICING + '.bak');
+      } catch (e) {
+        process.stderr.write(`[refresh-prices] ⚠pricing.json 备份(.bak)失败（不阻断本次刷新）: ${e.message}\n`);
+      }
+    }
     const tmp = PRICING + '.tmp';
     try {
       fs.mkdirSync(path.dirname(PRICING), { recursive: true });
@@ -496,6 +512,84 @@ function applyRetiredLocked(pricing, models) {
   return w;
 }
 
+// ===== v3.31.0（P0-5 / P1-7）：价格落盘前 sanity check =====
+// 背景（审计 §六 核心洞察）：本机缓存命中率 ~97%，**金额 ≈ 缓存价 × 缓存量** → pricing.json 一旦
+// 写入错价，toast / daily-usage.json / --report / --csv 全线同向错误且**无任何提示**；
+// 更糟的是写入后 `date` 被更新 → 当天不再重试 → 错价至少驻留 24h。
+//
+// 设计原则（宁可漏报，绝不误杀：误杀 = 正常刷新被拒 = 价库停滞 = 比错价更大的问题）：
+//   ① 只拦**数量级 / 骤变**级异常（超出合理区间，或相对旧值 ≥3× 骤变），常规波动一律放行；
+//   ② 任何拦截 = 保留旧值 + 可见告警（stderr 一行 + pricing._price_audit.warnings）；
+//   ③ 告警文本必须是 `<价库键>: 说明` 形状 —— token-tracker.js:3732 的 warnMentionsModel 取
+//      冒号前一段与本轮模型名做宽松匹配；写成别的形状要么污染全部弹窗、要么永远不显示。
+//   ④ 绝不把已有值回退成 null —— calcCost 里 `(m.cached_price || 0)` 会让 null 按 0 计，
+//      那比错价更隐蔽（P1-7 正是这个失败模式）。
+const PRICE_SANITY = {
+  min: 0.0005,  // 元/百万 token 下界（本机实测最低缓存价 0.02，向下留两个数量级余量）
+  max: 5000,    // 上界（本机实测最高输出价 100）；只用来拦「单位改成 元/千 token」这类整段错位
+  abortAt: 3,   // 相对旧值 ≥3× 或 ≤1/3 → 判异常，保留旧值（真调价极少一步 3 倍）
+  warnAt: 1.5,  // 相对旧值 ≥50% → 只告警不阻断（真调价属正常，不能把价库冻住）
+};
+const PRICE_FIELD_LABEL = { input_price: '输入价', output_price: '输出价', cached_price: '缓存命中价' };
+
+// 对单个模型「本次刷新后的值 now」与「刷新前的快照 pre」做体检。
+// 返回 { main:boolean, cached:boolean }：main=输入价/输出价异常（整块回退）；cached=仅缓存价异常。
+// warnSink 收集告警字符串（形状固定为 `<key>: 说明`）。
+function priceGate(key, now, pre, warnSink) {
+  const out = { main: false, cached: false };
+  const check = (field) => {
+    const nv = now[field];
+    if (nv == null) return false;                        // 本次没写这个字段 → 不校验
+    if (nv === pre[field]) return false;                 // 值没变 → 不校验（存量越界值不该天天报警）
+    const label = PRICE_FIELD_LABEL[field];
+    if (typeof nv !== 'number' || !isFinite(nv) || nv <= 0) {
+      warnSink.push(`${key}: ${label}抓取值非法(${nv})，已保留旧值`);
+      return true;
+    }
+    if (nv < PRICE_SANITY.min || nv > PRICE_SANITY.max) {
+      warnSink.push(`${key}: ${label}${nv} 元/百万token 超出合理区间[${PRICE_SANITY.min}, ${PRICE_SANITY.max}]（上游单位可能已变更，如改成「元/千 token」），已保留旧值`);
+      return true;
+    }
+    const ov = pre[field];
+    if (typeof ov === 'number' && isFinite(ov) && ov > 0) {
+      const r = nv / ov;
+      if (r >= PRICE_SANITY.abortAt || r <= 1 / PRICE_SANITY.abortAt) {
+        warnSink.push(`${key}: ${label}由 ${ov} 骤变至 ${nv}（×${r.toFixed(2)}，超 ${PRICE_SANITY.abortAt}× 阈值），已保留旧值待人工核验`);
+        return true;
+      }
+      if (r >= PRICE_SANITY.warnAt || r <= 1 / PRICE_SANITY.warnAt) {
+        warnSink.push(`${key}: ${label}由 ${ov} 变动至 ${nv}（×${r.toFixed(2)}，变动超 50%），请人工核验`);
+      }
+    }
+    return false;
+  };
+  const bi = check('input_price');
+  const bo = check('output_price');
+  out.main = bi || bo;                                   // 主价任一异常 → 整块回退（半新半旧更危险）
+  out.cached = check('cached_price');
+  // 交叉校验：缓存命中价必须 ≤ 输入价（缓存是折扣价）。命中此条几乎总是**列错位**
+  // （输入价与缓存价取串了）——正是 §六 点名的、影响 45%~86% 金额的最高风险形态。
+  const effIn = out.main ? pre.input_price : now.input_price;
+  const effCa = out.cached ? pre.cached_price : now.cached_price;
+  if (typeof effIn === 'number' && effIn > 0 && typeof effCa === 'number' && effCa > effIn) {
+    warnSink.push(`${key}: 缓存命中价 ${effCa} 高于输入价 ${effIn}（缓存应是折扣价），疑似列错位/单位错误，请人工核验`);
+    // 有旧值才回退；无旧值时保留新值（回退成 null 会被 calcCost 按 0 计，比错价更隐蔽）
+    if (pre.cached_price != null) out.cached = true;
+  }
+  return out;
+}
+
+// 整块回退到快照（含分支里被删/新增的字段：先删多出来的，再赋值）
+function restoreBlock(m, snap) {
+  for (const k of Object.keys(m)) if (!(k in snap)) delete m[k];
+  Object.assign(m, snap);
+}
+// 只回退缓存价（连同「是否估算」标记一起还原，避免标记与值互相撒谎）
+function restoreCached(m, snap) {
+  if (snap.cached_price === undefined) delete m.cached_price; else m.cached_price = snap.cached_price;
+  if (snap.cached_price_estimated === undefined) delete m.cached_price_estimated; else m.cached_price_estimated = snap.cached_price_estimated;
+}
+
 // v3.18（M6）：解析器注册表——拉取后立即解析并校验"解析出 >0 个模型"，
 // 上游 schema 变更/返回空体不再被计为"源成功"。
 const PARSERS = { llma: parseLlma, llc: parseLlc, or: parseOr, litellm: parseLitellm, portkey: parsePortkey };
@@ -643,6 +737,7 @@ async function main() {
 
   let updatedMain = 0, autoConverted = 0, usdUpdated = 0, regionSet = 0, bigDiff = [], lockKept = 0;
   const regionInferred = []; // v3.24（F2·缺陷5）：靠推断（而非天生带 region）得到国内外归属的模型 key
+  const sanityWarnings = []; // v3.31.0（P0-5 / P1-7）：价格体检告警（`<key>: 说明` 形状，并入 _price_audit）
 
   // v3.24（F2·缺陷4）：抓取前对每个模型做 JSON 快照，循环后用快照比对得出「本次真正改动过的 key」，
   // 供 save() 锁内归并时使用（只覆盖改动过的条目，保护抓取窗口内外部新增/更新的模型）。
@@ -686,6 +781,13 @@ async function main() {
       m.usd_output_price = Number(usdOut.toFixed(6));
       usdUpdated++;
     }
+
+    // v3.31.0（P0-5 / P1-7）：主价分支**之前**对本模型做一次深拷贝快照（region / usd_* 已写完，
+    // 这些是参考字段、不在体检范围内）。分支写完后用 priceGate 比对，异常即整体回退到本快照。
+    // 放在这里的好处：三个写价分支（官方价 / 国内源 / USD 换算）共用同一道闸，且分支内部逻辑
+    // 一行未改 → 正常路径逐字节不变。
+    const preSnap = JSON.parse(JSON.stringify(m));
+    const uMain0 = updatedMain, uAuto0 = autoConverted;
 
     if (m.region === 'CN') {
       // 国内模型：人民币主价优先国内源（llmabacus → llm-prices-cn）
@@ -754,6 +856,23 @@ async function main() {
         autoConverted++;
       }
     }
+
+    // v3.31.0（P0-5 / P1-7）：落盘前体检。异常 → 回退旧值 + 留可见告警，**绝不静默写错价**。
+    const gate = priceGate(key, m, preSnap, sanityWarnings);
+    if (gate.main) {
+      restoreBlock(m, preSnap);
+      updatedMain = uMain0; autoConverted = uAuto0; // 已回退 → 不能计入"已更新"
+    } else if (gate.cached && preSnap.cached_price != null) {
+      restoreCached(m, preSnap); // 旧值为 null 时不回退（写 null = calcCost 按 0 计，比错价更隐蔽）
+    }
+  }
+
+  // v3.31.0（P0-5 / P1-7）：体检告警必须**当场可见**（stderr），随后并入 _price_audit.warnings。
+  if (sanityWarnings.length) {
+    process.stderr.write(
+      `[refresh-prices] ⚠价格 sanity check 拦截 ${sanityWarnings.length} 处（已保留旧值，需人工核验）:\n`
+      + sanityWarnings.map((w) => `  - ${w}`).join('\n') + '\n'
+    );
   }
 
   pricing.models = models; // v3.24（F2·缺陷4）：确保写盘对象与归并基准同一引用
@@ -791,6 +910,9 @@ async function main() {
   // v3.24（F2·缺陷6）：峰谷模型价差 >60% 的条目（bigDiff）旧版只在 console.log 打印，
   // 用户/下游脚本看不到；这里并入 _price_audit.warnings（结构与字段不变，只是多追加字符串）。
   for (const b of bigDiff) auditWarnings.push(`${b}: 峰谷模型价差>60%，需人工核验`);
+  // v3.31.0（P0-5 / P1-7）：价格体检告警并入同一出口（形状同样是 `<key>: 说明`，
+  // 才能被 token-tracker.js 的 warnMentionsModel 点名命中、挂到对应模型的弹窗上）。
+  for (const w of sanityWarnings) auditWarnings.push(w);
 
   if (auditWarnings.length) pricing._price_audit = { at: new Date().toISOString(), warnings: auditWarnings };
   else delete pricing._price_audit;
@@ -860,4 +982,5 @@ if (require.main === module) {
 // 供测试/外部复用（不影响脚本直接运行）
 // v3.24（F2）：新增导出 isFreeVariant / parse* / mergeWithDisk / applyUsdCachedPrice /
 // retiredLockWarnings / applyRetiredLocked，供单元测试直接验证（纯函数，无副作用）
-module.exports = { save, load, todayStr, PRICING, usdFind, cnFind, looseFind, norm, median, AMBIG_WARNINGS, isFreeVariant, parseLlma, parseLlc, parseOr, parseLitellm, parsePortkey, mergeWithDisk, applyUsdCachedPrice, retiredLockWarnings, applyRetiredLocked };
+// v3.31.0（P0-5 / P1-7）：导出价格体检纯函数与阈值，供 selftest 离线单测（行为可验证，不靠源码守卫）
+module.exports = { save, load, todayStr, PRICING, usdFind, cnFind, looseFind, norm, median, AMBIG_WARNINGS, isFreeVariant, parseLlma, parseLlc, parseOr, parseLitellm, parsePortkey, mergeWithDisk, applyUsdCachedPrice, retiredLockWarnings, applyRetiredLocked, priceGate, restoreBlock, restoreCached, PRICE_SANITY };

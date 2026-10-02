@@ -755,6 +755,52 @@ else {
   const day = 24 * 3600 * 1000;
   const now = Date.now();
 
+  // ── v3.30.0（CI 红修复）：把 T12 的「联网前提」显式化，不再依赖外部环境 ──────────
+  // 根因：v3.29.0（A-3③）起主脚本在 token-tracker.js:278 读 WB_NO_NET / WB_DISABLE_NET 作为
+  //   **联网总开关**（`const ENABLE_NETWORK = !(process.env.WB_NO_NET === '1' || …)`），而
+  //   updateNotice()（:4746）与 updateTagForToast()（:4765）的**第一行**都是
+  //   `if (!(ENABLE_NETWORK && ENABLE_UPDATE_CHECK)) return …;` —— 在**读状态文件之前**就短路。
+  //   T12 的 c/d/e/f/q 组是 v3.21/3.22 时代写的老断言，它们的「离线」保证来自预置
+  //   `lastCheckAt: now` 关掉 7 天闸门；总开关先短路 → 闸门根本没机会生效 →
+  //   CI（env WB_NO_NET=1）里 c/q 拿 ''（假红）、e/f 恒 ''（**假绿**，等于没覆盖）。
+  // 修法：用同一目录下的两份**模块副本**，分别在「WB_NO_NET 未设」/「WB_NO_NET=1」两种环境里
+  //   require。ENABLE_NETWORK 是 require 期求值的模块级 const，同进程改 env 对已加载实例无效，
+  //   故必须换路径重新加载（不能只改 process.env）。副本与原件同目录 → `__dirname/.update-check.json`
+  //   仍是同一个文件，状态预置/落盘断言与 UF 落点全部照旧（刻意**不**挪 .update-check.json）。
+  //   零联网仍由「预置 lastCheckAt=now 关掉闸门」承担，并由下面的 execFileSync 探针**硬证明**。
+  // 为什么不用 spawnSync 起子进程：本沙箱 node→node spawnSync 报 EBUSY（SPAWN_OK=false），
+  //   子进程方案在最需要验证的环境里反而跑不到、只能 envSkip；同进程重新 require 效果等价且可验证。
+  const TTJS = path.join(skillDir, 'token-tracker.js');
+  const mkVariant = (name, noNet) => {
+    const p = path.join(skillDir, name);
+    fs.copyFileSync(TTJS, p);
+    const saved = { WB_NO_NET: process.env.WB_NO_NET, WB_DISABLE_NET: process.env.WB_DISABLE_NET };
+    if (noNet) process.env.WB_NO_NET = '1';
+    else { delete process.env.WB_NO_NET; delete process.env.WB_DISABLE_NET; }
+    try { return require(p); }
+    finally {
+      for (const k of ['WB_NO_NET', 'WB_DISABLE_NET']) {
+        if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
+      }
+    }
+  };
+  const ttNet = mkVariant('token-tracker.net.js', false);     // 联网总开关**开启**（CI / 本机表现一致）
+  const ttNoNet = mkVariant('token-tracker.nonnet.js', true); // 联网总开关**关闭**
+
+  // 零联网硬证明：queryLatestTag（:4692）是版本查询的唯一出口
+  //   （`require('child_process').execFileSync(process.execPath, ['-e', script])`，script 含
+  //   `api.github.com`）。探针只对这类调用计数并**直接抛错**（绝不放行），跑完断言计数必须为 0。
+  const cp = require('child_process');
+  const realExecFileSync = cp.execFileSync;
+  let netProbes = 0;
+  cp.execFileSync = function (file, args) {
+    if (Array.isArray(args) && args.some((a) => String(a).indexOf('api.github.com') >= 0)) {
+      netProbes++;
+      throw new Error('T12 探针：闸门闭合期间不得发起版本查询');
+    }
+    return realExecFileSync.apply(this, arguments);
+  };
+
   // a：新增函数/常量已导出
   const ex12 = ['updateNotice', 'cmpVersion', 'loadUpdateState', 'saveUpdateState', 'queryLatestTag',
     'updateTagForToast', 'maybeFetchLatest', 'maybeFetchLatestForStop', 'claimNotify', 'hookIdle'];
@@ -775,30 +821,32 @@ else {
     cv('3.21.0', '3.21.0') === 0 && cv('3.21.0.0', '3.21.0') === 0);
 
   // c：闸门闭合 + 远端更高 → 返回提示（离线：lastCheckAt=now 关掉 7 天检查）
+  //    用 ttNet（联网总开关开启）→ 断言的是真实产品行为，而非 CI 上被总开关短路的假结果。
   put({ lastCheckAt: now, latestVersion: '9.9.9', failCount: 0, nextRetryAt: 0 });
-  const n1 = ttMod.updateNotice();
+  const n1 = ttNet.updateNotice();
   ok('T12-c1 ★远端更高时返回一行提示（闸门闭合 → 零联网）',
     typeof n1 === 'string' && n1.indexOf('v9.9.9') >= 0, JSON.stringify(n1));
   ok('T12-c2 提示文案极短（≤ 45 字符）且不含金额/链接/升级步骤',
     n1.length > 0 && n1.length <= 45 && !/¥|http|git |覆盖|备份/.test(n1), `len=${n1.length} ${n1}`);
 
   // d：节流 —— 同版本 24h 内第二次静默
-  ok('T12-d1 同版本 24h 内第二次不重复提示', ttMod.updateNotice() === '');
+  //    （e/f 同理：WB_NO_NET=1 时这两条是**假绿**——总开关先短路返回 ''，判据恒真；改用 ttNet 才有覆盖）
+  ok('T12-d1 同版本 24h 内第二次不重复提示', ttNet.updateNotice() === '');
   const st1 = ttMod.loadUpdateState();
   ok('T12-d2 提示计数已落盘（notifiedVersion + notifyCount）',
     st1.notifiedVersion === '9.9.9' && st1.notifyCount === 1, JSON.stringify(st1));
-  put(Object.assign({}, st1, { notifyCount: ttMod.UPDATE_MAX_NOTIFY }));
-  ok('T12-d3 达到提示上限后彻底静默', ttMod.updateNotice() === '');
+  put(Object.assign({}, st1, { notifyCount: ttNet.UPDATE_MAX_NOTIFY }));
+  ok('T12-d3 达到提示上限后彻底静默', ttNet.updateNotice() === '');
 
   // e：本地已是最新 / 远端更旧 → 静默
-  put({ lastCheckAt: now, latestVersion: ttMod.SKILL_VERSION });
-  ok('T12-e1 远端 == 本地 → 静默', ttMod.updateNotice() === '');
+  put({ lastCheckAt: now, latestVersion: ttNet.SKILL_VERSION });
+  ok('T12-e1 远端 == 本地 → 静默', ttNet.updateNotice() === '');
   put({ lastCheckAt: now, latestVersion: '3.9.0' });
-  ok('T12-e2 远端低于本地（3.9.0 < 当前版本）→ 静默', ttMod.updateNotice() === '');
+  ok('T12-e2 远端低于本地（3.9.0 < 当前版本）→ 静默', ttNet.updateNotice() === '');
 
   // f：退避未到 → 静默且不联网（nextRetryAt 在未来）
   put({ failCount: 1, nextRetryAt: now + 3600000 });
-  ok('T12-f 退避未到（nextRetryAt 在未来）→ 静默且不发起检查', ttMod.updateNotice() === '');
+  ok('T12-f 退避未到（nextRetryAt 在未来）→ 静默且不发起检查', ttNet.updateNotice() === '');
 
   // g：状态文件损坏/缺失容错
   fs.writeFileSync(UF, '{broken json');
@@ -857,16 +905,36 @@ else {
 
   // q：toast 兜底标记（模块级缓存 → 只测一次 + 缓存行为；反向分支由源码守卫覆盖）
   put({ lastCheckAt: now, latestVersion: '9.9.9', failCount: 0, nextRetryAt: 0 }); // 无 lastHookAt → hookIdle=true
-  const tag1 = ttMod.updateTagForToast(now);
+  const tag1 = ttNet.updateTagForToast(now);
   ok('T12-q1 ★没配 hook（无 lastHookAt）→ toast 兜底标记产出 `⬆v9.9.9`', tag1 === '⬆v9.9.9', JSON.stringify(tag1));
   ok('T12-q2 同进程重复调用返回缓存（一次 Stop 会格式化多次 toastLine1，不能重复消费计数）',
-    ttMod.updateTagForToast(now + 99999) === tag1);
+    ttNet.updateTagForToast(now + 99999) === tag1);
   ok('T12-q3 ★源码守卫：updateTagForToast 内先判 hookIdle、再 claimNotify（hook 活着 → 永不产出标记）', (() => {
     const i = mainSrc.indexOf('function updateTagForToast');
     const body = mainSrc.slice(i, mainSrc.indexOf('function maybeFetchLatestForStop', i));
     return body.indexOf('if (!hookIdle(now, st)) return gUpTag;') > 0
       && body.indexOf('claimNotify(st') > body.indexOf('hookIdle(now, st)');
   })());
+
+  // r：v3.30.0 新增 —— **联网总开关优先级**：WB_NO_NET=1 时状态文件不得绕过总开关。
+  //    这条同时是「c/d/q 改用 ttNet 仍属零联网」的对偶锁：总开关关 = 一律静默（断网时的正确产品行为）。
+  put({ lastCheckAt: now, latestVersion: '9.9.9', failCount: 0, nextRetryAt: 0 }); // 无 lastHookAt → hookIdle=true
+  const r1 = ttNoNet.updateNotice(now);
+  const r2 = ttNoNet.updateTagForToast(now);
+  ok('T12-r1 ★WB_NO_NET=1（联网总开关关）→ updateNotice() 恒为 ""（状态文件不得绕过总开关）',
+    r1 === '', JSON.stringify(r1));
+  ok('T12-r2 ★WB_NO_NET=1 → updateTagForToast() 恒为 ""（没配 hook 也不得产出 ⬆ 标记）',
+    r2 === '', JSON.stringify(r2));
+  const stNo = ttMod.loadUpdateState();
+  ok('T12-r3 ★总开关关闭时不落盘提示计数（notifiedVersion / notifyCount 均未写）',
+    !stNo.notifiedVersion && !stNo.notifyCount, JSON.stringify(stNo));
+  cp.execFileSync = realExecFileSync; // 还原探针（后续 T12-j 的 spawn 不受影响）
+  // 零联网证据：① execFileSync 探针 0 次（从未走到 queryLatestTag）；② 闸门字段未被改写
+  //   （lastCheckAt 仍是预置的 now、failCount 仍为 0 → 没发起过任何一次版本查询）。
+  const stEnd = ttMod.loadUpdateState();
+  ok('T12-r4 ★零联网证明：c/d/e/f/q/r 全程未发起版本查询（探针 0 次 + lastCheckAt/failCount 未变）',
+    netProbes === 0 && stEnd.lastCheckAt === now && Number(stEnd.failCount) === 0,
+    `netProbes=${netProbes} ${JSON.stringify(stEnd)}`);
 
   // i：版本号四处一致（防漂移：源码常量 / manifest / README 徽章 / CHANGELOG 顶部条目）
   const v = ttMod.SKILL_VERSION;
@@ -891,22 +959,34 @@ else {
     missingSide.length === 0, missingSide.join(', ') || '全部存在');
 
   // j：端到端（spawn）—— 预置「有新版」状态跑 --hook，提示必须出现在注入里
+  //   ★v3.30.0：j 组与 c/d/q 同源——`env` 继承 CI 的 WB_NO_NET=1 → 子进程里 updateNotice() 走
+  //   总开关短路返回 '' → j1/j2 在真 CI（SPAWN_OK=true）上必红（本沙箱 SPAWN_OK=false 被跳过才没暴露）。
+  //   这里给子进程一套**删掉 WB_NO_NET / WB_DISABLE_NET** 的环境（envNet），零联网仍由
+  //   `lastCheckAt = nowJ` 关掉 7 天闸门承担（见下面 j4 的证据断言）。
+  const envNet = Object.assign({}, env);
+  delete envNet.WB_NO_NET; delete envNet.WB_DISABLE_NET;
+  const nowJ = Date.now();
   if (!SPAWN_OK) envSkip('T12-j --hook 端到端注入提示', SPAWN_SKIP_REASON);
   else {
-    put({ lastCheckAt: Date.now(), latestVersion: '9.9.9', failCount: 0, nextRetryAt: 0 });
+    put({ lastCheckAt: nowJ, latestVersion: '9.9.9', failCount: 0, nextRetryAt: 0 });
     const r = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'],
-      { input: HOOK_PAYLOAD, env, timeout: 30000, windowsHide: true, encoding: 'utf8' });
+      { input: HOOK_PAYLOAD, env: envNet, timeout: 30000, windowsHide: true, encoding: 'utf8' });
     const ac = (() => { try { return JSON.parse(r.stdout).hookSpecificOutput.additionalContext; } catch (e) { return ''; } })();
     ok('T12-j1 ★有新版时 --hook 的 additionalContext 末尾带更新提示',
       String(ac).indexOf('[技能更新]') >= 0, String(ac).slice(0, 160));
     ok('T12-j2 提示位于注入内容最后一行（不插入到用量行中间）',
       String(ac).split('\n').slice(-1)[0].indexOf('[技能更新]') === 0, JSON.stringify(String(ac).split('\n').slice(-2)));
     // 换成「已是最新」再跑一次 → 注入内容必须**不含**提示（回归：旧行为逐字节不变）
-    put({ lastCheckAt: Date.now(), latestVersion: ttMod.SKILL_VERSION, notifyCount: 0 });
+    put({ lastCheckAt: nowJ, latestVersion: ttNet.SKILL_VERSION, notifyCount: 0 });
     const r2 = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'],
-      { input: HOOK_PAYLOAD, env, timeout: 30000, windowsHide: true, encoding: 'utf8' });
+      { input: HOOK_PAYLOAD, env: envNet, timeout: 30000, windowsHide: true, encoding: 'utf8' });
     ok('T12-j3 已是最新时 --hook 注入不含任何更新提示（旧行为不变）',
       String(r2.stdout || '').indexOf('[技能更新]') < 0, String(r2.stdout).slice(0, 160));
+    // j4：子进程侧零联网证明 —— 闸门闭合（lastCheckAt=nowJ、nextRetryAt=0）时若真发起过查询，
+    //   maybeFetchLatest 必然改写 lastCheckAt 或把 failCount 加 1；两者都没变 = 一次都没查。
+    const stJ = ttMod.loadUpdateState();
+    ok('T12-j4 ★子进程零联网证明：lastCheckAt 未变且 failCount 仍为 0（未发起版本查询）',
+      stJ.lastCheckAt === nowJ && Number(stJ.failCount) === 0, JSON.stringify(stJ));
   }
   fs.rmSync(UF, { force: true });
 }
@@ -1406,6 +1486,81 @@ else {
   }
 }
 
+// ===== T20：v3.31.0 第二轮审计修复——新行为判据锁定 =====
+// 覆盖五组：A 峰谷批级时刻（toastLine2 源码守卫）/ 缺陷C isLocalModel 短名门槛（源码守卫）/
+//   P0-5 priceGate sanity（行为断言）/ P1-7 noPriceTag1 优先级（行为断言）/ 缺陷B 区间透传（行为断言）。
+// 为什么 isLocalModel/toastLine2 用源码守卫：isLocalModel 有模块级缓存（_localModelNames）本进程无法
+//   安全注入短名 fixture；toastLine2 峰谷行为级验证需构造跨档时刻对（收口时 focus.js 已验 4/4）。
+//   源码守卫在本机与 CI 都真跑，锁"逻辑被改没"这类回归；数值级行为另有独立 CLI 验证留档。
+{
+  const mod20 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  if (!mod20) ok('T20 v3.31.0 修复验证（主模块加载失败）', false, 'token-tracker.js require 失败 —— CI 正常环境下这必是代码回归，不允许静默跳过');
+  else {
+    const main20 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+
+    // ── a. 缺陷C：isLocalModel 短名门槛 ──
+    const ilStart = main20.indexOf('function isLocalModel');
+    const ilEnd = main20.indexOf('\nfunction ', ilStart + 10);
+    const ilBody = ilEnd > ilStart ? stripComments(main20.slice(ilStart, ilEnd)) : '';
+    ok('T20-a1 ★isLocalModel 双向子串必须带 lm.length>=5 门槛（短名 qwen 曾可把 qwen-max 误判本地免费）',
+      ilBody.includes('lm.length >= 5') && ilBody.includes('n.includes(lm)') && ilBody.includes('lm.includes(n)'),
+      '双向都保留但短名必须被挡；此条红 = 有人动了匹配逻辑');
+    ok('T20-a2 精确匹配在门槛之前（n===lm 永远放行，登记全名↔调用短名互变的底线）',
+      ilBody.indexOf('n === lm') >= 0 && ilBody.indexOf('n === lm') < ilBody.indexOf('lm.length >= 5'));
+
+    // ── b. A 修复：toastLine2 峰谷批级时刻 ──
+    const tlStart = main20.indexOf('function toastLine2');
+    const tlEnd = main20.indexOf('\nfunction ', tlStart + 10);
+    const tlBody = tlEnd > tlStart ? stripComments(main20.slice(tlStart, tlEnd)) : '';
+    ok('T20-b1 ★toastLine2 用批级峰谷时刻 batchTs（跨 12:00/18:00 边界混合轮弹窗金额必须==账本金额）',
+      tlBody.includes('batchTs'), '红 = 弹窗退回逐模型 lastTs，与账本口径分裂（弹窗¥2.00/账本¥4.00 形态复发）');
+
+    // ── c. P0-5/P1-7：priceGate sanity（纯函数，直接行为断言）──
+    const rp20 = (() => { try { return require(path.join(SRC, 'refresh-prices.js')); } catch (e) { return null; } })();
+    if (!rp20) ok('T20-c priceGate 验证', false, 'refresh-prices.js require 失败');
+    else {
+      const warns20 = [];
+      const gPass = rp20.priceGate('m', { input_price: 5, output_price: 15, cached_price: 0.5 }, { input_price: 4.5, output_price: 16, cached_price: 0.5 }, warns20);
+      ok('T20-c1 正常波动（±10%）放行且零告警（宁可漏报绝不误杀的下半句：不冤枉正常刷新）',
+        gPass && gPass.main === false && gPass.cached === false && warns20.length === 0, JSON.stringify({ gPass, warns20 }));
+      warns20.length = 0;
+      const gHuge = rp20.priceGate('m', { input_price: 6000, output_price: 15 }, { input_price: 5, output_price: 15, cached_price: 0.5 }, warns20);
+      ok('T20-c2 ★主价 ×1200 骤变拦截 + 告警形状「key: 说明」（可被弹窗 ⚠价核验 点名命中）',
+        gHuge && gHuge.main === true && warns20.length === 1 && /^m: /.test(warns20[0]), JSON.stringify({ gHuge, warns20 }));
+      warns20.length = 0;
+      // 列错位形态：cached 4→6 仅 ×1.5 不触发骤变，但 6 > input 5 → 交叉校验必须兜底
+      const gMis = rp20.priceGate('m', { input_price: 5, output_price: 15, cached_price: 6 }, { input_price: 5, output_price: 15, cached_price: 4 }, warns20);
+      ok('T20-c3 ★cached>input 列错位：告警点名「列错位」+ 有旧值回退（cached=true）',
+        gMis && gMis.cached === true && warns20.some((w) => w.includes('列错位')), JSON.stringify({ gMis, warns20 }));
+      ok('T20-c4 sanity 阈值导出（abortAt=3 的刻度不许被悄悄改掉）',
+        rp20.PRICE_SANITY && rp20.PRICE_SANITY.abortAt === 3, JSON.stringify(rp20.PRICE_SANITY || null));
+    }
+
+    // ── d. P1-7：noPriceTag1 优先级（行为断言）──
+    // 判定消费的是 refresh-prices 落盘的显式标记 cached_price_unknown:true（不是"条目缺 cached_price 键"）。
+    const P20 = { models: { 'm-x': { input_price: 2, output_price: 6, cached_price_unknown: true } } }; // 主价真、缓存价未公布
+    ok('T20-d1 ★cached_price_unknown + 有缓存命中 → 行1 标「⚠缓存价未知」（缓存占比 ~97% 时金额低估 45%~86% 的形态）',
+      mod20.noPriceTag1({ model: 'm-x', in: 1000, out: 500, cached: 9000 }, P20).includes('缓存价未知'));
+    ok('T20-d2 cached_price_unknown 但无缓存命中 → 不标（零噪音，没用到缓存就没有低估）',
+      mod20.noPriceTag1({ model: 'm-x', in: 1000, out: 500, cached: 0 }, P20).length === 0);
+    // 优先级的真实形态是**混合轮**：一个模型无公开价、另一个缓存价未知 → 只亮更严重的「无公开价」
+    // （同一模型两种状态互斥：anyCachePriceUnknown 显式排除 pricing_status==='unpublished'）
+    const stat20d3 = { model: 'm-pub', in: 1000, out: 500, cached: 9000, models: { 'm-pub': { in: 900, out: 400, cached: 8000 }, 'm-unk': { in: 100, out: 100, cached: 1000 } } };
+    const P20d3 = { models: { 'm-pub': { pricing_status: 'unpublished' }, 'm-unk': { input_price: 2, output_price: 6, cached_price_unknown: true } } };
+    ok('T20-d3 ★优先级：无公开价 > 缓存价未知（混合轮同时存在只显示前者，一个标注位给最严重的）',
+      (() => { const t = mod20.noPriceTag1(stat20d3, P20d3); return t.includes('无公开价') && !t.includes('缓存价未知'); })());
+
+    // ── e. 缺陷B：unpriced 区间透传（收口 CLI 验证抓到的漏网：聚合层曾只透传 no_price/cached_price_unknown）──
+    const agg20 = mod20.aggregateRangeModels(
+      { '2026-10-01': { models: { 'new-m': { in: 10, out: 5, cached: 0, total: 15, cost: 0, unpriced: true } } } },
+      '2026-10-01', '2026-10-02');
+    ok('T20-e1 ★aggregateRangeModels 透传 unpriced（标记丢失曾让区间表静默打 ¥0.00 且零告警）',
+      !!(agg20.models['new-m'] && agg20.models['new-m'].unpriced === true), JSON.stringify(agg20.models['new-m'] || null));
+    ok('T20-e2 ★formatUsageRow unpriced → 「未收录」（单日/区间共用行格式，不允许退回 ¥0.00）',
+      mod20.formatUsageRow({ label: 'new-m', in: 10, out: 5, cached: 0, total: 15, cost: 0, unpriced: true, hit: 0 }, false).includes('未收录'));
+  }
+}
+
 // ===== 导出一致性（A-16）：自动推导，替代"手工清单"的兜底 =====
 // 病根：selftest 里"新增导出必须存在"是**三张手工清单**（T8-N1g/N2 的 typeof 检查、T11-a 的 `exported`、
 //   T12-a 的 `ex12`），全靠人记得往里加。`cleanupCoalesceLocks` 三张都不含 → 一旦它"定义还在、导出没了"，
@@ -1416,7 +1571,7 @@ else {
 {
   const selfCode = stripComments(fs.readFileSync(path.join(SRC, 'selftest.js'), 'utf-8'));
   // 被测主模块在 selftest 里的全部局部变量名（grep 得来，勿漏；均为 require(skillDir/token-tracker.js) 的别名）
-  const MOD_VARS = ['mod', 'ttMod', 'tt2', 'mod16', 'mod17', 'mod18', 'mod19'];
+  const MOD_VARS = ['mod', 'ttMod', 'tt2', 'mod16', 'mod17', 'mod18', 'mod19', 'mod20'];
   const memberRe = new RegExp('\\b(?:' + MOD_VARS.join('|') + ')\\.([A-Za-z_$][A-Za-z0-9_$]*)', 'g');
   const referenced = new Set();
   let mm;

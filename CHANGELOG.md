@@ -3,6 +3,46 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.31.0（2026-10-03）—— 第二轮审计：静默错价与口径分裂集中修复
+
+> 起因：第二轮全量审计报告（第三方，2026-10-02 深夜）指出"金额准确性无 sanity check、多处静默不一致"。按「先分派子代理并行分析修复 + 交叉验证」执行；其中 5 名修复者中途因模型限流中断，已落盘改动经逐文件考古核实完整后由主代理补齐验证与收口。审计本身也有误报：P0-1 的机制描述（"区间聚合只认 `^\d{4}-\d{2}-\d{2}$`"）与实现不符——实际是字典序比较（正则只用于 CLI 参数校验），且账本键全部由本工具以 ISO 写入，**判定不修**；P1-2 / P1-3 / P2 外推经代码核实分别属于"机制已失效 / 提法夸大 / 结论已保守"，**均不修**。
+
+### 一、峰谷判定时刻：弹窗与账本两出口分裂（本轮最严重，审计未点名、复核时新发现）
+
+- **病根**：账本侧 `recordUsage` 对 `byModel` 里**每个模型**都传同一个批级 `tsMs`（= 主+子代理全部行取 max 的 `peakTs`）判峰谷；弹窗侧 `toastLine2` 却按各模型**自己的** `lastTs` 判。跨 12:00/18:00 峰谷边界的混合轮（含 DeepSeek 系 ×2）会出现**同一批 token：弹窗 ¥2.00 / 账本 ¥4.00**，差整倍且零提示——而 `toastLine2` 旧注释还宣称"与账本同口径"。
+- **修法**：弹窗逐模型计价前先取**各模型 lastTs 的最大值**作为批级 ts，全部模型统一用它（≈ 账本 `peakTs`；两者仅在"批内最后一条是无 usage 行"的毫秒级场景可不同，时段判定不受影响）。单模型轮 max = 原值，**零行为变化**。
+- **为什么不透传 `peakTs`**：弹窗渲染发生在 watcher/Stop 另一条调用路径，`stat` 结构里没有批级字段，透传要改聚合结构、侵入面大；而 `max(lastTs)` 与 `peakTs` 来自同一批行，语义等价。
+
+### 二、未收录模型（unpriced）与无公开价（no_price）口径补齐
+
+- **病根**：`cost=null`（价库**没收录**该模型）与 `no_price`（厂商**没公布**单价）是两种成因、两种处置（前者先补录、后者等公布后 recalc），但账本只对后者留痕。未收录模型 token 照记、金额恒 0，单日表/summary/区间/CSV 全部输出 `¥0.00` 无任何告警，而弹窗有「未收录」→ 三出口口径不一致，"算不出"被读成"免费"。
+- **修法**：`addModelUsage` 对 `cost==null` 且**非本地模型**者留痕 `unpriced`（互斥于 `no_price`，价恢复即删）；单日表 costCell、summary 尾注、区间表、CSV 四个出口统一显示/告警，措辞与 no_price 那套逐字同构（只差"未收录单价 / 补进 pricing.json"）。**本地模型不计费是既定正确行为，绝不打 unpriced**。summary 同时补齐 no_price 告警——它此前是三出口里唯一既无告警又直接打 `¥0.00` 的（P1-8）。正常有价数据的全部输出逐字节不变（零噪音验证：8 个 report 入口 + 2 条 --csv 改动前后 diff 为空）。
+- **收口验证补漏（区间出口）**：CLI 实跑发现区间表仍把未收录模型显示成 `¥0.00` 且零告警——`formatUsageRow` 虽为单日/区间共用且已含「未收录」分支，但 `aggregateRangeModels` 只透传了 `no_price`/`cached_price_unknown`、**漏透传 `unpriced`**，标记在聚合时丢失；`reportRangeTxt` 也缺尾注块。已补：聚合层透传 1 行 + 区间尾注 1 块（与 no_price 块并列、措辞同构）。教训：**"共用函数已修好"≠"所有调用方生效"——标记要穿过聚合层才算数**；四个出口必须各用真实 fixture 实跑断言，不能只验证代码存在。
+
+### 三、isLocalModel 短名误伤（定时炸弹，本机当前未触发）
+
+- **病根**：`isLocalModel` 对 models.json 登记名做**双向子串**匹配。本机若挂一个短名本地模型（如 `qwen`/`glm`），任何含该短串的**云端**模型（`qwen-max`/`glm-5.3-flash`）都会被判成本地免费 → `calcCost` 返回 null → 三出口全 ¥0.00 且连 unpriced 都不打（`isLocalModel` 先拦截）。
+- **修法**：**精确匹配永远放行；双向子串要求登记名 ≥5 字符**。不删任一方向——登记全名 ↔ 调用短名互变两个方向各有真实场景（`lmstudio-community/qwen3.5-9b` ↔ `qwen3.5-9b`），删任何一侧都会破坏真本地模型的豁免。本机 models.json 无本地模型 → 零行为变化。
+
+### 四、价格管线 sanity（P0-4 / P0-5 / P1-7 / P1-13 / P1-14，refresh-prices.js + deepseek-official.js）
+
+- **P0-5 主价体检**：落盘前对每个模型做数量级/骤变校验（合理区间 [0.0005, 10000] 元/百万 + 相对旧值 ≥3× 骤变即拦）。拦截 → **保留旧值** + stderr 可见 + 写入 `_price_audit.warnings`（形状 `<key>: 说明`，可被弹窗 `⚠价核验` 点名命中）。阈值刻意保守：**宁可漏报绝不误杀**（误杀 = 正常刷新失败 = 价库停滞 = 更大问题）。
+- **P0-4 官方表列对齐**：`grab()` 从"数字个数 ≥ 列数就 slice"改为——`< n` 判缺列返 null、`> n` 判**列错位嫌疑**返 null 并留证据（旧行为是静默取前 n 个，官方页在价格列前插一列即整体错位；作者自己在注释里记过一次同类事故：v4-pro 拿到 v4.1 的价、vision-exp 拿到 v4-pro 的价，全程不报错）。
+- **P1-13 备份**：写盘前把当前 pricing.json 复制为唯一一份 `.pricing.json.bak`（与账本/水位线的备份策略对齐）；备份失败不阻断主流程。
+- **P1-14 并发**：两脚本的 tmp 名分离（不再共用 `pricing.json.tmp`）；deepseek-official 写盘前探测 `.pricing.lock` 持有者，被持锁则退回纯内存不落盘。**不做**跨进程统一写锁（代价是第二份跨进程锁实现，收益仅覆盖一个窄窗口，取舍记录在代码注释）。
+- **P1-7 缓存价**：刷新侧纳入同一套体检（cached > input 告警、骤变拦截）；补录侧（token-tracker.js）缓存价缺失按 0 计的金额行为**保持不变**（不瞎猜价），但账本留痕 `cached_price_unknown` + 弹窗行1 挂「⚠缓存价未知」——缓存占比 ~97% 的真实负载下这是金额低估 45%~86% 的最大静默源，必须可见。刻意**不**并入 anyNoPublicPrice（那会触发行2 整段藏金额，把"有价但偏低"说成"算不出来"，丢信息）。
+
+### 五、recalc / holidays（P1-15 / P0-6）
+
+- **P1-15**：recalc-day 的轮次归属改**整名优先、前缀兜底取最长**（`hy4-preview` ↔ `hy4-preview-xxx` 互为前缀时旧实现两边都算 → 高峰占比互相拉偏 → 回算金额偏离当日），被仲裁掉的轮次打 stderr 明示。
+- **P0-6**：refresh-holidays **全部年份刷新失败时不写盘**（旧守卫只在"已有有效旧数据"时跳过，首跑/旧文件损坏时照样把 `{years:{}}` 空骨架写进 holidays.json → 全年法定假日不判假：真假日按高峰 ×2 多算 + 调休上班日按周末低峰少算，双向错且全年静默）；部分年份缺数据时写 `_stale:true` + 逐年 stderr 告警。
+
+### 六、测试与文档
+
+- selftest：T12 四条 CI 假红修复（v3.29.0 A-3③ 让主脚本开始读 `WB_NO_NET` 后，`updateNotice`/`updateTagForToast` 第一行就短路，老断言的"闸门闭合即离线"前提被打穿；同源 T12-j 在真 CI 必红一并修）——**不靠跳过换绿**，用同目录副本模块在"删 WB_NO_NET / 保留 WB_NO_NET"两种前提下分别 require，并新增 T12-r1~r4 锁死"断网 → 恒空 + 不落盘 + 零联网"（探针带正例自检，证明闸门闭合时真的零请求）。`WB_NO_NET=1` 与不设两轮均 **210 过 / 0 败 / EXIT=0**。
+- SKILL.md：版本要点补 v3.28/3.29/3.30（`⚠价核验` 结构化判据、行2 两级降级链、`TOAST_LINE_MAX_W=51`）；CHANGELOG 补 v3.20.0 缺失的节标题、文件结构清单对齐实际；README 徽章/口径同步；`.gitignore` 的 `docs/` 整目录忽略改为放行 3 个公开 docs（本地 git 从此能看出这 3 个文件与上游的差异，私有审计文档仍屏蔽）。
+- **已知残余**（记 KNOWN-ISSUES）：P1-10 transcript 重写且重写后 size ≥ 旧值时的弹窗重复窗口——无副作用的修法不存在（`size 相同 + mtime 变化`若清缓存会全量重读、把已弹行再弹一遍），入账有水位线保护、仅影响弹窗。
+
 ## v3.30.0（2026-10-02）—— 弹窗行2 三处真因修正（截图反馈：价核验误报 / 缓存被顶掉 / 标签时有时无）
 
 > 起因：用户发来弹窗历史记录截图，提了三个疑问 ——「明明有价格，为什么又在报价核验？」「又报价核验，又把缓存命中百分比也顶掉了」「有的缓存正常、价格正常、缓存百分比也有，有的又没有那个价核验」。
@@ -639,7 +679,7 @@ v3.24.0 改动段 alive0（TTL 过期探活口径与存量一致）、recalc 保
 - 文档：`SKILL.md` 新增「版本更新提示 & 如何升级」章节（升级操作步骤的**唯一权威处**）；`README.md` 新增「🔔 版本更新提示」功能行 + 「如何升级」章节 + 联网开关表第 4 行 + 文件清单 `.update-check.json`；`CHANGELOG.md` 隐私与安全章节的出网主机清单补 `api.github.com`（版本检查）。
 - 测试：`selftest.js` 新增 T12 段（版本比较 / 闸门 / 节流 / 退避 / 状态损坏容错 / 提示文案长度与内容 / 仅 hook 挂载的源码守卫 / 版本号四处一致守卫）。
 
-
+## v3.20.0（2026-10-01）—— `--report` 区间汇总 / CSV 导出 / 消耗外推 / 轮次明细留档 + 金额口径三处同步声明
 
 > 缘起两句用户原话：
 > ①「这两项一起做，做好测试，然后推仓库。」
@@ -1381,18 +1421,25 @@ token-usage-tracker/
 ├── recalc-day.js             # 账本单日回溯重算（价格补录/更正后重建某天金额，峰谷感知）
 ├── backfill.js               # 历史账本全量重建（--write 前自动备份；老账本机器慎用）
 ├── refresh-holidays.js       # 中国法定假日表刷新（峰谷判定的假日感知）
-├── fetch-cn-prices.py        # 国内厂商官方价直抓（MiniMax/阶跃/智谱/Kimi；需 Python3 + requests）
+├── fetch-cn-prices.py        # 国内厂商官方价直抓（MiniMax/阶跃/智谱/Kimi；需 Python3，`requests` 为**可选**依赖：v3.23.4 起缺失时自动回退内置 urllib 实现）
 ├── parse_tokenhub.py         # 腾讯云 TokenHub 官方价解析（混元系）
 ├── build_index.py            # 合并 prices/latest.json + tokenhub + pricing.json(lock) → index.json
 ├── pricing.json              # 人民币主价（lock=人工核验权威）+ region + 峰谷/夜间字段
 ├── holidays.json             # 法定假日表（refresh-holidays.js 产出）
 ├── SKILL.md                  # 技能说明与使用指令
+├── README.md                 # 面向用户的介绍（安装 / 功能表 / 查消耗问法 / 排障入口）
 ├── CHANGELOG.md              # 完整版本变更史（v3.18 起从 README/SKILL 拆出）
-├── manifest.yaml / LICENSE / BACKLOG.md / docs/
+├── KNOWN-ISSUES.md           # 已知未修问题的根因记录（KI-1 ~ KI-7）
+├── TROUBLESHOOTING.md        # 排障手册（不弹窗 / 内容不对 / 账本对不上 / 价库异常）
+├── selftest.js               # 自测套件（`node selftest.js`，T1~T19 段；CI 亦跑它）
+├── peak-rules.js             # 峰谷时段判定的**唯一实现**（v3.19.0 起主脚本 / backfill.js / recalc-day.js 共用，消除三份硬编码导致的口径分裂）
+├── manifest.yaml / LICENSE
+├── docs/                     # 按需加载的旁支文档（本机保留，`.gitignore` 排除）
 └── prices/index.json         # 本地官方价格库（Python 流水线产出，路径自动发现）
 ```
 - `daily-usage.json`（运行时生成，不入库）：每日分模型账本，长期保存；`--report` 查看。
 - `local-config.json`（可选，不入库）：本机私有开关，如 `{"enable_balance_query": true}`。
+- 其它运行时产物（均为本地文件、不入库）：`rounds/rounds-YYYY-MM.jsonl`（每轮明细，保留 6 个月）、`exports/`（`--csv` 导出物）、`.snapshot-<sid>.json`、`.balance.json`、`.ledger-watermark.json`、`.update-check.json`。
 
 ## 系统要求
 
