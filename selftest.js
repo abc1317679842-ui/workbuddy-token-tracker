@@ -1157,22 +1157,47 @@ else {
     const pUnpub = { models: { 'unpub-m': UNPUB } };
     const pMix = { models: { 'unpub-m': UNPUB, 'paid-m': PAID } };
     const pFree = { models: { 'free-m': { name: 'free-m', input_price: 0, output_price: 0, region: 'CN' } } };
+    const pPaid = { models: { 'paid-m': PAID } };
     const statU = { in: 500000, out: 10000, cached: 400000, model: 'unpub-m',
       models: { 'unpub-m': { in: 500000, out: 10000, cached: 400000, total: 510000, lastTs: 1727827200000 } } };
     const statM = { in: 1000000, out: 50000, cached: 900000, model: 'paid-m',
       models: { 'paid-m': { in: 1000000, out: 50000, cached: 900000, total: 1050000, lastTs: 1727827200000 },
                 'unpub-m': { in: 500000, out: 10000, cached: 400000, total: 510000, lastTs: 1727827200000 } } };
     const lU = mod18.toastLine2(statU, pUnpub);
-    ok('T18-a1 ★纯无公开价轮：金额位显示「无公开价」而非 ¥<0.01（后者会被读成"几乎免费"）',
-      lU.indexOf('无公开价') >= 0 && lU.indexOf('¥') < 0, lU);
-    ok('T18-a2 ★无公开价轮带「⚠无公开价」标注（区别于「⚠未计价」= 我们没收录到）',
-      lU.indexOf('⚠无公开价') >= 0, lU);
+    // v3.27.0（用户 2026-10-02 定版布局）：⚠无公开价 在**行1**、行2 **完全不显示金额**
+    ok('T18-a1 ★纯无公开价轮：行2 不显示任何金额（不是 ¥0、也不是「无公开价」字样）',
+      lU.indexOf('¥') < 0 && lU.indexOf('无公开价') < 0, lU);
+    ok('T18-a2 ★纯无公开价轮：行2 保留缓存百分比且无孤悬分隔符「｜」结尾',
+      lU.indexOf('缓存80.00%') >= 0 && !/｜\$/.test(lU) && lU.indexOf('｜｜') < 0, lU);
     const lM = mod18.toastLine2(statM, pMix);
-    ok('T18-a3 ★混合轮（有价 + 无公开价）：**已知金额照常显示** + 缺口标注（不抹掉已知部分）',
-      /¥[\d.]+/.test(lM) && lM.indexOf('⚠无公开价') >= 0, lM);
+    ok('T18-a3 ★混合轮（有价 + 无公开价）：行2 **已知金额照常显示**（不抹掉已知部分）',
+      /¥[\d.]+/.test(lM), lM);
     const lF = mod18.toastLine2({ in: 1000000, out: 50000, cached: 900000, model: 'free-m' }, pFree);
     ok('T18-a4 ★真 0 元（免费）保持旧显示 ¥<0.01、不误标无公开价（不制造新噪声）',
       /¥/.test(lF) && lF.indexOf('无公开价') < 0, lF);
+    // 行1 标记：位置、宽度、以及超宽时的降级
+    const tagU = mod18.noPriceTag1(statU, pUnpub);
+    ok('T18-a5 ★⚠无公开价 标记落在**行1**（toastLine1 第 6 参），格式为「｜⚠无公开价」', tagU === '｜⚠无公开价', 'got=' + tagU);
+    const full1 = mod18.toastLine1(statU, 'space-bunny', '', '', '', tagU);
+    const l1Only = full1.split('\n')[0];
+    ok('T18-a6 ★行1 输出含标记且不超宽（≤45u）',
+      l1Only.indexOf('⚠无公开价') >= 0 && mod18.dispWidthTitle(l1Only) <= 45,
+      `w=${mod18.dispWidthTitle(l1Only)} line1=${l1Only}`);
+    const LONGA = 'a-very-very-long-model-name-that-overflows-row1-limit';
+    const shrink1 = mod18.toastLine1(statU, LONGA, '（高峰）', '', '', mod18.noPriceTag1(statU, pUnpub)).split('\n')[0];
+    ok('T18-a7 ★超长模型名：缩名保标注（两标注都在、不超宽）',
+      shrink1.indexOf('⚠无公开价') >= 0 && shrink1.indexOf('高峰') >= 0 && mod18.dispWidthTitle(shrink1) <= 45,
+      `w=${mod18.dispWidthTitle(shrink1)} line1=${shrink1}`);
+    const drop1 = mod18.toastLine1(statU, LONGA, '（高峰 ×2 时段很长）', '', '', mod18.noPriceTag1(statU, pUnpub)).split('\n')[0];
+    ok('T18-a8 ★标注预算不足时丢标注保模型名（不超宽、数据不丢）',
+      mod18.dispWidthTitle(drop1) <= 45 && drop1.indexOf('⚠无公开价') < 0, `w=${mod18.dispWidthTitle(drop1)} line1=${drop1}`);
+    ok('T18-a9 ★无标注轮行1 逐字节不变（超长名 + 高峰，回归旧行为）',
+      mod18.toastLine1(statU, LONGA, '（高峰）', '', '', '').split('\n')[0] === 'a-very-very-long…flows-row1-limit （高峰）',
+      mod18.toastLine1(statU, LONGA, '（高峰）', '', '', '').split('\n')[0]);
+    // 行1/行2 判定口径必须同源（分裂会出「行1没标、金额也没显示」的诡异组合）
+    ok('T18-a10 ★行1 标记与行2 省略共用 anyNoPublicPrice 同一判定（口径不得分裂）',
+      mod18.anyNoPublicPrice(statU, pUnpub) === true && mod18.anyNoPublicPrice(statM, pMix) === true
+      && mod18.anyNoPublicPrice(statM, pPaid) === false && mod18.anyNoPublicPrice({ in: 1, out: 1, model: 'free-m' }, pFree) === false);
     // 账本层：formatUsageRow 对 no_price 显示「无公开价」；普通条目逐字节不变
     const rowU = mod18.formatUsageRow({ label: 'unpub-m', in: 500000, out: 10000, cached: 400000, total: 510000, cost: 0, hit: 80, no_price: true }, false);
     ok('T18-b1 ★账本行 no_price → 金额列「无公开价」而非 ¥0.00', rowU.indexOf('无公开价') >= 0 && rowU.indexOf('¥0.00') < 0, rowU);

@@ -1,5 +1,12 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.27.0 (2026-10-02)
+// token-usage-tracker v3.28.0 (2026-10-02)
+// v3.28.0：**⚠无公开价 标注挪到行1、行2 不再显示金额**（用户 2026-10-02 定版布局）——
+//   行2 已有「输入/输出/缓存/缓存命中/金额」五段，标注塞那里会把缓存百分比挤掉；行1 模型名右侧
+//   本来就有空位。改法：toastLine1 新增可选第 6 参 extraTag（默认空串 → 12 个调用点行为不变），
+//   标记并入既有超宽守卫的「标注预算」（periodTxt + tagTxt 一起算）；行2 在本轮无任何已知金额时
+//   **整段省略金额**（不是 ¥0、也不是「无公开价」字样），混合轮的有价部分照常显示。
+//   ★顺带修一个既有守卫缺陷：旧写法在「head+标注其实放得下、只是被更新标记顶超宽」时会掉进
+//   fallback 把标注整段丢掉（实测高峰标注+⚠无公开价+长模型名=49.5u，本可缩名到 30.5u 放下）。
 // v3.27.0：**无公开价模型显式标注（匿名/订阅制模型厂商不公布按 token 单价）** ——
 //   病根：两个查价源校验写作 price>=0，把聚合平台对这类模型标的 $0 当成合法价写进 pricing.json
 //   → 弹窗显示 ¥<0.01（读起来像"几乎免费"）、账本 cost:0 与"真免费"不可区分、当日合计被系统性
@@ -3724,7 +3731,7 @@ function shrinkTitle(s, maxW) {
   return head + ell + tail;
 }
 
-function toastLine1(stat, modelShort, period, balTxt, todayTxt) {
+function toastLine1(stat, modelShort, period, balTxt, todayTxt, extraTag) {
   let head = modelShort || '';
   // v3.11：团队轮在第一行补「（子代理 X）」——只补与主模型**不同**的子代理模型；最多列 1 个 + 「等」。
   //   需求（用户 2026-09-23 明确）：① 第一个必须是主模型；② 第一行最多两个模型名；③ 超宽就截断，先截子代理段。
@@ -3745,8 +3752,12 @@ function toastLine1(stat, modelShort, period, balTxt, todayTxt) {
     }
   } catch (e) { /* 标注失败不影响主流程 */ }
   // 行1：模型名 + 时段标注（空格分隔，不占用时间位置）
+  // v3.27.0：extraTag（如「｜⚠无公开价」）并入行1 —— 用户 2026-10-02 明确要求放行1：
+  //   行2 已有「输入/输出/缓存/缓存命中/金额」五段，标注塞那里会把缓存百分比挤掉；
+  //   行1 模型名右侧本来就有空位。标注同样受下面的超宽守卫保护（放不下就丢标注，绝不挤掉数据）。
   const periodTxt = period ? ` ${period}` : '';
-  const line1 = `${head}${periodTxt}`;
+  const tagTxt = extraTag ? String(extraTag) : '';
+  const line1 = `${head}${periodTxt}${tagTxt}`;
   // v3.22.0：版本更新标记（`⬆vX.Y.Z`）——**只有「本机没配 UserPromptSubmit hook」的用户会出现**
   //   （updateTagForToast 内以 lastHookAt 判定；已配 hook 的永远走回答注入，这里恒为空串）。
   //   空间规则：**整个标记放得下才加**，因此绝不会触发下面的「缩略模型名」逻辑、绝不动 line2。
@@ -3774,35 +3785,46 @@ function toastLine1(stat, modelShort, period, balTxt, todayTxt) {
   }
   // 行1 超宽守卫（v2.81 重写）：标注优先保住——缩略名字给标注留位；名字+标注都放不下才丢标注；
   // 耗时行（line2）任何情况不丢。TOAST_ROW1_MAX_W=45。
+  // v3.27.0：① periodTxt 与 tagTxt 一起算进「标注预算」（extraTag 与 period 同属要保住的标注）；
+  //   ② 顺带修一个既有缺陷——旧写法在「head+标注其实放得下、只是被行1 的第三个元素（更新标记）
+  //   顶超宽」时会掉进 fallback 把标注**整段丢掉**（实测：高峰标注 + ⚠无公开价 + 长模型名 =
+  //   49.5u，本可缩名到 30.5u 放下，却输出成裸模型名）。现按「标注预算」统一缩名，不再误丢。
   if (dispWidthTitle(line1Out) > TOAST_ROW1_MAX_W) {
-    if (periodTxt) {
-      const budget = TOAST_ROW1_MAX_W - dispWidthTitle(periodTxt);
-      if (budget >= 8 && dispWidthTitle(head) + dispWidthTitle(periodTxt) > TOAST_ROW1_MAX_W) {
-        return `${shrinkTitle(head, budget)}${periodTxt}\n${line2}`;
-      }
+    const keep = periodTxt + tagTxt;
+    const keepW = dispWidthTitle(keep);
+    if (keep && TOAST_ROW1_MAX_W - keepW >= 8) {
+      const budget = TOAST_ROW1_MAX_W - keepW;
+      const headKeep = dispWidthTitle(head) > budget ? shrinkTitle(head, budget) : head;
+      return `${headKeep}${keep}\n${line2}`;
     }
     const headFit = dispWidthTitle(head) > TOAST_ROW1_MAX_W ? shrinkTitle(head, TOAST_ROW1_MAX_W) : head;
     return `${headFit}\n${line2}`;
   }
   return `${line1Out}\n${line2}`;
 }
+// v3.27.0：本轮是否存在「厂商未公布按 token 单价」的模型（pricing_status:'unpublished'）。
+//   行1 标记（noPriceTag1）与行2 金额省略（toastLine2）**共用这一判定**——两处口径分裂会出
+//   「行1没标、金额也没显示」或反之的诡异组合。混合轮看全部模型（stat.models），旧形状看顶层 model。
+function anyNoPublicPrice(stat, pricing) {
+  if (!stat || !pricing || !pricing.models) return false;
+  const isUnpub = (n) => {
+    const m = pricing.models[n];
+    return !!(m && m.pricing_status === 'unpublished');
+  };
+  if (stat.models && typeof stat.models === 'object') {
+    for (const n of Object.keys(stat.models)) if (isUnpub(n)) return true;
+  }
+  return isUnpub(stat.model);
+}
+// v3.27.0：行1 用的标注文本（用户 2026-10-02 指定放行1 模型名右侧，那里有空位）。
+//   有 token 消耗才标（空轮不标）；行1 放不下时由 toastLine1 的超宽守卫丢弃，绝不挤掉数据。
+function noPriceTag1(stat, pricing) {
+  if (!anyNoPublicPrice(stat, pricing)) return '';
+  return ((stat && stat.in) || (stat && stat.out)) ? '｜⚠无公开价' : '';
+}
 function toastLine2(stat, pricing) {
   const isLocal = isLocalModel(stat && stat.model);
-  // v3.27.0：「厂商未公布按 token 单价」（pricing_status:'unpublished'）与「真免费」严格区分。
-  //   旧口径：这类条目 input_price=0 → fmtCost(0) → 「¥<0.01」——读起来像"几乎免费"，
-  //   而真相是"厂商根本没公布价"（匿名/订阅制模型），且当日合计被系统性低估。
-  //   现显式标注 ⚠无公开价；混合轮里只要有任一无公开价模型就标（金额是已知部分 + 缺口）。
-  const modelsObjV = (stat && stat.models && typeof stat.models === 'object') ? stat.models : null;
-  const noPriceKey = (name) => {
-    if (!pricing || !pricing.models) return null;
-    const mm = pricing.models[name];
-    return mm && mm.pricing_status === 'unpublished' ? name : null;
-  };
-  const topNoPrice = noPriceKey(stat && stat.model);
-  let anyNoPrice = topNoPrice;
-  if (!anyNoPrice && modelsObjV) {
-    for (const n of Object.keys(modelsObjV)) { const k = noPriceKey(n); if (k) { anyNoPrice = k; break; } }
-  }
+  const anyNoPrice = anyNoPublicPrice(stat, pricing);
   // v3.26.0（KI-6 ⑧）：混合模型轮**分模型计价求和**（与账本/轮次明细同口径）——
   // 旧口径 = 全部 tokens 按 stat.model（子代理优先）单一价折算，混合轮金额失真且与账本对不上。
   // 规则：① models 明细存在 → 逐模型 calcCost（带各自 lastTs 峰谷时刻；本地模型免费跳过）；
@@ -3830,19 +3852,26 @@ function toastLine2(stat, pricing) {
     costVal = calcCost(stat, pricing);
   }
   const allLocal = isLocal && cloudCount === 0; // 顶层本地且无云端参与（顶层本地但混合云端 → 显示云端金额）
-  // v3.27.0：无公开价模型的处理分两种——
-  //   ① **没有任何已知金额**（该模型或全部模型都是无公开价）→ 金额位直接显示「无公开价」，
-  //      替代 ¥<0.01 / ¥0.00（那会被读成"几乎免费"/"免费"）；
-  //   ② **有已知金额 + 混合了无公开价模型** → 金额照常显示（是已知部分和），另加「⚠无公开价」标注明示缺口。
-  //   绝不能因为混了一个无公开价模型就把已知金额也抹掉（那比旧口径更糟）。
+  // v3.27.0（用户 2026-10-02 明确要求，**标记挪到行1**）：本轮涉及无公开价模型时，
+  //   **行2 整段不显示金额**——不显示 ¥0、也不显示「无公开价」字样（两个字比数字占位更多，
+  //   而标注已移到行1 模型名右侧）。行2 已有「输入/输出/缓存/缓存命中/金额」五段，
+  //   金额算不出来时直接省掉整段最干净，也就不会挤掉缓存百分比。
+  //   有已知金额（混合轮里的有价部分）→ 照常显示，缺口由行1 的 ⚠无公开价 标注承担。
+  const hideCost = !!anyNoPrice && !(costVal > 0);
   const cost = allLocal ? '本地·免费'
-    : (anyNoPrice && !(costVal > 0) ? '无公开价' : (fmtCost(costVal) || '未收录'));
+    : (hideCost ? '' : (fmtCost(costVal) || '未收录'));
   const input = (stat && stat.in) || 0;
   const cached = (stat && stat.cached) || 0;
   // 缓存占比精确到两位小数（如 99.12%）；无输入数据则不显示缓存段
   const ratioPct = input > 0 ? ((cached / input) * 100).toFixed(2) : null;
-  const ratioTxt = ratioPct === null ? '' : `缓存${ratioPct}%｜`;
-  let line = `输入 ${fmt(stat.in)} / 输出 ${fmt(stat.out)}｜${ratioTxt}${cost}`;
+  const ratioTxt = ratioPct === null ? '' : `缓存${ratioPct}%`;
+  // 金额段整段省略时，用「｜」只作为 ratio 与 cost 之间的分隔（两者都有才加），行尾不留孤竖线
+  const parts2 = [`输入 ${fmt(stat.in)} / 输出 ${fmt(stat.out)}`];
+  const segs = [];
+  if (ratioTxt) segs.push(ratioTxt);
+  if (cost) segs.push(cost);
+  if (segs.length) parts2.push(segs.join('｜'));
+  let line = parts2.join('｜');
   // v2.31：价格多源拉取全失败 → 提示「价⚠️」，表示费用按上次价格估算（refresh-prices.js 全源失败时写入 last_refresh_error）
   if (pricing && pricing.last_refresh_error) {
     line += '｜价⚠️';
@@ -3858,10 +3887,11 @@ function toastLine2(stat, pricing) {
   if ((pricing && !isLocal && costVal == null && ((stat && stat.in) || (stat && stat.out))) || partUnknown) {
     line += '｜⚠未计价';
   }
-  // v3.27.0：无公开价标注。⚠未计价 = "我们没收录到价"；⚠无公开价 = "厂商根本没公布单价"——
-  // 两者对用户的行动含义完全不同（前者去补录，后者只能等官方/换订阅），必须能区分。
-  if (anyNoPrice && ((stat && stat.in) || (stat && stat.out))) {
-    line += '｜⚠无公开价';
+  // v3.27.0：⚠未计价 = "我们没收录到价"；⚠无公开价 = "厂商根本没公布单价"——行动含义不同，必须能区分。
+  //   **⚠无公开价 已挪到行1**（用户 2026-10-02 明确要求：行2 位置留给缓存百分比）。
+  //   行2 只保留「金额算不出来」类标注：⚠未计价（账本/弹窗会缺金额）仍留行2。
+  if ((pricing && !isLocal && costVal == null && ((stat && stat.in) || (stat && stat.out))) || partUnknown) {
+    line += '｜⚠未计价';
   }
   // v3.24.0（级联①）：transcript 被平台压缩/重写导致水位线冻结 → 之后的消耗静默少计。
   // 旗标由 readTranscLinesFrom 落盘（24h 节流），这里让用户在弹窗里看得见。7 天后自动失效。
@@ -3873,7 +3903,10 @@ function toastLine2(stat, pricing) {
   } catch (e2) { /* 无旗标 = 正常 */ }
   // 宽度保护：超宽丢缓存占比，保住价格与核心数字（高峰标注已移至行1，行2 不再有溢出风险）
   if (dispWidth(line) > TOAST_LINE_MAX_W) {
-    line = line.replace(ratioTxt, '');
+    // v3.27.0：ratioTxt 现在不带尾随「｜」（金额段可能整体缺席），
+    //   所以要多清一次「<ratio>｜」形式，以及清完后的行尾孤立「｜」。
+    line = line.replace(ratioTxt + '｜', '').replace(ratioTxt, '');
+    line = line.replace(/｜(?=｜)|｜$/g, '');
   }
   return line;
 }
@@ -3881,9 +3914,9 @@ function toastLine2(stat, pricing) {
 // v3.12：在 toast 第一行模型名后插入状态标注（异常轮用"子代理运行中"、补弹用"子代理"），
 //   不改动 toastLine1 本体（保证正常轮/团队轮一字不变）。超宽时放弃标注，绝不超出 TOAST_ROW1_MAX_W。
 function toastLineTagged(agg, pricing, tag) {
-  if (!tag) return toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), balanceText(), todayUsageTxt());
+  if (!tag) return toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), balanceText(), todayUsageTxt(), noPriceTag1(agg, pricing));
   const mShort = shortModelName(agg, pricing);
-  const base = toastLine1(agg, mShort, periodNote(agg, pricing), balanceText(), todayUsageTxt());
+  const base = toastLine1(agg, mShort, periodNote(agg, pricing), balanceText(), todayUsageTxt(), noPriceTag1(agg, pricing));
   const nl = base.indexOf('\n');
   const line1 = nl >= 0 ? base.slice(0, nl) : base;
   const tail = nl >= 0 ? base.slice(nl) : '';
@@ -4384,7 +4417,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
             line: lineFor(aggC, false, modelC), source: 'transcript-cancelled-round-watch',
             intrAt: new Date(cancelTs).toISOString() });
           showToast(
-            toastLine1(aggC, modelC, '（手动取消）', balanceText(), todayUsageTxt()),
+            toastLine1(aggC, modelC, '（手动取消）', balanceText(), todayUsageTxt(), noPriceTag1(aggC, pricing)),
             toastLine2(aggC, pricing),
             'cancelled-round-watch'
           );
@@ -4403,7 +4436,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
               note: 'cancelled-round-watch-est', transcriptPath: tsPath, stat: estStat,
               line: '本轮被手动取消，估算 token（usage 未落盘）', source: 'transcript-cancelled-round-watch-est',
               intrAt: new Date(cancelTs).toISOString() });
-            showToast(toastLine1(estStat, estModelShort, '（手动取消）（估算）', balanceText(), todayUsageTxt()), toastLine2(estStat, pricing), 'cancelled-round-watch-est');
+            showToast(toastLine1(estStat, estModelShort, '（手动取消）（估算）', balanceText(), todayUsageTxt(), noPriceTag1(estStat, pricing)), toastLine2(estStat, pricing), 'cancelled-round-watch-est');
           } else {
             // 取消早于首字节落盘（连 incomplete reasoning 行都没有，2026-09-05 15:33 实测型）→ 无估算依据。
             // 对齐 Stop 端 v2.51：弹「无记录」提示而非静默退出，让用户知道该轮已取消、无本地数据可计
@@ -4450,7 +4483,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.27.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.28.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -5048,7 +5081,7 @@ function main() {
         const modelShort = shortModelName(agg, pricing);
         const subEntry = subModels.get(normalizeModelName(agg.model || ''));
         const modelLabel = subEntry ? modelShort + subagentTagOf(subEntry) : modelShort;
-        showToast(toastLine1(agg, modelLabel, periodNote(agg, pricing), bal, todayUsageTxt()), toastLine2(agg, pricing), toastReason, info.tsPath);
+        showToast(toastLine1(agg, modelLabel, periodNote(agg, pricing), bal, todayUsageTxt(), noPriceTag1(agg, pricing)), toastLine2(agg, pricing), toastReason, info.tsPath);
         clearCoalesce(fSid);
         // v2.27：watcher 弹窗完成 = 专家团本轮真正结束 → 推进 lastStopAt（供 hook 端起点刷新守卫）
         const ws = loadSnapshot(fSid) || {};
@@ -5264,7 +5297,7 @@ function main() {
           // 普通轮：同步立即弹（不 spawn、不等确认窗），并清掉 coalesce 以免被兜底二次补弹
           try {
             showToast(
-              toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), balanceText(), todayUsageTxt()),
+              toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), balanceText(), todayUsageTxt(), noPriceTag1(agg, pricing)),
               toastLine2(agg, pricing),
               (typeof toastReason === 'string' && toastReason) ? toastReason + '+plain-immediate' : 'plain-immediate',
               tsPath
@@ -5342,7 +5375,7 @@ function main() {
           if (stillPending) {
             try {
               showToast(
-                toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), balanceText(), todayUsageTxt()),
+                toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), balanceText(), todayUsageTxt(), noPriceTag1(agg, pricing)),
                 toastLine2(agg, pricing),
                 (typeof toastReason === 'string' && toastReason) ? toastReason + '+no-watcher' : 'no-watcher-fallback',
                 tsPath
@@ -5379,7 +5412,7 @@ function main() {
           writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sid, sameRound: false, transcriptPath: tsPath, stat: estStat, line: '本轮被中断，估算 token（思考未落盘 usage）', source: 'transcript-interrupted-est', payload: summarizePayload(payloadRaw) });
           // 注意：估算值已在 incrementalRecord（本函数开头）按水位线记入账本，这里不再重复 recordUsage。
           const bal = balanceText();
-          showToast(toastLine1(estStat, estModelShort, '（估算）', bal, todayUsageTxt()), toastLine2(estStat, pricing), 'estimate');
+          showToast(toastLine1(estStat, estModelShort, '（估算）', bal, todayUsageTxt(), noPriceTag1(estStat, pricing)), toastLine2(estStat, pricing), 'estimate');
           out({ hookSpecificOutput: {} });
           return;
         }
@@ -5570,7 +5603,7 @@ function main() {
         const pendModelBase = shortModelName(pendAgg, pricing);
         const pendEntry = pendSubModels.get(normalizeModelName(pendAgg.model || ''));
         const pendModel = pendEntry ? pendModelBase + subagentTagOf(pendEntry) : pendModelBase;
-        showToast(toastLine1(pendAgg, pendModel, periodNote(pendAgg, pricing), bal, todayDisplay(pendAgg, pricing)), toastLine2(pendAgg, pricing), 'hook-fallback');
+        showToast(toastLine1(pendAgg, pendModel, periodNote(pendAgg, pricing), bal, todayDisplay(pendAgg, pricing), noPriceTag1(pendAgg, pricing)), toastLine2(pendAgg, pricing), 'hook-fallback');
         clearCoalesce(sid);
         // v2.27：兜底补弹完成 → 该轮已结束，标记 lastStopAt（供下轮起点刷新判断）
         const psnap = loadSnapshot(sid) || {};
@@ -5634,7 +5667,7 @@ function main() {
               line: lineFor(aggC, false, modelC), source: 'transcript-cancelled-round', intrAt: new Date(intrInfo.ts).toISOString() });
             const balC = balanceText();
             showToast(
-              toastLine1(aggC, modelC, '（手动取消）', balC, todayUsageTxt()),
+              toastLine1(aggC, modelC, '（手动取消）', balC, todayUsageTxt(), noPriceTag1(aggC, pricing)),
               toastLine2(aggC, pricing),
               'cancelled-round-flush'
             );
@@ -5760,6 +5793,7 @@ module.exports = {
   updateNotice, cmpVersion, loadUpdateState, saveUpdateState, queryLatestTag,
   updateTagForToast, maybeFetchLatest, maybeFetchLatestForStop, claimNotify, hookIdle,
   toastLine2, TRANSC_TRUNCATED_FILE, // v3.24.0：弹窗标注（⚠未计价/⚠账缺）行为测试用
+  toastLine1, noPriceTag1, anyNoPublicPrice, dispWidthTitle, dispWidth, // v3.27.0：⚠无公开价 挪进行1 + 布局测试用
   mergeEstIntoModels, // v3.26.0（KI-6 ⑧）：估算段并入分模型明细（selftest 单测）
   // v3.23.5：残留锁清理导出（KI-3 副产物；selftest 可直接单测"删旧留新、当前会话锁不动"）
   cleanupCoalesceLocks, coalescePath,
