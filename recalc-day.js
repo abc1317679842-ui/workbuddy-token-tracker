@@ -163,6 +163,12 @@ function main() {
         peakRatio: peakRatio === null ? '未知(按空闲)' : `${(peakRatio * 100).toFixed(0)}%`,
       });
     }
+    // v3.27.0：官方价补上并回算后，条目不再属于「无公开价」→ 必须清标记，
+    //   否则金额已是真实值、报表却仍显示「无公开价」+ 合计偏低提示（自己打自己的脸）。
+    if (stat.no_price && cost > 0) {
+      delete stat.no_price; delete stat.no_price_note;
+      report.push({ model, note: '已补公开价并回算，清除 no_price 标记' });
+    }
     dayTotal += stat.cost;
   }
 

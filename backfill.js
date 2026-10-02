@@ -204,6 +204,10 @@ function scanFile(fp, acc, modelNames) {
     m.in += u.in; m.out += u.out; m.cached += u.cached; m.total += u.in + u.out;
     const c = rowCost(_pricing, name, u, ts);
     if (c != null) m.cost = Math.round((m.cost + c) * 1e6) / 1e6;
+    // v3.27.0：无公开价模型（pricing_status:'unpublished'）留痕 no_price —— 与主脚本
+    //   addModelUsage 同口径。漏了它，backfill --write 重建出来的账本会把无公开价模型显示成
+    //   ¥0.00（读成"免费"），正是 v3.27.0 要消灭的那种静默误导。
+    if (isNoPublicPrice(name)) m.no_price = true;
   }
   // v2.52 中断补偿（按日期归属）：与增量记账同口径，被中断的思考也补进账本
   estimateInterruptedToDate(rows, acc);
@@ -211,6 +215,15 @@ function scanFile(fp, acc, modelNames) {
 }
 
 let _pricing = { models: {} };
+
+// v3.27.0：该模型在价库中是否标了「厂商未公布按 token 单价」。走 findModel 宽松匹配，
+//   与主脚本 toastLine2 / addModelUsage 的判定口径一致（避免同一模型两处结论不同）。
+function isNoPublicPrice(name) {
+  try {
+    const hit = tt.findModel(_pricing, name, 'price');
+    return !!(hit && hit.m && hit.m.pricing_status === 'unpublished');
+  } catch (e) { return false; }
+}
 
 // v3.19.2（B5）：normalizeModelName / findModel 已改为直接复用主脚本导出（见文件顶部 require 块），
 // 原先这里手抄的三件镜像（normalizeModelName / alnumKey / findModel）已删除——「命名/匹配口径」由

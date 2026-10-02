@@ -1145,6 +1145,62 @@ else {
   }
 }
 
+// ===== T18：无公开价模型（v3.27.0）——匿名/订阅制模型厂商不公布按 token 单价 =====
+// 病根：两个查价源对这类模型都标价 $0，旧代码把 0 当合法价写进 pricing.json →
+//   弹窗显示 ¥<0.01（读起来像"几乎免费"）、账本 cost:0 与"真免费"不可区分、当日合计被系统性低估且零提示。
+{
+  const mod18 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  if (!mod18) skip('T18 无公开价行为验证（主模块加载失败）');
+  else {
+    const UNPUB = { name: 'unpub-m', input_price: 0, cached_price: null, output_price: 0, region: 'US', pricing_status: 'unpublished' };
+    const PAID = { name: 'paid-m', input_price: 1, cached_price: 0.25, output_price: 4, region: 'CN' };
+    const pUnpub = { models: { 'unpub-m': UNPUB } };
+    const pMix = { models: { 'unpub-m': UNPUB, 'paid-m': PAID } };
+    const pFree = { models: { 'free-m': { name: 'free-m', input_price: 0, output_price: 0, region: 'CN' } } };
+    const statU = { in: 500000, out: 10000, cached: 400000, model: 'unpub-m',
+      models: { 'unpub-m': { in: 500000, out: 10000, cached: 400000, total: 510000, lastTs: 1727827200000 } } };
+    const statM = { in: 1000000, out: 50000, cached: 900000, model: 'paid-m',
+      models: { 'paid-m': { in: 1000000, out: 50000, cached: 900000, total: 1050000, lastTs: 1727827200000 },
+                'unpub-m': { in: 500000, out: 10000, cached: 400000, total: 510000, lastTs: 1727827200000 } } };
+    const lU = mod18.toastLine2(statU, pUnpub);
+    ok('T18-a1 ★纯无公开价轮：金额位显示「无公开价」而非 ¥<0.01（后者会被读成"几乎免费"）',
+      lU.indexOf('无公开价') >= 0 && lU.indexOf('¥') < 0, lU);
+    ok('T18-a2 ★无公开价轮带「⚠无公开价」标注（区别于「⚠未计价」= 我们没收录到）',
+      lU.indexOf('⚠无公开价') >= 0, lU);
+    const lM = mod18.toastLine2(statM, pMix);
+    ok('T18-a3 ★混合轮（有价 + 无公开价）：**已知金额照常显示** + 缺口标注（不抹掉已知部分）',
+      /¥[\d.]+/.test(lM) && lM.indexOf('⚠无公开价') >= 0, lM);
+    const lF = mod18.toastLine2({ in: 1000000, out: 50000, cached: 900000, model: 'free-m' }, pFree);
+    ok('T18-a4 ★真 0 元（免费）保持旧显示 ¥<0.01、不误标无公开价（不制造新噪声）',
+      /¥/.test(lF) && lF.indexOf('无公开价') < 0, lF);
+    // 账本层：formatUsageRow 对 no_price 显示「无公开价」；普通条目逐字节不变
+    const rowU = mod18.formatUsageRow({ label: 'unpub-m', in: 500000, out: 10000, cached: 400000, total: 510000, cost: 0, hit: 80, no_price: true }, false);
+    ok('T18-b1 ★账本行 no_price → 金额列「无公开价」而非 ¥0.00', rowU.indexOf('无公开价') >= 0 && rowU.indexOf('¥0.00') < 0, rowU);
+    const rowN = mod18.formatUsageRow({ label: 'paid-m', in: 100, out: 10, cached: 50, total: 110, cost: 1.23, hit: 50 }, false);
+    ok('T18-b2 无 no_price 的行输出逐字节不变（正常路径零变化）', rowN === '| paid-m | 100 | 10 | 50 | 50.00% | 110 | ¥1.23 |', rowN);
+    // 区间聚合透传 no_price（同一份数据两个入口不得显示不同）
+    const aggD = { '2026-10-01': { models: { 'unpub-m': { in: 500000, out: 10000, cached: 400000, total: 510000, cost: 0, hit: 80, no_price: true } },
+      total: { in: 500000, out: 10000, cached: 400000, total: 510000, cost: 0, hit: 80 } } };
+    const aggR = mod18.aggregateRangeModels(aggD, '2026-10-01', '2026-10-01');
+    ok('T18-b3 区间聚合透传 no_price（单日表标了、区间表也必须标）', aggR.models['unpub-m'] && aggR.models['unpub-m'].no_price === true);
+  }
+  // 源码守卫：查价源必须拒 0 价（否则下次自动补录又会写回误导条目）
+  {
+    const code = (f) => fs.readFileSync(path.join(SRC, f), 'utf-8').replace(/\r\n/g, '\n');
+    const main18 = code('token-tracker.js');
+    const back18 = code('backfill.js');
+    const recalc18 = code('recalc-day.js');
+    ok('T18-c1 ★两个查价源都把「输入输出同为 0」判为未公布单价（NO_PUBLIC_PRICE），不再当合法价',
+      (main18.match(/NO_PUBLIC_PRICE/g) || []).length >= 4, 'occurrences=' + (main18.match(/NO_PUBLIC_PRICE/g) || []).length);
+    ok('T18-c2 ★哨兵值与 null/undefined 三态严格区分（查不到 vs 查失败 vs 无公开价）',
+      /const NO_PUBLIC_PRICE = Symbol/.test(main18) && /if \(ref === NO_PUBLIC_PRICE\)/.test(main18) && /if \(cnRef === NO_PUBLIC_PRICE\)/.test(main18));
+    ok('T18-c3 ★backfill 重建账本时同样留痕 no_price（漏则 --write 会把标记洗掉）',
+      /isNoPublicPrice\(name\)/.test(back18) && /m\.no_price = true/.test(back18));
+    ok('T18-c4 ★recalc 回算后清除 no_price 标记（金额已真实，不能仍显示"无公开价"）',
+      /delete stat\.no_price/.test(recalc18) && /cost > 0/.test(recalc18));
+  }
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
 // v3.24.0（审计⑤）：skip 数显式化 —— 「138 全绿」曾掩盖 26 条端到端用例全部 SKIP 的事实
 // （SPAWN_OK=false 的沙箱环境里绿 ≠ 真跑过）。结果行带 skip 数；**有跳过时退出码 = 2**

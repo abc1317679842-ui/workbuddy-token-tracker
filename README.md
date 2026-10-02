@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.26.0-blue)
+![Version](https://img.shields.io/badge/version-v3.27.0-blue)
 
 > 在每次回答后显示 **Token 消耗 / 耗时 / 折算费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -56,6 +56,39 @@
 **准确的是什么**：`输入 / 输出 / 缓存命中 / 总 token` 四列全部来自平台自己落盘的 usage 记录，是**真实值**——分析用量请以这四列为准。所有金额列（toast、账本、区间报表、CSV）都带「按 API 单价折算」的口径标注，CSV 里字段名直接写成 `cost_api_equiv`，就是为了防止半年后自己都把它当成真实扣费。
 
 > 实测佐证（作者本机，2026-10-01）：账本近 6 日折算金额日均 **¥39.03**，而同一时期自定义 API 余额观测值**恒定 5.36 两天未变**——按折算金额算"余额只够 0.14 天"，显然荒谬。这正说明金额列是虚拟计价、不是真实扣款。
+
+### ⚠️ 无公开价模型：金额列显示「无公开价」（v3.27.0 起）
+
+有些模型**厂商根本没有公布按 token 的单价**，最常见的是两类：
+
+- **匿名模型**（厂商未公布身份，聚合平台上标 `$0`），例如 `space-bunny`（社区普遍推测是 MiniMax M3.1 Flash，但官方从未确认）；
+- **订阅制模型**（只在包月套餐 / 官方客户端内可用，不按调用计费），例如 `MiniMax-M3.1-Flash-Preview`。
+
+这类模型的 token 用量**照常精确统计**（输入/输出/缓存/命中率四列都是真实值），但**金额算不出来**。本技能的处理：
+
+| 位置 | 表现 |
+|---|---|
+| 弹窗第二行 | 金额位显示 **`无公开价`** + `⚠无公开价` 标注（**不是** `¥0.00`——那会被读成"免费"） |
+| `--report` 表格 | 该行金额列显示 **`无公开价`**，表尾追加一行 `⚠ 本日 N 个模型无公开价 → 合计金额偏低` |
+| 区间报表 | 同上（口径与单日表一致） |
+| 账本条目 | 除金额 0 之外带 `no_price: true` 标记，供后续排查 |
+
+**⚠️ 这意味着：只要当天用过这类模型，当日合计金额就是偏低的**（只含有价部分）。这是有意为之的诚实标注，不是 bug。
+
+**厂商日后公布单价怎么办**（两条路，任选其一，之后跑一条命令即可回算历史）：
+
+```bash
+# ① 直接编辑 pricing.json 里那个模型条目的 input_price / output_price（单位：元 / 百万 token）
+#    （把 pricing_status: "unpublished" 删掉）
+# ② 或把它加进 SKILL 顶部的查价开关清单，让每日刷新自动补价
+
+# 然后回算历史（自动备份 + 原子写 + 自动清除 no_price 标记）：
+node recalc-day.js              # 今天
+node recalc-day.js 2026-10-02   # 指定某天
+node recalc-day.js              # 不带参数即当天；历史多天需逐日执行
+```
+
+> 注意：`backfill --write` 是**全量重建替换**，不是 merge——用它回填会抹掉压缩窗口外的历史账，**不要为回填目的跑它**（详见 `TROUBLESHOOTING.md` 与 KNOWN-ISSUES KI-5）。
 
 ## 为什么做这个
 

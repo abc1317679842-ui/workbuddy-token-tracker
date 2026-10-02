@@ -1,5 +1,15 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.26.0 (2026-10-02)
+// token-usage-tracker v3.27.0 (2026-10-02)
+// v3.27.0：**无公开价模型显式标注（匿名/订阅制模型厂商不公布按 token 单价）** ——
+//   病根：两个查价源校验写作 price>=0，把聚合平台对这类模型标的 $0 当成合法价写进 pricing.json
+//   → 弹窗显示 ¥<0.01（读起来像"几乎免费"）、账本 cost:0 与"真免费"不可区分、当日合计被系统性
+//   低估且零提示（本项目典型静默失败）。修：查价源遇「输入输出同为 0」→ 抛 NO_PUBLIC_PRICE 哨兵
+//   （与 null=查不到 / undefined=网络失败三态严格区分）→ 落 pricing_status:unpublished 条目；
+//   弹窗金额位显示「无公开价」+⚠无公开价；--report 该行「无公开价」+ 表尾提示合计偏低；
+//   账本条目带 no_price 标记（cost 保留 0 供将来 recalc 回填）；backfill 重建同样留痕；
+//   recalc 回算后自动清标记。**token 四列统计始终是真实值，不受影响。**
+//   实测案例：space-bunny（匿名，社区推测 MiniMax M3.1 Flash，官方未确认）、
+//   MiniMax-M3.1-Flash-Preview（订阅制，官方与多方来源一致确认无按 token 费率）。
 // v3.26.0：**KI-6 弹窗层三件套（⑧⑨）+ 连锁自审双修正** ——
 //   ⑧ 混合模型轮弹窗金额改为**分模型计价求和**（与账本/轮次明细同口径）：aggregateTranscLines
 //      同循环产出分模型明细（与总量同一 seen 去重），aggregateTranscript 合并主+子明细，
@@ -583,6 +593,15 @@ function normalizeModelName(n) {
 // 当前为空表——需要时手动添加，格式：'实际使用的名字': 'pricing.json 里的 key'。
 // 注意：这里每加一条就等价于放行一次"不同名同价"，务必人工核实二者确实是同一模型且同价后再加。
 const MODEL_ALIASES = {};
+
+// v3.27.0：**「查到了但厂商未公布按 token 价」**的哨兵值（匿名模型 / 订阅制模型，OpenRouter 标 $0）。
+//   与 `null`（查不到这个模型）、`undefined`（网络/解析失败）三者严格区分——三种情况处理方式不同：
+//     null  → not-found：不写入任何条目，弹窗标 ⚠未计价
+//     undefined → 失败：静默重试下轮
+//     NO_PUBLIC_PRICE → 写入 pricing_status:'unpublished' 的 0 元条目，弹窗/账本标「无公开价」
+//   为什么必须单独一类：把 $0 当合法价写进价库，会让弹窗显示 ¥<0.01（读起来像"几乎免费"）、
+//   账本记 cost:0（与"真的免费"不可区分），当日合计被系统性低估且零提示——静默失败。
+const NO_PUBLIC_PRICE = Symbol('no_public_price');
 
 // 通用文件锁（复用 watch 锁思路：原子 openSync 'wx' + TTL + pid 存活探测）。
 // 返回 { ok, result, skipped }。acquire 失败（被其他进程持有）→ 重试 retries 次，仍失败则 skipped
@@ -2997,6 +3016,18 @@ function addModelUsage(day, model, stat, pricing, tsMs) {
   m.in += stat.in || 0; m.out += stat.out || 0; m.cached += stat.cached || 0; m.total += stat.total || 0;
   m.hit = hitRate(m.in, m.cached);
   if (cost != null) m.cost += cost;
+  // v3.27.0：无公开价模型（pricing_status:'unpublished'）在账本条目上留痕 no_price=true。
+  //   cost 仍保持 0（token 数照常记、金额待官方公布后由 recalc-day.js 回填），
+  //   但 no_price 让展示层能把「厂商没公布价」与「真的免费（cost 0）」区分开——
+  //   否则 --report 里显示 ¥0.00，用户无从知道当日合计因它而偏低。
+  if (pricing && pricing.models && pricing.models[name]
+      && pricing.models[name].pricing_status === 'unpublished') {
+    m.no_price = true;
+    m.no_price_note = '厂商未公布按 token 单价（匿名/订阅制模型）'; // 供 --report 表格与后续排查
+  } else if (m.no_price) {
+    // 价库已补上真实单价 → 清标记，下轮起金额正常计入（recalc 回填后由 recalc-day 清，见 recalc 侧）
+    delete m.no_price; delete m.no_price_note;
+  }
   day.total = dayTotalOf(day.models);
 }
 // 统一记账入口：byModel（transcript 按模型分桶）优先；否则按 stat.model 单桶。
@@ -3248,7 +3279,11 @@ function formatUsageRow(s, bold) {
   const f = (v) => (bold ? `**${v}**` : v);
   // hit 列：优先读已存字段，旧数据兜底现算；两位小数 %
   const hit = (s.hit != null ? s.hit : (s.in > 0 ? hitRate(s.in, s.cached) : 0)).toFixed(2) + '%';
-  return `| ${f(s.label)} | ${f(fmt(s.in))} | ${f(fmt(s.out))} | ${f(fmt(s.cached))} | ${f(hit)} | ${f(fmt(s.total))} | ${f(s.cost > 0 ? fmtCost(s.cost) : '¥0.00')} |`;
+  // v3.27.0：no_price 条目（厂商未公布按 token 单价）金额列显示「无公开价」而不是 ¥0.00——
+  //   ¥0.00 会被读成"这天这个模型免费"，而真相是"厂商没发布价、这笔钱算不出来"，
+  //   直接导致读者以为当日合计是完整的。合计行不标（合计本来就只是已知部分和，另有行尾提示）。
+  const costCell = s.no_price ? '无公开价' : (s.cost > 0 ? fmtCost(s.cost) : '¥0.00');
+  return `| ${f(s.label)} | ${f(fmt(s.in))} | ${f(fmt(s.out))} | ${f(fmt(s.cached))} | ${f(hit)} | ${f(fmt(s.total))} | ${f(costCell)} |`;
 }
 // ===== v3.20.0：--report 区间 / CSV / 外推 =====
 // 设计红线：既有的 `--report`、`--report <date>`、`--report all`、`--report summary [all|<date>]`
@@ -3292,6 +3327,9 @@ function aggregateRangeModels(d, from, to) {
       const t = models[n] || (models[n] = { in: 0, out: 0, cached: 0, total: 0, cost: 0 });
       t.in += m.in || 0; t.out += m.out || 0; t.cached += m.cached || 0;
       t.total += m.total || 0; t.cost += m.cost || 0;
+      // v3.27.0：区间聚合透传 no_price（任一天有标记即整段标记）——否则区间表会把无公开价
+      // 模型的金额显示成 ¥0.00，与单日表口径不一致（同一份数据两个入口显示不同 = 新的不一致源）。
+      if (m.no_price) t.no_price = true;
     }
   }
   for (const t of Object.values(models)) t.hit = hitRate(t.in, t.cached);
@@ -3319,6 +3357,13 @@ function reportRangeTxt(from, to) {
     lines.push(formatUsageRow(Object.assign({ label: '合计' }, agg.total), true));
   }
   lines.push('');
+  // v3.27.0：与单日表同口径——区间内有 no_price 模型时明示合计偏低。
+  const npRange = names.filter((n) => agg.models[n] && agg.models[n].no_price);
+  if (npRange.length) {
+    lines.push(`⚠ 本区间 ${npRange.length} 个模型无公开价（${npRange.join('、')}）`
+      + `→ 上面的合计金额**偏低**，只含有价部分；厂商公布单价后补录并跑 recalc-day.js 可回算`);
+    lines.push('');
+  }
   lines.push('口径：金额按 pricing.json 的 API 单价折算（缓存价 / 峰谷倍数已计入），**不是真实扣费**；');
   lines.push('      本技能只读 WorkBuddy 落盘的 token 用量，与客户端自带积分/额度之间不存在换算关系。');
   return lines.join('\n');
@@ -3440,6 +3485,12 @@ function reportTxt(arg) {
     } else {
       for (const n of names) lines.push(cells({ label: n, ...models[n] }, false));
       lines.push(cells({ label: '合计', ...total }, true));
+    }
+    // v3.27.0：当日存在无公开价模型 → 明示"合计金额偏低"，否则读者会把 ¥0.00 当成免费。
+    const noPriceNames = names.filter((n) => models[n] && models[n].no_price);
+    if (noPriceNames.length) {
+      lines.push(`⚠ 本日 ${noPriceNames.length} 个模型无公开价（${noPriceNames.join('、')}）`
+        + `→ 上面的合计金额**偏低**，只含有价部分；厂商公布单价后补录并跑 recalc-day.js ${date} 可回算`);
     }
     // v3.18（M3 修复）：删除 v2.58 引入的「【读取方指令】」提示行——SKILL.md 要求 AI"原样贴出
     // --report 输出"，而该行自带"请勿包含本行"，两者矛盾；且"数据输出里嵌给 AI 的指令"本身就是
@@ -3737,6 +3788,21 @@ function toastLine1(stat, modelShort, period, balTxt, todayTxt) {
 }
 function toastLine2(stat, pricing) {
   const isLocal = isLocalModel(stat && stat.model);
+  // v3.27.0：「厂商未公布按 token 单价」（pricing_status:'unpublished'）与「真免费」严格区分。
+  //   旧口径：这类条目 input_price=0 → fmtCost(0) → 「¥<0.01」——读起来像"几乎免费"，
+  //   而真相是"厂商根本没公布价"（匿名/订阅制模型），且当日合计被系统性低估。
+  //   现显式标注 ⚠无公开价；混合轮里只要有任一无公开价模型就标（金额是已知部分 + 缺口）。
+  const modelsObjV = (stat && stat.models && typeof stat.models === 'object') ? stat.models : null;
+  const noPriceKey = (name) => {
+    if (!pricing || !pricing.models) return null;
+    const mm = pricing.models[name];
+    return mm && mm.pricing_status === 'unpublished' ? name : null;
+  };
+  const topNoPrice = noPriceKey(stat && stat.model);
+  let anyNoPrice = topNoPrice;
+  if (!anyNoPrice && modelsObjV) {
+    for (const n of Object.keys(modelsObjV)) { const k = noPriceKey(n); if (k) { anyNoPrice = k; break; } }
+  }
   // v3.26.0（KI-6 ⑧）：混合模型轮**分模型计价求和**（与账本/轮次明细同口径）——
   // 旧口径 = 全部 tokens 按 stat.model（子代理优先）单一价折算，混合轮金额失真且与账本对不上。
   // 规则：① models 明细存在 → 逐模型 calcCost（带各自 lastTs 峰谷时刻；本地模型免费跳过）；
@@ -3764,7 +3830,13 @@ function toastLine2(stat, pricing) {
     costVal = calcCost(stat, pricing);
   }
   const allLocal = isLocal && cloudCount === 0; // 顶层本地且无云端参与（顶层本地但混合云端 → 显示云端金额）
-  const cost = allLocal ? '本地·免费' : (fmtCost(costVal) || '未收录');
+  // v3.27.0：无公开价模型的处理分两种——
+  //   ① **没有任何已知金额**（该模型或全部模型都是无公开价）→ 金额位直接显示「无公开价」，
+  //      替代 ¥<0.01 / ¥0.00（那会被读成"几乎免费"/"免费"）；
+  //   ② **有已知金额 + 混合了无公开价模型** → 金额照常显示（是已知部分和），另加「⚠无公开价」标注明示缺口。
+  //   绝不能因为混了一个无公开价模型就把已知金额也抹掉（那比旧口径更糟）。
+  const cost = allLocal ? '本地·免费'
+    : (anyNoPrice && !(costVal > 0) ? '无公开价' : (fmtCost(costVal) || '未收录'));
   const input = (stat && stat.in) || 0;
   const cached = (stat && stat.cached) || 0;
   // 缓存占比精确到两位小数（如 99.12%）；无输入数据则不显示缓存段
@@ -3785,6 +3857,11 @@ function toastLine2(stat, pricing) {
   // v3.26.0（KI-6 ⑧）：分模型计价时「部分模型无价」同样标注（partUnknown）——金额是部分和，必须明示缺口。
   if ((pricing && !isLocal && costVal == null && ((stat && stat.in) || (stat && stat.out))) || partUnknown) {
     line += '｜⚠未计价';
+  }
+  // v3.27.0：无公开价标注。⚠未计价 = "我们没收录到价"；⚠无公开价 = "厂商根本没公布单价"——
+  // 两者对用户的行动含义完全不同（前者去补录，后者只能等官方/换订阅），必须能区分。
+  if (anyNoPrice && ((stat && stat.in) || (stat && stat.out))) {
+    line += '｜⚠无公开价';
   }
   // v3.24.0（级联①）：transcript 被平台压缩/重写导致水位线冻结 → 之后的消耗静默少计。
   // 旗标由 readTranscLinesFrom 落盘（24h 节流），这里让用户在弹窗里看得见。7 天后自动失效。
@@ -3940,6 +4017,12 @@ function lookupOrPrice(modelName, timeoutMs) {
     "    const pr = (hit.pricing || {});",
     "    const pIn = Number(pr.prompt), pOut = Number(pr.completion);",
     "    if (!(pIn >= 0 && pOut >= 0)) { console.error('NO_PRICE'); process.exit(4); }",
+    // v3.27.0：输入输出**同时为 0** = 厂商未公布按 token 价（匿名/订阅制模型在 OpenRouter 标价 $0，
+    //   例如 Space Bunny、MiniMax-M3.1-Flash-Preview 均为订阅制无单价）。旧代码把 0 当合法价写进
+    //   pricing.json → 弹窗显示 ¥<0.01（读起来像"几乎免费"）、账本记 cost:0 → 与"真的免费"不可区分，
+    //   且当日合计被系统性低估而无任何提示（本项目最典型的静默失败）。改抛 NO_PUBLIC_PRICE，
+    //   由 ensureNewModelPricing 落 pricing_status:'unpublished' 条目。
+    "    if (pIn === 0 && pOut === 0) { console.error('NO_PUBLIC_PRICE'); process.exit(5); }",
     "    console.log(JSON.stringify({ id: hit.id, usdIn: pIn * 1e6, usdOut: pOut * 1e6 }));",
     "  } catch (e) { console.error(String(e && e.message)); process.exit(1); }",
     '})();',
@@ -3953,6 +4036,9 @@ function lookupOrPrice(modelName, timeoutMs) {
   } catch (e) {
     const stderr = String((e && e.stderr) || '').trim();
     if (stderr.includes('NOT_FOUND') || stderr.includes('NO_PRICE')) return null;
+    // v3.27.0：查到了但厂商未公布按 token 价（OpenRouter 标 $0 = 订阅制）→ 返回特殊标记，
+    //   调用方据此落 pricing_status:'unpublished'，而不是当成"免费"或"查不到"。
+    if (stderr.includes('NO_PUBLIC_PRICE')) return NO_PUBLIC_PRICE;
     process.stderr.write(`[token-tracker] OpenRouter 查价失败: ${stderr.slice(0, 150)}\n`);
     return undefined;
   }
@@ -3975,6 +4061,8 @@ function lookupCnPrice(modelName, timeoutMs) {
     "    if (!hit) { console.error('NOT_FOUND'); process.exit(3); }",
     "    const inP = Number(hit.inputPrice), outP = Number(hit.outputPrice);",
     "    if (!(inP >= 0 && outP >= 0)) { console.error('NO_PRICE'); process.exit(4); }",
+    // v3.27.0：与 OpenRouter 同款保护——输入输出同时为 0 = 未公布按 token 价（匿名/订阅制），不是免费。
+    "    if (inP === 0 && outP === 0) { console.error('NO_PUBLIC_PRICE'); process.exit(5); }",
     "    const cached = hit.cachedInputPrice != null ? Number(hit.cachedInputPrice) : null;",
     "    console.log(JSON.stringify({ id: hitId, in: inP, out: outP, cached, priceCurrency: hit.priceCurrency || null }));",
     "  } catch (e) { console.error(String(e && e.message)); process.exit(1); }",
@@ -3989,6 +4077,7 @@ function lookupCnPrice(modelName, timeoutMs) {
   } catch (e) {
     const stderr = String((e && e.stderr) || '').trim();
     if (stderr.includes('NOT_FOUND') || stderr.includes('NO_PRICE')) return null;
+    if (stderr.includes('NO_PUBLIC_PRICE')) return NO_PUBLIC_PRICE; // v3.27.0：同 OpenRouter
     process.stderr.write(`[token-tracker] llmabacus 查价失败: ${stderr.slice(0, 150)}\n`);
     return undefined;
   }
@@ -4084,6 +4173,7 @@ function ensureNewModelPricing(pricing, stat) {
 
   // v2.31：先查国内源 llmabacus（人民币价，自动判断国内外），再回退 OpenRouter
   const cnRef = lookupCnPrice(stat.model);
+  if (cnRef === NO_PUBLIC_PRICE) return rememberNoPublicPrice(pricing, stat.model);
   if (cnRef && typeof cnRef.id === 'string') {
     if (cnRef.priceCurrency === 'CNY') {
       // 国内模型：直接人民币价补录
@@ -4101,6 +4191,7 @@ function ensureNewModelPricing(pricing, stat) {
   }
 
   const ref = lookupOrPrice(stat.model);
+  if (ref === NO_PUBLIC_PRICE) return rememberNoPublicPrice(pricing, stat.model);
   if (ref === null) {
     // 国内外源均确认没有 → 记入已查列表，避免每次运行都联网
     // v3.18.1（N6）：已查列表改存本地 sidecar 文件（.lookedup-models.json，不入库）——
@@ -4118,6 +4209,32 @@ function ensureNewModelPricing(pricing, stat) {
   }
   const ok = addModelPrice(pricing, stat.model, ref, 'US');
   return { status: ok ? 'added' : 'error', note: ok ? `ℹ️ 新模型 ${stat.model} 已自动补录估算价（OpenRouter·国外定价，待核验）；时段折扣策略（高峰/夜间）请用搜索技能核验补录` : `⚠️ 新模型 ${stat.model} 价格写入失败` };
+}
+
+// v3.27.0：查到了模型但**厂商未公布按 token 价**（匿名模型 / 订阅制模型，两个源都标 0）时调用。
+//   落一个 pricing_status:'unpublished' 的 0 元条目——token 照常统计、金额记 0 供将来 recalc 回填，
+//   但**所有展示层都必须能把它与"真的免费"区分开**（弹窗「⚠无公开价」、账本 no_price 标记、报表不显示 ¥0.00）。
+//   为什么不直接不写条目：那样每轮都会重新联网查（lookupCnPrice→lookupOrPrice 双源 2 次子进程 fetch），
+//   且弹窗只会显示笼统的「⚠未计价」——用户看不出"厂商根本没公布价"和"我们没收录到"的区别。
+function rememberNoPublicPrice(pricing, modelName) {
+  const key = lookupKeyOf(modelName);
+  const m = pricing.models[key] || (pricing.models[key] = {
+    name: String(modelName), input_price: 0, cached_price: null, output_price: 0,
+    region: 'US', peak_multiplier: 1, pricing_status: 'unpublished',
+    price_source: 'openrouter/llmabacus(标价 0 = 订阅制或未公布单价)',
+    note: '厂商未公布按 token 单价（多为匿名/订阅制模型，聚合平台标价 $0）→ 金额记 0 待回填；'
+      + '官方公布价格后把本条 input_price/output_price 补上并跑 recalc-day.js 即可回算历史',
+  });
+  m.pricing_status = 'unpublished'; // 已存在条目时确保标记（可能是旧版误写的 0 元条目）
+  m.input_price = 0; m.output_price = 0;
+  const persist = stripLocalDbEntries(pricing);
+  const lr = withFileLock(PRICING_LOCK_FILE, () => savePricingAtomic(persist), { ttl: 300000, retries: 50, retryDelay: 100 });
+  if (lr.skipped) process.stderr.write(`[token-tracker] 无公开价标记写入跳过（被其他进程持锁）\n`);
+  return {
+    status: 'no-public-price',
+    note: `⚠ 无公开价 新模型 ${modelName} 厂商未公布按 token 单价（多为匿名/订阅制模型）`
+      + `→ 本轮 token 照记、金额暂记 0；官方公布价格后补录并跑 recalc-day.js 可回算历史`,
+  };
 }
 
 // v2.85：--round-watch <sid> <tsPath> <roundStart> 主循环（detached 自限时进程，非兜底非驻留）。
@@ -4333,7 +4450,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.26.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.27.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

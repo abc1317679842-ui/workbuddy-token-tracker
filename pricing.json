@@ -187,11 +187,26 @@
       "name": "hy3",
       "peak_multiplier": 1,
       "region": "CN",
-      "input_price": 1.0,
-      "output_price": 4.0,
+      "input_price": 1,
+      "output_price": 4,
       "cached_price": 0.25,
       "price_source": "腾讯混元官方（与本地价库 prices/index.json 一致；v3.24.0 补录——shipped 库缺 hy3 导致纯净环境子代理金额静默=0）",
       "tier_note": "混元3（hy3）：WorkBuddy/CodeBuddy 子代理默认模型，缺价会让所有子代理轮次金额=0"
+    },
+    "space-bunny": {
+      "name": "space-bunny",
+      "peak_multiplier": 1,
+      "region": "US",
+      "input_price": 0,
+      "cached_price": null,
+      "output_price": 0,
+      "or_id": "stealth/space-bunny-alpha",
+      "usd_input_price": 0,
+      "usd_output_price": 0,
+      "price_source": "usd×汇率(国外源) + v3.27.0 标记：输入输出同为 0 = 厂商未公布按 token 单价",
+      "auto_converted": true,
+      "note": "厂商未公布按 token 单价（匿名/订阅制模型，聚合平台标价 $0）→ 金额记 0 待回填；公布价格后补 input_price/output_price 并跑 recalc-day.js 回算历史",
+      "pricing_status": "unpublished"
     }
   },
   "last_source": "multi-source",
