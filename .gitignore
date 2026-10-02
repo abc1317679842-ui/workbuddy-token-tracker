@@ -55,3 +55,7 @@ rounds/
 
 # v3.21.0：版本更新检查的本地状态（每台机器各自不同，不入库）
 .update-check.json
+
+# 本地私有：推送 SOP（含凭证）与价格库运行时数据，永不入库
+PUSH-SOP.local.md
+prices/
