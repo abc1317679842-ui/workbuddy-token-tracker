@@ -22,8 +22,36 @@ import re
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LATEST = os.path.join(HERE, 'prices', 'latest.json')
-PRICING = os.path.join(os.path.expanduser('~'), '.workbuddy', 'skills',
-                       'token-usage-tracker', 'pricing.json')
+
+
+def detect_workbuddy_root():
+    """v0.5（2026-10-02）：WorkBuddy 数据根探测，与 Node 侧 detectWorkBuddyRoot
+    （token-tracker.js:239-249 / refresh-prices.js:40-50）**逐字等价**。背景：新版客户端可能把数据根
+    迁到 ~/.workbuddy-ai，若此处写死 ~/.workbuddy，本脚本的 PRICING 会指向错误路径 —— 而下方
+    `if os.path.exists(PRICING)` 为假时会**整段跳过** pricing.json(lock) 权威覆盖层（既不覆盖也不
+    注入），用户已校对的官方价与 Hy4 等 SPA 模型会静默从索引里消失，且无任何报错。
+    语义（与 Node 完全一致，勿自作聪明「更稳」——两端必须算出同一个根）：
+      ① WB_ROOT 环境变量**非空即用**（空串等同未设置；不校验目录是否存在，对应 Node 的 `||`）；
+      ② 否则在 [~/.workbuddy-ai, ~/.workbuddy] 中取第一个含 traces/ 或 settings.json 签名者；
+      ③ 都不命中 → 兜底 ~/.workbuddy（对应 Node 末尾的 return）。
+    ⚠️ 本函数需与 fetch-cn-prices.py 中的同名实现保持一致，且必须与 token-tracker.js:239-249 等价
+      （两个 py 文件无共享模块，各自实现）。
+    """
+    env = os.environ.get('WB_ROOT')
+    if env:  # 空串等同未设置，与 Node 的 `process.env.WB_ROOT ||` 一致
+        return env
+    h = os.path.expanduser('~')
+    for c in (os.path.join(h, '.workbuddy-ai'), os.path.join(h, '.workbuddy')):
+        try:
+            if os.path.exists(os.path.join(c, 'traces')) or os.path.exists(os.path.join(c, 'settings.json')):
+                return c
+        except OSError:
+            pass
+    return os.path.join(h, '.workbuddy')
+
+
+WB_ROOT = detect_workbuddy_root()
+PRICING = os.path.join(WB_ROOT, 'skills', 'token-usage-tracker', 'pricing.json')
 OUT = os.path.join(HERE, 'prices', 'index.json')
 TOKENHUB = os.path.join(HERE, 'prices', 'tokenhub_lang.json')
 

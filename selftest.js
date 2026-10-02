@@ -2,8 +2,12 @@
 // selftest.js —— 离线冒烟自测（v3.18.2 起随仓库分发，第三方可复跑）
 // 用法：node selftest.js
 // 不依赖 WorkBuddy 环境：全部在 os.tmpdir() 隔离目录跑，TOKEN_TRACKER_NO_TOAST=1，不碰真实账本、不弹通知。
-// 退出码：0=通过（可能有跳过项）；1=有失败项。受限环境（禁止 node 子进程）只跳过需要 spawn 的用例
-// （标注 –）；基于 require 的单元测试段始终运行 —— v3.18.4 起不再整表 SKIP。
+// 退出码：0=通过（可能有**环境受限**跳过项）；1=有失败项（含主模块 require/导出缺失）。
+//   环境受限跳过（envSkip，需要 spawn 的端到端用例 / WB_NO_NET 前提不成立）属**环境能力**问题，
+//   与代码正确性无关 → **不影响退出码**（此前误用 exit 2，在 CI 上被 GitHub Actions 当成 job 失败，
+//   红的原因看起来像"测试失败"而非"环境受限"）。真回归仍然 exit 1。
+//   代价：CI（SPAWN_OK=true、无 WB_NO_NET 前提缺口）上 envSkip 数应为 0，summary 会显式标注。
+// 基于 require 的单元测试段始终运行 —— v3.18.4 起不再整表 SKIP。
 'use strict';
 const fs = require('fs');
 const os = require('os');
@@ -12,13 +16,32 @@ const { spawnSync } = require('child_process');
 
 const SRC = __dirname;
 const NODE = process.execPath;
-let pass = 0, fail = 0, skipped = false, skipCount = 0;
+let pass = 0, fail = 0, envSkipCount = 0;
 
 function ok(name, cond, extra) {
   if (cond) { pass++; console.log(`  ✓ ${name}`); }
   else { fail++; console.error(`  ✗ ${name}${extra ? ' —— ' + extra : ''}`); }
 }
-function skip(name) { skipCount++; skipped = true; console.log(`  – ${name}（跳过：本环境禁止 node 子进程）`); }
+// envSkip：**环境受限**类跳过（非代码问题）——只统计，不影响退出码。reason 必须说明真实原因，
+// 不再像旧 skip() 那样所有跳过都硬编码「本环境禁止 node 子进程」（require 失败也这么说 → 误导）。
+function envSkip(name, reason) {
+  envSkipCount++;
+  console.log(`  – ${name}（跳过：${reason}）`);
+}
+const SPAWN_SKIP_REASON = '本环境禁止 node 子进程（SPAWN_OK=false，属环境能力限制、非代码问题；CI 上应真跑）';
+
+// 统一注释剥离（T10/T14/T17 源码守卫与「导出一致性」检查共用这一份，不再各自维护一份实现）：
+// ① 先统一行尾 \r\n → \n（Windows 上 git checkout 默认 core.autocrlf=true，残留 \r 会让行尾正则失效）；
+// ② 逐行剥 `//` 到行尾（`(^|[^:])` 保证 `https://` 这类 `//` 不被误当注释起始）；
+// ③ 逐行剥**同行** `/* … */`（不跨行）。
+// 为什么不用跨行块注释正则 `/\*[\s\S]*?\*\//`：本项目实测踩过——注释里出现的 glob 写法（如
+// `subagents/*.jsonl`、`~/WorkBuddy/*/prices/index.json`）会让 `/*` 被当成块注释开头，跨行吞掉**真实代码**。
+// 局限：字符串字面量里若出现 ` // ` 仍可能被误剥（token-tracker.js 现无此写法）；这里选择"宁可多剥注释
+// 也不跨行吞代码"，这是本项目两害相权后的既定取舍。
+const stripComments = (s) => s.replace(/\r\n/g, '\n')
+  .split('\n')
+  .map((l) => l.replace(/(^|[^:])\/\/.*$/, '$1').replace(/\/\*[^*]*\*\//g, ''))
+  .join('\n');
 
 // 环境能力探测：部分沙箱禁止 node→node 子进程（spawnSync 报 EBUSY）。只有需 spawn 的用例受影响。
 function canSpawn() {
@@ -33,7 +56,7 @@ const SYNTAX_FILES = ['token-tracker.js', 'refresh-prices.js', 'deepseek-officia
 
 // ── T0：语法检查 ───────────────────────────────────────────────────────────
 for (const f of SYNTAX_FILES) {
-  if (!SPAWN_OK) { skip(`语法 ${f}`); continue; }
+  if (!SPAWN_OK) { envSkip(`语法 ${f}`, SPAWN_SKIP_REASON); continue; }
   const r = spawnSync(NODE, ['--check', path.join(SRC, f)], { windowsHide: true });
   ok(`语法 ${f}`, r.status === 0, String(r.stderr || '').slice(0, 120));
 }
@@ -61,22 +84,34 @@ fs.writeFileSync(path.join(skillDir, '.update-check.json'),
   JSON.stringify({ lastCheckAt: Date.now(), latestVersion: '0.0.0', failCount: 0, nextRetryAt: 0 }));
 
 // ── T1：--hook 正常路径 → exit 0 ───────────────────────────────────────────
-if (!SPAWN_OK) skip('T1 --hook exit 0');
+if (!SPAWN_OK) envSkip('T1 --hook exit 0', SPAWN_SKIP_REASON);
 else {
   const r = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'], { input: HOOK_PAYLOAD, env, timeout: 30000, windowsHide: true });
   ok('T1 --hook exit 0', r.status === 0, `exit=${r.status} ${String(r.stderr).slice(0, 120)}`);
 }
 
 // ── T2：--report all → exit 0 且无「读取方指令」（M3 回归） ─────────────────
-if (!SPAWN_OK) skip('T2 --report 无指令注入');
+if (!SPAWN_OK) envSkip('T2 --report 无指令注入', SPAWN_SKIP_REASON);
 else {
   const r = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--report', 'all'], { env, timeout: 30000, windowsHide: true, encoding: 'utf8' });
+  const out = r.stdout || '';
   ok('T2 --report all exit 0', r.status === 0, `exit=${r.status}`);
-  ok('T2 --report 无指令注入行', (r.stdout || '').indexOf('读取方指令') < 0);
+  // A-12 修复（原断言是永真式）：`out.indexOf('读取方指令') < 0` —— 该串在 token-tracker.js 里
+  //   **只出现在注释**（:565 / :2879 / :3511），没有任何可达代码路径会输出它；更糟的是 --report 崩溃、
+  //   输出空串时 indexOf<0 依旧为真 → 假绿。补两道真判据：
+  //   ① 正例自检：把含标记的样本喂给同一检测器必须得 true（证明检测器本身有效，断言不是恒真）；
+  //   ② 输出形状前置：stdout 必须确实含 --report 的 7 列表头（空账本 / 异常键账本都会照常输出表头），
+  //      崩溃、空输出、非报告文本不得蒙混通过。
+  //   实测可红：向 --report 路径注入一行输出该串的代码 → 判据变 false（见交付说明的注入试验）。
+  const hasInjection = (s) => s.indexOf('读取方指令') >= 0;
+  const outLooksLikeReport = out.includes('| 模型 | 输入 | 输出 | 缓存 | 缓存命中 | 总 token | 金额 |');
+  ok('T2 --report 无指令注入行（检测器带正例自检 + 输出须确为报告正文）',
+    hasInjection('【读取方指令】自检样本') === true && outLooksLikeReport && !hasInjection(out),
+    `outLooksLikeReport=${outLooksLikeReport} outLen=${out.length} hasInjection=${hasInjection(out)}`);
 }
 
 // ── T3：损坏 pricing → 备份 + （重建成功时）⚠价库 告警（R4 / F1 / G1） ──────
-if (!SPAWN_OK) skip('T3 损坏备份 + ⚠价库 告警');
+if (!SPAWN_OK) envSkip('T3 损坏备份 + ⚠价库 告警', SPAWN_SKIP_REASON);
 else {
   const big = JSON.stringify({ date: '2020-01-01', models: Object.fromEntries(Array.from({ length: 16 }, (_, i) => [`model-${i}`, { input_price: 1 + i, output_price: 2 + i, region: 'US' }])) }, null, 2);
   fs.writeFileSync(path.join(skillDir, 'pricing.json'), big.slice(0, Math.floor(big.length * 0.7))); // 截断 30%
@@ -87,13 +122,13 @@ else {
     try { JSON.parse(fs.readFileSync(path.join(skillDir, 'pricing.json'), 'utf8')); return true; } catch (e) { return false; }
   })());
   const rebuilt = (() => { try { return JSON.parse(fs.readFileSync(path.join(skillDir, 'pricing.json'), 'utf8')); } catch (e) { return null; } })();
-  if (process.env.WB_NO_NET === '1') console.log('  – T3 R4 告警断言：WB_NO_NET=1 断网环境重建走失败分支，前提不成立，已跳过（CI）');
+  if (process.env.WB_NO_NET === '1') envSkip('T3 R4 告警断言', 'WB_NO_NET=1（CI 断网：损坏重建走失败分支、前提不成立；已知覆盖缺口见 CHANGELOG「T3 R4」条目，本机不设此变量时真实验证）');
   else if (rebuilt) ok('T3 R4 护栏告警进 stderr（⚠价库）', String(r.stderr || '').indexOf('⚠价库') >= 0, String(r.stderr || '').slice(0, 140));
-  else console.log('  – T3 R4 告警断言：重建未完成（离线/受限），已跳过');
+  else envSkip('T3 R4 告警断言', '重建未完成（离线/受限），前提不成立');
 }
 
 // ── T4：deepseek-official M7 守卫 —— 损坏 pricing 原地存在时拒绝覆盖 ────────
-if (!SPAWN_OK) skip('T4 M7 守卫');
+if (!SPAWN_OK) envSkip('T4 M7 守卫', SPAWN_SKIP_REASON);
 else {
   fs.writeFileSync(path.join(skillDir, 'pricing.json'), '{"broken');
   const r = spawnSync(NODE, [path.join(skillDir, 'deepseek-official.js')], { env, timeout: 60000, windowsHide: true, encoding: 'utf8' });
@@ -102,13 +137,19 @@ else {
 }
 
 // ── T5：账本损坏防护（H6）——BOM 账本不产生 .corrupt-* 备份 ─────────────────
-if (!SPAWN_OK) skip('T5 BOM 账本防护');
+if (!SPAWN_OK) envSkip('T5 BOM 账本防护', SPAWN_SKIP_REASON);
 else {
   fs.writeFileSync(path.join(skillDir, 'daily-usage.json'), '\uFEFF{"days":{}}');
   const before = fs.readdirSync(skillDir).filter((f) => f.startsWith('daily-usage.json.corrupt-')).length;
-  spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--report', 'all'], { env, timeout: 30000, windowsHide: true });
+  const r = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--report', 'all'], { env, timeout: 30000, windowsHide: true, encoding: 'utf8' });
   const after = fs.readdirSync(skillDir).filter((f) => f.startsWith('daily-usage.json.corrupt-')).length;
   ok('T5 BOM 账本不再被判损坏（无新增 .corrupt-*）', after === before);
+  // A-12 修复：原断言只比 .corrupt-* 文件数 —— 若 --report 在 BOM 账本上整体崩溃退出，同样不会生成
+  //   .corrupt-*，测试照样"通过"（测不出真正结果）。补进程级断言：必须正常退出（status 0）、
+  //   未被信号杀死、spawn 本身无 error（排除超时/被杀/起不来）。
+  ok('T5 --report 在 BOM 账本下正常退出（status=0、未超时、未被信号杀死）',
+    r.status === 0 && r.signal === null && !r.error,
+    `status=${r.status} signal=${r.signal} error=${r.error && r.error.code}`);
 }
 
 // ── T6：直接 require 单测导出函数（不依赖 spawn，受限环境同样运行） ─────────
@@ -168,7 +209,7 @@ else {
 }
 
 // P2：recalc-day 写盘三件套（需子进程；受限环境跳过）
-if (!SPAWN_OK) skip('T7-P2 recalc-day 写盘原子性/备份');
+if (!SPAWN_OK) envSkip('T7-P2 recalc-day 写盘原子性/备份', SPAWN_SKIP_REASON);
 else {
   const d = { '2026-01-01': { models: { 'deepseek-v4-flash': { in: 1000000, cached: 0, out: 1000, cost: 0, hit: 0 } }, total: { cost: 0, in: 1000000, cached: 0, out: 1000 } } };
   fs.writeFileSync(path.join(skillDir, 'daily-usage.json'), '\uFEFF' + JSON.stringify(d, null, 2)); // 带 BOM（P2 崩溃场景）
@@ -227,14 +268,33 @@ else {
     const st = { rowsCache: [], linesRead: 0, lastSize: 0, lastReadSize: -1, lastReadMtime: -1 };
     ttMod.watchReadStep(st, fp, fs.statSync(fp));
     const firstLines = st.linesRead;
-    const origRead = fs.readFileSync; let reads = 0; const stFixed = fs.statSync(fp);
-    fs.readFileSync = function (...a) { reads++; return origRead.apply(this, a); };
-    for (let i = 0; i < 5; i++) ttMod.watchReadStep(st, fp, stFixed);
-    fs.readFileSync = origRead;
-    ok('T8-N2a ★文件未变的 5 轮轮询 readFileSync 调用 0 次', reads === 0 && firstLines === 3, `reads=${reads} lines=${firstLines}`);
-    fs.appendFileSync(fp, [mkRow(4), mkRow(5)].join('\n') + '\n');
-    ttMod.watchReadStep(st, fp, fs.statSync(fp));
+    // A-12 修复（mock 了被测逻辑）：原实现只替换 `fs.readFileSync` 计数 —— 若 watchReadStep 改用
+    //   `fs.openSync`/`fs.createReadStream` 等通道，"reads === 0" 会**假绿**（计数器永远为 0）。
+    //   这里改为**覆盖所有可能的读文件通道**（readFileSync / openSync / readSync / createReadStream），
+    //   并加一条**正向对照**：文件真正变化后必须观察到读事件（证明计数器确实能非零，上一条不是恒真）。
+    const origAPI = { readFileSync: fs.readFileSync, openSync: fs.openSync, readSync: fs.readSync, createReadStream: fs.createReadStream };
+    let reads = 0, idleReads = 0, changedReads = 0;
+    try {
+      const bump = () => { reads++; };
+      fs.readFileSync = function (...a) { bump(); return origAPI.readFileSync.apply(this, a); };
+      fs.openSync = function (...a) { bump(); return origAPI.openSync.apply(this, a); };
+      fs.readSync = function (...a) { bump(); return origAPI.readSync.apply(this, a); };
+      fs.createReadStream = function (...a) { bump(); return origAPI.createReadStream.apply(this, a); };
+      const stFixed = fs.statSync(fp);
+      for (let i = 0; i < 5; i++) ttMod.watchReadStep(st, fp, stFixed);
+      idleReads = reads;
+      fs.appendFileSync(fp, [mkRow(4), mkRow(5)].join('\n') + '\n');
+      const afterAppend = reads; // appendFileSync 自身可能走 openSync，剔除它，只看 watchReadStep 的读
+      ttMod.watchReadStep(st, fp, fs.statSync(fp));
+      changedReads = reads - afterAppend;
+    } finally {
+      Object.assign(fs, origAPI);
+    }
     const full = ttMod.parseTranscChunk(fs.readFileSync(fp, 'utf-8')).length;
+    ok('T8-N2a ★文件未变的 5 轮轮询不产生任何文件读（覆盖 readFileSync/openSync/readSync/createReadStream）',
+      idleReads === 0 && firstLines === 3, `idleReads=${idleReads} lines=${firstLines}`);
+    ok('T8-N2a2 ★正向对照：文件变化后确实发生了读（证明计数器可非零、N2a 不是恒真假绿）',
+      changedReads > 0, `changedReads=${changedReads}`);
     ok('T8-N2b 追加后增量结果与全量解析等价', st.linesRead === full && st.rowsCache.length === full, `${st.linesRead}/${full}`);
     fs.rmSync(fp, { force: true });
   }
@@ -337,13 +397,26 @@ else {
   // B7：全部 agent-*.jsonl 正则必须带 i 标志
   {
     const bad = [];
+    // A-12 修复（定位价值为零 + 守卫恒真）：
+    // ① 原 `bad.push(f)` 只报文件名、`extra` 重复列文件名 → 改为 `文件:行`，一行指到具体位置。
+    // ② 原正则 `/\^agent-[^\n]*\\\.jsonl\$\/\./g` 结尾的 `\.` 是**字面点**（不是"任意字符"），
+    //    只能命中 `$/` 后紧跟 `.` 的形态（如 `$/.test(`），对 `$/g`、`$/;` 一律漏报 →
+    //    实测在整个仓库 **0 命中**，这条守卫从建立起就是恒真的。真意图 = "`$/` 后面的 flags 里没有 i"，
+    //    故改为**捕获 flags 组再判断**（`([a-z]*)` + `includes('i')`）：
+    //    - `/…$/i`     → flags=`i`     → 合规
+    //    - `/…$/gi`    → flags=`gi`    → 合规（含 i；若用 `[^i]` 会把 `gi` 误判为违规）
+    //    - `/…$/.test` → flags=``      → 违规（无 i）
+    //    - `/…$/g`     → flags=`g`     → 违规（无 i）
     for (const f of SYNTAX_FILES) {
-      const s = src(f);
-      const re = /\^agent-[^\n]*\\\.jsonl\$\/\./g; // 命中 `$/` 紧跟 `.`（= 无 i 标志）
-      let m;
-      while ((m = re.exec(s)) !== null) bad.push(`${f}`);
+      src(f).split('\n').forEach((line, i) => {
+        const re = /\^agent-[^\n]*\\\.jsonl\$\/([a-z]*)/g;
+        let m;
+        while ((m = re.exec(line)) !== null) {
+          if (!m[1].includes('i')) bad.push(`${f}:${i + 1}`);
+        }
+      });
     }
-    ok('T9-B7 agent-*.jsonl 正则全部带 i 标志（0 处缺）', bad.length === 0, bad.join(','));
+    ok('T9-B7 agent-*.jsonl 正则全部带 i 标志（0 处缺；违规按 文件:行 定位）', bad.length === 0, bad.join(', '));
   }
 
   // B8：峰谷按 token 发生时刻判定，不再按"脚本运行时刻"
@@ -397,13 +470,9 @@ else {
 {
   const src = (f) => fs.readFileSync(path.join(SRC, f), 'utf-8');
   const ttMod = require(path.join(skillDir, 'token-tracker.js'));
-  // 剥掉块注释与整行 `//` 注释后再做"残留引用"检查——本版在注释里保留了大量历史说明，
-  // 直接对源码文本做正则会被注释误判（教训：守卫测试必须只看代码，不看注释）。
-  const stripComments = (s) => s
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .split('\n')
-    .filter((l) => !/^\s*\/\//.test(l))
-    .join('\n');
+  // 剥掉注释后再做"残留引用"检查——本版在注释里保留了大量历史说明，直接对源码文本做正则会被
+  // 注释误判（教训：守卫测试必须只看代码，不看注释）。用**全局共享**的行级 stripComments
+  // （此前 T10/T14/T17 各有一份、行为不一，同一段代码会被"看"成不同内容）。
   const codeOnly = stripComments(src('token-tracker.js'));
 
   // a：新判据已导出
@@ -525,10 +594,20 @@ else {
     },
   };
   fs.writeFileSync(path.join(skillDir, 'daily-usage.json'), JSON.stringify(led11, null, 2));
-  if (!SPAWN_OK) skip('T11-d 既有 --report 入口逐字节不变');
+  if (!SPAWN_OK) envSkip('T11-d 既有 --report 入口逐字节不变', SPAWN_SKIP_REASON);
   else {
     const run = (...a) => spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--report'].concat(a),
       { env, timeout: 30000, windowsHide: true, encoding: 'utf8' }).stdout || '';
+    // A-15 修复：原先直接 `===` 逐字节比较，把**可读数字格式**也焊死（¥3.50 的小数位、150万/100.1万 的
+    //   中文单位写法）——任何纯格式化改进都会被误判为 bug。改为「**归一化数字格式后再逐字节比较**」。
+    //   关键：只规范化**呈现格式**（去掉小数尾零、统一数值写法），**保留数值与顺序**——否则把 150万 与 2万
+    //   两列对调也会被归一化成同一个「#万」而漏检（实测踩过）。这样列顺序 / 分隔符 / 文案 / 缺列多列等
+    //   结构性回归照样被抓，纯数字格式改进不再假红。
+    //   （刻意不碰裸数字 `1000` 与百分比 `93.33%`——它们不属于"可读格式"，改动仍应被抓。）
+    const canonNum = (n) => { const v = parseFloat(n); return Number.isFinite(v) ? String(v) : n; };
+    const normNums = (s) => s
+      .replace(/¥(\d+(?:\.\d+)?)/g, (_, n) => '¥' + canonNum(n))        // ¥3.50 → ¥3.5
+      .replace(/(\d+(?:\.\d+)?)(万|亿)/g, (_, n, u) => canonNum(n) + u); // 150.0万 → 150万
     const HDR = ['| 模型 | 输入 | 输出 | 缓存 | 缓存命中 | 总 token | 金额 |', '| --- | --- | --- | --- | --- | --- | --- |'];
     const wantAll = [
       '===== 2026-01-02 =====',
@@ -540,14 +619,17 @@ else {
       '| m-b | 100万 | 1000 | 0 | 0.00% | 100.1万 | ¥1.25 |',
       '| **合计** | **100万** | **1000** | **0** | **0.00%** | **100.1万** | **¥1.25** |',
     ].join('\n') + '\n';
-    ok('T11-d1 --report all 逐字节不变', run('all') === wantAll, JSON.stringify(run('all').slice(0, 160)));
+    const gotAll = run('all');
+    ok('T11-d1 --report all 结构逐字节不变（数字格式归一化后比较）', normNums(gotAll) === normNums(wantAll), JSON.stringify(normNums(gotAll).slice(0, 160)));
     const wantOne = ['===== 2026-01-01 =====', ...HDR,
       '| m-b | 100万 | 1000 | 0 | 0.00% | 100.1万 | ¥1.25 |',
       '| **合计** | **100万** | **1000** | **0** | **0.00%** | **100.1万** | **¥1.25** |'].join('\n') + '\n';
-    ok('T11-d2 --report <date> 逐字节不变', run('2026-01-01') === wantOne, JSON.stringify(run('2026-01-01').slice(0, 160)));
+    const gotOne = run('2026-01-01');
+    ok('T11-d2 --report <date> 结构逐字节不变（数字格式归一化后比较）', normNums(gotOne) === normNums(wantOne), JSON.stringify(normNums(gotOne).slice(0, 160)));
     const wantSum = '2026-01-02  输入 150万 / 输出 2万 / 缓存 140万 / 总 152万 tokens ｜ ¥3.50\n'
       + '2026-01-01  输入 100万 / 输出 1000 / 缓存 0 / 总 100.1万 tokens ｜ ¥1.25\n';
-    ok('T11-d3 --report summary all 逐字节不变', run('summary', 'all') === wantSum, JSON.stringify(run('summary', 'all').slice(0, 160)));
+    const gotSum = run('summary', 'all');
+    ok('T11-d3 --report summary all 结构逐字节不变（数字格式归一化后比较）', normNums(gotSum) === normNums(wantSum), JSON.stringify(normNums(gotSum).slice(0, 160)));
   }
 
   // e：区间报告 —— 列头与单日一致 + 必带金额口径声明 + 空区间不崩
@@ -809,7 +891,7 @@ else {
     missingSide.length === 0, missingSide.join(', ') || '全部存在');
 
   // j：端到端（spawn）—— 预置「有新版」状态跑 --hook，提示必须出现在注入里
-  if (!SPAWN_OK) skip('T12-j --hook 端到端注入提示');
+  if (!SPAWN_OK) envSkip('T12-j --hook 端到端注入提示', SPAWN_SKIP_REASON);
   else {
     put({ lastCheckAt: Date.now(), latestVersion: '9.9.9', failCount: 0, nextRetryAt: 0 });
     const r = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'],
@@ -859,10 +941,7 @@ else {
 {
   const srcOf = (f) => fs.readFileSync(path.join(SRC, f), 'utf8');
   // 源码守卫必须先剥注释：注释里会引用"改之前的写法"做说明（本轮正是因此误判一次）。
-  // 必须先统一行尾为 \n：Windows 上 git checkout 默认 core.autocrlf=true，文件是 CRLF，
-  // 行尾残留的 \r 会让 `//…$` 这类按行剥注释的正则失效（CI 首跑 T14-a1 红的根因，本机 LF 不复现）。
-  const stripComments = (s) => s.replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//g, '')
-    .split('\n').map((l) => l.replace(/(^|\s)\/\/.*$/, '$1')).join('\n');
+  // 用全局共享的行级 stripComments（已内含 \r\n → \n 归一化，解决 Windows CRLF 让 `//…$` 失效的问题）。
   const recalc = srcOf('recalc-day.js');
   const recalcCode = stripComments(recalc);
   const refresh = srcOf('refresh-prices.js');
@@ -890,7 +969,8 @@ else {
     try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; }
   })();
   // a3：findModel 能命中、裸字典命中不了 —— 证明「recalc 原先会静默漏价」不是理论风险
-  if (!tt2) skip('T14-a3 findModel 归一化命中（裸字典不命中）');
+  // 主模块 require 失败在 CI 正常环境（SPAWN_OK=true）下必是代码回归，不再是"环境受限"→ 真 fail。
+  if (!tt2) ok('T14-a3 findModel 归一化命中（裸字典不命中）', false, 'token-tracker.js require 失败 —— CI 正常环境下这必是代码回归，不允许静默跳过');
   else {
     const p = { models: { 'DeepSeek-V4-Flash': { input_price: 1, output_price: 2 } } };
     const bare = p.models['deepseek-v4-flash'];              // 裸字典：大小写不同 → 取不到
@@ -899,7 +979,7 @@ else {
       bare === undefined && !!(viaFn && viaFn.m && viaFn.m.input_price === 1));
   }
   // d2：残留锁清理 —— 旧锁删除、新锁保留、当前会话锁绝不动
-  if (!tt2 || typeof tt2.cleanupCoalesceLocks !== 'function') skip('T14-d2 cleanupCoalesceLocks 行为');
+  if (!tt2 || typeof tt2.cleanupCoalesceLocks !== 'function') ok('T14-d2 cleanupCoalesceLocks 行为', false, 'token-tracker.js 导出缺失或 require 失败 —— CI 正常环境下这必是代码回归，不允许静默跳过');
   else {
     const snapDir = path.join(skillDir); // SNAP_DIR = WB/skills/token-usage-tracker，隔离环境即此
     const mk = (name, ageDays) => {
@@ -950,7 +1030,7 @@ else {
   ok('T15-c3 ★recalc 峰谷占比未知时不得改写已有金额（原账>0 → 保留原额）',
     /dayTotal \+= stat\.cost; continue;/.test(rcSrc));
   // d：行为验证（直接调主脚本导出函数）
-  if (!tt2) skip('T15-d 行为验证（fmtCost/hitRate/dbStaleTag）');
+  if (!tt2) ok('T15-d 行为验证（fmtCost/hitRate/dbStaleTag）', false, 'token-tracker.js require 失败 —— CI 正常环境下这必是代码回归，不允许静默跳过');
   else {
     ok('T15-d1 ★fmtCost(NaN) → null（NaN 曾直出「¥NaN」上 toast）',
       tt2.fmtCost(NaN) === null && tt2.fmtCost(-1) === null && tt2.fmtCost(1.234) === '¥1.23');
@@ -967,7 +1047,7 @@ else {
   // v3.25.0 教训：曾用 require(SRC)——require 时 WB_ROOT 已恢复 → 实例路径指向真实技能目录，
   // 测试数据直接写进真实账本（已修复并清理）。同进程缓存命中，与其他 T 段共用实例。
   const mod16 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
-  if (!mod16) skip('T16 KI-5 行为验证（主模块加载失败）');
+  if (!mod16) ok('T16 KI-5 行为验证（主模块加载失败）', false, 'token-tracker.js require 失败 —— CI 正常环境下这必是代码回归，不允许静默跳过');
   else {
     const T16 = path.join(tmp, 'projects', 'ki5');
     fs.mkdirSync(path.join(T16, 's1', 'subagents'), { recursive: true });
@@ -1030,7 +1110,7 @@ else {
 {
   // ⑧ 行为测试（require skillDir 副本实例——模块级路径由 require 时的 WB_ROOT 决定，见 T16 教训）
   const mod17 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
-  if (!mod17) skip('T17 KI-6 行为验证（主模块加载失败）');
+  if (!mod17) ok('T17 KI-6 行为验证（主模块加载失败）', false, 'token-tracker.js require 失败 —— CI 正常环境下这必是代码回归，不允许静默跳过');
   else {
     const T17 = path.join(tmp, 'projects', 'ki6');
     fs.mkdirSync(path.join(T17, 's1', 'subagents'), { recursive: true });
@@ -1102,12 +1182,10 @@ else {
     ok('T17-a10 旧形状聚合并入估算不崩（自动建 models 桶）', aggE2.models && aggE2.models.x && aggE2.models.x.in === 5);
   }
   // ⑨ 源码守卫（**行级剥注释**——注释里的 `/*.jsonl` glob 会被朴素块注释剥离误当 `/*` 开头、
-  // 跨行吞掉真实代码（本版实测吞掉 1 处调用 → 守卫假红），故不跨行匹配）
+  // 跨行吞掉真实代码（本版实测吞掉 1 处调用 → 守卫假红），故不跨行匹配）。
+  // 用全局共享的 stripComments（同一份实现，T10/T14/T17 不再各写各的）。
   {
-    const src17 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n')
-      .split('\n')
-      .map((l) => l.replace(/(^|\s)\/\/.*$/, '').replace(/\/\*[^*]*\*\//g, ''))
-      .join('\n');
+    const src17 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8'));
     ok('T17-b1 ★⑨结算分支推进的 stopAtH 必须存活到最终快照写入（L5543 整文件覆盖曾把它打回旧值）',
       /stopAtH = nowH;/.test(src17) && /lastStopAt: stopAtH/.test(src17));
     ok('T17-b2 ★旧缺陷写法不得回归（lastStopAt: psnap2.lastStopAt || 0）',
@@ -1117,7 +1195,7 @@ else {
       (src17.match(/mergeEstIntoModels\(/g) || []).length >= 4);
   }
   // ⑨ 端到端（spawn）：残留 coalesce 超时 + 子代理静止 → 结算推进双时间戳。沙箱 SPAWN_OK=false 时跳过，CI 真跑。
-  if (!SPAWN_OK) skip('T17-c1 ⑨端到端（需要 node 子进程）');
+  if (!SPAWN_OK) envSkip('T17-c1 ⑨端到端（需要 node 子进程）', SPAWN_SKIP_REASON);
   else {
     const SID17 = 't17e2e';
     const proj17 = path.join(tmp, 'projects', 'ki6e2e');
@@ -1150,7 +1228,7 @@ else {
 //   弹窗显示 ¥<0.01（读起来像"几乎免费"）、账本 cost:0 与"真免费"不可区分、当日合计被系统性低估且零提示。
 {
   const mod18 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
-  if (!mod18) skip('T18 无公开价行为验证（主模块加载失败）');
+  if (!mod18) ok('T18 无公开价行为验证（主模块加载失败）', false, 'token-tracker.js require 失败 —— CI 正常环境下这必是代码回归，不允许静默跳过');
   else {
     const UNPUB = { name: 'unpub-m', input_price: 0, cached_price: null, output_price: 0, region: 'US', pricing_status: 'unpublished' };
     const PAID = { name: 'paid-m', input_price: 1, cached_price: 0.25, output_price: 4, region: 'CN' };
@@ -1223,12 +1301,151 @@ else {
       /isNoPublicPrice\(name\)/.test(back18) && /m\.no_price = true/.test(back18));
     ok('T18-c4 ★recalc 回算后清除 no_price 标记（金额已真实，不能仍显示"无公开价"）',
       /delete stat\.no_price/.test(recalc18) && /cost > 0/.test(recalc18));
+    // T18-c5（v3.28.0）：toastLine2 曾把「⚠未计价」追加块**逐字复制两遍**（条件相同、都 `line += '｜⚠未计价'`）
+    //   → 弹窗实测出现 `｜⚠未计价｜⚠未计价`。这里锁住"标签追加块"的数量不变量，专防复制粘贴：
+    //   ① `line += '｜…'`（追加一个标签段）在全函数体内**恰好 5 处**（价⚠️/官价⚠️/⚠价核验/⚠未计价/⚠账缺）；
+    //   ② `line += '｜⚠未计价'` **恰好 1 次**（这处正是被复制过的那个块）。
+    //   若有人再粘贴一遍任何标签块，①或②必然超标 → 立刻红。（后续新增正当标签时需同步更新此计数，
+    //   这正是"新标签必须被显式意识到"的预期摩擦，不是误报。）
+    const tl2Start = main18.indexOf('function toastLine2');
+    const tl2End = main18.indexOf('\nfunction ', tl2Start + 10);
+    const tl2Body = stripComments(main18.slice(tl2Start, tl2End));
+    const tagAppendCount = (tl2Body.match(/line \+= '｜/g) || []).length;
+    const unpaidAppendCount = (tl2Body.match(/line \+= '｜⚠未计价'/g) || []).length;
+    ok('T18-c5 ★toastLine2 标签追加块无重复（line += \'｜…\' 恰好 5 处、⚠未计价 恰好追加 1 次）',
+      tl2Start > 0 && tl2End > tl2Start && tagAppendCount === 5 && unpaidAppendCount === 1,
+      `tagAppend=${tagAppendCount} unpaidAppend=${unpaidAppendCount}`);
+  }
+}
+
+// ===== T19：弹窗行2 真因修正（v3.30.0）—— 价核验误报 / 缓存被顶掉 / emoji 估宽 =====
+// 起因：用户 2026-10-02 发弹窗截图三问（有价格还报价核验 / 缓存百分比被顶掉 / 有的有标签有的没有）。
+// 定位：把截图与 ~/.workbuddy/token-tracker-toast.log 的 toastText 逐条对账 —— 5 条**全部**含「｜⚠价核验」，
+//   但 3 条在气泡里被横向裁掉 → 第三问不是代码分支，是渲染层裁切（详见 CHANGELOG v3.30.0）。
+// 本段把三条修法的**行为判据**钉死，防回归。
+{
+  const mod19 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  if (!mod19) ok('T19 弹窗行2 修正验证（主模块加载失败）', false, 'token-tracker.js require 失败 —— CI 正常环境下这必是代码回归，不允许静默跳过');
+  else {
+    // 隔离：⚠账缺 旗标（TRANSC_TRUNCATED_FILE）会被本段之前的用例写出来，而它的优先级最高、**绝不丢**
+    //   → 会稳定吃掉行2 的 12u 预算，把本段要验的标签/缓存挤掉（首轮 T19 就是因此 4 条误红）。
+    //   断言期间临时移走、结束后原样恢复，把被测因素隔离出来。
+    const tfPath19 = mod19.TRANSC_TRUNCATED_FILE;
+    let tfSaved19 = null;
+    try { tfSaved19 = fs.readFileSync(tfPath19, 'utf-8'); fs.unlinkSync(tfPath19); } catch (e) { tfSaved19 = null; }
+    try {
+    const M19 = 'deepseek-v4.1-flash';
+    const PAID19 = { name: 'paid-m', input_price: 1, cached_price: 0.25, output_price: 4, region: 'CN' };
+    const P19 = (extra) => Object.assign({ models: { [M19]: PAID19 } }, extra || {});
+    // 短行（base ≈ 40u）：标签才有机会存活 —— 用来验证"该挂的时候挂得上"
+    const short19 = { model: M19, in: 1000000, out: 10000, cached: 0 };
+    const l2of = (s, p) => mod19.toastLine2(s, p);
+
+    // ── a. 价核验触发源收窄（用户疑问①：停用历史流水账 + 必须点名本轮模型）──
+    const pNote19 = P19({ last_refresh_note: '2026-10-01T17:53:35.143Z 多源刷新：⚠️模糊匹配歧义: kimi-k3: ...' });
+    ok('T19-a1 ★历史 last_refresh_note 含 ⚠ 不再挂「⚠价核验」（A-8 的永久误报根因）',
+      l2of(short19, pNote19).indexOf('价核验') < 0, l2of(short19, pNote19));
+    const pOther19 = P19({ _ambig_warnings: ['kimi-k3: USD源 模糊命中 2 个不同价候选，已放弃', 'glm-5.3-flash: USD源 模糊命中 3 个'] });
+    ok('T19-a2 ★与本轮模型**无关**的歧义不挂标签（别的模型的问题不得污染每一条弹窗）',
+      l2of(short19, pOther19).indexOf('价核验') < 0, l2of(short19, pOther19));
+    const pMine19 = P19({ _ambig_warnings: ['kimi-k3: xx', M19 + ': USD源 模糊命中 2 个不同价候选，已放弃'] });
+    ok('T19-a3 ★点名本轮模型的歧义 → 照常挂标签（收窄不等于失效）',
+      l2of(short19, pMine19).indexOf('⚠价核验') >= 0, l2of(short19, pMine19));
+    const pAudit19 = P19({ _price_audit: { at: 'x', warnings: [M19 + ': 人民币价 1 vs usd×7.2=0.5 偏差 50%'] } });
+    ok('T19-a4 ★_price_audit 点名本轮模型 → 挂标签', l2of(short19, pAudit19).indexOf('⚠价核验') >= 0, l2of(short19, pAudit19));
+    const pAuditOther19 = P19({ _price_audit: { at: 'x', warnings: ['other-m: 偏差 50%'] } });
+    ok('T19-a5 ★_price_audit 与本轮无关 → 不挂', l2of(short19, pAuditOther19).indexOf('价核验') < 0, l2of(short19, pAuditOther19));
+    const pHy19 = { models: { hy3: PAID19 }, _ambig_warnings: ['hy3-preview: USD源歧义'] };
+    ok('T19-a6 ★显示名与价库键不一致也能命中（hy3 ↔ hy3-preview 宽松匹配）',
+      l2of({ model: 'hy3', in: 1000000, out: 10000, cached: 0 }, pHy19).indexOf('⚠价核验') >= 0);
+
+    // ── b. 行2 宽度守卫优先级（用户疑问②：缓存百分比优先于降级标签）──
+    const long19 = { model: M19, in: 2163000, out: 20000, cached: Math.round(2163000 * 0.9557) };
+    const lLong19 = l2of(long19, pMine19);
+    ok('T19-b1 ★长行时「缓存百分比」不被「⚠价核验」顶掉（v3.27.0 用户定版优先级）',
+      lLong19.indexOf('缓存95.57%') >= 0 && lLong19.indexOf('价核验') < 0, lLong19);
+    ok('T19-b2 ★长行结果宽度 ≤ 上限', mod19.dispWidth(lLong19) <= 51, 'w=' + mod19.dispWidth(lLong19));
+    const huge19 = { model: M19, in: 199800000, out: 11100000, cached: 190000000 };
+    const lHuge19 = l2of(huge19, P19());
+    ok('T19-b3 ★超长行不留孤悬「｜」结尾 / 不出现「｜｜」',
+      !/｜$/.test(lHuge19) && lHuge19.indexOf('｜｜') < 0, lHuge19);
+    ok('T19-b4 ★超长行宽度仍 ≤ 上限', mod19.dispWidth(lHuge19) <= 51, 'w=' + mod19.dispWidth(lHuge19));
+
+    // ── c. 显示宽度模型（用户疑问③：⚠ 按 emoji 呈现，实际 ≈ 2 个汉字）──
+    ok('T19-c1 ★dispWidth(⚠) === 4（emoji 呈现宽；旧模型按 2 计 → 每个 ⚠ 低估 2u）',
+      mod19.dispWidth('⚠') === 4, 'w=' + mod19.dispWidth('⚠'));
+    ok('T19-c2 dispWidth(⚠️) === 4（变体选择符 U+FE0F 零宽）', mod19.dispWidth('⚠️') === 4, 'w=' + mod19.dispWidth('⚠️'));
+    ok('T19-c3 常规汉字/ASCII 宽度未变（输入 ab = 7u）', mod19.dispWidth('输入 ab') === 7, 'w=' + mod19.dispWidth('输入 ab'));
+    ok('T19-c4 纯 ASCII 行宽度未变（输入 127万 / 输出 9002 = 22u）',
+      mod19.dispWidth('输入 127万 / 输出 9002') === 22, 'w=' + mod19.dispWidth('输入 127万 / 输出 9002'));
+    // 回归守卫：emoji 区间必须以 `u` 标志 + \u{...} 书写。不加 `u` 时 `\u1F000` 会被拆成 `\u1F00`+`0`，
+    // 与 `-` 拼成 `0-\u1FAF` → **吃掉整个 ASCII 区**，行宽被算成 2 倍（本次开发中真实踩到）。
+    ok('T19-c5 ★emoji 区间不吞 ASCII（回归：畸形区间曾把行宽算成 2 倍）',
+      mod19.dispWidth('abcXYZ0189') === 10, 'w=' + mod19.dispWidth('abcXYZ0189'));
+
+    // ── d/e. 既有不变量：⚠未计价 绝不丢；空 stat 不崩 ──
+    const lUnpaid19 = l2of({ model: 'nope-m', in: 1000000, out: 50000, cached: 900000 }, { models: {} });
+    ok('T19-d1 ★「⚠未计价」不被宽度守卫丢弃（数据不可信信号优先级最高）',
+      lUnpaid19.indexOf('⚠未计价') >= 0, lUnpaid19);
+    let noCrash19 = true;
+    try { l2of(null, P19({ _ambig_warnings: [M19 + ': x'] })); } catch (e) { noCrash19 = false; }
+    ok('T19-e1 stat=null 不抛异常（函数内半防御风格的兜底归一）', noCrash19);
+
+    // ── f. 源码守卫：priceAuditTag 体内**不得**再出现 last_refresh_note（防"流水账当状态"重演）──
+    const main19 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+    const paStart = main19.indexOf('function priceAuditTag');
+    const paEnd = main19.indexOf('\nfunction ', paStart + 10);
+    const paBody = paEnd > paStart ? stripComments(main19.slice(paStart, paEnd)) : '';
+    ok('T19-f1 ★priceAuditTag 不再消费 last_refresh_note（流水账 ≠ 当前健康状态，永久条目 = 永久噪音）',
+      paStart > 0 && paBody.length > 0 && paBody.indexOf('last_refresh_note') < 0
+      && paBody.indexOf('_ambig_warnings') >= 0 && paBody.indexOf('_price_audit') >= 0);
+    } finally {
+      // 原样恢复被临时移走的 ⚠账缺 旗标
+      if (tfSaved19 !== null) { try { fs.writeFileSync(tfPath19, tfSaved19); } catch (e) { /* 恢复失败不影响被测逻辑 */ } }
+    }
+  }
+}
+
+// ===== 导出一致性（A-16）：自动推导，替代"手工清单"的兜底 =====
+// 病根：selftest 里"新增导出必须存在"是**三张手工清单**（T8-N1g/N2 的 typeof 检查、T11-a 的 `exported`、
+//   T12-a 的 `ex12`），全靠人记得往里加。`cleanupCoalesceLocks` 三张都不含 → 一旦它"定义还在、导出没了"，
+//   :902 的 `typeof tt2.cleanupCoalesceLocks !== 'function'` 只会走 skip，而 T14-d1 的源码正则只证明
+//   "函数**定义**还在"、不证明"被**导出**" → 该状态零覆盖（静默）。
+// 做法：从 selftest.js **自身源码**（剥注释后）正则抽取所有对被测模块的成员引用，与模块的实际导出键
+//   求差集；差集非空 = 引用了一个并不存在的导出 = 必是代码回归 → fail。
+{
+  const selfCode = stripComments(fs.readFileSync(path.join(SRC, 'selftest.js'), 'utf-8'));
+  // 被测主模块在 selftest 里的全部局部变量名（grep 得来，勿漏；均为 require(skillDir/token-tracker.js) 的别名）
+  const MOD_VARS = ['mod', 'ttMod', 'tt2', 'mod16', 'mod17', 'mod18', 'mod19'];
+  const memberRe = new RegExp('\\b(?:' + MOD_VARS.join('|') + ')\\.([A-Za-z_$][A-Za-z0-9_$]*)', 'g');
+  const referenced = new Set();
+  let mm;
+  while ((mm = memberRe.exec(selfCode)) !== null) referenced.add(mm[1]);
+  // 例外：selftest 有意断言"该成员**不得**被导出"（T9-B3b 的死副本守卫）——负向引用不是"引用缺失导出"。
+  const ABSENT_BY_DESIGN = new Set(['parsePeakSchedule']);
+
+  let ttAll = null;
+  try { ttAll = require(path.join(skillDir, 'token-tracker.js')); } catch (e) { ttAll = null; }
+  if (!ttAll) {
+    ok('★导出一致性：selftest 引用到的所有成员都必须真的被导出', false,
+      'token-tracker.js require 失败 —— 无法核对导出');
+  } else {
+    // hasOwnProperty 排除原型链属性（constructor / toString 等），只认真正的显式导出。
+    const missing = [...referenced].filter(
+      (n) => !ABSENT_BY_DESIGN.has(n) && !Object.prototype.hasOwnProperty.call(ttAll, n));
+    ok('★导出一致性：selftest 引用到的所有成员都必须真的被导出（自动推导，非手工清单）',
+      missing.length === 0,
+      '缺失: ' + missing.join(', ') + `（已核对 ${referenced.size} 个引用成员）`);
   }
 }
 
 fs.rmSync(tmp, { recursive: true, force: true });
 // v3.24.0（审计⑤）：skip 数显式化 —— 「138 全绿」曾掩盖 26 条端到端用例全部 SKIP 的事实
-// （SPAWN_OK=false 的沙箱环境里绿 ≠ 真跑过）。结果行带 skip 数；**有跳过时退出码 = 2**
-// （0=全过、1=有失败、2=全过但有跳过），CI（SPAWN_OK=true、无跳过）不受影响。
-console.log(`\n结果：${pass} 过 / ${fail} 败 / ${skipCount} 跳过${skipped ? '（受限环境：需要 node 子进程的用例未真跑）' : ''}`);
-process.exit(fail ? 1 : (skipCount > 0 ? 2 : 0));
+// （SPAWN_OK=false 的沙箱环境里绿 ≠ 真跑过）。
+// v3.29.0（A-3）：**退出码语义修正** —— 只有真失败才 exit 1；envSkip 是"环境能力受限"（沙箱禁 spawn、
+//   CI 的 WB_NO_NET 前提缺口），不是代码问题，**不再让 job 变红**（旧行为 exit 2 会被 GitHub Actions
+//   一律判失败，且红的原因看起来像"测试失败"）。CI 正常环境下 envSkip 应为 0，summary 会显式标注。
+//   为此**不需要** job 级 continue-on-error —— 那玩意无法区分 exit 1/2，会连带吞掉真实回归。
+console.log(`\n结果：${pass} 过 / ${fail} 败 / ${envSkipCount} 环境受限跳过`
+  + (envSkipCount > 0 ? '（需要 node 子进程或 WB_NO_NET 前提缺口；属环境能力限制、不计入退出码；CI 上应为 0）' : ''));
+process.exit(fail ? 1 : 0);

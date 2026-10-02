@@ -112,79 +112,128 @@ function main() {
   const day = daily[date];
   if (!day) { console.error(`账本中无 ${date} 记录`); process.exit(1); }
 
-  let dayTotal = 0;
-  const report = [];
+  // v3.29.0（S-2 补漏）：锁外预热 roundHoursOf —— 它是本工具里唯一的重 I/O（每次调用都整份读 toast 日志）。
+  //   锁内重算时优先查缓存，只对缓存里没有的模型（并发新出现的）才现场调用，账本锁持有时间基本不增加。
+  const hoursCache = new Map();
+  for (const model of Object.keys(day.models || {})) hoursCache.set(model, roundHoursOf(date, model));
 
-  for (const [model, stat] of Object.entries(day.models || {})) {
-    if (onlyModel && model !== onlyModel) { dayTotal += stat.cost || 0; continue; }
-    // v3.23.5：查价改走主脚本的 findModel（归一化 + 边界匹配 + 别名），与 backfill / 主链路同口径。
-    // 原先裸查字典 `(pricing.models || {})[model]` —— 账本里的模型名与价库键差一个后缀/别名就取不到价，
-    // 表现为「同一天 backfill 算得出金额、recalc 算不出」，且没有任何报错。
-    const hit = tt.findModel(pricing, model, 'price');
-    const m = hit ? hit.m : null;
-    if (!m || typeof m.input_price !== 'number') { dayTotal += stat.cost || 0; continue; }
+  // v3.29.0（S-2 补漏）：把「重算一天」抽成函数，逻辑逐字搬自原 L115-175（findModel/峰谷/no_price/costOf 一律不动）。
+  //   基准改为**传入的 dayObj**：锁内传入的是 cur[date] 现值（不再是锁外旧快照），
+  //   这样「目标日期自己在锁外窗口被主链路追加的新数据」才不会被旧快照静默抹掉。
+  function recalcDay(dayObj) {
+    let dayTotal = 0;
+    const report = [];
 
-    const hours = roundHoursOf(date, model);
-    let peakRatio = null;
-    if (hours) {
-      peakRatio = hours.filter((iso) => isPeakBeijing(iso, pricing)).length / hours.length;
-    } else if ((typeof m.peak_multiplier === 'number' && m.peak_multiplier > 1) || /(^|[\/\-_])deepseek/i.test(String(model || ''))) {
-      peakRatio = null; // 有峰谷价但拿不到轮次时间 → 占比未知
-    } else {
-      peakRatio = 0;
+    for (const [model, stat] of Object.entries(dayObj.models || {})) {
+      if (onlyModel && model !== onlyModel) { dayTotal += stat.cost || 0; continue; }
+      // v3.23.5：查价改走主脚本的 findModel（归一化 + 边界匹配 + 别名），与 backfill / 主链路同口径。
+      // 原先裸查字典 `(pricing.models || {})[model]` —— 账本里的模型名与价库键差一个后缀/别名就取不到价，
+      // 表现为「同一天 backfill 算得出金额、recalc 算不出」，且没有任何报错。
+      const hit = tt.findModel(pricing, model, 'price');
+      const m = hit ? hit.m : null;
+      if (!m || typeof m.input_price !== 'number') { dayTotal += stat.cost || 0; continue; }
+
+      // v3.29.0（S-2 补漏）：优先用锁外预热缓存；并发新出现的模型（不在缓存里）才现场读 toast。
+      const hours = hoursCache.has(model) ? hoursCache.get(model) : roundHoursOf(date, model);
+      let peakRatio = null;
+      if (hours) {
+        peakRatio = hours.filter((iso) => isPeakBeijing(iso, pricing)).length / hours.length;
+      } else if ((typeof m.peak_multiplier === 'number' && m.peak_multiplier > 1) || /(^|[\/\-_])deepseek/i.test(String(model || ''))) {
+        peakRatio = null; // 有峰谷价但拿不到轮次时间 → 占比未知
+      } else {
+        peakRatio = 0;
+      }
+
+      const base = costOf(m, stat.in, stat.cached, stat.out, 1);
+      let cost;
+      if (peakRatio === null) {
+        // v3.24.0（级联④，补 v3.23.5 的另一半）：峰谷占比未知时**不得瞎改已有金额**。
+        // 原实现一律按空闲 ×1 重写 —— 对已有账（按 token 实际发生时刻记的，含高峰 ×2 部分）
+        // 是口径改写：任何一次 recalc 都会把历史金额悄悄改小。现在分两种情况：
+        //   原账 > 0 → 保留原额不动（只在报告标注"时段未知"）；
+        //   原账 = 0 → 是"当时未收录"的历史欠账，按空闲价补上（低估可接受，且这正是本工具存在的目的）。
+        if (Number(stat.cost || 0) > 0) { dayTotal += stat.cost; continue; }
+        cost = base; // ¥0 欠账 → 按空闲价补记
+      } else {
+        // v3.23.5：缺省值与主脚本 calcCost（token-tracker.js L2599）对齐——DeepSeek 系缺省 2，其余缺省 1。
+        // 原先一律 `|| 1`：deepseek 条目若缺 peak_multiplier 字段，回溯重算会比主链路**整整少算一倍**，且不报错。
+        const isDeepSeek = /(^|[\/\-_])deepseek/i.test(String(model || ''));
+        const peakMult = typeof m.peak_multiplier === 'number' ? m.peak_multiplier : (isDeepSeek ? 2 : 1);
+        // 加权：高峰部分按 peak_multiplier，其余按 1
+        const ratio = Math.min(1, Math.max(0, peakRatio));
+        cost = costOf(m, stat.in, stat.cached, stat.out, 1 + (peakMult - 1) * ratio);
+      }
+
+      const old = Number(stat.cost || 0);
+      if (Math.abs(cost - old) > 0.0005) {
+        stat.cost = cost;
+        report.push({
+          model, old, neu: cost,
+          rounds: hours ? hours.length : 0,
+          peakRatio: peakRatio === null ? '未知(按空闲)' : `${(peakRatio * 100).toFixed(0)}%`,
+        });
+      }
+      // v3.27.0：官方价补上并回算后，条目不再属于「无公开价」→ 必须清标记，
+      //   否则金额已是真实值、报表却仍显示「无公开价」+ 合计偏低提示（自己打自己的脸）。
+      if (stat.no_price && cost > 0) {
+        delete stat.no_price; delete stat.no_price_note;
+        report.push({ model, note: '已补公开价并回算，清除 no_price 标记' });
+      }
+      dayTotal += stat.cost;
     }
 
-    const base = costOf(m, stat.in, stat.cached, stat.out, 1);
-    let cost;
-    if (peakRatio === null) {
-      // v3.24.0（级联④，补 v3.23.5 的另一半）：峰谷占比未知时**不得瞎改已有金额**。
-      // 原实现一律按空闲 ×1 重写 —— 对已有账（按 token 实际发生时刻记的，含高峰 ×2 部分）
-      // 是口径改写：任何一次 recalc 都会把历史金额悄悄改小。现在分两种情况：
-      //   原账 > 0 → 保留原额不动（只在报告标注"时段未知"）；
-      //   原账 = 0 → 是"当时未收录"的历史欠账，按空闲价补上（低估可接受，且这正是本工具存在的目的）。
-      if (Number(stat.cost || 0) > 0) { dayTotal += stat.cost; continue; }
-      cost = base; // ¥0 欠账 → 按空闲价补记
-    } else {
-      // v3.23.5：缺省值与主脚本 calcCost（token-tracker.js L2599）对齐——DeepSeek 系缺省 2，其余缺省 1。
-      // 原先一律 `|| 1`：deepseek 条目若缺 peak_multiplier 字段，回溯重算会比主链路**整整少算一倍**，且不报错。
-      const isDeepSeek = /(^|[\/\-_])deepseek/i.test(String(model || ''));
-      const peakMult = typeof m.peak_multiplier === 'number' ? m.peak_multiplier : (isDeepSeek ? 2 : 1);
-      // 加权：高峰部分按 peak_multiplier，其余按 1
-      const ratio = Math.min(1, Math.max(0, peakRatio));
-      cost = costOf(m, stat.in, stat.cached, stat.out, 1 + (peakMult - 1) * ratio);
-    }
-
-    const old = Number(stat.cost || 0);
-    if (Math.abs(cost - old) > 0.0005) {
-      stat.cost = cost;
-      report.push({
-        model, old, neu: cost,
-        rounds: hours ? hours.length : 0,
-        peakRatio: peakRatio === null ? '未知(按空闲)' : `${(peakRatio * 100).toFixed(0)}%`,
-      });
-    }
-    // v3.27.0：官方价补上并回算后，条目不再属于「无公开价」→ 必须清标记，
-    //   否则金额已是真实值、报表却仍显示「无公开价」+ 合计偏低提示（自己打自己的脸）。
-    if (stat.no_price && cost > 0) {
-      delete stat.no_price; delete stat.no_price_note;
-      report.push({ model, note: '已补公开价并回算，清除 no_price 标记' });
-    }
-    dayTotal += stat.cost;
+    dayObj.total.cost = Math.round(dayTotal * 1e6) / 1e6;
+    return { total: dayObj.total.cost, report };
   }
 
-  day.total.cost = Math.round(dayTotal * 1e6) / 1e6;
   // v3.19.0（P2）：先备份，再走主脚本的原子写（tmp+rename）。原先直接 writeFileSync 覆盖，
   // 写盘中断 = 全部历史账本损坏（唯一三样全无的写入路径）。
-  backupDaily();
-  if (!tt.saveDailyUsageRaw(daily)) { console.error('账本写入失败，原文件未改动'); process.exit(1); }
+  // v3.29.0（S-2 修复）：原先只复用了主脚本**无锁**的内层写 saveDailyUsageRaw —— 主链路 recordUsage 是
+  //   withFileLock(DAILY_USAGE_FILE + '.lock') 包着同一个写函数（token-tracker.js L3062），recalc 却把锁丢了；
+  //   且 recalc 在锁外早已读好 daily 快照（约 L106），期间主链路累加的新数据会被这份旧快照整体覆盖。
+  //   现在改为：与主链路共用**同一把锁**（DAILY + '.lock' 即 DAILY_USAGE_FILE + '.lock'），
+  //   锁内**重读账本现值**，只把「目标日期」这一个键替换成重算结果，其余日期保持账本现值
+  //   （recalc 是单日回算，绝不能整份替换）。
+  // v3.29.0（S-2 补漏）：重算也搬进锁内、以锁内现值 cur[date] 为基准 —— 原先把锁外旧快照 day 直接塞回
+  //   cur[date]，只挡住了「其他日期被覆盖」，挡不住「目标日期自己在锁外窗口被追加的新数据被旧快照抹掉」。
+  let writeOk = false;
+  let rereadFailed = false;
+  let targetMissing = false;
+  let recalc = null;
+  const lockRes = tt.withFileLock(DAILY + '.lock', () => {
+    let cur = null;
+    try { cur = JSON.parse(fs.readFileSync(DAILY, 'utf-8').replace(/^\uFEFF/, '')); } catch (e) { cur = null; }
+    if (!cur || typeof cur !== 'object') { rereadFailed = true; return; } // 重读失败 → 不写，原文件保持不动
+    // v3.29.0（S-2 补漏）：目标日期锁外存在、锁内却没了（极端并发删除）→ 不写盘，锁外报错退出
+    if (!cur[date]) { targetMissing = true; return; }
+    backupDaily();          // 备份仍在本工具写盘之前执行
+    // v3.29.0（S-2 补漏）：以锁内现值 cur[date] 为基准重算（不再是锁外旧快照），其余日期绝不触碰
+    recalc = recalcDay(cur[date]);
+    writeOk = tt.saveDailyUsageRaw(cur);
+  }, { ttl: 300000, retries: 50 });
+
+  if (!lockRes || !lockRes.ok) {
+    // 抢锁失败：绝不无锁续写（否则又退回「旧快照整体覆盖」老问题）
+    console.error('账本正被占用（WorkBuddy 可能正在运行），请先退出 WorkBuddy 再执行 recalc-day');
+    process.exit(1);
+  }
+  if (rereadFailed) { console.error('账本读取失败，原文件未改动；请检查 daily-usage.json'); process.exit(1); }
+  if (targetMissing) { console.error(`账本中无 ${date} 记录（重算期间被并发改动？）；原文件未改动`); process.exit(1); }
+  if (!writeOk) { console.error('账本写入失败，原文件未改动'); process.exit(1); }
 
   console.log(`===== 回溯重算 ${date} =====`);
-  if (!report.length) console.log('无需修正（各模型金额已一致）');
-  for (const r of report) {
+  if (!recalc.report.length) console.log('无需修正（各模型金额已一致）');
+  for (const r of recalc.report) {
+    // v3.29.0：report 里有**两类**条目 —— ①「金额变更」带 old/neu/rounds/peakRatio；
+    //   ②「仅清 no_price 标记」只有 {model, note}（见上方 `report.push({ model, note })`）。
+    //   原先无条件读 `r.old.toFixed()` → 走到 ② 就抛 `TypeError: Cannot read properties of undefined`。
+    //   而 ② 恰恰在**本工具的主用法**上触发（补价后 recalc：no_price 条目从 ¥0 变成 >0）。
+    //   此时账本已写盘成功，用户却只看到一段异常栈、拿不到重算报告 → 误以为工具失败。
     console.log(`  ${r.model}`);
+    if (r.note) { console.log(`    ${r.note}`); continue; }
     console.log(`    原 ¥${r.old.toFixed(4)} → 现 ¥${r.neu.toFixed(4)}  （轮次 ${r.rounds}，高峰占比 ${r.peakRatio}）`);
   }
-  console.log(`  当日合计 ¥${day.total.cost.toFixed(2)}`);
+  console.log(`  当日合计 ¥${recalc.total.toFixed(2)}`);
 }
 
 main();

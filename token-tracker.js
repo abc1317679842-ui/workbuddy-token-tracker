@@ -1,5 +1,23 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.28.0 (2026-10-02)
+// token-usage-tracker v3.30.0 (2026-10-02)
+// v3.30.0：**弹窗行2 三处真因修正（用户 2026-10-02 弹窗截图反馈）** ——
+//   ① 价核验标签**永久误报**：A-8 把 `last_refresh_note`（刷新操作流水账，历史 ⚠️ 条目永久驻留）
+//      当触发源之一 → 每一条弹窗都挂「⚠价核验」，用户："明明有价格，为什么又在报价核验？"
+//      → 只认"当前价库真实健康状态"的结构化字段（_price_audit / _ambig_warnings，刷新即重写、干净即删），
+//      且**必须点名本轮弹窗涉及的模型**才挂；stderr 仍全量输出（含与本轮无关者）。
+//   ② 缓存百分比被标签顶掉：行2 宽度守卫**顺序倒挂**（先丢缓存、后丢标签），违反 v3.27.0 用户定版的
+//      「行2 位置留给缓存百分比」→ 改为标签先丢、缓存后丢；⚠未计价/⚠账缺 两级都不丢。
+//   ③ "有的弹窗有标签、有的没有"**不是代码分支**：toast 诊断日志里 5 条全部含「｜⚠价核验」，
+//      但 3 条在通知气泡里被**横向裁掉行尾** —— dispWidth 把 ⚠ 按 2u 计，实际 emoji 呈现 ≈ 4u，
+//      每个 ⚠ 低估 2u → 修正 dispWidth（emoji 4u / 变体选择符 0u），上限 52 → 51（实测 51u 才"占满"）。
+//   修正轮次：17 条新增行为断言全绿 + 全量 selftest 188 过 / 0 败。
+// v3.29.0：**审计报告 42 条集中修复（S×3 / A×16 / D×11 / C×5 + 连锁链 4 条）** ——
+//   硬核是两条**账本可能被静默抹掉**的严重缺陷：S-1 `backfill --write` 零锁全量覆盖、
+//   S-2 `recalc-day` 绕过账本锁（及其「目标日期」TOCTOU 残留窗口）。其余：定价抓取链
+//   （内存快照整份覆盖 / 0 价与 :free 变体 / 缓存价维度 / 峰谷倍率硬编码 / 周末低峰锚点
+//   未命中真实文案）、Python 环境探测与主脚本逐字对齐、节假日两源不一致逐日告警、
+//   文档一致性（D-1~D-9）、测试体系（退出码语义、导出一致性自动推导、统一注释剥离）。
+//   完整条目见 CHANGELOG.md。
 // v3.28.0：**⚠无公开价 标注挪到行1、行2 不再显示金额**（用户 2026-10-02 定版布局）——
 //   行2 已有「输入/输出/缓存/缓存命中/金额」五段，标注塞那里会把缓存百分比挤掉；行1 模型名右侧
 //   本来就有空位。改法：toastLine1 新增可选第 6 参 extraTag（默认空串 → 12 个调用点行为不变），
@@ -253,7 +271,11 @@ const TRACE_DIR = path.join(WB, 'traces');
 // 说明：本脚本默认「零密钥联网」——唯一的密钥型请求（DeepSeek 余额查询）默认关闭。
 // 公开价表（OpenRouter）每日自动刷新/新模型补录默认开启，均无需密钥，失败自动降级为本地价。
 // 三个分开关各自独立；ENABLE_NETWORK=false 时所有联网请求一律跳过（一键零联网）。
-const ENABLE_NETWORK = true;        // 总开关：false = 全部联网功能关闭（含分开关）
+// v3.29.0（A-3③）：允许环境变量强制关闭——此前 WB_NO_NET=1 只被 refresh-prices.js / deepseek-official.js
+//   消费，主脚本自己完全不读，于是「离线自测」（CI 里设 WB_NO_NET=1）对主脚本无效、仍会发起真实网络请求。
+//   现主脚本同样遵从 WB_NO_NET / WB_DISABLE_NET（任一为 '1' 即全局关闭）；local-config.json 对分开关的
+//   控制语义不变（ENABLE_NETWORK=false 时全部分开关短路，见下方 ENABLE_NETWORK && ENABLE_XXX 判断）。
+const ENABLE_NETWORK = !(process.env.WB_NO_NET === '1' || process.env.WB_DISABLE_NET === '1'); // 总开关：false = 全部联网功能关闭（含分开关）
 // v3.18（2026-09-30）：余额查询开关改读**本地未入库**配置 local-config.json（仓库分发版默认 false）。
 //   要开启：在技能目录放 local-config.json 写 {"enable_balance_query": true}（该文件不进仓库，
 //   密钥本身仍在 models.json）。2026-09-28 用户曾指令本机开启（弹窗第二行显示「余额¥X」），
@@ -2625,15 +2647,20 @@ function autoRefreshPricing(pricing) {
 }
 
 // 模型匹配（v2.71 起双模式；v2.67 曾严格化为"只认归一化完全相等"）。
-// 模式：
-// - 默认（精确）：只认「归一化后完全相等」的模型名，失败返回 null。统计分桶/别名判定用。
-// - 计费（mode='price'）：归一化精确匹配失败后，遍历 pricing 所有 key 做双向 includes
-//   子串匹配（原始名.includes(key) 或 key.includes(原始名)），命中多个取 key 长度最长的；
-//   仍失败才返回 null。用于计费/显示/时段标注/补录判定——让 hy3-x 按 hy3 计价、
-//   deepseek-ai/DeepSeek-V4-Flash 按 deepseek-v4-flash 计价，而统计桶名保持原始名（分开统计）。
+// v3.29.0（D-1 文档核实，仅更正注释）：**当前全仓 4 个调用点全部传 mode='price'**
+//   （calcCost:2802、显示用名 shortModelName:3602、时段标注 periodNote:3702、新模型补录判定 ensureNewModelPricing:4239），
+//   **不存在走默认模式的调用点**。故「默认（精确）」分支目前无实际使用者，仅作为精确匹配的前置阶段被
+//   mode='price' 复用（步骤 1/1.5/2 对两种模式都执行，只有步骤 3 宽松边界匹配受 mode 控制）。
+//   ——此前注释写「默认（精确）…统计分桶/别名判定用」与实现不符（统计分桶实际用的是原始名，不经 findModel）。
+// 两种模式的差异只在步骤 3：
+// - mode='price'（计费模式）：步骤 3 做「边界分隔 + 单向」宽松匹配——只允许具体模型名命中
+//   家族/前缀 key（norm 较长、key 是它的边界子串），命中多个取 key 最长者。用于计费/显示/时段标注/补录判定——
+//   让 hy3-x 按 hy3 计价、deepseek-ai/DeepSeek-V4-Flash 按 deepseek-v4-flash 计价。
+// - 其它（默认/精确）：跳过步骤 3，只保留步骤 1（归一化完全相等）+1.5（去标点）+2（别名表），
+//   失败即返回 null（当前无调用点，保留为 API 语义与防御）。
 // 依据（v2.67 源数据核查仍有效）：日期后缀模型的价格并不可靠相同——deepseek-r1 vs r1-0528、
 // deepseek-chat-v3-0324 vs chat-v3.1、deepseek-v4-pro vs v4-pro-0813 价格均不同；
-// 因此【精确模式】不做后缀归并（宁可不计价也不算错价）；【计费模式】仅做双向子串匹配
+// 因此【精确路径】不做后缀归并（宁可不计价也不算错价）；【计费路径】仅做边界子串匹配
 // 近似取价（精确优先，宽松兜底），且统计与计费解耦——桶名永不受影响。
 function findModel(pricing, modelName, mode) {
   if (!pricing || !pricing.models || !modelName) return null;
@@ -3602,10 +3629,23 @@ function shortModelName(stat, pricing) {
 }
 
 // 显示宽度近似：全角字符≈2、半角≈1（用于 toast 超宽保护，避免触发换行变 3 行）
+const CJK_WIDE_RE = /[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]/;
+// v3.30.0（F-3）：⚠ 这类符号在 Windows 通知里按 **emoji 呈现**渲染，实际占位 ≈ 2 个汉字（4 半角单位），
+//   而旧模型按 1 个汉字（2u）计 → **每出现一个 ⚠ 就低估 2u**。这不是理论问题，是实测踩中的坑：
+//   用户 2026-10-02 截图里"有的弹窗有标签、有的没有"，与 toast 诊断日志逐条对账后发现——
+//   日志里 5 条**全部**含「｜⚠价核验」，但其中 3 条（估宽 50~52u）在通知气泡里被**横向裁掉了行尾标签**。
+//   OS 裁切发生在渲染层，代码完全无感 → 只有把"估宽"修到 ≥ 实际渲染宽，守卫才拦得住。
+//   现把 emoji 呈现类字符按 4u 计；变体选择符（U+FE0E/FE0F）按 0u 计（它是零宽，旧模型误记 1u）。
+// 注意：必须带 `u` 标志并用 \u{...} 写星平面码点——不加 `u` 时 `\u1F000` 会被 JS 拆成 `\u1F00` + `0`，
+//   与后面的 `-` 拼成 `0-\u1FAF` 这种**吃掉整个 ASCII 区**的畸形区间（实测把行宽算成 2 倍）。
+const EMOJI_WIDE_RE = /[\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{1F000}-\u{1FAFF}]/u;
+const EMOJI_VS_RE = /[\uFE0E\uFE0F]/;
 function dispWidth(s) {
   let w = 0;
   for (const ch of String(s || '')) {
-    w += /[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]/.test(ch) ? 2 : 1;
+    if (EMOJI_VS_RE.test(ch)) continue;                     // 变体选择符零宽
+    if (EMOJI_WIDE_RE.test(ch)) { w += 4; continue; }       // emoji 呈现 ≈ 2 个汉字
+    w += CJK_WIDE_RE.test(ch) ? 2 : 1;
   }
   return w;
 }
@@ -3655,6 +3695,67 @@ function peakRuleTag(pricing) {
   return '';
 }
 
+// v3.29.0（A-8）：价格诊断告警链修复 —— refresh-prices.js 会往 pricing.json 落四类诊断字段，
+//   但此前 token-tracker.js **只消费 last_refresh_error**，其余（_price_audit / last_refresh_note /
+//   _ambig_warnings）全部只写不读，用户在弹窗里完全看不到。这里补上：toast 只挂一个**极短**标签
+//   「⚠价核验」（行2 宽度敏感，TOAST_LINE_MAX_W=51，绝不能塞整段文本），详细告警走 stderr 落日志。
+// 触发源（任一命中即标；字段类型容错，缺字段/类型异常都安全忽略）：
+//   ① pricing._price_audit        —— refresh-prices.js 价格一致性自检 { at, warnings:[...] }，无告警即 delete
+//   ② pricing._ambig_warnings     —— 模糊匹配歧义（纯字符串数组），无歧义即 delete
+//   —— 两者都是"当前价库真实健康状态"的**结构化**字段，每次刷新重写、干净就删除 → 自愈、不会永久驻留。
+//
+// v3.30.0（F-1 修正）：A-8 原实现还消费了第三个触发源 `pricing.last_refresh_note`（"含 ⚠ 即挂"），
+//   实测**把标签变成了常驻噪音**——该字段是"上次刷新的操作流水账"，历史 ⚠️ 条目会永远留在文本里
+//   （本机 2026-10-01T17:53 写入的「⚠️模糊匹配歧义: kimi-k3 / glm-5.3-flash」到 10-02 仍在，
+//   刷新前一直有效），于是**每一条**弹窗都挂「⚠价核验」。用户看到的正是：
+//   「明明有价格，为什么又在报那个价核验？」——这不是误报某一次，是**永恒误报**。
+//   这与 A-7 当初把 `_retired_locked` 刻意踢出 `_price_audit` 要躲的是**同一个坑**（永久性条目 = 永久噪音）。
+//   现修正为两条：
+//     ① **不再消费 last_refresh_note**（流水账不做 toast 触发源，只进 stderr 诊断）；
+//     ② 且结构化告警**必须点名本轮弹窗涉及的模型**才挂标签——别的模型的歧义/价差（如上面两条
+//        kimi-k3 / glm-5.3-flash）与本轮计价无关，不该污染每一条弹窗。
+//   stderr 仍**全量**输出所有告警（含与本轮无关者），诊断能力不减。
+let _priceAuditLogged = false; // 同轮可能经多条路径构建行2 → stderr 详情只打一轮，避免刷屏
+
+// 本轮弹窗涉及的模型名集合（顶层模型 + 分模型明细的键；显示名与实际键可能不同，故匹配用宽松口径）
+function roundModelNames(stat) {
+  const s = new Set();
+  const add = (n) => { const v = String(n == null ? '' : n).trim(); if (v) s.add(v); };
+  if (stat && typeof stat === 'object') {
+    add(stat.model); add(stat.modelMain);
+    if (stat.models && typeof stat.models === 'object') for (const k of Object.keys(stat.models)) add(k);
+  }
+  return [...s];
+}
+// 告警条目形如 `<价库键>: 说明`（见 refresh-prices.js 的 warning 构造）→ 取冒号前做宽松匹配。
+// 宽松口径：完全相同 / 互为子串 均算相关（覆盖「hy3」vs「hy3-preview」这类显示名与键名不一致）。
+function warnMentionsModel(w, names) {
+  const seg = String(w == null ? '' : w).split(/[:：]/)[0].trim().toLowerCase();
+  if (!seg) return false;
+  return names.some((n) => {
+    const b = String(n).toLowerCase();
+    return !!b && (seg === b || seg.indexOf(b) >= 0 || b.indexOf(seg) >= 0);
+  });
+}
+function priceAuditTag(stat, pricing) {
+  if (!pricing || typeof pricing !== 'object') return '';
+  const audit = pricing._price_audit;
+  const auditWarn = (audit && typeof audit === 'object' && Array.isArray(audit.warnings)) ? audit.warnings.filter(Boolean) : [];
+  const ambigWarn = Array.isArray(pricing._ambig_warnings) ? pricing._ambig_warnings.filter(Boolean) : [];
+  const all = [];
+  for (const w of auditWarn) all.push({ kind: '价格一致性自检', text: w });
+  for (const w of ambigWarn) all.push({ kind: '模糊匹配歧义', text: w });
+  const names = roundModelNames(stat);
+  const hit = names.length ? all.filter((it) => warnMentionsModel(it.text, names)) : [];
+  if (!_priceAuditLogged && all.length) {
+    _priceAuditLogged = true;
+    // 全量告警走 stderr（诊断不减）；命中的额外标一行，便于对照"为什么这条弹窗挂了标签"
+    const lines = all.map((it) => `[token-tracker]   - ${it.kind}: ${it.text}`);
+    process.stderr.write(`[token-tracker] 价格库待人工核验项 ${all.length} 个${hit.length ? `（其中 ${hit.length} 个涉及本轮模型 → 弹窗已标注「⚠价核验」）` : '（均与本轮模型无关 → 弹窗不标注）'}：\n${lines.join('\n')}\n`);
+  }
+  return hit.length ? '⚠价核验' : '';
+}
+
 function periodNote(stat, pricing) {
   const base = periodPeakNote(stat, pricing);
   const tag = [dbStaleTag(pricing), peakRuleTag(pricing)].filter(Boolean).join(' ');
@@ -3702,7 +3803,10 @@ function isNightHour(m, now) {
 // 说明：Windows toast 第二行默认即「正文小字号」（ToastText02 模板标题大字+正文小字）；
 //       更小字号（Caption）需 AdaptiveGroup+HintStyle 自定义 XML（Win10 周年更新+），兼容性有风险，未采用。
 // 分隔符「｜」两侧不加空格以省宽度。两行均有超宽保护，保证绝不触发换行变 3 行。
-const TOAST_LINE_MAX_W = 52; // 一行最大显示宽度单位（正文小字上限；实测用户原行1 约 51u 即"占满"，52 为安全值）
+// v3.30.0（F-3 修正）：52 → 51。原注释自述"实测用户原行1 约 51u 即**占满**，52 为安全值"——
+//   "占满"= 能完整显示的最后一格，不是"还有富余"；把 52 当"安全值"等于明知 51 已是极限还多放 1u。
+//   （真正造成裁切的元凶是下方 dispWidth 对 ⚠ 的低估，已单独修正；这里只做 51→52 这一处收紧。）
+const TOAST_LINE_MAX_W = 51; // 一行最大显示宽度单位（正文小字上限；51u = 实测"占满"，即极限值本身）
 // v2.17 实测修正：用户弹 5 个通知逐步加空格定位真实极限——测试四（模型名后 4 空格=47u）第一行不换行、测试五（5 空格=48u）换行
 // → 行1 标题大字真实上限 47u（纯半角；此前 42u 是保守估算值，低估了 5u）
 // v2.33（2026-08-14）：行1 改用保守模型 dispWidthTitle（中文按 2.5 计）后，阈值定为 45——
@@ -3823,6 +3927,9 @@ function noPriceTag1(stat, pricing) {
   return ((stat && stat.in) || (stat && stat.out)) ? '｜⚠无公开价' : '';
 }
 function toastLine2(stat, pricing) {
+  // v3.30.0（F-2）：本函数内部对 stat 的取值风格本就是"半防御"（model 用 `stat &&`、in/out 直接点），
+  //   一旦有别处传 null 就会在 `fmt(stat.in)` 上抛 TypeError。补一句归一，风格统一、零行为变化。
+  stat = stat || {};
   const isLocal = isLocalModel(stat && stat.model);
   const anyNoPrice = anyNoPublicPrice(stat, pricing);
   // v3.26.0（KI-6 ⑧）：混合模型轮**分模型计价求和**（与账本/轮次明细同口径）——
@@ -3880,13 +3987,21 @@ function toastLine2(stat, pricing) {
   if (pricing && pricing.deepseek_refresh_error) {
     line += '｜官价⚠️';
   }
+  // v3.29.0（A-8）：价格诊断告警链修复——把 refresh-prices.js 已落盘的 _price_audit / _ambig_warnings
+  //   变成用户可见提示。toast 只挂极短标签「⚠价核验」（详情见 priceAuditTag 的 stderr 输出），
+  //   与上方 价⚠️ / 官价⚠️ 同位置、同模式，避免撑破行2。
+  // v3.30.0（F-1）：触发源去掉 last_refresh_note（历史流水账 → 永久误报），且改为"只报本轮模型被点名的"。
+  if (pricing) {
+    // v3.30.0（F-1）：必须传 stat —— 标签只在本轮模型被点名的告警上挂（详见 priceAuditTag 注释）
+    const auditTag = priceAuditTag(stat, pricing);
+    if (auditTag) line += '｜' + auditTag;
+  }
   // v3.24.0（级联②）：该模型在价库里找不到 → 金额显示「未收录」，但那不够醒目（报告实测：
   // 纯净环境无本地价库时 hy3 等子代理模型金额静默=0，用户毫无感知）。补「⚠未计价」标注，
   // 对齐 价⚠️/官价⚠️ 模式。只在确实有 token 消耗时标注（空轮不标）。
   // v3.26.0（KI-6 ⑧）：分模型计价时「部分模型无价」同样标注（partUnknown）——金额是部分和，必须明示缺口。
-  if ((pricing && !isLocal && costVal == null && ((stat && stat.in) || (stat && stat.out))) || partUnknown) {
-    line += '｜⚠未计价';
-  }
+  // v3.29.0 修正：此块曾被**重复写了两遍**（v3.28.0 行2 布局重构时复制粘贴引入），弹窗实测出现
+  //   `｜⚠未计价｜⚠未计价` 双标签。这里收敛为单块；selftest T18 已补「同一标签在行2 至多出现一次」断言。
   // v3.27.0：⚠未计价 = "我们没收录到价"；⚠无公开价 = "厂商根本没公布单价"——行动含义不同，必须能区分。
   //   **⚠无公开价 已挪到行1**（用户 2026-10-02 明确要求：行2 位置留给缓存百分比）。
   //   行2 只保留「金额算不出来」类标注：⚠未计价（账本/弹窗会缺金额）仍留行2。
@@ -3901,7 +4016,22 @@ function toastLine2(stat, pricing) {
       line += '｜⚠账缺';
     }
   } catch (e2) { /* 无旗标 = 正常 */ }
-  // 宽度保护：超宽丢缓存占比，保住价格与核心数字（高峰标注已移至行1，行2 不再有溢出风险）
+  // 宽度守卫（两级，**顺序即优先级**）。
+  // v3.30.0（F-2 修正）：A-8/A-10 时期这里**顺序倒挂**——第一级先丢缓存占比（ratioTxt），第二级才丢标签；
+  //   于是"为了给 ⚠价核验 腾位置，先把缓存命中百分比砍掉"成了默认行为。用户 2026-10-02 直接点破：
+  //   「那个子代理下面的，又报价核验，又把那个缓存命中百分比也顶掉了」。
+  //   而 v3.27.0 用户定版布局的原话是「行2 位置留给缓存百分比」（⚠无公开价 就是为此被挪到行1 的）
+  //   → 缓存占比的优先级**高于**价格来源降级标签，现按此重排：
+  //     第一级：丢价格降级标签（详情都在 stderr / 日志里，丢得起）
+  //     第二级：仍放不下，才丢缓存占比
+  //   ⚠未计价（金额缺失）/ ⚠账缺（token 少计）是「数据不可信」信号，**两级都不丢**。
+  // 安全说明：'｜价⚠️' 与 '｜官价⚠️' **不会互相误伤**——`'｜官价⚠️'.indexOf('｜价⚠️') === -1`
+  //   （「｜」后紧邻的是「官」而非「价」），故 replace 各丢各的，顺序无副作用。
+  const TAG_DROP_ORDER = ['｜⚠价核验', '｜价⚠️', '｜官价⚠️'];
+  for (const t of TAG_DROP_ORDER) {
+    if (dispWidth(line) <= TOAST_LINE_MAX_W) break;
+    line = line.replace(t, '');
+  }
   if (dispWidth(line) > TOAST_LINE_MAX_W) {
     // v3.27.0：ratioTxt 现在不带尾随「｜」（金额段可能整体缺席），
     //   所以要多清一次「<ratio>｜」形式，以及清完后的行尾孤立「｜」。
@@ -4483,7 +4613,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.28.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.30.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

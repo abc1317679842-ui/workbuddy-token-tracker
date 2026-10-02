@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-国内厂商官方人民币价抓取器（v0.4，2026-10-02）
+国内厂商官方人民币价抓取器（v0.5，2026-10-02）
+- v0.5：① 数据根探测 detect_workbuddy_root()（WB_ROOT > ~/.workbuddy-ai > ~/.workbuddy，与 Node 侧
+  detectWorkBuddyRoot 同口径）——修「客户端迁到 ~/.workbuddy-ai 后 Python 侧仍写死 ~/.workbuddy」；
+  ② requests 分支补 verify=，修 CN_PRICES_INSECURE_TLS 降级对「装了 requests 的机器」静默失效；
+  ③ 抓取失败改为结构化摘要（stderr + JSON _fetch_summary），exit code 维持 fail-soft 语义（详见 main()）。
 - v0.4：requests 降为可选依赖（缺失自动回退 urllib 的 fetch()，无 requests 的机器不再 ImportError 整条崩）；
   TLS 恢复严格证书校验（价格影响计费；确需降级设 CN_PRICES_INSECURE_TLS=1，会打警告）
 - v0.3：阶跃列序修正(输入未命中/输入命中/输出)；step-5-preview 白名单；MiniMax 专用解析
@@ -50,10 +54,35 @@ if os.environ.get('CN_PRICES_INSECURE_TLS') == '1':
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
 TIMEOUT = 30
 
+def detect_workbuddy_root():
+    """v0.5（2026-10-02）：WorkBuddy 数据根探测，与 Node 侧 detectWorkBuddyRoot
+    （token-tracker.js:239-249 / refresh-prices.js:40-50）**逐字等价**。背景：新版客户端可能把数据根
+    迁到 ~/.workbuddy-ai，若此处写死 ~/.workbuddy，本脚本读 DeepSeek 价的 PRICING_PATH 会指向错误
+    路径，且 build_index.py 的「沿用旧价」分支会静默兜底，用户完全察觉不到。
+    语义（与 Node 完全一致，勿自作聪明「更稳」——两端必须算出同一个根）：
+      ① WB_ROOT 环境变量**非空即用**（空串等同未设置；不校验目录是否存在，对应 Node 的 `||`）；
+      ② 否则在 [~/.workbuddy-ai, ~/.workbuddy] 中取第一个含 traces/ 或 settings.json 签名者；
+      ③ 都不命中 → 兜底 ~/.workbuddy（对应 Node 末尾的 return）。
+    ⚠️ 本函数需与 build_index.py 中的同名实现保持一致，且必须与 token-tracker.js:239-249 等价
+      （两个 py 文件无共享模块，各自实现）。
+    """
+    env = os.environ.get('WB_ROOT')
+    if env:  # 空串等同未设置，与 Node 的 `process.env.WB_ROOT ||` 一致
+        return env
+    h = os.path.expanduser('~')
+    for c in (os.path.join(h, '.workbuddy-ai'), os.path.join(h, '.workbuddy')):
+        try:
+            if os.path.exists(os.path.join(c, 'traces')) or os.path.exists(os.path.join(c, 'settings.json')):
+                return c
+        except OSError:
+            pass
+    return os.path.join(h, '.workbuddy')
+
+
 # DeepSeek 官方价由用户已在 pricing.json 校对（lock），不重复抓取，
 # 直接读该文件作为库的 DeepSeek first_party 源。
-PRICING_PATH = os.path.join(os.path.expanduser('~'), '.workbuddy', 'skills',
-                            'token-usage-tracker', 'pricing.json')
+WB_ROOT = detect_workbuddy_root()
+PRICING_PATH = os.path.join(WB_ROOT, 'skills', 'token-usage-tracker', 'pricing.json')
 
 # 阿里云(通义千问)不抓本地库——计费统一走聚合源(llmabacus)人民币价；
 # 其官方价分地域/阶梯/思考模式/Batch半价，本地难以精确解析，故放弃本地存储。
@@ -137,9 +166,20 @@ def fetch(url, timeout=TIMEOUT):
 
 def http_get(url, timeout=TIMEOUT):
     """GET 取回文本：有 requests 就用它（自动跟随 301），没有就回退上面的 urllib 实现。
-    v3.23.4：requests 从「硬依赖」降级为「可选」——没有它的机器上整条流水线不再因 ImportError 崩掉。"""
+    v3.23.4：requests 从「硬依赖」降级为「可选」——没有它的机器上整条流水线不再因 ImportError 崩掉。
+    v0.5（2026-10-02）：requests 分支此前不传 verify，完全绕过模块级 CTX，导致
+      CN_PRICES_INSECURE_TLS=1 的 TLS 降级对「装了 requests 的机器」（本函数首选路径）静默失效，
+      而 fetch() 的 urllib 分支（urlopen(..., context=CTX)）是认 CTX 的 —— 两条路径语义不一致。
+      实测 requests 2.34.2 的 verify 只接受 bool|str|None：adapters._urllib3_request_context 仅处理
+      verify is False 与 isinstance(verify, str) 两种情况，传 ssl.SSLContext 会被当 truthy 静默忽略
+      （实测 verify=<CERT_NONE 的 SSLContext> 仍得到 cert_reqs=CERT_REQUIRED），故不能靠传 CTX 生效。
+      正确做法：按 CTX 的校验模式显式翻译 ——
+        降级（CTX.verify_mode == CERT_NONE）→ verify=False（同时关链校验与 hostname 校验，与 urllib 分支对齐）
+        否则 → verify=True（requests 默认严格校验，与修复前行为一致）"""
     if requests is not None:
-        return requests.get(url, headers={'User-Agent': UA}, timeout=timeout).text
+        verify = False if CTX.verify_mode == ssl.CERT_NONE else True
+        return requests.get(url, headers={'User-Agent': UA}, timeout=timeout,
+                            verify=verify).text
     return fetch(url, timeout)
 
 
@@ -495,7 +535,36 @@ def main():
         result['vendors'][key] = entry
         time.sleep(0.5)
 
+    # v0.5（2026-10-02）：抓取失败结构化摘要。
+    # 原问题：只要有任意一家抓成功（total 非 0）进程就 exit 0，下游只看到「成功」——
+    #   今天 4/5 家源挂了、价库悄悄少一大半数据，无人察觉。
+    # 判定口径与流水线 M6 一致：status=error，或「成功但解析出 0 个模型」，都算失败
+    #   （官网改版 / 软 404 常见于后者，旧版会把它静默算成功）。
+    failed = {}
+    for key, entry in result['vendors'].items():
+        if entry['status'] != 'ok':
+            failed[key] = entry.get('error') or '未知错误'
+        elif not entry['models']:
+            failed[key] = '解析出 0 个模型（官网改版/schema 变更?）'
+    ok_keys = [k for k in result['vendors'] if k not in failed]
+
     result['model_count'] = total
+    # 供下游消费的失败摘要（本脚本 stdout 无 JSON 契约，此字段落在 cn-prices-*.json / latest.json）。
+    # ⚠需下游配合读取：目前 build_index.py 只读 result['vendors']，本字段为增量信息、向后兼容（不破坏解析）。
+    result['_fetch_summary'] = {
+        'vendors_total': len(result['vendors']),
+        'vendors_ok': len(ok_keys),
+        'vendors_failed': len(failed),
+        'models_total': total,
+        'ok': ok_keys,
+        'failed': failed,
+        'note': 'failed 非空表示当日这些厂商源未产出数据，价格可能沿用上版；需下游配合读取',
+    }
+    if failed:
+        sys.stderr.write('[FAIL-SUMMARY] %d/%d 家厂商抓取失败（其余 %d 家成功，共 %d 个模型）：\n'
+                         % (len(failed), len(result['vendors']), len(ok_keys), total))
+        for key, err in failed.items():
+            sys.stderr.write('  - %s(%s): %s\n' % (result['vendors'][key]['name'], key, err))
     stamp = datetime.datetime.now().strftime('%Y-%m-%d')
     path = os.path.join(OUT_DIR, 'cn-prices-%s.json' % stamp)
     # v2.82：原子写（唯一 tmp + os.replace）。多会话并发刷新时另一进程的 build_index.py
@@ -511,6 +580,13 @@ def main():
     os.replace(tmp2, latest)
     print('\n共 %d 个模型，已写入：\n  %s\n  %s'
           % (total, path, latest))
+    # v0.5：exit code 维持 fail-soft（仅「全军覆没」total==0 才非 0）。
+    # 依据实际调用契约（token-tracker.js kickLocalDbRefresh → runAll）：三脚本按
+    #   fetch-cn-prices.py && parse_tokenhub.py && build_index.py 串行，且**只有 code===0 才继续下一个**
+    #   （c.on('exit') 里 `if (code === 0 && !timedOut) return resolve(runAll(idx + 1))`）。
+    # 若「部分厂商失败」也返回非 0 → 流水线在此中断，parse_tokenhub.py / build_index.py 不再执行，
+    #   今天已抓到的部分数据不会并入 index.json，连 build_index.py 的「逐模型沿用上版」兜底也失效，
+    #   比保持 0 更糟。故部分失败仍返回 0，改以 stderr [FAIL-SUMMARY] + JSON _fetch_summary 暴露。
     return 0 if total else 1
 
 

@@ -1,7 +1,9 @@
 # selftest CI（v3.23.2 起）：每次 push 自动在干净的 Windows runner 上跑全套离线自测。
 # 用 windows-latest：selftest 的 watcher/toast/PowerShell 相关断言依赖 Windows 行为。
 # 零依赖：不装任何包，正好验证「零依赖单文件」这个卖点没被悄悄破坏。
-# WB_NO_NET=1：refresh-prices / deepseek-official 读它，模拟断网，CI 里禁止真联网。
+# WB_NO_NET=1：让 refresh-prices / deepseek-official 走模拟断网路径。
+# ⚠ 副作用：selftest 的 T3-R4「⚠价库告警」断言在 CI 不会执行（见 CHANGELOG v3.23.3 的已知覆盖缺口），
+#   该断言只在本机不设此变量时真实验证。
 # 注：selftest 内部已自设 TOKEN_TRACKER_NO_TOAST=1 + WB_ROOT=os.tmpdir() 隔离，不碰真实账本。
 name: selftest
 
@@ -19,6 +21,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      - name: Verify runner can spawn node subprocesses (selftest 前提)
+        run: node -e "const r=require('child_process').spawnSync(process.execPath,['-e','console.log(1)']); if(r.status!==0){console.error('spawn 探测失败：本 runner 上 selftest 的端到端用例会静默跳过');process.exit(1)} console.log('spawn OK')"
       - name: Run selftest (offline, isolated)
         run: node selftest.js
         env:

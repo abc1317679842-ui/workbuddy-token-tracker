@@ -12,6 +12,10 @@
 //
 // 采用策略：两源一致 → 直接采用；**不一致 → 采用交集**（只认两源都说是假日的日期，最保守）
 //   并把差异（onlyA / onlyB）写进 holidays.json 的 cross_check，便于人工核查。
+// v3.29.0（C-5）：不一致时**额外**输出 stderr 告警（逐日列出「仅A / 仅B 认为是假日」的清单，非只给计数）
+//   + 落盘 `cross_check_diff`（按年 `{ only_a: [...], only_b: [...] }`，元素为 YYYY-MM-DD）。
+//   动机：「取交集」会把差异**静默吞掉** —— 源 A 页面改版漏抓时，漏判的假日会按高峰 ×2 **多算**、
+//   误判的调休工作日会按低峰 **少算**，属双向计费偏差，必须可见。**最终判定（取交集）保持不变**。
 //
 // 用法：node refresh-holidays.js            # 去年/今年/明年
 //      node refresh-holidays.js 2027        # 指定年份
@@ -60,7 +64,23 @@ async function fromB(y, tok) {
   return { offDays: [...set].sort(), officialUrl: (o.source || {}).source_url || '', declared: o.holiday_day_count || null };
 }
 
-(async () => {
+// v3.29.0（C-5）：两源交叉校验抽为**纯函数**（便于离线单测，见下）。
+// 逻辑与修复前的内联实现**逐字等价**，判定结果一格未改——只把「取交集」的计算显式化，以便直接断言 adopt。
+//   onlyA / onlyB：仅源A / 仅源B 认定为「放假」的日期（YYYY-MM-DD），供告警与 cross_check_diff 使用
+//   agree：两源完全一致 → true；有差异 → false（单源场景不走本函数，由调用方置 null）
+//   adopt：**最终采用值 = 交集（保守策略）**；一致时即 a 本身
+function crossCheck(a, bOffDays) {
+  const sa = new Set(a), sb = new Set(bOffDays);
+  const onlyA = a.filter((d) => !sb.has(d));
+  const onlyB = bOffDays.filter((d) => !sa.has(d));
+  const agree = onlyA.length === 0 && onlyB.length === 0;
+  const adopt = agree ? a : a.filter((d) => sb.has(d)); // 不一致 → 取交集（保守）
+  return { onlyA, onlyB, agree, adopt };
+}
+
+// v3.29.0（C-5）：IIFE 仅在**直接运行**时执行。原实现无此守卫——一旦被 require 就会立即联网抓取
+// 并覆盖 holidays.json（对测试/复用是隐患，也与本仓库其它脚本的 `require.main === module` 约定不一致）。
+if (require.main === module) (async () => {
   const arg = process.argv[2];
   const nowY = new Date(Date.now() + 8 * 3600e3).getUTCFullYear();
   const years = arg ? [Number(arg)] : [nowY - 1, nowY, nowY + 1];
@@ -69,6 +89,9 @@ async function fromB(y, tok) {
   try { old = JSON.parse(fs.readFileSync(OUT, 'utf-8')); } catch (e) {}
   const yearsMap = Object.assign({}, old.years || {});
   const cross = Object.assign({}, old.cross_check || {});
+  // v3.29.0（C-5）：两源差异单独留一份**浅层、按年**的清单，供排查与文档直接引用
+  // （cross_check 里虽已有 only_a/only_b，但深埋在按年对象内、且与一堆元数据混在一起）。
+  const crossDiff = Object.assign({}, old.cross_check_diff || {});
   let ok = 0; const fails = [];
 
   for (const y of years) {
@@ -76,17 +99,23 @@ async function fromB(y, tok) {
     try { a = await fromA(y, tok); } catch (e) { fails.push(`A/${y}: ${e.message}`); }
     try { b = await fromB(y, tok); } catch (e) { fails.push(`B/${y}: ${e.message}`); }
     if (!a && !b) { console.log(`  ⚠ ${y}: 两源都取不到 → 保留旧数据`); continue; }
-    // 两源比对
+    // 两源比对（v3.29.0/C-5：计算抽为纯函数 crossCheck，逻辑与原先内联实现逐字等价）
     let adopt, agree = null, onlyA = [], onlyB = [];
     if (a && b) {
-      const sa = new Set(a), sb = new Set(b.offDays);
-      onlyA = a.filter((d) => !sb.has(d));
-      onlyB = b.offDays.filter((d) => !sa.has(d));
-      agree = onlyA.length === 0 && onlyB.length === 0;
-      adopt = agree ? a : a.filter((d) => sb.has(d)); // 不一致 → 取交集（保守）
+      const cc = crossCheck(a, b.offDays);
+      onlyA = cc.onlyA; onlyB = cc.onlyB; agree = cc.agree; adopt = cc.adopt;
     } else {
       adopt = a || b.offDays; // 单源可用 → 采用
       agree = null;
+    }
+    // v3.29.0（C-5）：**两源不一致必须告警**（原先只在 stdout 打两行，人工可见但不会被日志/CI 捕获；
+    // 「取交集」又会把差异静默吞掉 → 源 A 页面改版漏抓的假日会双向出错：漏判的假日按高峰 ×2 **多算**，
+    // 误判的调休工作日按低峰 **少算**）。故补 stderr：**逐日清单**，不是只给计数。
+    // 位置刻意放在下方「空年守卫」之前 —— 否则「交集为空 → 保留旧数据」这种最严重的分歧会被 continue 跳过、零告警。
+    if (a && b && agree === false) {
+      process.stderr.write(`[refresh-holidays] ⚠ ${y} 两源不一致（A=${a.length} 天 / B=${b.offDays.length} 天）→ 按交集取 ${adopt.length} 天（保守）；差异需人工核验\n`);
+      process.stderr.write(`[refresh-holidays]   仅源A(${SRC_A}) 认为是假日 ${onlyA.length} 天: ${onlyA.join(' ') || '（无）'}\n`);
+      process.stderr.write(`[refresh-holidays]   仅源B(${SRC_B}) 认为是假日 ${onlyB.length} 天: ${onlyB.join(' ') || '（无）'}\n`);
     }
     // v3.24.0（级联⑦）：**空年守卫** —— 中国每年法定假日 ≥11 天（另有调休上班日），全年 0 天
     // 只可能是"源返回了空内容"（页面改版 / API 空响应 / 字段改名），不是真实数据。
@@ -106,6 +135,8 @@ async function fromB(y, tok) {
       count_a: a ? a.length : null, count_b: b ? b.offDays.length : null,
       only_a: onlyA, only_b: onlyB,
     };
+    // v3.29.0（C-5）：与 cross_check 同步落一份按年差异清单（浅层、供排查/文档引用）
+    crossDiff[String(y)] = { only_a: onlyA, only_b: onlyB };
     if (adopt.length) ok++;
     console.log(`  ${y}: A=${a ? a.length : '×'} 天  B=${b ? b.offDays.length : '×'} 天  → ${agree === true ? '✓一致，采用' : (agree === false ? `✗不一致 → 取交集 ${adopt.length} 天` : `仅单源 → 采用 ${adopt.length} 天`)}`);
     if (agree === false) {
@@ -125,6 +156,8 @@ async function fromB(y, tok) {
     sources: { primary: SRC_A, verify: SRC_B },
     years: yearsMap,
     cross_check: cross,
+    // v3.29.0（C-5）：两源差异清单（按年；两源一致时为空数组）。字段结构见文件头注释。
+    cross_check_diff: crossDiff,
   }, null, 1);
   {
     const tmp = OUT + '.tmp';
@@ -135,3 +168,6 @@ async function fromB(y, tok) {
   console.log(`  覆盖年份: ${Object.keys(yearsMap).sort().join(', ')}`);
   if (fails.length) { console.log('  部分失败: ' + fails.join(' | ')); process.exitCode = 1; }
 })();
+
+// v3.29.0（C-5）：导出纯函数供离线单测（本文件此前无可 require 的导出，且 IIFE 会立即联网写盘）。
+module.exports = { crossCheck };

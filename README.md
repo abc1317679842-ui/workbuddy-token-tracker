@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.28.0-blue)
+![Version](https://img.shields.io/badge/version-v3.30.0-blue)
 
 > 在每次回答后显示 **Token 消耗 / 耗时 / 折算费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -92,6 +92,19 @@ node recalc-day.js              # 不带参数即当天；历史多天需逐日�
 ```
 
 > 注意：`backfill --write` 是**全量重建替换**，不是 merge——用它回填会抹掉压缩窗口外的历史账，**不要为回填目的跑它**（详见 `TROUBLESHOOTING.md` 与 KNOWN-ISSUES KI-5）。
+
+### ⚠️ 弹窗标注速查：`⚠未计价` / `⚠账缺` / `⚠价核验`
+
+弹窗正文行（行2）末尾偶尔会出现 `｜⚠未计价` / `｜⚠账缺` / `｜⚠价核验`。它们和你直接能在弹窗里看到的 `（估算）` 一样，是**有意暴露的数据缺口提示**，不是渲染错误；`｜⚠无公开价` 见上一节。含义各不相同：
+
+| 标注 | 出现位置 | 含义（触发条件） | 你该怎么办 |
+|---|---|---|---|
+| `｜⚠未计价` | 行2 末尾 | **本轮有 token 消耗、但金额算不出来**：该模型在 `pricing.json` 里查不到匹配（未收录 / `findModel` 未命中），或混合轮里**部分模型无价** → 金额位显示 `未收录`（混合轮为有价部分的**部分和**） | 「这轮金额缺了一块」。补 `pricing.json` 该条目价 → `node recalc-day.js <日期>` 回算历史；**不要用 `backfill --write`**（会抹历史账）。无输入/输出的空轮不会标 |
+| `｜⚠账缺` | 行2 末尾 | 平台**压缩 / 重写过 transcript**，文件完整行数少于水位线 → 压缩窗口之后**可能静默少计**。v3.25.0 起新消耗已自动恢复记账，但**被压缩掉的历史行本地不可恢复**（见 `KNOWN-ISSUES.md` KI-5） | 对账时这段历史缺口**以服务商账单为准**；旗标（`.transcript-truncated.json`）7 天自动过期，**不要用 `backfill --write`** |
+| `价⚠️` / `官价⚠️` | 行2 末尾 | 价格多源刷新**全源失败** / DeepSeek **官方价抓取失败** → 本轮金额按上一次的价格估算 | 属刷新失败的可见化；看 `pricing.json` 的 `last_refresh_error` / `deepseek_refresh_error`，稍后重刷即可 |
+| `｜⚠价核验` | 行2 末尾 | `pricing.json` 里存在**待人工核验**的告警条目（`_price_audit.warnings` 价格一致性自检 / `_ambig_warnings` 模糊匹配歧义）**且点名了本轮这个模型** → 该模型计价可能不准。**v3.30.0 起才会这样**：之前它读的是 `last_refresh_note`（刷新操作流水账），历史告警会永久留在文本里 → 每条弹窗都挂标签、永远消不掉 | 跑 `node refresh-prices.js` 重刷一次价库（干净则告警字段被删、标签自动消失）。详细条目在 `pricing.json` 的 `_price_audit` / `_ambig_warnings`，**每次刷新进程的 stderr 也会全量打印**（含与本轮无关的告警） |
+
+> 这些标注都受弹窗宽度守卫保护，**顺序即优先级**：超宽时先丢「价格来源降级」类标注（`⚠价核验` → `价⚠️` → `官价⚠️`，详情都能在 stderr / 日志里追），仍放不下才丢**缓存命中百分比**；`⚠未计价` / `⚠账缺` 是「数据不可信」信号，**任何情况下都不丢**（v3.30.0 起。此前顺序相反，会出现"缓存百分比被 `⚠价核验` 顶掉"）。
 
 ## 为什么做这个
 
@@ -210,7 +223,7 @@ DeepSeek-V4 Flash 高峰双倍
   - 第一行 = 模型完整名 + 时段标注（`高峰双倍` / `夜间X折`，仅有时段策略的模型显示）
   - 第二行 = `耗时` + **今日累计消费**（`今日¥X`，当天 24 小时总花费）+ **余额**（`余额¥X`，仅开启余额且检测到变化时显示）
 - **行2（正文小字）**：输入 / 输出 + 缓存占比（两位小数）+ 费用（未收录显示「未收录」）
-- 永不溢出换行：行1 第一行 ≤ 45u（`TOAST_ROW1_MAX_W=45`）、行1 第二行 ≤ 42u（`TOAST_ROW2_MAX_W=42`，超限按「丢余额 → 丢今日价 → 保底耗时」降级）、行2 ≤ 52u（`TOAST_LINE_MAX_W=52`）——**以上三个阈值均以代码为准**（见 `token-tracker.js` 常量定义），文档若与代码冲突一律以代码为准
+- 永不溢出换行：行1 第一行 ≤ 45u（`TOAST_ROW1_MAX_W=45`）、行1 第二行 ≤ 42u（`TOAST_ROW2_MAX_W=42`，超限按「丢余额 → 丢今日价 → 保底耗时」降级）、行2 ≤ 51u（`TOAST_LINE_MAX_W=51`）——**以上三个阈值均以代码为准**（见 `token-tracker.js` 常量定义），文档若与代码冲突一律以代码为准
 
 ## 💬 怎么查消耗：直接问模型就行（附真实输出示例）
 
@@ -226,7 +239,7 @@ DeepSeek-V4 Flash 高峰双倍
 | 「这个月消耗」「本月到现在」 | `--report month` | **本月至今**按模型汇总的一张表 |
 | 「9 月 1 号到 9 月 30 号」 | `--report 2026-09-01..2026-09-30` | 任意区间按模型汇总的一张表（**起止写反会自动纠正**） |
 | 「把历史都列出来」 | `--report all` | 全部历史天，每天一块明细 + 该日合计 |
-| 「只要个总数，别列模型」 | `--report summary all` | 每天**只有一行**总计（模型内部看趋势用，**不是正式表格**） |
+| 「只要个总数，别列模型」 | `--report summary all` | 每天**只有一行**总计（仅当用户明确要「只要总数/别列模型」时才贴；它**不含模型明细**，不是默认视图） |
 | 「照这速度还能用多久」「估一下后面的消耗」 | `--report forecast` | **只推 token、不推金额**的速率外推（样本不足 2 天会拒绝算） |
 | 「导个 CSV」「要能在 Excel 里打开的」 | `--report <范围> --csv` | **不贴表格**，只回**一行文件路径** |
 | 「上一轮用了多少」 | 手动模式（无参数） | 一行：上一轮的模型 / 耗时 / 输入输出 token |
@@ -288,7 +301,7 @@ DeepSeek-V4 Flash 高峰双倍
 
 > 注意这里**只有一行路径、没有表格**——文件是给 Excel 用的（逐日 × 逐模型明细 + `ALL` 合计行，带 UTF-8 BOM 所以中文列头不会乱码），把几十行贴进对话纯属刷屏。
 
-**⑥ 问「只要个总数」→ `--report summary all`**（每天一行，模型内部看趋势用）
+**⑥ 问「只要个总数」→ `--report summary all`**（每天一行；仅在用户明确要「只要总数/别列模型」时展示，不含模型明细）
 
 | 日期 | 输入 | 输出 | 缓存 | 总 token | 金额 |
 |---|---|---|---|---|---|
@@ -336,7 +349,7 @@ cp -r workbuddy-token-tracker ~/.workbuddy/skills/token-usage-tracker
 | `refresh-prices.js` | 多源价格刷新（每天首次运行自动触发，也可手动跑） |
 | `peak-rules.js` | 峰谷时段判定的**唯一实现**：主脚本 / `backfill.js` / `recalc-day.js` 共用（v3.19.0 起，消除三份硬编码副本） |
 | `deepseek-official.js` | DeepSeek 官方定价抓取（被 refresh-prices 调用） |
-| `refresh-holidays.js` | 中国法定节假日双源刷新（峰谷计费用，手动运行） |
+| `refresh-holidays.js` | 中国法定节假日双源刷新（峰谷计费用，手动运行）。两源不一致时**取交集**（保守）并在 **stderr 逐日告警**（列出仅 A / 仅 B 认定的假日）；差异按年落 `holidays.json` 的 `cross_check_diff.<年份>.only_a / .only_b` |
 | `fetch-cn-prices.py` | 国内厂商官网价抓取（Python 3；`requests` 可选，缺失自动回退 urllib） |
 | `parse_tokenhub.py` / `build_index.py` | 本地官方价库解析/建索引（可选） |
 | `pricing.json` / `holidays.json` | 价格库 / 节假日数据（技能目录内） |
@@ -344,7 +357,7 @@ cp -r workbuddy-token-tracker ~/.workbuddy/skills/token-usage-tracker
 | `SKILL.md` / `CHANGELOG.md` / `manifest.yaml` / `LICENSE` | 技能说明 / 变更史 / 元数据 / 许可 |
 | `selftest.js` | 离线冒烟自测（`node selftest.js`，不碰真实账本；沙箱类受限环境自动 SKIP） |
 | `KNOWN-ISSUES.md` | 已知未修问题（脱敏公开记录） |
-| `TROUBLESHOOTING.md` | **故障排查手册**（弹窗诊断日志 + 31 行故障速查表），v3.23.0 从 SKILL.md 移出 |
+| `TROUBLESHOOTING.md` | **故障排查手册**（弹窗诊断日志 + 34 行故障速查表），v3.23.0 从 SKILL.md 移出 |
 | `docs/balance.md` | 余额显示细节（原理 / 启用条件 / 模式识别 / 隐私） |
 | `docs/pricing-refresh.md` | 价格刷新策略（5 源）+ 峰谷时段口径 + 计费公式 |
 | `docs/windows-notification.md` | Windows「不弹横幅」修复（SmartOptOut 注册表法 + 实测证据） |

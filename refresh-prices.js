@@ -173,10 +173,70 @@ function withPricingLock(fn) {
   }
 }
 
-function save(p) {
+// v3.24（F2·缺陷4）：锁内「逐 key 归并写」——修复 12 秒抓取窗口造成的 lost update。
+// 背景：main() 在 load() 之后要联网抓 5 个源（约 12 秒），期间 token-tracker.js 的
+// addModelPrice 可能已正确持锁写入新模型；旧版最后用整份内存 pricing 覆盖写盘，
+// 会把抓取期间新增/更新的条目整体抹掉（不是竞态，是设计层面的 lost update）。
+// 归并规则（保守优先，只覆盖本次真正改动过的 key）：
+//   ① 磁盘现值打底：本次刷新**未改动**的 key 一律保留磁盘现值（含窗口期外部新增/更新）；
+//   ② 内存值覆盖：仅覆盖 changedKeys（本次刷新实际写入过的 key）；
+//   ③ 清理删除的 key（deletedKeys）不复活；
+//   ④ 磁盘读不到（缺失/损坏）→ 退化为整份写（与旧行为一致）。
+// 注：changedKeys/deletedKeys 均来自 main() 的实测快照比对与清理清单，不依赖人肉维护。
+function mergeWithDisk(p, changedKeys, deletedKeys) {
+  let disk;
+  try { disk = JSON.parse(fs.readFileSync(PRICING, 'utf-8')); }
+  catch (e) { return p; } // 读不到现值 → 不做归并（保持原整份写语义）
+  const diskModels = (disk && disk.models && typeof disk.models === 'object') ? disk.models : null;
+  if (!diskModels) return p;
+  const memModels = (p.models && typeof p.models === 'object') ? p.models : {};
+  const changed = changedKeys instanceof Set ? changedKeys : new Set(changedKeys || []);
+  const deleted = deletedKeys instanceof Set ? deletedKeys : new Set(deletedKeys || []);
+  const merged = {};
+  for (const k of Object.keys(diskModels)) {           // ①
+    if (deleted.has(k)) continue;                      //   ③
+    if (changed.has(k)) continue;                      //   ② 稍后用内存值覆盖
+    merged[k] = diskModels[k];
+  }
+  for (const k of changed) { if (memModels[k]) merged[k] = memModels[k]; } // ②
+  for (const k of Object.keys(memModels)) {            // ④ 防御：内存有但磁盘无且未删除
+    if (!(k in merged) && !deleted.has(k)) merged[k] = memModels[k];
+  }
+  p.models = merged;
+  return p;
+}
+
+// v3.24（F2·缺陷3）：返回值语义明确化——false = 抢锁超时，本次**未落盘**（不是"写成功"）。
+// 调用方必须检查返回值：真实生产事故里 save() 只打一行 stderr，进程照样跑完全流程
+// （date 不更新 → 次日才重试），刷新被静默丢弃。
+// opts 为可选写盘模式参数：
+//   - { changedKeys, deletedKeys } → 锁内逐 key 归并写（缺陷4，正常刷新路径）；
+//   - { errorOnly: true }          → 锁内以磁盘现值为基准，只贴错误标记（缺陷4 全源失败路径补漏）；
+//   - 不传                          → 整份写（向后兼容旧行为）。
+function save(p, opts) {
   delete p._shrink_note; // v3.18.3（F1）：成功全量刷新后清除「⚠价库缩水」标记
   // 修复6 + 修复9：临时文件 + rename 原子写，加锁避免与 addModelPrice 并发覆盖
   const ok = withPricingLock(() => {
+    if (opts && opts.errorOnly) {
+      // v3.24（F2·缺陷4 补漏）：全源失败路径同样不得整份覆盖——pricing 是 12 秒抓取窗口**之前**
+      // load() 来的快照，若整份写会抹掉窗口期内 token-tracker.js addModelPrice 新增/更新的模型
+      // （该模型随即变「未收录」，下轮计费显示「费用未收录」）。断网时每次刷新都走这条路，不可接受。
+      // 处理：以锁内磁盘现值为基准，只贴 last_refresh_error/at 并清除 _shrink_note，其余一律保留。
+      // 注意：磁盘上的 date 本来就未被本路径改动，故「date 不变、次日重试」的更严格语义自动成立；
+      //       不新增任何落盘字段。
+      let disk = null;
+      try { disk = JSON.parse(fs.readFileSync(PRICING, 'utf-8')); } catch (e) { disk = null; }
+      if (disk && typeof disk === 'object' && !Array.isArray(disk)) {
+        delete disk._shrink_note;
+        disk.last_refresh_error = p.last_refresh_error;
+        disk.last_refresh_error_at = p.last_refresh_error_at;
+        p = disk;
+      }
+      // 读不到磁盘（缺失/损坏）→ 退化为整份写（此时磁盘本身异常，用内存快照重建可接受）
+    } else if (opts && (opts.changedKeys || opts.deletedKeys)) {
+      // v3.24（F2·缺陷4）：锁内重读磁盘并逐 key 归并（必须在锁内，否则归并读与 rename 之间仍有窗口）
+      p = mergeWithDisk(p, opts.changedKeys, opts.deletedKeys);
+    }
     const tmp = PRICING + '.tmp';
     try {
       fs.mkdirSync(path.dirname(PRICING), { recursive: true });
@@ -194,6 +254,16 @@ function save(p) {
 
 // 名称归一化：小写 + 去所有非字母数字（glm-5-2 → glm52；glm5.2 → glm52）
 function norm(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
+
+// v3.24（F2·缺陷1）：免费变体识别。OpenRouter 等源里零价模型的 id 形如
+//   `vendor/model:free`（最常见）或 `xxx-free`；这类变体的报价恒为 0，一旦被精确命中，
+//   主价会被刷成 `input_price: 0`（¥0 计费且无任何标记），因此解析阶段直接跳过、不参与定价。
+// 注意：这里只跳"明确的免费变体后缀"，**不做 0 价一刀切** —— 部分源用 0 表示"未提供价格"，
+// 那种情况由 median()/各解析器的 `> 0` 下界统一过滤（见缺陷1 的另一半修改）。
+function isFreeVariant(id) {
+  const s = String(id || '').toLowerCase();
+  return s.endsWith(':free') || s.endsWith('-free');
+}
 
 async function fetchJson(url) {
   const ctrl = new AbortController();
@@ -215,7 +285,11 @@ async function fetchJson(url) {
 }
 
 function median(arr) {
-  const v = arr.filter((x) => typeof x === 'number' && isFinite(x) && x >= 0);
+  // v3.24（F2·缺陷1）：价格合法性下界 `>= 0` → `> 0`。0 既可能是 `:free` 变体的真实报价，
+  // 也可能是源"未提供价格"的哨兵值；两者混在一起会让中位数算成 0 → 主价被写成 ¥0 且无告警。
+  // 统一按「仅 > 0 视为有效报价」处理：0/负数/NaN/Infinity 一律丢弃；全被丢弃时返回 null，
+  // 上层据此保留本地价（不覆盖），宁可保留旧价也不写错价。
+  const v = arr.filter((x) => typeof x === 'number' && isFinite(x) && x > 0);
   if (!v.length) return null;
   v.sort((a, b) => a - b);
   const mid = Math.floor(v.length / 2);
@@ -228,8 +302,10 @@ function parseLlma(j) {
   for (const v of (j.vendors || [])) vendors[v.id] = { country: v.country, currency: v.currency };
   const models = {};
   for (const m of (j.models || [])) {
+    // v3.24（F2·缺陷1）：跳过 `:free`/`-free` 免费变体（报价恒为 0，精确命中会把主价刷成 ¥0）
+    if (isFreeVariant(m.id)) continue;
     const inP = Number(m.inputPrice), outP = Number(m.outputPrice);
-    if (!(inP >= 0 && outP >= 0)) continue;
+    if (!(inP > 0 && outP > 0)) continue;
     const cached = m.cachedInputPrice != null ? Number(m.cachedInputPrice) : null;
     models[m.id] = {
       in: inP, out: outP, cached,
@@ -245,9 +321,11 @@ function parseLlma(j) {
 function parseLlc(j) {
   const out = {};
   for (const m of (j.models || [])) {
+    // v3.24（F2·缺陷1）：跳过 `:free`/`-free` 免费变体
+    if (isFreeVariant(m.id)) continue;
     const inP = Number(m.input_price_cny_per_m);
     const outP = Number(m.output_price_cny_per_m);
-    if (!(inP >= 0 && outP >= 0)) continue;
+    if (!(inP > 0 && outP > 0)) continue;
     const cached = m.cached_input_price_cny_per_m != null ? Number(m.cached_input_price_cny_per_m) : null;
     out[m.id] = { in: inP, out: outP, cached };
   }
@@ -255,42 +333,62 @@ function parseLlc(j) {
 }
 
 // ===== 源 C：OpenRouter（USD/token → USD/1M） =====
+// v3.24（F2·A-4c）：新增 cacheUsd 维度。OpenRouter 的模型对象里缓存命中价是
+// `pricing.input_cache_read`（单位 USD/token，与 prompt/completion 同单位）→ ×1e6 换算为 USD/1M。
+// 实测（2026-10-02 抓取）：464 个模型中 304 个带该字段。未提供时为 null（由 median 丢弃）。
 function parseOr(j) {
   const out = {};
   for (const m of (j.data || [])) {
+    // v3.24（F2·缺陷1）：OpenRouter 的 `:free` 变体是零价重灾区，解析阶段直接跳过
+    if (isFreeVariant(m && m.id)) continue;
     const pr = (m && m.pricing) || {};
     const pIn = Number(pr.prompt), pOut = Number(pr.completion);
-    if (!(pIn >= 0 && pOut >= 0)) continue;
-    out[m.id] = { usdIn: pIn * 1e6, usdOut: pOut * 1e6 };
+    if (!(pIn > 0 && pOut > 0)) continue;
+    const cRaw = pr.input_cache_read != null ? Number(pr.input_cache_read) : NaN;
+    out[m.id] = { usdIn: pIn * 1e6, usdOut: pOut * 1e6, cacheUsd: isFinite(cRaw) ? cRaw * 1e6 : null };
   }
   return out;
 }
 
 // ===== 源 D：LiteLLM（USD/token → USD/1M） =====
+// v3.24（F2·A-4c）：新增 cacheUsd 维度——LiteLLM 字段名 `cache_read_input_token_cost`
+// （USD/token，与 input_cost_per_token 同单位）→ ×1e6 换算为 USD/1M。
+// 实测：4453 条目中 1700 条带该字段（只取基础档，忽略 *_above_200k 等分档变体）。
 function parseLitellm(j) {
   const out = {};
   for (const key of Object.keys(j)) {
     const m = j[key];
     if (!m || typeof m !== 'object') continue;
+    // v3.24（F2·缺陷1）：跳过 `:free`/`-free` 免费变体
+    if (isFreeVariant(key)) continue;
     const pIn = Number(m.input_cost_per_token);
     const pOut = Number(m.output_cost_per_token);
-    if (!(pIn >= 0 && pOut >= 0)) continue;
-    out[key] = { usdIn: pIn * 1e6, usdOut: pOut * 1e6 };
+    if (!(pIn > 0 && pOut > 0)) continue;
+    const cRaw = m.cache_read_input_token_cost != null ? Number(m.cache_read_input_token_cost) : NaN;
+    out[key] = { usdIn: pIn * 1e6, usdOut: pOut * 1e6, cacheUsd: isFinite(cRaw) ? cRaw * 1e6 : null };
   }
   return out;
 }
 
 // ===== 源 E：Portkey（美分/token → ×1e4 = USD/1M） =====
+// v3.24（F2·A-4c）：新增 cacheUsd 维度——Portkey 缓存命中价在 pay_as_you_go 下的
+// `cache_read_input_token.price`，与 request_token/response_token **同一层级、同一单位**
+// （美分/token），故沿用既有 ×1e4 换算得到 USD/1M。实测：5 个条目中 4 个带该字段
+// （deepseek-chat/reasoner/v4-flash/v4-pro；default 无）。
 function parsePortkey(j) {
   const out = {};
   for (const key of Object.keys(j)) {
     const m = j[key];
     if (!m || typeof m !== 'object') continue;
+    // v3.24（F2·缺陷1）：跳过 `:free`/`-free` 免费变体
+    if (isFreeVariant(key)) continue;
     const cfg = (m.pricing_config && m.pricing_config.pay_as_you_go) || {};
     const rIn = Number(cfg.request_token && cfg.request_token.price);
     const rOut = Number(cfg.response_token && cfg.response_token.price);
-    if (!(rIn >= 0 && rOut >= 0)) continue;
-    out[key] = { usdIn: rIn * 1e4, usdOut: rOut * 1e4 };
+    if (!(rIn > 0 && rOut > 0)) continue;
+    const cRaw = (cfg.cache_read_input_token && cfg.cache_read_input_token.price) != null
+      ? Number(cfg.cache_read_input_token.price) : NaN;
+    out[key] = { usdIn: rIn * 1e4, usdOut: rOut * 1e4, cacheUsd: isFinite(cRaw) ? cRaw * 1e4 : null };
   }
   return out;
 }
@@ -302,6 +400,9 @@ function parsePortkey(j) {
 //      唯一命中 → 采用；多个命中但价格一致 → 取首个（无害）；多个命中且价格不同 → 判歧义放弃并告警。
 // v3.19.1（N3）：Set 去重——同一模型会在多个 USD 源（openrouter/litellm/portkey…）各回路上各报一次，
 // 原数组 push 让真实 last_refresh_note 里同一条出现 2 次（实测 20 条里 10 组重复），纯冗余。
+// v3.24（F2·缺陷2）：该 Set 旧版只在 last_refresh_note 里拼进一行文本，**从未落盘**，等于没有消费方
+// （下次刷新进程重启即丢）。现在由 main() 在写盘前落成 pricing._ambig_warnings（纯字符串数组，
+// 不带时间戳对象，便于 token-tracker.js 或其他脚本直接读取消费）。
 const AMBIG_WARNINGS = new Set();
 function looseFind(index, localNorm, kind, forKey) {
   if (!index) return null;
@@ -313,7 +414,17 @@ function looseFind(index, localNorm, kind, forKey) {
     if (localNorm.length >= 4 && kn.length >= 4 && (kn.includes(localNorm) || localNorm.includes(kn))) hits.push(k);
   }
   if (!hits.length) return null;
-  if (hits.length === 1) return index[hits[0]];
+  if (hits.length === 1) {
+    // v3.24（F2·缺陷2）：唯一命中 ≠ 可信命中。若命中的源键与被查键「归一化后并不相等」，
+    // 说明它是靠子串/边界放宽才撞上的（如 deepseek-v4-flash 撞上 deepseek-v4-flash-vision-exp），
+    // 价格很可能属于另一个模型。旧版直接采用且不告警 → 错价静默传播。
+    // 处理策略（保守）：仍采用该候选（不放价，避免误伤正常命中的源），但记入 AMBIG_WARNINGS，
+    // 由 main() 在写盘时落到 pricing._ambig_warnings，让人工核验时能看见。
+    if (norm(hits[0]) !== localNorm) {
+      AMBIG_WARNINGS.add(`${forKey}: ${kind} 唯一模糊命中 ${hits[0]}（与被查键不同名，已采用但需人工核验）`);
+    }
+    return index[hits[0]];
+  }
   const priceSig = (v) => JSON.stringify([v.usdIn != null ? v.usdIn : v.in, v.usdOut != null ? v.usdOut : v.out]);
   const sigs = new Set(hits.map((k) => priceSig(index[k])));
   if (sigs.size === 1) return index[hits[0]];
@@ -333,6 +444,56 @@ function cnFind(cnIndex, srcId, localNorm, forKey) {
   if (!cnIndex) return null;
   if (srcId && cnIndex[srcId]) return cnIndex[srcId];
   return looseFind(cnIndex, localNorm, '国内源', forKey || localNorm);
+}
+
+// v3.24（F2·A-4c）：USD 系（US 模型 + CN 的 auto_converted 估算分支）缓存价写入策略。
+// 背景：三个 USD 源解析器旧版都不提取缓存价 → US 模型的 cached_price 只能用「输入价×10%」
+// 拍脑袋估算，且一次写入后永不更新（历史事故：hy4-preview 的 cache 被估成翻倍值）。
+// 现已从三源提取真实缓存价（cacheUsd，USD/1M tokens 中位数），策略改为：
+//   ① 源有真实值 → 用源值×汇率覆盖，并清除估算标记；
+//   ② 源无值但本地已有 cached_price → 沿用本地（保持既有行为）；若本地本就是估算的，
+//      保留 cached_price_estimated 标记（提示用户这个数还是拍的）；
+//   ③ 源无值且本地也没有 → 才退回「输入价×10%」估算，并打 cached_price_estimated: true。
+// 返回取值来源：'source' | 'kept' | 'kept-estimated' | 'estimated'（供统计/测试）。
+function applyUsdCachedPrice(m, cacheUsd, usdIn, rate) {
+  if (cacheUsd != null) {
+    m.cached_price = Number((cacheUsd * rate).toFixed(2));
+    delete m.cached_price_estimated; // 真实值到位 → 估算标记必须清除，否则标记会撒谎
+    return 'source';
+  }
+  if (m.cached_price != null) return m.cached_price_estimated === true ? 'kept-estimated' : 'kept';
+  m.cached_price = Number((usdIn * rate * 0.1).toFixed(2));
+  m.cached_price_estimated = true;
+  return 'estimated';
+}
+
+// v3.24（F2·A-7）：retired + lock 组合 = 永久冻结的错价条目。三处逻辑叠加导致「三不管」：
+//   ① 第 ~457 行 `if (m.lock === true || m.alias_of) continue;` → 陈旧清理永久跳过；
+//   ② 主价分支 `else if (m.lock === true)` → 主价永久不被覆盖；
+//   ③ `retired` 全仓无读取方 → 也不会被标记为「不可用」。
+// 结果：该条目永远不会被刷新、不会被删除、也不会被标记不可用，若仍被调用就永久按已下线旧价计费。
+// 本函数**只产出告警文案，不改任何 lock/retired 语义**（解除冻结属人工决策）。
+function retiredLockWarnings(models) {
+  const out = [];
+  for (const [key, m] of Object.entries(models || {})) {
+    if (!m || typeof m !== 'object') continue;
+    if (m.retired === true && m.lock === true) {
+      out.push(`${key}: 已标记 retired 但 lock=true，价格永久冻结在 ${m.input_price}/${m.output_price} —— 不会被刷新、不会被清理、也不会被标记不可用；若该模型确已下线请人工核验`);
+    }
+  }
+  return out;
+}
+
+// v3.24（F2·A-7）：把 retired+lock 清单落到独立字段 `_retired_locked`（纯字符串数组，与 _ambig_warnings 同构）。
+// **刻意不进 _price_audit**：retired+lock 是 TROUBLESHOOTING.md 白纸黑字记载的**设计行为**
+//（已下线模型按旧价计费），我们刻意未解除 lock；它永远无法被用户消除，若挂上弹窗就是永久噪音，
+// 会稀释 ⚠价核验 对「可修复异常」的警示价值（与 D-10「exit 2 让 CI 常红 → 被习惯性忽略」同一失败模式）。
+// 故只做「落盘留痕 + stderr 告警」，不进 _price_audit。返回告警数组供调用方打印。
+function applyRetiredLocked(pricing, models) {
+  const w = retiredLockWarnings(models);
+  if (w.length) pricing._retired_locked = w;
+  else delete pricing._retired_locked;
+  return w;
 }
 
 // v3.18（M6）：解析器注册表——拉取后立即解析并校验"解析出 >0 个模型"，
@@ -406,7 +567,12 @@ async function main() {
     const errMsg = Object.entries(results).map(([k, r]) => `${SOURCES[k].name}: ${r.err || '?'}`).join('；');
     pricing.last_refresh_error = `所有价格源拉取失败（${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}）：${errMsg}`;
     pricing.last_refresh_error_at = new Date().toISOString();
-    try { save(pricing); } catch (e) { process.stderr.write(`[refresh-prices] 写入失败: ${e.message}\n`); process.exit(1); }
+    // v3.24（F2·缺陷3）：同样接收返回值——抢锁超时时错误标记也没落盘，必须让退出码/日志可见，
+    // 否则「全源失败」这个事实会被静默吞掉。此处本就以非零码退出，退出码沿用原有语义。
+    // v3.24（F2·缺陷4 补漏）：传 errorOnly，禁止用窗口期前的内存快照整份覆盖（会抹掉窗口内新增模型）。
+    let errSaved = false;
+    try { errSaved = save(pricing, { errorOnly: true }); } catch (e) { process.stderr.write(`[refresh-prices] 写入失败: ${e.message}\n`); process.exit(1); }
+    if (!errSaved) process.stderr.write('[refresh-prices] 价库写入失败：抢锁超时（可能有其他进程正在刷新），本次刷新未落盘\n');
     process.stderr.write(`[refresh-prices] 全部 ${Object.keys(SOURCES).length} 个价格源拉取失败，已写 last_refresh_error（费用按上次价格估算）\n`);
     process.exit(1);
   }
@@ -424,6 +590,7 @@ async function main() {
 
   // v2.65：清理超过 14 天未使用的模型，防止 pricing.json 无限膨胀。
   // 删除不影响历史账本：daily-usage.json 独立存储，不依赖 pricing.models 里条目。
+  const cleanedKeys = new Set(); // v3.24（F2·缺陷4）：本次清理删除的 key（供锁内归并写排除，避免复活）
   {
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - 14);
@@ -468,11 +635,22 @@ async function main() {
       console.log(`[refresh-prices]   拟删清单（前10）: ${doomed.slice(0, 10).join(', ')}`);
     } else {
       for (const key of doomed) { delete models[key]; removed++; }
+      // v3.24（F2·缺陷4）：记录本次清理删除的 key —— 锁内归并写时据此不把已删条目「复活」
+      for (const key of doomed) cleanedKeys.add(key);
       if (removed) console.log(`[refresh-prices] 已清理 ${removed} 个超过14天未使用的模型（共 ${keysBefore} 个）`);
     }
   }
 
   let updatedMain = 0, autoConverted = 0, usdUpdated = 0, regionSet = 0, bigDiff = [], lockKept = 0;
+  const regionInferred = []; // v3.24（F2·缺陷5）：靠推断（而非天生带 region）得到国内外归属的模型 key
+
+  // v3.24（F2·缺陷4）：抓取前对每个模型做 JSON 快照，循环后用快照比对得出「本次真正改动过的 key」，
+  // 供 save() 锁内归并时使用（只覆盖改动过的条目，保护抓取窗口内外部新增/更新的模型）。
+  const beforeSnap = new Map();
+  for (const key of Object.keys(models)) {
+    const m = models[key];
+    beforeSnap.set(key, m && typeof m === 'object' ? JSON.stringify(m) : null);
+  }
 
   for (const key of Object.keys(models)) {
     const m = models[key];
@@ -484,15 +662,22 @@ async function main() {
     const llcHit = llc ? cnFind(llc, srcId, localNorm, key) : null;
 
     // region 推断：模型无 region 字段时，优先用 llmabacus vendors country（US→US，其余→CN）
+    // v3.24（F2·缺陷5）：**判定行为保持不变**（改了会影响计价口径），仅增加可观测性——
+    // 把「靠推断得到归属」的模型 key 收集起来，写盘为 pricing._region_inferred，
+    // 并在汇总行打印，让用户清楚这些模型的国内/国外归属是猜的、需要人工核验。
     if (!m.region) {
       if (llmaHit && llmaHit.country === 'US') m.region = 'US';
       else m.region = 'CN'; // 默认国内（现有模型均为国产）
       regionSet++;
+      regionInferred.push(key);
     }
 
     // USD 参考价：三 USD 源中位数
     const usdIn = median(usdSources.map((u) => usdFind(u, key, m.or_id, localNorm)?.usdIn));
     const usdOut = median(usdSources.map((u) => usdFind(u, key, m.or_id, localNorm)?.usdOut));
+    // v3.24（F2·A-4c）：USD 缓存命中价（三源中位数，USD/1M tokens 口径）。无任何源提供时为 null，
+    // 交由 applyUsdCachedPrice 决定「沿用本地 / 退回 10% 估算并打标记」。
+    const cacheUsd = median(usdSources.map((u) => usdFind(u, key, m.or_id, localNorm)?.cacheUsd));
     // v3.18（H3）：usd_* 参考字段只对 region=US 模型写盘——region=CN 的人民币主价是权威口径，
     // 计费从不读 usd_*，留着只会与主价互相矛盾（实测偏差 -78%~+8%）并污染人工对账。
     // CN 模型的 usdIn/usdOut 仍保留在循环变量里，供下方 auto_converted 估算兜底使用。
@@ -519,6 +704,7 @@ async function main() {
         m.price_source = 'deepseek官方';
         delete m.auto_converted;
         delete m.retired;
+        delete m.cached_price_estimated; // v3.24（F2·A-4c）：官方真实缓存价到位 → 清估算标记（只清标记，不动价格）
         updatedMain++;
       } else if (m.lock === true) {
         // 跳过人民币主价覆盖，保留本地价 + peak_multiplier
@@ -526,7 +712,10 @@ async function main() {
         const oldIn = m.input_price, oldOut = m.output_price;
         m.input_price = cnHit.in;
         m.output_price = cnHit.out;
-        if (cnHit.cached != null) m.cached_price = cnHit.cached;
+        if (cnHit.cached != null) {
+          m.cached_price = cnHit.cached;
+          delete m.cached_price_estimated; // v3.24（F2·A-4c）：国内源真实缓存价到位 → 清估算标记
+        }
         m.price_source = llmaHit ? 'llmabacus(国内)' : 'llm-prices-cn(国内)';
         delete m.auto_converted;
         updatedMain++;
@@ -541,7 +730,8 @@ async function main() {
         if (usdIn != null && usdOut != null) {
           m.input_price = Number((usdIn * rate).toFixed(2));
           m.output_price = Number((usdOut * rate).toFixed(2));
-          m.cached_price = Number((m.cached_price != null ? m.cached_price : usdIn * rate * 0.1).toFixed(2));
+          // v3.24（F2·A-4c）：缓存价优先用 USD 源真实值；无源值才退回 10% 估算并打标记
+          applyUsdCachedPrice(m, cacheUsd, usdIn, rate);
           m.price_source = 'usd×汇率(估算)';
           autoConverted++;
         }
@@ -557,12 +747,24 @@ async function main() {
       if (usdIn != null && usdOut != null) {
         m.input_price = Number((usdIn * rate).toFixed(2));
         m.output_price = Number((usdOut * rate).toFixed(2));
-        m.cached_price = Number((m.cached_price != null ? m.cached_price : usdIn * rate * 0.1).toFixed(2));
+        // v3.24（F2·A-4c）：缓存价优先用 USD 源真实值（三源中位数×汇率），无源值才退回 10% 估算 + 标记
+        applyUsdCachedPrice(m, cacheUsd, usdIn, rate);
         m.price_source = 'usd×汇率(国外源)';
         m.auto_converted = true;
         autoConverted++;
       }
     }
+  }
+
+  pricing.models = models; // v3.24（F2·缺陷4）：确保写盘对象与归并基准同一引用
+
+  // v3.24（F2·缺陷4）：快照比对得出本次真正改动过的 key（含 region/USD/主价/lock 等任何字段变动），
+  // 交给 save() 做「只覆盖改动条目」的锁内归并写，避免覆盖抓取窗口内新增的模型。
+  const changedKeys = new Set();
+  for (const key of Object.keys(models)) {
+    const m = models[key];
+    const nowSnap = m && typeof m === 'object' ? JSON.stringify(m) : null;
+    if (beforeSnap.get(key) !== nowSnap) changedKeys.add(key);
   }
 
   pricing.date = today;
@@ -586,8 +788,36 @@ async function main() {
       auditWarnings.push(`${key}: peak_multiplier=${m.peak_multiplier} 但非 DeepSeek 原厂系，与 peak_hours_cn 声明矛盾`);
     }
   }
+  // v3.24（F2·缺陷6）：峰谷模型价差 >60% 的条目（bigDiff）旧版只在 console.log 打印，
+  // 用户/下游脚本看不到；这里并入 _price_audit.warnings（结构与字段不变，只是多追加字符串）。
+  for (const b of bigDiff) auditWarnings.push(`${b}: 峰谷模型价差>60%，需人工核验`);
+
   if (auditWarnings.length) pricing._price_audit = { at: new Date().toISOString(), warnings: auditWarnings };
   else delete pricing._price_audit;
+
+  // v3.24（F2·A-7）：retired+lock = 设计行为下的永久冻结（见 retiredLockWarnings 注释）。
+  // **刻意不进 _price_audit**：它永远无法被用户消除，挂上弹窗就是永久噪音，
+  // 会稀释 ⚠价核验 对「可修复异常」的警示价值。改为独立字段 + stderr 留痕。
+  const frozenRetired = applyRetiredLocked(pricing, models);
+  if (frozenRetired.length) {
+    process.stderr.write(`[refresh-prices] ⚠retired+lock 永久冻结条目 ${frozenRetired.length} 个（价格既不会刷新、也不会被清理，且未被标记不可用）: ${frozenRetired.map((s) => s.split(':')[0]).join('、')}\n`);
+  }
+
+  // v3.24（F2·A-4c）：cached_price 仍是「输入价×10%」拍脑袋估算的条目数，只走 stderr 汇总一行
+  //（不逐条塞 _price_audit，避免刷屏）。这些条目的 cached_price 缺真实源值，用户需知晓。
+  const cacheEstimatedKeys = Object.keys(models).filter((k) => models[k] && models[k].cached_price_estimated === true);
+  if (cacheEstimatedKeys.length) {
+    process.stderr.write(`[refresh-prices] ⚠cached_price 为估算值（输入价×10%）的条目 ${cacheEstimatedKeys.length} 个（三 USD 源均未提供缓存价）: ${cacheEstimatedKeys.slice(0, 10).join('、')}${cacheEstimatedKeys.length > 10 ? ' 等' : ''}\n`);
+  }
+
+  // v3.24（F2·缺陷2）：模糊匹配告警必须落盘（旧版只进 last_refresh_note 文本，进程结束即丢）。
+  // 字段名固定为 `_ambig_warnings`，内容是纯字符串数组（无时间戳对象），便于其他脚本直接消费。
+  if (AMBIG_WARNINGS.size) pricing._ambig_warnings = [...AMBIG_WARNINGS];
+  else delete pricing._ambig_warnings;
+
+  // v3.24（F2·缺陷5）：靠推断得到 region 的模型清单（可观测性；判定行为本身未改）。
+  if (regionInferred.length) pricing._region_inferred = [...regionInferred];
+  else delete pricing._region_inferred;
 
   const noteParts = [];
   for (const [k, s] of Object.entries(SOURCES)) {
@@ -605,10 +835,18 @@ async function main() {
   }
   pricing.last_refresh_note = `${new Date().toISOString()} 多源刷新：${noteParts.join(' | ')}；人民币主价更新 ${updatedMain} 个${autoConverted ? `，USD换算 ${autoConverted} 个` : ''}，USD参考 ${usdUpdated} 个，region 设定 ${regionSet} 个${lockKept ? `，lock 价保留 ${lockKept} 个` : ''}（汇率 ${rate}）${bigDiff.length ? `；⚠️峰谷模型价差>60%需核验：${bigDiff.join('、')}` : ''}${officialOk ? '；DeepSeek官方价✓' : '；DeepSeek官方价✗(回落聚合源)'}${AMBIG_WARNINGS.size ? `；⚠️模糊匹配歧义: ${[...AMBIG_WARNINGS].join('；')}` : ''}${auditWarnings.length ? `；⚠️价格一致性自检: ${auditWarnings.join('；')}` : ''}`;
 
-  try { save(pricing); }
+  // v3.24（F2·缺陷3）：接收 save() 返回值。false = 抢锁超时、本次未落盘（date/价格都没更新）。
+  // 用 process.exitCode=1 而非 process.exit(1)：不中断后续汇总输出与 atexit 清理，
+  // 但退出码仍为非零，调用方（token-tracker.js spawnSync / 定时任务）能识别失败并重试。
+  let saved = false;
+  try { saved = save(pricing, { changedKeys, deletedKeys: cleanedKeys }); }
   catch (e) { process.stderr.write(`[refresh-prices] 写入失败: ${e.message}\n`); process.exit(1); }
+  if (!saved) {
+    process.stderr.write('[refresh-prices] 价库写入失败：抢锁超时（可能有其他进程正在刷新），本次刷新未落盘\n');
+    process.exitCode = 1;
+  }
 
-  console.log(`[refresh-prices] 多源刷新完成：date=${today}，源成功 ${okCount}/${Object.keys(SOURCES).length}(国内${cnOk ? '✓' : '✗'} 国外${usdOk ? '✓' : '✗'})，人民币主价 ${updatedMain} 个，USD换算 ${autoConverted} 个，USD参考 ${usdUpdated} 个，region ${regionSet} 个${lockKept ? `，lock 价保留 ${lockKept} 个` : ''}${bigDiff.length ? `，⚠️价差大：${bigDiff.join('、')}` : ''}`);
+  console.log(`[refresh-prices] 多源刷新完成：date=${today}，源成功 ${okCount}/${Object.keys(SOURCES).length}(国内${cnOk ? '✓' : '✗'} 国外${usdOk ? '✓' : '✗'})，人民币主价 ${updatedMain} 个，USD换算 ${autoConverted} 个，USD参考 ${usdUpdated} 个，region ${regionSet} 个${regionInferred.length ? `（⚠️${regionInferred.length} 个靠推断: ${regionInferred.join('、')}）` : ''}${lockKept ? `，lock 价保留 ${lockKept} 个` : ''}${bigDiff.length ? `，⚠️价差大：${bigDiff.join('、')}` : ''}`);
 }
 
 // 仅当以 `node refresh-prices.js` 直接运行时才执行主流程；被 require 时不自动跑（避免测试/复用触发联网刷新）
@@ -620,4 +858,6 @@ if (require.main === module) {
 }
 
 // 供测试/外部复用（不影响脚本直接运行）
-module.exports = { save, load, todayStr, PRICING, usdFind, cnFind, looseFind, norm, median, AMBIG_WARNINGS };
+// v3.24（F2）：新增导出 isFreeVariant / parse* / mergeWithDisk / applyUsdCachedPrice /
+// retiredLockWarnings / applyRetiredLocked，供单元测试直接验证（纯函数，无副作用）
+module.exports = { save, load, todayStr, PRICING, usdFind, cnFind, looseFind, norm, median, AMBIG_WARNINGS, isFreeVariant, parseLlma, parseLlc, parseOr, parseLitellm, parsePortkey, mergeWithDisk, applyUsdCachedPrice, retiredLockWarnings, applyRetiredLocked };

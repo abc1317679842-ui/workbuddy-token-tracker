@@ -207,13 +207,43 @@ function extractPeakSchedule(text) {
   return null;
 }
 
-// 提取时段规则 + 周末低峰声明 + 生效时间（从页面文本）
+// v3.29.0（A-10）：周末低谷价判定加固（原实现见下方三级判定说明）。
+// A-10 原始缺陷：旧实现 `weekend_off_peak = /周一至周五/.test(text)` —— 官方定价页**任意一处**
+// 出现「周一至周五」这个词就置 true。若官方只是改文案提到该词、而实际周末已恢复原价，
+// 本地会继续按「周末全天低谷」计费 → **系统性少算且无任何告警**。
+// 现分三级判定（**硬性前提：当前判定结果必须不变**——当前该值为 true 且正确）：
+//   ① 带锚点（高置信）：以下两条任一命中即 true，均视为「周末语义与周一至周五同处邻近上下文」：
+//      ①-a 邻近：`周末…(≤80字)…周一至周五` 或 `周一至周五…(≤80字)…周末`（同句 / 窗口内，不含句末标点）
+//      ①-b 正向表述：`周末…(≤80字)…低谷|低峰|低价|优惠|折扣|空闲`（含官方现行「…包括周末…全天均为空闲时段」句式）
+//   ② 全文兜底（低置信，保底回退）：锚点未命中、但原文任意位置含「周一至周五」→ **仍判 true**，
+//      同时打 `weekend_off_peak_fallback=true` 标记 + stderr 告警一次（置信度低，需人工核验）。
+//   ③ ①②都不命中 → false（原行为）。
+// 【窗口为何是 80（A-10 二次修正）】独立验证方实测官方**真实**定价页：「周一至周五」与「周末」的
+//   字符间距为 56，而初版窗口 40 → ①-a 在真页面上**永不命中** → 每次刷新都落到 ② 兜底 → 每次都写
+//   `weekend_off_peak_fallback:true` + 每次 stderr 告警，兜底告警从「异常」退化成「常态噪声」。
+//   放宽到 80 的风险论证：
+//   · ①-a **恒为 ② 的子集**——它要求「周末」与「周一至周五」同时出现 ⇒ 全文必含「周一至周五」⇒ ②
+//     必然也命中。故放宽 ①-a 窗口**不可能**产生 ② 不会产生的 true，**不引入任何新的假阳性**；
+//     放宽后仅剩「多出的假阳性」一种风险，而该风险在放宽前已由 ② 全额承担。收益是真页面回归高置信分支。
+//   · ①-b **不是 ② 的子集**（只要求「周末 + 低谷/空闲…」，不要求出现「周一至周五」），本就是一条
+//     **独立的正向信号**——本次把「空闲」并入其词表是有意为之：官方现行文案正是用「空闲时段」表达
+//     周末低峰，只认「低谷/低峰/低价/优惠」会漏掉它。其新增假阳性面（「周末」与「空闲」因无关语义
+//     落进同一 80 字窗口）**远窄于** ② 全文兜底，且页面正文里「周末」基本只出现在规则句。
+const WEEKEND_ANCHOR_RE = /周末[^。；\n]{0,80}周一至周五|周一至周五[^。；\n]{0,80}周末/; // ①-a 邻近锚点
+const WEEKEND_POSITIVE_RE = /周末[^。；\n]{0,80}(?:低谷|低峰|低价|优惠|折扣|空闲)/;      // ①-b 正向表述
+let _weekendFallbackWarned = false; // 「告警一次」：同一进程内兜底告警只打一次
 function parseRules(html) {
   const text = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
   const peakSchedule = extractPeakSchedule(text);
-  // 周末低峰规则存在性：
-  //   新版：明确"周一至周五"为高峰时段（即周末空闲）；旧版：明确"周末...统一按照低谷时段价格"
-  const weekend = /周一至周五/.test(text) || /周末[^。]{0,80}统一按照低谷时段价格/.test(text);
+  // 周末低峰规则存在性（v3.29.0/A-10：见文件内 WEEKEND_* 常量上方的三级判定说明）
+  const weekendAnchor = WEEKEND_ANCHOR_RE.test(text) || WEEKEND_POSITIVE_RE.test(text); // ① 高置信
+  const weekendFallback = !weekendAnchor && /周一至周五/.test(text);                    // ② 全文兜底（保底，结果仍 true）
+  const weekend = weekendAnchor || weekendFallback;
+  if (weekendFallback && !_weekendFallbackWarned) {
+    _weekendFallbackWarned = true;
+    // stderr（不用 console.log：stdout 是给 refresh-prices.js 的纯 JSON，不能污染）
+    process.stderr.write('[deepseek-official] ⚠ 周末低谷价判定来自全文兜底匹配（官方文案任意位置提及「周一至周五」即生效），置信度低；若周末已恢复原价请人工核验\n');
+  }
   // 生效时间：官方"将于北京时间YYYY年M月D日（周X）HH:MM起/00:00起"或"自...起"。
   // 无生效时间 → 视为立即生效（effective_at = null，由调用方按"立即生效"处理）。
   // 北京时间固定 UTC+8。
@@ -230,6 +260,9 @@ function parseRules(html) {
   return {
     peak_schedule: peakSchedule, // v3.19.1（N1）：null = 解析失败 → 调用方保留旧值 + 告警，绝不清空
     weekend_off_peak: weekend,
+    // v3.29.0（A-10）：本次 weekend_off_peak 是否来自「全文兜底」（②分支）——仅作置信度标记，
+    //   布尔语义与字段名 `weekend_off_peak` 完全不变（下游 token-tracker.js 只读后者）。
+    weekend_off_peak_fallback: weekendFallback,
     effective_at: effectiveAt,
   };
 }
@@ -259,6 +292,8 @@ function applyRules(pricing, rules, nowIso, officialUrl) {
     pricing.deepseek_rules_pending = {
       peak_schedule: rules.peak_schedule,
       weekend_off_peak: rules.weekend_off_peak,
+      // v3.29.0（A-10）：兜底标记随规则落盘（仅置信度标记，不下发弹窗；见 parseRules 三级判定说明）
+      weekend_off_peak_fallback: rules.weekend_off_peak_fallback === true,
       effective_at: rules.effective_at,
       fetched_at: nowIso,
     };
@@ -269,6 +304,9 @@ function applyRules(pricing, rules, nowIso, officialUrl) {
   pricing.deepseek_rules = {
     peak_schedule: rules.peak_schedule,
     weekend_off_peak: rules.weekend_off_peak,
+    // v3.29.0（A-10）：同上——落盘置信度标记，但**不**接进 token-tracker.js 的 priceAuditTag
+    //   （否则每天刷新弹窗都挂 ⚠价核验，属常态噪音而非异常）。
+    weekend_off_peak_fallback: rules.weekend_off_peak_fallback === true,
     effective_at: rules.effective_at,
     updated_at: nowIso,
   };
@@ -277,13 +315,30 @@ function applyRules(pricing, rules, nowIso, officialUrl) {
   return 'applied';
 }
 
+// v3.29.0（A-4a）：由官方页解析出的「高峰价 / 空闲价」比值推**真实**峰谷倍率。
+// 旧实现 toModelBlock 恒写 peak_multiplier: 2 —— parseOfficial 明明解析了 prices.*.peak（第 147-152 行），
+// 但该值只参与完整性校验、从未参与计价：官方把倍率改成 ×1.5 / ×3 或分档时，本地仍一律按 ×2 算，
+// 且倍率变化不在 bigDiff（那里只在源价差 >60% 时告警）监控范围内 → 系统性少算/多算且零告警。
+// 基准取「未命中输入价」（三组价通常同倍率）；异常时依次回退 output / cached；全失败兜底 2（向后兼容旧行为）。
+function peakMultiplierOf(prices, i) {
+  for (const g of [prices && prices.uncached, prices && prices.output, prices && prices.cached]) {
+    const off = g && g.off ? g.off[i] : NaN;
+    const peak = g && g.peak ? g.peak[i] : NaN;
+    if (typeof off === 'number' && off > 0 && typeof peak === 'number') {
+      const r = peak / off;
+      if (Number.isFinite(r) && r > 0) return Number(r.toFixed(4));
+    }
+  }
+  return 2; // 解析不出真实倍率 → 保持向后兼容（与旧硬编码一致）
+}
+
 // 官方价 → 本地模型块（只填价格+峰谷，其他字段不动）
 function toModelBlock(prices, models, i) {
   return {
     input_price: prices.uncached.off[i],
     cached_price: prices.cached.off[i],
     output_price: prices.output.off[i],
-    peak_multiplier: 2,
+    peak_multiplier: peakMultiplierOf(prices, i),
   };
 }
 
@@ -367,7 +422,8 @@ async function main() {
             input_price: blk.input_price,
             cached_price: blk.cached_price,
             output_price: blk.output_price,
-            peak_multiplier: 2,
+            // v3.29.0（A-4a）：旧实现此处同样硬编码 2（与 toModelBlock 同病）→ 改用官方真实峰谷倍率
+            peak_multiplier: blk.peak_multiplier,
             or_id: existing.or_id || `deepseek/${mkey}`,
             usd_input_price: existing.usd_input_price,
             usd_output_price: existing.usd_output_price,
@@ -442,13 +498,16 @@ async function main() {
             );
           }
         });
-        // 2) 本地 DeepSeek 系、官方清单没有的 → 标记 retired（保留历史账本，不再计费匹配）
+        // 2) 本地 DeepSeek 系、官方清单没有的 → 标记 retired（**仅作来源标注**，供人工排查「官方已下线」）
+        //    ⚠ D-3 事实说明（v3.29.0 更正）：`retired` **只写不读** —— token-tracker.js 全仓无任何
+        //    `retired` 读取（grep 零命中），`findModel` / `calcCost` 都不检查该标记；被打上 retired 的
+        //    模型**仍按留存旧价继续计费**（不会回退去联网估算、也不会「不再计费」）。此处旧注释与实现相反。
         for (const key of Object.keys(pricing.models)) {
           const isDS = /(^|[\/\-_])deepseek/i.test(key);
-          // v2.92：手动补录条目豁免 retired——「官方暂未收录」不等于「官方已下线」。
-          // 否则新模型刚手工补价，次日刷新就被打成 retired（=不再计费），补录等于白做。
+          // v2.92：手动补录条目豁免 retired——「官方暂未收录」不等于「官方已下线」，不应污染其来源标注
+          //   （注意：标记与否都不影响计费，`retired` 只写不读，见上方说明）。
           // v3.07：alias_of 条目同样豁免——它绑定了官方在售模型（只是本地 key 不同名），
-          // 若被打成 retired 会导致运行时该名查不到价（回退联网估算），故必须保留可计费。
+          //   豁免是为避免来源标注被误写成「官方已下线」；其价已由官方接管，计费不受此标记影响。
           if (pricing.models[key].manual === true || pricing.models[key].alias_of) continue;
           if (isDS && !officialSet.has(key)) {
             pricing.models[key].retired = true;
@@ -472,6 +531,17 @@ async function main() {
       parsed.models.forEach((mkey, i) => {
         out.official[mkey] = toModelBlock(parsed.prices, parsed.models, i);
       });
+      // v3.29.0（A-4a）：倍率 != 2 时留痕——系统性少算/多算的来源，必须让调用方与日志都看得到。
+      // 注意：stdout 是给 refresh-prices.js 的**纯 JSON**（它做 JSON.parse(sp.stdout)），
+      // 故提示只能走 stderr + out.peak_multiplier_note，绝不能用 console.log（会污染 JSON 输出）。
+      const peakNotes = parsed.models
+        .map((mkey, i) => ({ mkey, mult: peakMultiplierOf(parsed.prices, i) }))
+        .filter((x) => x.mult !== 2)
+        .map((x) => `${x.mkey} ×${x.mult}`);
+      if (peakNotes.length) {
+        out.peak_multiplier_note = `官方高峰倍率已变更（非 ×2）：${peakNotes.join('、')}；本地已按官方真实倍率计费`;
+        process.stderr.write(`[deepseek-official] ⚠ 官方高峰倍率已变更为非 ×2：${peakNotes.join('、')}（本地已同步真实倍率，请人工复核官方定价页）\n`);
+      }
       console.log(JSON.stringify(out, null, 2));
       return 0;
     } catch (e) {
@@ -487,7 +557,8 @@ async function main() {
 }
 
 // v3.19.1：导出纯函数供 selftest 直接单测（句式解析是 N1 的核心，必须能离线验证六个文案变体）
-module.exports = { parseRules, extractPeakSchedule, extractRanges, applyRules, PEAK_PATTERNS };
+// v3.29.0（A-4a）：补导出 peakMultiplierOf —— 真实峰谷倍率推导是 A-4a 的核心，同样必须能离线单测
+module.exports = { parseRules, extractPeakSchedule, extractRanges, applyRules, PEAK_PATTERNS, peakMultiplierOf };
 
 if (require.main === module) {
   main().catch((e) => {

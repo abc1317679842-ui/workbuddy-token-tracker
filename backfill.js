@@ -271,6 +271,12 @@ function main() {
   const newWm = {};          // ledgerKey -> { main, subs:{f:lines} }
   let filesMain = 0, filesSub = 0;
 
+  // v3.29.0（S-1 加固）：扫描窗口账本指纹 —— 在**开始递归扫描之前**记录。锁只能保证「写入原子」，
+  //   保证不了「扫描内容含最新行」：若主链路在 backfill 读完某 transcript 之后、本进程写盘之前才把
+  //   当轮 usage 写进当天账本，该轮不在 newDaily 的同日期桶里，会被 Object.assign 直接覆盖，而水位线
+  //   照推 → 永久丢失。故扫描前记 size/mtimeMs，锁内写盘前再比对，不一致即中止本次写入。
+  const preStat = (() => { try { const s = fs.statSync(DAILY); return { size: s.size, mtimeMs: s.mtimeMs }; } catch (e) { return null; } })();
+
   // 布局：projects/<项目目录>/<sid>.jsonl + projects/<项目目录>/<sid>/subagents/agent-*.jsonl
   //       （兼容根直放 projects/<sid>.jsonl）
   const projDirs = [];
@@ -373,17 +379,87 @@ function main() {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const bak1 = DAILY + '.bak-backfill-' + stamp;
   const bak2 = WATERMARK + '.bak-backfill-' + stamp;
-  try { if (fs.existsSync(DAILY)) fs.copyFileSync(DAILY, bak1); } catch (e) {}
-  try { if (fs.existsSync(WATERMARK)) fs.copyFileSync(WATERMARK, bak2); } catch (e) {}
-  const tmp1 = DAILY + '.tmp-' + process.pid;
-  fs.writeFileSync(tmp1, JSON.stringify(newDaily, null, 2) + '\n');
-  fs.renameSync(tmp1, DAILY);
-  const tmp2 = WATERMARK + '.tmp-' + process.pid;
-  fs.writeFileSync(tmp2, JSON.stringify(mergedWm));
-  fs.renameSync(tmp2, WATERMARK);
+
+  // v3.29.0（S-1 修复）：账本写入必须与主链路 recordUsage（token-tracker.js）共用**同一把锁**。
+  //   DAILY + '.lock' 即 DAILY_USAGE_FILE + '.lock'（两者都解析到 skills/token-usage-tracker/daily-usage.json），
+  //   锁路径不一致就锁不住主链路，等于没加锁。
+  //   原实现零锁直写：backfill 要递归扫描 projects/**/*.jsonl（本机数百文件），全程不持锁 —— TOCTOU 窗口极大。
+  //   扫描期间用户正常对话 → Stop hook 持锁累加本轮增量并落盘 → backfill 扫描完再 rename 覆盖 → 本轮及窗口内
+  //   所有增量被整体抹除，而水位线已被推满（下面几步），这些消耗永久无法恢复。
+  //   锁内**重读账本再合并**：重放结果覆盖同日期，同时保留账本里重放不到的日期（如 transcript 已删除、旧日期）。
+  // v3.29.0（S-1 加固）：锁内写盘前再比对 preStat 指纹（见扫描前注释）——扫描窗口内账本被改过即中止。
+  //   备份 bak1/bak2 放在锁内、指纹比对**之后**（仍在本工具写盘之前）：这样中止分支不会留下多余的
+  //   *.bak-backfill-* 残留，且备份内容更贴近真实写入前状态。
+  const lockRes = tt.withFileLock(DAILY + '.lock', () => {
+    const postStat = (() => { try { const s = fs.statSync(DAILY); return { size: s.size, mtimeMs: s.mtimeMs }; } catch (e) { return null; } })();
+    if (preStat === null) {
+      // 扫描前账本不存在：锁内若已被创建，同样视为「扫描期间被改」
+      if (postStat !== null) return { aborted: true };
+    } else if (postStat === null || postStat.size !== preStat.size || postStat.mtimeMs !== preStat.mtimeMs) {
+      // size 或 mtimeMs 任一不同 → 扫描期间有进程写过账本（Windows 上 mtimeMs 精度足够直接 !== 比较）
+      return { aborted: true };
+    }
+    // 指纹一致：确认扫描窗口内无人改动，再备份 + 合并写入
+    try { if (fs.existsSync(DAILY)) fs.copyFileSync(DAILY, bak1); } catch (e) {}
+    try { if (fs.existsSync(WATERMARK)) fs.copyFileSync(WATERMARK, bak2); } catch (e) {}
+    let cur = {};
+    try { cur = JSON.parse(fs.readFileSync(DAILY, 'utf-8')); } catch (e) { cur = {}; }
+    const mergedDaily = Object.assign({}, cur, newDaily); // newDaily 覆盖同日期，cur 的其余日期保留
+    const tmp1 = DAILY + '.tmp-' + process.pid;           // 保留原临时文件名（不与主链路共享固定名）
+    fs.writeFileSync(tmp1, JSON.stringify(mergedDaily, null, 2) + '\n');
+    fs.renameSync(tmp1, DAILY);
+    return mergedDaily;
+  }, { ttl: 600000, retries: 50 }); // ttl/retries 放宽：回填扫描长、持锁久，给足重试等待
+  if (!lockRes || !lockRes.ok) {
+    // 抢锁失败：绝不无锁续写，否则又退回上面的「整体覆盖丢增量」老问题
+    console.error('[backfill] 账本正被占用（WorkBuddy 可能正在运行），请先退出 WorkBuddy 再执行 backfill --write');
+    process.exit(1);
+  }
+  if (lockRes.result && lockRes.result.aborted) {
+    // 扫描窗口内账本被改：本次可能漏掉新写入的当天增量，直接覆盖＝永久丢失；水位线也一并放弃推进
+    console.error('[backfill] 扫描期间账本已被其他进程修改（WorkBuddy 可能正在记账中），为避免覆盖造成不可恢复的丢失，本次写入已中止；请退出 WorkBuddy 后重试');
+    process.exit(1);
+  }
+
+  // 水位线：v3.29.0（S-1 加固）—— 与主链路 incrementalRecord 共用**同一把锁**（WATERMARK + '.lock' 即
+  //   token-tracker.js 的 LEDGER_WATERMARK_FILE + '.lock'），锁内「重读现值 → 逐键取 max → 原子写」。
+  //   原先是锁外整份覆盖：backfill 在扫描后才读 oldWm（L316），而扫描期间主链路一直在记账并推水位线，
+  //   主链路在 L316 之后推的会话键/行数不在 mergedWm 里 → 被整份覆盖 → 水位线**回退** → 下轮主链路从
+  //   偏早偏移重读已记账的行 → **重复计费**（历史教训：v2.99 实测 .bak 回退造成重放增量 5500 in / 1600 out）。
+  //   「只许前进，绝不回退」的理由：水位线偏低 = 少记（可恢复），水位线回退 = 重记（不可恢复地多收费）；
+  //   宁可少记不重记，与主链路 incrementalRecord 的 `if (!recorded) return` 同一哲学。
+  //   合并保留四层字段 {main, subs, lastTs, subTs}（v3.25.0 KI-5：丢 lastTs/subTs = 截断恢复退化为冻结）。
+  const wmRes = tt.withFileLock(WATERMARK + '.lock', () => {
+    let cur = {};
+    try { cur = JSON.parse(fs.readFileSync(WATERMARK, 'utf-8')) || {}; } catch (e) { cur = {}; }
+    const out = Object.assign({}, cur); // 主链路可能新增会话键：以现值打底，逐键用 max 抬升、绝不删键
+    for (const [k, v] of Object.entries(mergedWm)) {
+      const o = out[k] || { main: 0, subs: {}, lastTs: 0, subTs: {} };
+      const subs = Object.assign({}, o.subs || {});
+      for (const [sf, n] of Object.entries(v.subs || {})) subs[sf] = Math.max(subs[sf] || 0, n);
+      const subTs = Object.assign({}, o.subTs || {});
+      for (const [sf, t] of Object.entries(v.subTs || {})) subTs[sf] = Math.max(subTs[sf] || 0, t);
+      out[k] = {
+        main: Math.max(o.main || 0, v.main || 0),
+        subs,
+        lastTs: Math.max(o.lastTs || 0, v.lastTs || 0),
+        subTs,
+      };
+    }
+    const tmp2 = WATERMARK + '.tmp-' + process.pid;
+    fs.writeFileSync(tmp2, JSON.stringify(out));
+    fs.renameSync(tmp2, WATERMARK);
+    return out;
+  }, { ttl: 300000, retries: 50 });
+  if (!wmRes || !wmRes.ok) {
+    // 账本此刻**已经写入**。此处绝不回滚账本：回滚只会制造「账本没写、水位线没推」之外的新不一致；
+    // 且水位线未推进是安全态——下轮主链路会从旧偏移重读、把增量补记（少记可恢复，不重复计费）。
+    console.error('[backfill] 水位线正被占用，账本已写入但水位线未推进；请退出 WorkBuddy 后重跑（水位线不改不会重复计费，安全）');
+    process.exit(1);
+  }
   console.log('');
   console.log(`✅ 已写入账本：${DAILY}`);
-  console.log(`✅ 已推满水位线：${WATERMARK}（${Object.keys(mergedWm).length} 个会话键，逐键取 max 防回退）`);
+  console.log(`✅ 已推满水位线：${WATERMARK}（${Object.keys(wmRes.result).length} 个会话键，逐键取 max 防回退）`);
   console.log(`备份：${bak1}`);
   console.log(`备份：${bak2}`);
 }
