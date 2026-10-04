@@ -3,6 +3,24 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.32.1（2026-10-04）—— CI 三版连红根因修复（selftest 断言与环境语义对齐）
+
+> 起因：推送 v3.32.0 后巡检发现 CI 自 v3.30.0 起连续三版 failure（614219ea / bfa7c2b6 / d767712 / 97bc5c8 同红），v3.28.0（b027e21e）是最后一次绿。四个失败项全部是**测试断言与运行环境语义不匹配**，产品代码零改动。
+
+### 深层教训（先记）
+本机沙箱 node→node spawn EBUSY → `SPAWN_OK=false` → spawn 系断言（T1~T4 / T12-j / T22-e）全程 envSkip → **「本机双环境 253 全绿」对 CI 环境是盲区**：CI runner spawn 正常 + 有真网 + step 设 WB_NO_NET=1，这三个条件本机一个都不占。spawn 系断言的真实首跑发生在 CI，红点全在那里暴露。
+
+### 四个根因与修法（全部只动 selftest.js）
+1. **T2**（v3.31.0 起）：断言前提「空账本也会照常输出表头」不成立——空账本输出「账本为空（暂无记录）」短句（CI `outLen=11` 与本机复现逐字符吻合）。修：spawn 分支内预置 1 条最小账本记录（schema 同 T11），断言在「有账本」形态下验证报告正文；错误注释一并纠正。
+2. **T3**（v3.30.0 起）：WB_NO_NET=1 下 v3.18.1（N3）既定保守行为 = 损坏 pricing **不 rename**（联网开关关闭无法重建，改名只会移走原文件）——CI step 恰设 WB_NO_NET=1 → rename 断言必红（found=0）。修：按环境分支各守各的行为——断网守「不 rename + stderr 告警出现」，联网守「rename 备份 + 原文件移走」。
+3. **T12-j4**（v3.31.0 起）：`put()` 是整文件覆盖，j3 前的 put 漏带 failCount/nextRetryAt → j4 读回对象无 failCount 键 → `Number(undefined)=NaN ≠ 0` 假红（CI 输出自证：lastCheckAt 仍等于 nowJ、latestVersion=put 值——**并非真联网**，j 组闸门闭合有效）。修：put 补全字段 + 断言改 `Number(stJ.failCount || 0)`（键缺失与 0 同义）。
+4. **T22-e1**（v3.32.0 本轮新增）：fixture 只写 `dir22/holidays.json` 未建 `skills/token-usage-tracker/` 层级 → `refresh-holidays.js resolveOutPath()` 按读取方口径的存在性检查不过 → 退回 `__dirname` **静默读真仓库 holidays.json**（CI stderr 自证退回路径）→ 断言在错误的文件上空转。修：fixture 建出该层级；e2 改用写前快照对比。
+
+### 验证
+- T12-j4 断言四方向等价测试全对（旧 bug 形态→绿 / 正常形态→绿 / 真查询→红 / 真失败→红）；
+- T2 / T3 / T22-e1 本机端到端复现绿（预置账本出表头 / 断网告警出现且零 corrupt / --check 点名 2027 未知 + 2023 陈旧）；
+- 全量 selftest 基线不变：253 过 / 0 败 / 18 跳 / EXIT=0；推送后 CI 应恢复绿（v3.30.0 起首绿）。
+
 ## v3.32.0（2026-10-04）—— 第三轮全量审计：真价优先 + 假日三态自动刷新
 
 > 来源：第三轮全量审计（25 文件 / 14,957 行，4 路子代理 + 主引擎通读）+ 逐条证据复核（12 条 P1 成立 11 条半，1 条 P2 判误报）。

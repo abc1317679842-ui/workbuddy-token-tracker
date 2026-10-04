@@ -1,5 +1,8 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.32.0 (2026-10-04)
+// token-usage-tracker v3.32.1 (2026-10-04)
+// v3.32.1：**CI 三版连红根因修复（selftest 断言与环境语义对齐，产品代码零改动）** ——
+//   CI 自 v3.30.0 起连续 failure，四个失败项全是测试断言与运行环境不匹配（详见 CHANGELOG v3.32.1）；
+//   深层教训：本机沙箱 SPAWN_OK=false 让 spawn 系断言全程跳过 → 「本机全绿」对 CI 环境是盲区。
 // v3.32.0：**第三轮全量审计（2026-10-04，25 文件 14,957 行）落地** ——
 //   ① P1-1 治根+兜底+守卫三层：refresh-prices 补价成功后删 pricing_status（此前全文件零命中）；
 //      四出口新增共用判定 costCellKind（真价优先 cost>0，未收录/无公开价措辞不变）；T21 段 14 条断言。
@@ -4940,7 +4943,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.32.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.32.1'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

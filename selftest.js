@@ -95,6 +95,16 @@ else {
 // ── T2：--report all → exit 0 且无「读取方指令」（M3 回归） ─────────────────
 if (!SPAWN_OK) envSkip('T2 --report 无指令注入', SPAWN_SKIP_REASON);
 else {
+  // v3.32.1（CI 红根因修复①）：本断言的「输出须确为报告正文」靠 7 列表头判据，但**空账本输出的是
+  //   「账本为空（暂无记录）」短句**（无表头）——v3.31.0 注释里「空账本也会照常输出表头」的前提不成立。
+  //   本机沙箱 SPAWN_OK=false 全程跳过才一直假绿；CI（SPAWN_OK=true）首次真跑即红（outLen=11）。
+  //   预置 1 条最小记录（schema 同 T11-led11），让 T2 在「有账本」形态下验证报告正文。
+  fs.writeFileSync(path.join(skillDir, 'daily-usage.json'), JSON.stringify({
+    '2026-10-04': {
+      models: { 'ci-fixture-model': { in: 100, out: 50, cached: 0, total: 150, cost: 0.01, hit: 0 } },
+      total: { in: 100, out: 50, cached: 0, total: 150, cost: 0.01, hit: 0 },
+    },
+  }, null, 2));
   const r = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--report', 'all'], { env, timeout: 30000, windowsHide: true, encoding: 'utf8' });
   const out = r.stdout || '';
   ok('T2 --report all exit 0', r.status === 0, `exit=${r.status}`);
@@ -102,8 +112,8 @@ else {
   //   **只出现在注释**（:565 / :2879 / :3511），没有任何可达代码路径会输出它；更糟的是 --report 崩溃、
   //   输出空串时 indexOf<0 依旧为真 → 假绿。补两道真判据：
   //   ① 正例自检：把含标记的样本喂给同一检测器必须得 true（证明检测器本身有效，断言不是恒真）；
-  //   ② 输出形状前置：stdout 必须确实含 --report 的 7 列表头（空账本 / 异常键账本都会照常输出表头），
-  //      崩溃、空输出、非报告文本不得蒙混通过。
+  //   ② 输出形状前置：stdout 必须确实含 --report 的 7 列表头（上方预置了 1 条最小记录，有账本才有表头；
+  //      空账本输出「账本为空（暂无记录）」短句——见上方 v3.32.1 注释），崩溃、空输出、非报告文本不得蒙混通过。
   //   实测可红：向 --report 路径注入一行输出该串的代码 → 判据变 false（见交付说明的注入试验）。
   const hasInjection = (s) => s.indexOf('读取方指令') >= 0;
   const outLooksLikeReport = out.includes('| 模型 | 输入 | 输出 | 缓存 | 缓存命中 | 总 token | 金额 |');
@@ -119,10 +129,19 @@ else {
   fs.writeFileSync(path.join(skillDir, 'pricing.json'), big.slice(0, Math.floor(big.length * 0.7))); // 截断 30%
   const r = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'], { input: HOOK_PAYLOAD, env, timeout: 90000, windowsHide: true, encoding: 'utf8' });
   const baks = fs.readdirSync(skillDir).filter((f) => f.startsWith('pricing.json.corrupt-'));
-  ok('T3 损坏 pricing 产生 .corrupt-* 备份', baks.length === 1, `found=${baks.length}`);
-  ok('T3 损坏文件已改名移走', !fs.existsSync(path.join(skillDir, 'pricing.json')) || (() => {
-    try { JSON.parse(fs.readFileSync(path.join(skillDir, 'pricing.json'), 'utf8')); return true; } catch (e) { return false; }
-  })());
+  // v3.32.1（CI 红根因修复②）：WB_NO_NET=1 下 v3.18.1（N3）既定保守行为 = 损坏**不 rename**（联网开关
+  //   关闭无法重建，改名只会移走原文件、用户没法即时恢复）——CI step 设了 WB_NO_NET=1 → rename 分支
+  //   永远不执行，原断言在 CI 必红（found=0，v3.30.0 起三版连续）。改为按环境各守各的行为：
+  //   断网守「不 rename + 告警出现」，联网守「rename 备份 + 原文件移走」（自愈链路）。
+  if (process.env.WB_NO_NET === '1') {
+    ok('T3 断网模式：损坏 pricing 不 rename（既定保守行为，联网才自愈重建）', baks.length === 0, `found=${baks.length}`);
+    ok('T3 断网模式：stderr 提示联网开关关闭（可观测）', String(r.stderr || '').indexOf('联网开关关闭') >= 0, String(r.stderr || '').slice(0, 140));
+  } else {
+    ok('T3 损坏 pricing 产生 .corrupt-* 备份', baks.length === 1, `found=${baks.length}`);
+    ok('T3 损坏文件已改名移走', !fs.existsSync(path.join(skillDir, 'pricing.json')) || (() => {
+      try { JSON.parse(fs.readFileSync(path.join(skillDir, 'pricing.json'), 'utf8')); return true; } catch (e) { return false; }
+    })());
+  }
   const rebuilt = (() => { try { return JSON.parse(fs.readFileSync(path.join(skillDir, 'pricing.json'), 'utf8')); } catch (e) { return null; } })();
   if (process.env.WB_NO_NET === '1') envSkip('T3 R4 告警断言', 'WB_NO_NET=1（CI 断网：损坏重建走失败分支、前提不成立；已知覆盖缺口见 CHANGELOG「T3 R4」条目，本机不设此变量时真实验证）');
   else if (rebuilt) ok('T3 R4 护栏告警进 stderr（⚠价库）', String(r.stderr || '').indexOf('⚠价库') >= 0, String(r.stderr || '').slice(0, 140));
@@ -979,7 +998,10 @@ else {
     ok('T12-j2 提示位于注入内容最后一行（不插入到用量行中间）',
       String(ac).split('\n').slice(-1)[0].indexOf('[技能更新]') === 0, JSON.stringify(String(ac).split('\n').slice(-2)));
     // 换成「已是最新」再跑一次 → 注入内容必须**不含**提示（回归：旧行为逐字节不变）
-    put({ lastCheckAt: nowJ, latestVersion: ttNet.SKILL_VERSION, notifyCount: 0 });
+    // v3.32.1（CI 红根因修复③）：put 是**整文件覆盖**——此前漏带 failCount/nextRetryAt，
+    //   j4 读回的对象没有 failCount 键 → Number(undefined)=NaN ≠ 0 → CI 必红（j4 输出自证：
+    //   lastCheckAt 仍等于 nowJ、latestVersion=put 值，红的是 NaN 而非真联网）。
+    put({ lastCheckAt: nowJ, latestVersion: ttNet.SKILL_VERSION, notifyCount: 0, failCount: 0, nextRetryAt: 0 });
     const r2 = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'],
       { input: HOOK_PAYLOAD, env: envNet, timeout: 30000, windowsHide: true, encoding: 'utf8' });
     ok('T12-j3 已是最新时 --hook 注入不含任何更新提示（旧行为不变）',
@@ -987,8 +1009,9 @@ else {
     // j4：子进程侧零联网证明 —— 闸门闭合（lastCheckAt=nowJ、nextRetryAt=0）时若真发起过查询，
     //   maybeFetchLatest 必然改写 lastCheckAt 或把 failCount 加 1；两者都没变 = 一次都没查。
     const stJ = ttMod.loadUpdateState();
+    // failCount 用 ||0 容错（键缺失与 0 同义 = 未查询；真发起过查询则必为 ≥1 或 lastCheckAt 已变）。
     ok('T12-j4 ★子进程零联网证明：lastCheckAt 未变且 failCount 仍为 0（未发起版本查询）',
-      stJ.lastCheckAt === nowJ && Number(stJ.failCount) === 0, JSON.stringify(stJ));
+      stJ.lastCheckAt === nowJ && Number(stJ.failCount || 0) === 0, JSON.stringify(stJ));
   }
   fs.rmSync(UF, { force: true });
 }
@@ -1650,7 +1673,12 @@ else {
     ok('T22 模块加载', false, 'peak-rules.js / refresh-holidays.js require 失败');
   } else {
     const dir22 = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-holidays-'));
-    const hp22 = path.join(dir22, 'holidays.json');
+    // v3.32.1（CI 红根因修复④）：refresh-holidays.js resolveOutPath 按**读取方口径**解析
+    //   （WB_ROOT/skills/token-usage-tracker/，目录存在性检查不过 → 退回 __dirname）——fixture 必须建出
+    //   该层级，否则 --check 静默读到真仓库的 holidays.json（CI stderr 自证退回路径），断言全空转。
+    const skillsDir22 = path.join(dir22, 'skills', 'token-usage-tracker');
+    fs.mkdirSync(skillsDir22, { recursive: true });
+    const hp22 = path.join(skillsDir22, 'holidays.json');
     fs.writeFileSync(hp22, JSON.stringify({
       years: { '2025': ['2025-01-01'], '2026': ['2026-01-01', '2026-10-01'], '2027': null, '2024': [], '2023': ['2023-01-01'] },
       _stale: true, stale_years: ['2023'], stale_detail: { '2023': { since: '2026-10-04', reason: 'fixture' } },
@@ -1708,6 +1736,7 @@ else {
     if (!SPAWN_OK) {
       envSkip('T22-e --check 只读体检', SPAWN_SKIP_REASON);
     } else {
+      const before22e = fs.readFileSync(hp22, 'utf-8'); // 写前快照（e2 逐字节对比基准）
       const r22 = spawnSync(NODE, [path.join(SRC, 'refresh-holidays.js'), '--check'], {
         windowsHide: true, timeout: 20000,
         env: Object.assign({}, process.env, { WB_ROOT: dir22, TOKEN_TRACKER_NO_TOAST: '1' }),
@@ -1718,7 +1747,7 @@ else {
         && (out22.includes('未知') || out22.includes('陈旧')), `exit=${r22.status} out=${out22.slice(0, 200)}`);
       const after22 = fs.readFileSync(hp22, 'utf-8');
       ok('T22-e2 ★--check 不写盘（体检就是体检，文件逐字节不变）',
-        after22 === fs.readFileSync(path.join(dir22, 'holidays.json'), 'utf-8') && after22.includes('2027'));
+        after22 === before22e && after22.includes('2027'));
     }
     fs.rmSync(dir22, { recursive: true, force: true }); // 临时 fixture 清理（本目录自产自销）
   }
