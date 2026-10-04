@@ -52,7 +52,7 @@ const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
 const PRICING_LOCK_FILE = path.join(WB, 'skills', 'token-usage-tracker', '.pricing.lock'); // 修复6：pricing 并发写锁（与 token-tracker.js 共用）
 const DS_OFFICIAL = process.env.DS_OFFICIAL || path.join(__dirname, 'deepseek-official.js'); // 可覆盖（测试/镜像）
 const TIMEOUT_MS = 12000;
-const DEFAULT_RATE = 7.2;
+const DEFAULT_RATE = 7.2; // v3.32.0（P1-3）：USD→CNY 兜底汇率的**单一真源**，token-tracker.js 新模型补录兜底处引用本导出（selftest T21-d 断言两侧一致）
 const FORCE = process.argv.includes('--force');
 const NO_NET = process.env.WB_NO_NET === '1';
 
@@ -735,7 +735,8 @@ async function main() {
     }
   }
 
-  let updatedMain = 0, autoConverted = 0, usdUpdated = 0, regionSet = 0, bigDiff = [], lockKept = 0;
+  // v3.32.0（P1-1）：unpublishedCleared = 本次补到真价后被清掉的「无公开价」标记数（会在小结里报出来）
+  let updatedMain = 0, autoConverted = 0, usdUpdated = 0, regionSet = 0, bigDiff = [], lockKept = 0, unpublishedCleared = 0;
   const regionInferred = []; // v3.24（F2·缺陷5）：靠推断（而非天生带 region）得到国内外归属的模型 key
   const sanityWarnings = []; // v3.31.0（P0-5 / P1-7）：价格体检告警（`<key>: 说明` 形状，并入 _price_audit）
 
@@ -865,6 +866,17 @@ async function main() {
     } else if (gate.cached && preSnap.cached_price != null) {
       restoreCached(m, preSnap); // 旧值为 null 时不回退（写 null = calcCost 按 0 计，比错价更隐蔽）
     }
+    // v3.32.0（P1-1 治根）：补到真价后必须让「无公开价」标记**同步失效**。
+    //   病根：本文件此前对 pricing_status **零命中** —— 厂商公布单价、我们把价刷进 pricing.json 之后，
+    //   那个 'unpublished' 标记还挂在模型上 → 账本侧 addModelUsage 继续打 no_price=true（cost 已被算出 > 0），
+    //   于是四出口一律把**已算出来的真金额**盖成「无公开价」。靠人记得手动删字段，等于没有这道保障。
+    //   放在 gate 之后：价被 sanity 拦下并回退时（gate.main）说明新价不可信，**不许**顺手清标记。
+    if (!gate.main && m.pricing_status === 'unpublished'
+        && m.input_price != null && m.output_price != null) {
+      delete m.pricing_status;
+      delete m.pricing_status_note;
+      unpublishedCleared++;
+    }
   }
 
   // v3.31.0（P0-5 / P1-7）：体检告警必须**当场可见**（stderr），随后并入 _price_audit.warnings。
@@ -968,7 +980,7 @@ async function main() {
     process.exitCode = 1;
   }
 
-  console.log(`[refresh-prices] 多源刷新完成：date=${today}，源成功 ${okCount}/${Object.keys(SOURCES).length}(国内${cnOk ? '✓' : '✗'} 国外${usdOk ? '✓' : '✗'})，人民币主价 ${updatedMain} 个，USD换算 ${autoConverted} 个，USD参考 ${usdUpdated} 个，region ${regionSet} 个${regionInferred.length ? `（⚠️${regionInferred.length} 个靠推断: ${regionInferred.join('、')}）` : ''}${lockKept ? `，lock 价保留 ${lockKept} 个` : ''}${bigDiff.length ? `，⚠️价差大：${bigDiff.join('、')}` : ''}`);
+  console.log(`[refresh-prices] 多源刷新完成：date=${today}，源成功 ${okCount}/${Object.keys(SOURCES).length}(国内${cnOk ? '✓' : '✗'} 国外${usdOk ? '✓' : '✗'})，人民币主价 ${updatedMain} 个，USD换算 ${autoConverted} 个，USD参考 ${usdUpdated} 个，region ${regionSet} 个${regionInferred.length ? `（⚠️${regionInferred.length} 个靠推断: ${regionInferred.join('、')}）` : ''}${lockKept ? `，lock 价保留 ${lockKept} 个` : ''}${unpublishedCleared ? `，补价后清「无公开价」标记 ${unpublishedCleared} 个` : ''}${bigDiff.length ? `，⚠️价差大：${bigDiff.join('、')}` : ''}`);
 }
 
 // 仅当以 `node refresh-prices.js` 直接运行时才执行主流程；被 require 时不自动跑（避免测试/复用触发联网刷新）
@@ -983,4 +995,4 @@ if (require.main === module) {
 // v3.24（F2）：新增导出 isFreeVariant / parse* / mergeWithDisk / applyUsdCachedPrice /
 // retiredLockWarnings / applyRetiredLocked，供单元测试直接验证（纯函数，无副作用）
 // v3.31.0（P0-5 / P1-7）：导出价格体检纯函数与阈值，供 selftest 离线单测（行为可验证，不靠源码守卫）
-module.exports = { save, load, todayStr, PRICING, usdFind, cnFind, looseFind, norm, median, AMBIG_WARNINGS, isFreeVariant, parseLlma, parseLlc, parseOr, parseLitellm, parsePortkey, mergeWithDisk, applyUsdCachedPrice, retiredLockWarnings, applyRetiredLocked, priceGate, restoreBlock, restoreCached, PRICE_SANITY };
+module.exports = { save, load, todayStr, PRICING, usdFind, cnFind, looseFind, norm, median, AMBIG_WARNINGS, isFreeVariant, parseLlma, parseLlc, parseOr, parseLitellm, parsePortkey, mergeWithDisk, applyUsdCachedPrice, retiredLockWarnings, applyRetiredLocked, priceGate, restoreBlock, restoreCached, PRICE_SANITY, DEFAULT_RATE };

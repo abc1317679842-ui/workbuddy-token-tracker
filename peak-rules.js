@@ -61,6 +61,32 @@ function isHolidayBeijing(tsMs, holidaysPath) {
   } catch (e) { return false; }
 }
 
+// v3.32.0（方案 H1，审计 P1-4）：该时刻所在年份的假日数据是「未知/陈旧」还是「已确认」？
+//   病根：isHolidayBeijing 的 `|| []` 把三种完全不同的状态压成同一个结果——
+//     ① years[y] = null / 键不存在 = 从未获取成功（未知）
+//     ② years[y] = []   = 旧版把「源返回 0 天」落了盘（陈旧，且 0 天在真实世界不可能，见 CHANGELOG 0 天守卫）
+//     ③ years[y] = [日期…] = 已确认（双源交叉验证过）
+//   ①②③的峰谷判定都是「按非假日降级」（不许凭空猜假日，这条红线不动），
+//   但**上层必须能看见这是降级而非事实**——2027 被当成"全年无假日"时，真假日按高峰 ×2 多算、
+//   调休上班日按周末低峰少算，双向错且此前零告警。本函数就是那个"能看见"的探针。
+//   返回 true = 该年数据不可信（判定是降级）；false = 已确认（判定是事实）。
+//   判定用 mtime 缓存同款 loadHolidays， watcher 长驻进程同样跟随文件更新。
+function holidayYearUnknown(tsMs, holidaysPath) {
+  if (!holidaysPath) return true; // 没表 = 一概未知（宁可多告警，不可静默假确认）
+  try {
+    const bj = new Date(Number(tsMs) + 8 * 3600 * 1000);
+    const y = String(bj.getUTCFullYear());
+    const h = loadHolidays(holidaysPath);
+    const v = (h.years || {})[y];
+    if (!Array.isArray(v) || v.length === 0) return true; // null / 键缺失 / 空数组 / 非数组 → 未知
+    if (h._stale === true && Array.isArray(h.stale_years)
+        && h.stale_years.map(String).indexOf(y) >= 0) return true; // 数据在但被标陈旧
+    // ↑ stale_years 元素可能是**数字**（refresh-holidays 的目标年份数组是 Number 数组），
+    //   必须两边 String 化再比，否则真实落盘形态下这条兜底永远不命中（实测 holidays.json 写出 [2027]）。
+    return false;
+  } catch (e) { return true; }
+}
+
 // tsMs：UTC epoch 毫秒（绝对时刻）→ 返回该时刻在北京时间下是否处于高峰
 function isPeakAt(tsMs, pricing, holidaysPath) {
   const bj = new Date(Number(tsMs) + 8 * 3600 * 1000);
@@ -88,4 +114,4 @@ function isPeakAt(tsMs, pricing, holidaysPath) {
   return DEFAULT_RANGES.some((r) => hm >= r.s && hm < r.e);
 }
 
-module.exports = { isPeakAt, isHolidayBeijing, parsePeakSchedule, DEFAULT_RANGES };
+module.exports = { isPeakAt, isHolidayBeijing, holidayYearUnknown, parsePeakSchedule, DEFAULT_RANGES };

@@ -59,3 +59,13 @@ rounds/
 # 本地私有：推送 SOP（含凭证）与价格库运行时数据，永不入库
 PUSH-SOP.local.md
 prices/
+
+# v3.32.0（审计 P1-10）：运行时产物——技能目录本身就是 git 工作区，git add -A 会直接提交它们。
+#   ① 通用锁文件（既有规则只覆盖 .coalesce-*.json.lock，另有 .pricing.lock / daily-usage.json.lock 等）
+#   ② KI-5 截断旗标（既有规则是 .transcript-*.jsonl，.json 后缀不匹配 → 漏）
+#   ③ 损坏文件备份（daily-usage.json.corrupt-<ts> / pricing.json.corrupt-<ts>，承载用量与价格数据）
+*.lock
+.transcript-truncated.json
+*.corrupt-*
+# v3.32.0（方案 H3）：假日自动刷新的节流状态（lastAttemptAt / lastSuccessAt）
+.holidays-refresh.json

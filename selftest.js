@@ -65,7 +65,9 @@ for (const f of SYNTAX_FILES) {
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-selftest-'));
 const skillDir = path.join(tmp, 'skills', 'token-usage-tracker');
 fs.mkdirSync(skillDir, { recursive: true });
-for (const f of ['token-tracker.js', 'refresh-prices.js', 'deepseek-official.js', 'pricing.json', 'holidays.json', 'peak-rules.js', 'recalc-day.js']) {
+// v3.32.0：refresh-holidays.js 必须随行——主脚本 v3.32.0 起 require('./refresh-holidays.js')
+//   （方案 H：触发判定共用同一实现），隔离目录缺它 = 主模块 MODULE_NOT_FOUND，整段测试全炸。
+for (const f of ['token-tracker.js', 'refresh-prices.js', 'deepseek-official.js', 'refresh-holidays.js', 'pricing.json', 'holidays.json', 'peak-rules.js', 'recalc-day.js']) {
   fs.copyFileSync(path.join(SRC, f), path.join(skillDir, f));
 }
 // v3.18.4（G2）：隔离本地官方价库——autoDiscoverCnPriceDir 第②级会扫 ~/WorkBuddy/*/prices/index.json
@@ -1561,6 +1563,167 @@ else {
   }
 }
 
+// ===== T21：v3.32.0 第三轮审计——「真价优先」不变量 + 四出口守卫（P1-1）=====
+// 病根：refresh-prices.js 对 pricing_status **零命中** —— 厂商公布单价、我们把价刷进 pricing.json 之后，
+//   'unpublished' 标记还挂在模型上 → 账本条目 cost>0 却带着 no_price → 四出口把**已算出的真金额**盖成
+//   「无公开价」。三层治理：F3 治根（补价后删标记）/ F4 兜底（cost>0 优先显示金额）/ 本段守卫。
+// 为什么除行为断言外还要**源码守卫**：v3.31.0 的教训是"共用函数已修 ≠ 调用方生效"——
+//   formatUsageRow 改好了，aggregateRangeModels 漏透传标记，区间表照样静默 ¥0.00。
+//   所以这里把"判定必须走同一个 costCellKind"也锁住，防第五个出口再复制一份旧的三元判定。
+{
+  const mod21 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  if (!mod21) ok('T21 v3.32.0 修复验证（主模块加载失败）', false, 'token-tracker.js require 失败 —— CI 正常环境下这必是回归，不允许静默跳过');
+  else {
+    const main21 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+
+    // ── a. 不变量本体：costCellKind「真价优先」 ──
+    ok('T21-a1 ★cost>0 + no_price 残留 → 显示金额（已算出的钱不许被陈旧标记藏起来）',
+      mod21.costCellKind({ cost: 3.5, no_price: true }) === 'ok');
+    ok('T21-a2 ★cost>0 + unpriced 残留 → 同样显示金额（同一类陈旧残留，判据必须一致）',
+      mod21.costCellKind({ cost: 3.5, unpriced: true }) === 'ok');
+    ok('T21-a3 cost=0 + no_price → 仍「无公开价」（红线 C4：真算不出钱的条目绝不能退回 ¥0.00）',
+      mod21.costCellKind({ cost: 0, no_price: true }) === 'no_price');
+    ok('T21-a4 cost=0 + unpriced → 「未收录」，且定序优先于 no_price（两标记互斥，此处只锁兜底顺序）',
+      mod21.costCellKind({ cost: 0, unpriced: true, no_price: true }) === 'unpriced'
+      && mod21.costCellKind({ cost: 0, no_price: true }) === 'no_price');
+    ok('T21-a5 cost=0 且无标记 → ¥0.00（真免费的模型照常显示 0，不许被误标）',
+      mod21.costCellKind({ cost: 0 }) === 'zero');
+
+    // ── b. 四出口：同一个矛盾态条目，各出口口径必须一致 ──
+    const row21 = mod21.formatUsageRow(
+      { label: 'm-x', in: 1000, out: 500, cached: 0, total: 1500, cost: 3.5, no_price: true, hit: 0 }, false);
+    ok('T21-b1 ★表格行出口：cost>0 + no_price → 显示 ¥金额且不含「无公开价」',
+      row21.includes('¥') && !row21.includes('无公开价'), row21);
+    const fnBody21 = (name) => {
+      const i = main21.indexOf('function ' + name);
+      if (i < 0) return '';
+      const j = main21.indexOf('\nfunction ', i + 10);
+      return stripComments(main21.slice(i, j > i ? j : undefined));
+    };
+    ok('T21-b2 ★表格行判定走共用 costCellKind（不是自己抄一份三元判定）',
+      fnBody21('formatUsageRow').includes('costCellKind(s)'), '红 = formatUsageRow 又内联了自己的优先级');
+    ok('T21-b3 ★CSV 判定走共用 costCellKind（此前两份判定各抄一遍 → 改一处漏一处是必然）',
+      fnBody21('exportReportCsv').includes('costCellKind(m)'), '红 = CSV 又复制了一份旧判定');
+    ok('T21-b4 ★全文件不得残留第三份 unpriced 三元判定（出现即新出口漏改）',
+      (stripComments(main21).match(/\bs\.unpriced \? '未收录'|\bm\.unpriced \? 'unpriced'/g) || []).length === 0);
+
+    // ── c. 区间透传：只传"当天真缺价"的标记 ──
+    const agg21a = mod21.aggregateRangeModels(
+      { '2026-10-01': { models: { 'm-x': { in: 10, out: 5, cached: 0, total: 15, cost: 3.5, no_price: true } } } },
+      '2026-10-01', '2026-10-02');
+    ok('T21-b5 ★区间透传：当天 cost>0 的陈旧标记不传播（否则整段发「合计偏低」假告警）',
+      !agg21a.models['m-x'].no_price, JSON.stringify(agg21a.models['m-x'] || null));
+    const agg21b = mod21.aggregateRangeModels(
+      { '2026-10-01': { models: { 'm-y': { in: 10, out: 5, cached: 0, total: 15, cost: 0, no_price: true } } } },
+      '2026-10-01', '2026-10-02');
+    ok('T21-b6 区间透传：当天 cost=0 的真缺价标记照传（月中补价的混合场景必须保住告警）',
+      agg21b.models['m-y'].no_price === true, JSON.stringify(agg21b.models['m-y'] || null));
+
+    // ── d. F3 治根：refresh-prices 补到真价后必须清标记 ──
+    const rf21 = stripComments(fs.readFileSync(path.join(SRC, 'refresh-prices.js'), 'utf-8').replace(/\r\n/g, '\n'));
+    ok('T21-c1 ★补价成功后 delete m.pricing_status（此前该文件对该字段零命中 = P1-1 病根）',
+      rf21.includes('delete m.pricing_status'), '红 = 补了价却不摘「无公开价」帽子，矛盾条目还会继续产生');
+    ok('T21-c2 清标记必须在 sanity gate 判定之后（价被 sanity 拦下回退时不许顺手清标记）',
+      rf21.indexOf('const gate = priceGate') >= 0
+      && rf21.indexOf('const gate = priceGate') < rf21.indexOf('delete m.pricing_status')
+      && rf21.includes('!gate.main'), '红 = 新价不可信时仍清标记，等于白捡一个假"已公布价"');
+
+    // ── e. F7：兜底汇率单一真源 ──
+    const rp21x = (() => { try { return require(path.join(SRC, 'refresh-prices.js')); } catch (e) { return null; } })();
+    ok('T21-d1 ★DEFAULT_RATE 单一真源：refresh-prices 导出 7.2，tt.js 兜底处引用它且全文件无第二个字面量',
+      !!rp21x && rp21x.DEFAULT_RATE === 7.2
+      && stripComments(main21).includes('priceRefreshModule.DEFAULT_RATE')
+      && (stripComments(main21).match(/: 7\.2(?!\d)/g) || []).length === 0,
+      '红 = 两处兜底汇率改不同步会静默跑偏（P1-3）');
+  }
+}
+
+// ===== T22：v3.32.0 方案 H——假日三态语义 + 自适应触发判定（审计 P1-4）=====
+// 病根：peak-rules 的 `years[y] || []` 把「null/缺键=未知」「[]=旧版 0 天落盘残留」「[日期…]=已确认」
+//   压成同一结果 → `2027: []` 被当"全年无假日"，真假日按高峰 ×2 多算、调休上班日按周末低峰少算，双向错且零告警。
+//   且 refresh-holidays 零调用方 → 数据永不更新。方案 H：三态语义（peak-rules 探针）+ 四条件自适应刷新
+//   （holidayRefreshNeeded 纯函数，主脚本与 selftest 共用实现）+ 挂每日链路 + --check 体检。
+{
+  const pr22 = (() => { try { return require(path.join(SRC, 'peak-rules.js')); } catch (e) { return null; } })();
+  const rh22 = (() => { try { return require(path.join(SRC, 'refresh-holidays.js')); } catch (e) { return null; } })();
+  if (!pr22 || !rh22) {
+    ok('T22 模块加载', false, 'peak-rules.js / refresh-holidays.js require 失败');
+  } else {
+    const dir22 = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-holidays-'));
+    const hp22 = path.join(dir22, 'holidays.json');
+    fs.writeFileSync(hp22, JSON.stringify({
+      years: { '2025': ['2025-01-01'], '2026': ['2026-01-01', '2026-10-01'], '2027': null, '2024': [], '2023': ['2023-01-01'] },
+      _stale: true, stale_years: ['2023'], stale_detail: { '2023': { since: '2026-10-04', reason: 'fixture' } },
+    }));
+    const ts22 = (s) => new Date(s + 'T12:00:00Z').getTime() - 8 * 3600e3; // 北京时间正午的 epoch ms
+    ok('T22-a1 ★null 年（从未获取成功）→ 未知=true（2027 病灶形态）',
+      pr22.holidayYearUnknown(ts22('2027-05-01'), hp22) === true);
+    ok('T22-a2 键缺失年 → 未知=true',
+      pr22.holidayYearUnknown(ts22('2028-05-01'), hp22) === true);
+    ok('T22-a3 ★[] 空数组（旧版 0 天落盘残留）→ 未知=true（不许再当"全年无假日"）',
+      pr22.holidayYearUnknown(ts22('2024-05-01'), hp22) === true);
+    ok('T22-a4 非空数组且未标陈旧 → 已确认=false',
+      pr22.holidayYearUnknown(ts22('2026-05-01'), hp22) === false
+      && pr22.holidayYearUnknown(ts22('2025-05-01'), hp22) === false);
+    ok('T22-a5 ★非空数组但被 _stale/stale_years 点名 → 未知=true（数据在但不可信）',
+      pr22.holidayYearUnknown(ts22('2023-05-01'), hp22) === true);
+    // v3.32.0 补验：真实落盘形态 stale_years 是**数字数组**（refresh 目标年份是 Number）→ 必须两边 String 化
+    const hp22n = path.join(dir22, 'holidays-num.json');
+    fs.writeFileSync(hp22n, JSON.stringify({
+      years: { '2026': ['2026-01-01'] }, _stale: true, stale_years: [2026],
+    }));
+    ok('T22-a5b ★stale_years 为数字数组（真实落盘形态）→ 同样命中（String 化比对）',
+      pr22.holidayYearUnknown(ts22('2026-05-01'), hp22n) === true);
+    ok('T22-a6 文件不存在 → 未知=true（宁可多告警，不可静默假确认）',
+      pr22.holidayYearUnknown(ts22('2026-05-01'), path.join(dir22, 'no-such.json')) === true);
+    ok('T22-b1 ★isHolidayBeijing 已确认年判定零变化（零噪音红线 C7）',
+      pr22.isHolidayBeijing(ts22('2026-10-01'), hp22) === true
+      && pr22.isHolidayBeijing(ts22('2026-10-09'), hp22) === false);
+    ok('T22-b2 ★isHolidayBeijing 未知年保持「非假日」降级（不许凭空猜假日，红线不动）',
+      pr22.isHolidayBeijing(ts22('2027-10-01'), hp22) === false);
+    // holidayRefreshNeeded：主脚本与 selftest 共用同一实现（不许两边各抄一份条件）
+    const now22 = Date.now();
+    const clean22 = { years: { '2026': ['2026-01-01'], '2027': ['2027-01-01'] } };
+    ok('T22-c1 ★缺今年 → missing-current（当前计费正在用，任何月份都紧急）',
+      rh22.holidayRefreshNeeded({ years: {} }, {}, now22) === 'missing-current');
+    ok('T22-c2 ★全齐 + 30 天内成功过 → null（完全不联网、零成本）',
+      rh22.holidayRefreshNeeded(clean22, { lastSuccessAt: now22 }, now22) === null);
+    ok('T22-c3 ★缺明年 + 10 月 → probe-next-year（国务院次年安排约 11 月发布，10-12 月每日探测）',
+      rh22.holidayRefreshNeeded({ years: { '2026': ['2026-01-01'] } }, { lastSuccessAt: now22 },
+        new Date('2026-10-15T04:00:00Z').getTime()) === 'probe-next-year');
+    ok('T22-c4 缺明年 + 9 月 + 近期成功 → null（发布窗口外不空跑）',
+      rh22.holidayRefreshNeeded({ years: { '2026': ['2026-01-01'] } }, { lastSuccessAt: now22 },
+        new Date('2026-09-15T04:00:00Z').getTime()) === null);
+    ok('T22-c5 ★任一年 _stale → stale（持续重试直到成功）',
+      rh22.holidayRefreshNeeded({ years: clean22.years, _stale: true, stale_years: ['2025'] }, {}, now22) === 'stale');
+    ok('T22-c6 全齐 + 距上次成功 > 30 天 → aged（低频兜底，防源方补录调休）',
+      rh22.holidayRefreshNeeded(clean22, { lastSuccessAt: now22 - 40 * 24 * 3600e3 }, now22) === 'aged');
+    // 源码守卫：0 天/两源全失败 → 落盘必须是 null 占位，绝不允许 [] 复发（C9）
+    const rf22 = stripComments(fs.readFileSync(path.join(SRC, 'refresh-holidays.js'), 'utf-8').replace(/\r\n/g, '\n'));
+    ok('T22-d1 ★0 天/全失败分支写 null 显式占位（keepOldOrMarkUnknown）',
+      rf22.includes('yearsMap[String(y)] = null'), '红 = 空数组落盘复发，2027 病灶形态回来');
+    ok('T22-d2 ★全文件不得存在 yearsMap 空数组赋值（防有人把占位改回去）',
+      (rf22.match(/yearsMap\[String\(y\)\]\s*=\s*\[\]/g) || []).length === 0);
+    // --check 只读体检（端到端，SPAWN_OK 才跑）
+    if (!SPAWN_OK) {
+      envSkip('T22-e --check 只读体检', SPAWN_SKIP_REASON);
+    } else {
+      const r22 = spawnSync(NODE, [path.join(SRC, 'refresh-holidays.js'), '--check'], {
+        windowsHide: true, timeout: 20000,
+        env: Object.assign({}, process.env, { WB_ROOT: dir22, TOKEN_TRACKER_NO_TOAST: '1' }),
+      });
+      const out22 = String(r22.stdout || '');
+      ok('T22-e1 ★--check 只读体检：exit 0 + 点名未知/陈旧年份 + 给出建议动作',
+        r22.status === 0 && out22.includes('2027') && out22.includes('2023')
+        && (out22.includes('未知') || out22.includes('陈旧')), `exit=${r22.status} out=${out22.slice(0, 200)}`);
+      const after22 = fs.readFileSync(hp22, 'utf-8');
+      ok('T22-e2 ★--check 不写盘（体检就是体检，文件逐字节不变）',
+        after22 === fs.readFileSync(path.join(dir22, 'holidays.json'), 'utf-8') && after22.includes('2027'));
+    }
+    fs.rmSync(dir22, { recursive: true, force: true }); // 临时 fixture 清理（本目录自产自销）
+  }
+}
+
 // ===== 导出一致性（A-16）：自动推导，替代"手工清单"的兜底 =====
 // 病根：selftest 里"新增导出必须存在"是**三张手工清单**（T8-N1g/N2 的 typeof 检查、T11-a 的 `exported`、
 //   T12-a 的 `ex12`），全靠人记得往里加。`cleanupCoalesceLocks` 三张都不含 → 一旦它"定义还在、导出没了"，
@@ -1571,7 +1734,7 @@ else {
 {
   const selfCode = stripComments(fs.readFileSync(path.join(SRC, 'selftest.js'), 'utf-8'));
   // 被测主模块在 selftest 里的全部局部变量名（grep 得来，勿漏；均为 require(skillDir/token-tracker.js) 的别名）
-  const MOD_VARS = ['mod', 'ttMod', 'tt2', 'mod16', 'mod17', 'mod18', 'mod19', 'mod20'];
+  const MOD_VARS = ['mod', 'ttMod', 'tt2', 'mod16', 'mod17', 'mod18', 'mod19', 'mod20', 'mod21'];
   const memberRe = new RegExp('\\b(?:' + MOD_VARS.join('|') + ')\\.([A-Za-z_$][A-Za-z0-9_$]*)', 'g');
   const referenced = new Set();
   let mm;

@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.31.0-blue)
+![Version](https://img.shields.io/badge/version-v3.32.0-blue)
 
 > 在每次回答后显示 **Token 消耗 / 耗时 / 折算费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -34,9 +34,9 @@
 模型长时间思考时你点了停止，这轮思考**已经用掉 token 且已被计费**，但平台不会把这段的 usage 写进本地文件。本技能在这条路径上做的是**估算**：
 
 - **输入侧**：往前找最近一次有 usage 的调用，**拿它的输入量当本轮输入量的近似**（同一会话上下文连续，量级接近）；
-- **输出侧**：按本地记到的思考文本长度粗算（中文约 1.5 字/token，其他字符约 4 字符/token）。
+- **输出侧**：按本地记到的思考文本长度粗算（**1 汉字 ≈ 1.5 token**，其他字符约 4 字符/token；与脚本 `cjk*1.5` 同口径）。
 
-**这个数字与真实计费不是一回事**：思考过程本身可能就没完整落盘（被截断），所以**通常偏低**。看到弹窗标注 `（估算）` 时，请当量级参考，不要当账单。
+**这个数字与真实计费不是一回事**，且**偏差方向不确定**：输入侧的近似系数偏高、而思考文本本身可能没完整落盘（被截断，这部分偏低），两股偏差方向相反、净结果不保证偏向哪边。看到弹窗标注 `（估算）` 时，请当量级参考，不要当账单。
 
 > **要对账，请以你的 API 服务商账单 / WorkBuddy 积分消耗记录为准。**
 >
@@ -121,7 +121,7 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 |---|---|
 | 🪟 **每轮即时推送** | 回答结束后，Windows 系统通知（toast）立即弹出本条消耗，**两行大字紧凑布局**：行1 第一行 = 模型名 + 时段标注（高峰双倍/夜间X折）；行1 第二行 = 耗时 + 今日累计消费 + 余额；行2 = 输入 / 输出 + 缓存占比 + 费用 |
 | 📊 **今日累计消费** | toast 行1 显示当天总消费 `今日¥X.XX`（读取每日账本 total.cost） |
-| 📓 **每日分模型账本** | 每轮 Stop 自动把消耗**按模型**累计进 `daily-usage.json`（本地日期分桶）：`{日期:{models:{模型:{in,out,cached,total,cost}}, total:{...}}}`——每个模型一行（输入/输出/缓存命中/总 token/金额）+ 不分模型的当日总合计；**长期保存不裁剪**，历史天仅保留各模型 + 合计，文件紧凑。查看：`--report`（今天）/ `--report all`（全部天）/ `--report <日期>`（明细+合计）；`--report summary [all|<日期>]` 只看每天**总合计**一行 |
+| 📓 **每日分模型账本** | 每轮 Stop 自动把消耗**按模型**累计进 `daily-usage.json`（本地日期分桶）：`{日期:{models:{模型:{in,out,cached,total,cost,hit}}, total:{...}}}`——每个模型一行（输入/输出/缓存命中/总 token/金额）+ 不分模型的当日总合计；`hit` 为该模型当日**缓存命中率**（百分比，`v3.30.0+` 落盘；旧数据由展示层现算兜底）；**长期保存不裁剪**，历史天仅保留各模型 + 合计，文件紧凑。查看：`--report`（今天）/ `--report all`（全部天）/ `--report <日期>`（明细+合计）；`--report summary [all|<日期>]` 只看每天**总合计**一行 |
 | 📅 **区间报表**（v3.20.0） | `--report week`（近 7 天）/ `--report month`（本月至今）/ `--report 2026-09-01..2026-09-30`（任意闭区间）→ 输出**一张按模型的汇总表**（列结构与单日完全一致）+ 合计行。区间命中率按 **Σ缓存/Σ输入 重算**，不是各天均值（跨天 token 量差 100 倍时均值毫无意义）；起止写反自动纠正；**既有四个入口的输出逐字节不变** |
 | 📤 **CSV 导出**（v3.20.0） | `--report week --csv` / `--report all --csv` / `--report 2026-09-30 --csv` → 落盘到 `exports/report-<范围>-<时间戳>.csv`（**逐日 × 逐模型**明细 + `ALL` 合计行，可在 Excel 里自行透视）。带 **UTF-8 BOM**，中文列头不乱码；命令只回一行路径，不把几十行数据灌进对话 |
 | 📈 **消耗外推**（v3.20.0） | `--report forecast` → 今日 token 速率外推 + 近 7 日实测均值对照。**只推 token，不推金额**（金额本身是折算值，再外推一次只会制造"这个月要花多少钱"的错觉）；样本不足 2 天时拒绝计算 |
@@ -169,7 +169,8 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 
 | 开关常量 | 默认值 | 联网功能 | 请求目标 | 是否携带密钥 |
 |---|---|---|---|---|
-| `ENABLE_NETWORK` | `true` | **总开关**——`false` 时 `token-tracker.js` **自身**的所有联网功能一律跳过（含 4 个分开关，**也包括每日自动调起的本地价库 Python 流水线**，见 `loadPricing` → `maybeRefreshLocalDb`）。注意：兄弟脚本（`refresh-prices.js`/`deepseek-official.js`）只认 `WB_NO_NET=1` 环境变量；`refresh-holidays.js` 无任何开关、**也不会被自动调用**（只在你手动运行时联网） | — | — |
+| `ENABLE_NETWORK` | `true` | **总开关**——`false` 时 `token-tracker.js` **自身**的所有联网功能一律跳过（含 5 个分开关，**也包括每日自动调起的本地价库 Python 流水线**，见 `loadPricing` → `maybeRefreshLocalDb`）。注意：兄弟脚本（`refresh-prices.js`/`deepseek-official.js`）只认 `WB_NO_NET=1` 环境变量 |
+| `ENABLE_HOLIDAY_REFRESH` | `true` | **分开关5（v3.32.0）**——法定假日表自适应自动刷新（`loadPricing` → `maybeRefreshHolidays` → detach spawn `refresh-holidays.js`）。四条件触发（缺今年 / 10-12 月缺明年 / 任一年陈旧 / >30 天未成功），不满足**完全不联网**，同日最多尝试一次。数据源为 2 个 GitHub 公开仓库（零密钥、不含本地数据）。关掉后峰谷判定遇到数据缺失年份按「非假日」降级并打 stderr 告警，修复用 `node refresh-holidays.js <年>` |
 | *(非开关项)* 本地价库 Python 流水线 | 只认总开关 | `fetch-cn-prices.py` → `parse_tokenhub.py` → `build_index.py`，由 `loadPricing()` **每日首次调用时自动后台调起**（`~12s`，非阻塞；每天成功一次即不再跑，失败按 3/10/30/60 分钟退避、当日满 5 次熔断）。`ENABLE_PRICE_REFRESH=false` **不会**关掉它 | `llmabacus` / 各厂商官网 / 腾讯云 TokenHub 文档页 | 否 |
 | `ENABLE_BALANCE_QUERY` | **`false`** | 余额查询 | 仅 `https://api.deepseek.com/user/balance` | ⚠️ **是**（DeepSeek API key） |
 | `ENABLE_PRICE_REFRESH` | `true` | 每日价格自动刷新 | **5 个公开价格源**：llmabacus（`llmabacus.com/api/prices`）、llm-prices-cn（GitHub raw）、OpenRouter（`openrouter.ai/api/v1/models`）、LiteLLM（GitHub raw）、Portkey（`configs.portkey.ai/pricing/<provider>.json`） | 否 |
@@ -196,7 +197,19 @@ const ENABLE_UPDATE_CHECK = loadLocalFlag('enable_update_check', true);    // �
 
 ## 🔐 隐私与数据安全
 
-> 完整的**出网主机清单、本地写盘位置、诊断日志内容、已知限制（固定汇率）**见 [CHANGELOG.md](CHANGELOG.md) 的「隐私与安全」章节（v3.18 起集中维护，本文件不重复抄写）。
+**出网主机清单（全部匿名只读，除余额查询外零密钥；完整的本地写盘位置、诊断日志内容、已知限制见 [CHANGELOG.md](CHANGELOG.md) 的「隐私与安全」章节）**：
+
+| 主机 | 用途 | 密钥 |
+|---|---|---|
+| `api.deepseek.com` | DeepSeek 官方价（`/models`）；余额查询（`/user/balance`） | 价：无；余额：需你的 DeepSeek key（默认关闭） |
+| `api-docs.deepseek.com` | DeepSeek 官方定价页解析 | 无 |
+| `www.llmabacus.com` | 聚合价源（国内·人民币·主） | 无 |
+| `raw.githubusercontent.com` | `szp2005/llm-prices-cn`（国内备）、`BerriAI/litellm`（USD）、`NateScarlet/holiday-cn` + `HankAviator/china-holiday-calendar`（法定假日表） | 无 |
+| `api.github.com` | 假日表 contents API（v3.32.0 起每日链路自适应触发）、版本更新检查（每 7 天） | 无 |
+| `openrouter.ai` | 聚合价源（USD） | 无 |
+| `configs.portkey.ai` | 聚合价源（USD） | 无 |
+
+请求内容一律不含本地对话/账本数据；假日与版本检查只读公开仓库。
 
 ## 🔐 余额查询安全性说明
 
@@ -349,7 +362,7 @@ cp -r workbuddy-token-tracker ~/.workbuddy/skills/token-usage-tracker
 | `refresh-prices.js` | 多源价格刷新（每天首次运行自动触发，也可手动跑） |
 | `peak-rules.js` | 峰谷时段判定的**唯一实现**：主脚本 / `backfill.js` / `recalc-day.js` 共用（v3.19.0 起，消除三份硬编码副本） |
 | `deepseek-official.js` | DeepSeek 官方定价抓取（被 refresh-prices 调用） |
-| `refresh-holidays.js` | 中国法定节假日双源刷新（峰谷计费用，手动运行）。两源不一致时**取交集**（保守）并在 **stderr 逐日告警**（列出仅 A / 仅 B 认定的假日）；差异按年落 `holidays.json` 的 `cross_check_diff.<年份>.only_a / .only_b` |
+| `refresh-holidays.js` | 中国法定节假日双源刷新（峰谷计费用）。**v3.32.0 起默认自动**：每日链路按四条件自适应触发（缺今年 / 10-12 月缺明年 / 任一年陈旧 / >30 天未成功），无需手动；强制触发 `node refresh-holidays.js <年>`，只读体检 `node refresh-holidays.js --check`。两源不一致时**取交集**（保守）并在 **stderr 逐日告警**（列出仅 A / 仅 B 认定的假日）；差异按年落 `holidays.json` 的 `cross_check_diff.<年份>.only_a / .only_b`；缺数据年份落 `null` + `_stale/stale_years` 标记（**绝不写空数组**） |
 | `peak-rules.js` | 峰谷时段判定的**唯一实现**（主脚本 / `recalc-day.js` / `backfill.js` 共用，避免三处硬编码口径分裂） |
 | `fetch-cn-prices.py` | 国内厂商官网价抓取（Python 3；`requests` 可选，缺失自动回退 urllib） |
 | `parse_tokenhub.py` / `build_index.py` | 本地官方价库解析/建索引（可选） |

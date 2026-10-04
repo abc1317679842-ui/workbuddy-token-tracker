@@ -1,5 +1,13 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.31.0 (2026-10-03)
+// token-usage-tracker v3.32.0 (2026-10-04)
+// v3.32.0：**第三轮全量审计（2026-10-04，25 文件 14,957 行）落地** ——
+//   ① P1-1 治根+兜底+守卫三层：refresh-prices 补价成功后删 pricing_status（此前全文件零命中）；
+//      四出口新增共用判定 costCellKind（真价优先 cost>0，未收录/无公开价措辞不变）；T21 段 14 条断言。
+//   ② P1-4 方案 H：假日年份三态语义（null=未知，废除空数组）+ holidayYearUnknown 探针 +
+//      四条件自适应自动刷新挂每日链路（maybeRefreshHolidays）+ --check 只读体检 + 2027:[] 数据迁移。
+//   ③ P1-3 汇率单一真源（DEFAULT_RATE）；P1-10 .gitignore 补 4 条；P1-12 KI-8 编号去重；
+//      文档订正 7+ 处（量纲/偏差方向/触发路径/零依赖口径/出网清单内联/hit 字段）。
+//   不修项（裁决记 KNOWN-ISSUES）：P1-6 savePricing 不持锁 / P1-9 日志轮转 / P1-5 源A单位校验。
 // v3.31.0：**第二轮审计（2026-10-02 深夜）静默错价/口径分裂集中修复** ——
 //   ① 峰谷判定时刻两出口分裂（最严重）：账本 recordUsage 对 byModel 每个模型都用**同一个**
 //      批级 peakTs 判峰谷，弹窗却按各模型**自己的** lastTs 判 → 跨 12:00/18:00 边界的混合轮
@@ -271,6 +279,13 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const peakRules = require('./peak-rules.js'); // v3.19.0（P1）：峰谷判定的单一实现，与 backfill/recalc-day 共用
+// v3.32.0（方案 H2/H3）：触发判定纯函数与主脚本共用同一实现（不许两边各抄一份条件）。
+//   refresh-holidays.js 顶部 IIFE 有 require.main 守卫（v3.29.0），被 require 不会联网/写盘。
+const holidayModule = require('./refresh-holidays.js');
+// v3.32.0（P1-3）：USD→CNY 兜底汇率**单一真源**在 refresh-prices.js（DEFAULT_RATE）——
+//   此前 addModelPrice 兜底处又硬编码了一个 7.2，两处一旦改不同步就会静默跑偏。require 无循环
+//   （refresh-prices → deepseek-official，均不反向依赖主脚本），且两者顶层都有 require.main 守卫。
+const priceRefreshModule = require('./refresh-prices.js');
 
 // v3.16（2026-09-28，外部用户 PR#2 要点采纳）：数据根智能探测。
 // 背景：较新版本 WorkBuddy 客户端可能把数据根迁移到 ~/.workbuddy-ai（~/.workbuddy 仅剩
@@ -315,6 +330,11 @@ const ENABLE_MODEL_LOOKUP = true;   // 分开关3：新模型价格自动补录�
 //   默认开启；要关掉在技能目录的 local-config.json 写 {"enable_update_check": false}。
 //   作用范围：仅在 `--hook` 路径触发（用户提问时），7 天闸门 → 绝大多数轮次零联网。
 const ENABLE_UPDATE_CHECK = loadLocalFlag('enable_update_check', true);
+// v3.32.0（方案 H3）：分开关5——假日数据自适应自动刷新（2 个 GitHub 公开仓库请求，零密钥、不含本地数据）。
+//   默认开启：DeepSeek 峰谷计费依赖法定假日表，表过期/缺失 = 双向静默计费偏差（真假日按高峰×2 多算、
+//   调休上班日按周末低峰少算）。触发条件见 refresh-holidays.js 的 holidayRefreshNeeded（不满足完全不联网）。
+//   要关掉在 local-config.json 写 {"enable_holiday_refresh": false}。
+const ENABLE_HOLIDAY_REFRESH = loadLocalFlag('enable_holiday_refresh', true);
 // 余额查询安全性：开启后仅向官方 https://api.deepseek.com/user/balance 发送请求，密钥只通过
 // Authorization: Bearer 头传给该官方域名，不会发给第三方；请求内容不含任何本地数据。
 const SNAP_DIR = path.join(WB, 'skills', 'token-usage-tracker');
@@ -2535,7 +2555,51 @@ function loadPricing() {
   try { p = JSON.parse(fs.readFileSync(PRICING, 'utf-8')); } catch (e) { return null; }
   try { p = mergeLocalPriceDb(p); } catch (e) {}
   try { if (ENABLE_NETWORK) maybeRefreshLocalDb(); } catch (e) {}
+  // v3.32.0（方案 H3）：假日数据自适应自动刷新，与 maybeRefreshLocalDb 并列挂每日链路。
+  //   开关/四条件/同日节流都在函数内自带（进程内每实例只判一次，热路径零 IO 增量）。
+  try { maybeRefreshHolidays(); } catch (e) {}
   return p;
+}
+
+// v3.32.0（方案 H3，审计 P1-4）：假日数据此前**零调用方**（README 自认"不会被自动调用"）——
+//   数据永不更新，2027 拿不到就永远空着；靠人记得手动跑 = 等于没有。现挂进每日刷新链路：
+//   每进程最多判定一次（loadPricing 高频调用，gHolidayRefreshKicked 闸门保证零 IO 增量）；
+//   命中 holidayRefreshNeeded 四条件之一才 spawn **detach** 子进程联网刷新（照 --round-watch 写法，
+//   同步会卡 hook 提问路径）；同日只试一次（lastAttemptDay 节流，stale 重试的天粒度）。
+//   子进程成败主流程不感知也不等——数据由 refresh-holidays.js 原子落盘 + 写回 lastSuccessAt；
+//   失败仅其内部退出码，可观测走 `node refresh-holidays.js --check`（只读体检）。
+let gHolidayRefreshKicked = false;
+function maybeRefreshHolidays() {
+  if (gHolidayRefreshKicked) return;
+  gHolidayRefreshKicked = true;
+  if (!(ENABLE_NETWORK && ENABLE_HOLIDAY_REFRESH)) return;
+  const statePath = path.join(SNAP_DIR, '.holidays-refresh.json');
+  const dataPath = path.join(SNAP_DIR, 'holidays.json');
+  let h = {}, state = {};
+  try { h = JSON.parse(fs.readFileSync(dataPath, 'utf-8')); } catch (e) { h = {}; }
+  try { state = JSON.parse(fs.readFileSync(statePath, 'utf-8')); } catch (e) { state = {}; }
+  const nowMs = Date.now();
+  const need = holidayModule.holidayRefreshNeeded(h, state, nowMs);
+  if (!need) return; // 四条件全不命中 → 完全不联网、零成本、零噪音
+  const day = todayStr();
+  if (state && state.lastAttemptDay === day) return; // 同日已试过（成败都算），明天再说
+  try {
+    fs.writeFileSync(statePath, JSON.stringify(Object.assign({}, state, {
+      lastAttemptDay: day, lastAttemptAt: nowMs, lastReason: need,
+    })));
+  } catch (e) { /* 状态写失败则本轮照试，最坏同日多试一次 */ }
+  try {
+    const child = require('child_process').spawn(process.execPath, [path.join(__dirname, 'refresh-holidays.js')], {
+      detached: true, stdio: 'ignore', windowsHide: true,
+      env: Object.assign({}, process.env, { WB_ROOT: WB }), // 与读取方同一 WB_ROOT 解析（P1-16 口径）
+    });
+    child.on('error', (e) => {
+      process.stderr.write(`[token-tracker] 假日数据刷新启动失败(异步): ${(e && e.message) || e}\n`);
+    });
+    child.unref();
+  } catch (e) {
+    process.stderr.write(`[token-tracker] 假日数据刷新 spawn 失败: ${(e && e.message) || e}\n`);
+  }
 }
 
 // v3.18.1（N6）：模型"已查未收录"列表——本地 sidecar 文件（.lookedup-models.json，.gitignore 排除），
@@ -2838,8 +2902,21 @@ function cleanModelName(name) {
 //   误导后人「照这里改」。现仅保留 HOLIDAYS_FILE 供 isPeakHour 使用；假日与时段判定全部走 peak-rules.js。
 const HOLIDAYS_FILE = path.join(WB, 'skills', 'token-usage-tracker', 'holidays.json');
 
+// v3.32.0（方案 H4）：峰谷真受影响时的**降级可见性**——有 DeepSeek 官方动态时段 + 该年假日数据未知/陈旧
+//   → 峰谷判定是降级而非事实，必须让用户看见（此前 2027:[] 被当"全年无假日"，双向错且零告警）。
+//   进程内每年至多 1 条 stderr（Set 去重；isPeakHour 是计费热路径，绝不能每笔都打）。
+const _holidayWarnedYears = new Set();
 function isPeakHour(rules, now) {
   const t = now || new Date();
+  if (rules && typeof rules === 'object' && rules.peak_schedule && HOLIDAYS_FILE) {
+    try {
+      const yNow = new Date(t.getTime() + 8 * 3600e3).getUTCFullYear();
+      if (!_holidayWarnedYears.has(yNow) && peakRules.holidayYearUnknown(t.getTime(), HOLIDAYS_FILE)) {
+        _holidayWarnedYears.add(yNow);
+        process.stderr.write(`[token-tracker] ⚠ ${yNow} 年法定假日数据未知或已陈旧 → 该年峰谷判定按「非假日」降级：真假日按高峰 ×2 多算、调休上班日按周末低峰少算；联网后跑 node refresh-holidays.js ${yNow} 可修复（默认自动链路也会探测）\n`);
+      }
+    } catch (e) { /* 告警失败绝不影响计费判定本身 */ }
+  }
   // v3.19.0（P1）：判定逻辑抽到 peak-rules.js 单一实现——backfill/recalc-day 调用同一模块。
   // 旧实现是三份复制（靠注释约束同步），官方改时段时只同步了假日、没同步时段 → 同一批数据金额差一倍。
   return peakRules.isPeakAt(t.getTime(), { deepseek_rules: rules }, HOLIDAYS_FILE);
@@ -3364,6 +3441,21 @@ function incrementalRecord(tsPath, sid, meta) {
   }, { ttl: 300000, retries: 30, retryDelay: 100 }); // v2.82.1：水位线锁；拿不到锁 → 本轮跳过，下轮补记
 }
 
+// ===== v3.32.0（P1-1 兜底）：金额格「该显示什么」的唯一判定 =====
+// 病根：此前「无公开价 / 未收录」的判定被**抄了三份**（表格行 / CSV / 区间透传），改一处漏一处是必然——
+//   v3.31.0 修 unpriced 时就踩过：formatUsageRow 改好了，aggregateRangeModels 没透传标记 → 区间表静默 ¥0.00。
+// 语义（**真价优先**，见 plan-v3.32.0 §0.2 裁决）：
+//   cost > 0 = 这笔钱已经算出来了 → 显示金额。此时若还挂着 no_price / unpriced 标记，
+//   那标记必是**陈旧残留**（价已补录但标记没清）；把已算出的钱藏起来 = 信息丢失，重于少显示一个标记。
+//   cost == 0 + 标记 = 钱真算不出来 → 显示成因（未收录 / 无公开价），绝不显示 ¥0.00（会被读成"免费"）。
+// 注意：本函数只决定「显示什么」，**不改账本标记**；告警尾注另走一套判据（见各尾注处的注释）。
+function costCellKind(s) {
+  if (s.cost > 0) return 'ok';
+  if (s.unpriced) return 'unpriced';
+  if (s.no_price) return 'no_price';
+  return 'zero';
+}
+
 // ===== v3.20.0：账本表格行格式化（reportTxt / reportRangeTxt 共用）=====
 // 抽出来只为一件事：让「单日/all」与「区间」两个入口的列格式**永远不可能失配**。
 // 若以后要加列，只改这里一处；selftest 有一条「既有入口逐字节不变」的断言兜底。
@@ -3378,7 +3470,12 @@ function formatUsageRow(s, bold) {
   //   它与 no_price（厂商未公布单价）是两种成因、两种处置，措辞**刻意不同**，用户一眼能分：
   //     「无公开价」= 等厂商公布；「未收录」= 我们没这模型，先把单价补进 pricing.json。
   //   两标记由 addModelUsage 互斥写入，这里先判 unpriced 只是为了兜底顺序确定。
-  const costCell = s.unpriced ? '未收录' : (s.no_price ? '无公开价' : (s.cost > 0 ? fmtCost(s.cost) : '¥0.00'));
+  // v3.32.0（P1-1 兜底）：判定交给 costCellKind 一处，本行不再自己排优先级——
+  //   真价优先（cost>0 → 显示金额）由那一个函数统一保证，CSV 与区间表共用同一判据。
+  const kindRow = costCellKind(s);
+  const costCell = kindRow === 'unpriced' ? '未收录'
+    : kindRow === 'no_price' ? '无公开价'
+      : (s.cost > 0 ? fmtCost(s.cost) : '¥0.00');
   return `| ${f(s.label)} | ${f(fmt(s.in))} | ${f(fmt(s.out))} | ${f(fmt(s.cached))} | ${f(hit)} | ${f(fmt(s.total))} | ${f(costCell)} |`;
 }
 // ===== v3.20.0：--report 区间 / CSV / 外推 =====
@@ -3438,12 +3535,16 @@ function aggregateRangeModels(d, from, to) {
       t.total += m.total || 0; t.cost += m.cost || 0;
       // v3.27.0：区间聚合透传 no_price（任一天有标记即整段标记）——否则区间表会把无公开价
       // 模型的金额显示成 ¥0.00，与单日表口径不一致（同一份数据两个入口显示不同 = 新的不一致源）。
-      if (m.no_price) t.no_price = true;
+      // v3.32.0（P1-1）：透传加 `!(m.cost > 0)` 门槛——**当天真的算出了钱**就说明这天的价是有的，
+      //   标记是陈旧残留，不该让它把整段都染上（否则区间表会为一段根本没缺失的数据发"合计偏低"假告警）。
+      //   门槛加在**每一天**而不是聚合结果上，是为了保住"月中补价"的混合场景：
+      //   day1 缺价(cost 0,有标记) + day2 有价(cost 5) → 标记照传（合计确实偏低），金额列仍显示 ¥5.00。
+      if (m.no_price && !(m.cost > 0)) t.no_price = true;
       // v3.31.0（P1-7）：缓存价未知同口径透传（任一天有 → 整段标记），否则区间表会比单日表多一份静默低估
-      if (m.cached_price_unknown) t.cached_price_unknown = true;
+      if (m.cached_price_unknown && !(m.cost > 0)) t.cached_price_unknown = true;
       // v3.31.0（缺陷B）：unpriced 同口径透传（任一天有 → 整段标记）。漏了它，区间表会把
       //   未收录模型显示成 ¥0.00 且零告警——formatUsageRow 虽为单日/区间共用，但标记在聚合时丢了。
-      if (m.unpriced) t.unpriced = true;
+      if (m.unpriced && !(m.cost > 0)) t.unpriced = true;
     }
   }
   for (const t of Object.values(models)) t.hit = hitRate(t.in, t.cached);
@@ -3523,7 +3624,11 @@ function exportReportCsv(range) {
       //   否则 Excel 里看到 0.000000 会当成"这笔免费"，与 --report 表的「未收录 / 无公开价」口径分裂。
       //   **刻意不新增列**：表头一变就会破坏既有 CSV 消费者，也会让"全有价账本输出一字不差"这条红线失效；
       //   改成只在这两类异常行里替换金额格的写法后，正常行仍严格是 %.6f 数字，零噪音成立。
-      const costCell = m.unpriced ? 'unpriced' : (m.no_price ? 'no_price' : (m.cost || 0).toFixed(6));
+      // v3.32.0（P1-1 兜底）：与表格行共用 costCellKind（此前两份判定各自抄一遍 → 改一处漏一处）。
+      const kindCsv = costCellKind(m);
+      const costCell = kindCsv === 'unpriced' ? 'unpriced'
+        : kindCsv === 'no_price' ? 'no_price'
+          : (m.cost || 0).toFixed(6);
       rows.push([date, cell(n), m.in || 0, m.out || 0, m.cached || 0, hit, m.total || 0, costCell].join(','));
     }
   }
@@ -3627,7 +3732,8 @@ function reportTxt(arg) {
       lines.push(cells({ label: '合计', ...total }, true));
     }
     // v3.27.0：当日存在无公开价模型 → 明示"合计金额偏低"，否则读者会把 ¥0.00 当成免费。
-    const noPriceNames = names.filter((n) => models[n] && models[n].no_price);
+    // v3.32.0（P1-1）：排除 cost>0 的条目——钱已算出还说"无公开价→合计偏低"是假告警（标记陈旧残留）
+    const noPriceNames = names.filter((n) => models[n] && models[n].no_price && !(models[n].cost > 0));
     if (noPriceNames.length) {
       lines.push(`⚠ 本日 ${noPriceNames.length} 个模型无公开价（${noPriceNames.join('、')}）`
         + `→ 上面的合计金额**偏低**，只含有价部分；厂商公布单价后补录并跑 recalc-day.js ${date} 可回算`);
@@ -3635,7 +3741,7 @@ function reportTxt(arg) {
     // v3.31.0（缺陷B）：未收录模型（价库里没有 → 金额算不出来）同样明示合计偏低。
     //   措辞沿用上面 no_price 那套口径风格（本日 N 个模型…→ 合计偏低…跑 recalc-day.js 可回算），
     //   但**成因与处置刻意写清区别**：未收录 = 我们没这模型，得先把单价补进 pricing.json（不是等厂商）。
-    const unpricedNames = names.filter((n) => models[n] && models[n].unpriced);
+    const unpricedNames = names.filter((n) => models[n] && models[n].unpriced && !(models[n].cost > 0));
     if (unpricedNames.length) {
       lines.push(`⚠ 本日 ${unpricedNames.length} 个模型未收录单价（${unpricedNames.join('、')}）`
         + `→ 上面的合计金额**偏低**，只含有价部分；把单价补进 pricing.json 后跑 recalc-day.js ${date} 可回算`);
@@ -3672,7 +3778,8 @@ function reportSummaryTxt(arg) {
     //   误导性比明细表更强（明细表至少还有「无公开价」单元格可看）。
     //   措辞与 reportTxt 单日行**逐字一致**（只把日期换成 ${date}），不发明第三套口径；
     //   合计金额本身照常显示（与 reportTxt 合计行一致：合计只含已知部分，偏低由本行提示，不改写数字）。
-    const npNames = Object.keys(models).sort().filter((n) => models[n] && models[n].no_price);
+    // v3.32.0（P1-1）：同上排除 cost>0（summary 是"今天花了多少"的默认入口，假告警在这里最伤人）
+    const npNames = Object.keys(models).sort().filter((n) => models[n] && models[n].no_price && !(models[n].cost > 0));
     if (npNames.length) {
       lines.push(`⚠ 本日 ${npNames.length} 个模型无公开价（${npNames.join('、')}）`
         + `→ 上面的合计金额**偏低**，只含有价部分；厂商公布单价后补录并跑 recalc-day.js ${date} 可回算`);
@@ -3680,7 +3787,7 @@ function reportSummaryTxt(arg) {
     // v3.31.0（缺陷B）：未收录模型同样告警——summary 是最容易被当成"今天花了多少"的默认入口，
     //   金额算不出来却打 ¥1.64（只含有价部分）而不说一句，比明细表更容易被读成完整金额。
     //   措辞与 reportTxt 单日行逐字一致，与 no_price 那条只差"未收录单价 / 把单价补进 pricing.json"。
-    const upNames = Object.keys(models).sort().filter((n) => models[n] && models[n].unpriced);
+    const upNames = Object.keys(models).sort().filter((n) => models[n] && models[n].unpriced && !(models[n].cost > 0));
     if (upNames.length) {
       lines.push(`⚠ 本日 ${upNames.length} 个模型未收录单价（${upNames.join('、')}）`
         + `→ 上面的合计金额**偏低**，只含有价部分；把单价补进 pricing.json 后跑 recalc-day.js ${date} 可回算`);
@@ -4469,7 +4576,7 @@ function savePricingAtomic(pricing, mergeKeys) {
 
 function addModelPrice(pricing, modelName, ref, region) {
   const name = String(modelName).toLowerCase();
-  const rate = Number(pricing.usd_cny_rate) > 0 ? pricing.usd_cny_rate : 7.2;
+  const rate = Number(pricing.usd_cny_rate) > 0 ? pricing.usd_cny_rate : priceRefreshModule.DEFAULT_RATE; // v3.32.0（P1-3）：兜底汇率收敛到 refresh-prices 单一真源，不再复制字面量
   // v2.94：按模型族写「正确的」峰谷倍率，而不是一律写 1。
   //   原实现一律写 1（number），会绕过 calcCost(:1979) 对 DeepSeek 的"缺省按 2"逻辑
   //   （typeof === 'number' 成立 → 不取缺省）→ 新收录的 DeepSeek 模型高峰不翻倍、长期低估。
@@ -4833,7 +4940,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.31.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.32.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -6117,7 +6224,7 @@ module.exports = {
   aggregateMainOnly, aggregateSubsOnly, aggregateTranscript,
   todayDisplay, reportTxt, reportSummaryTxt, normalizeDailyUsage,
   // v3.20.0：--report 区间 / CSV / 外推 + 轮次明细留档（selftest 直接单测，不再只能靠 spawn 看 stdout）
-  formatUsageRow, aggregateRangeModels, parseReportRange, reportRangeTxt,
+  formatUsageRow, costCellKind, aggregateRangeModels, parseReportRange, reportRangeTxt,
   exportReportCsv, reportForecastTxt, pruneRoundFiles,
   appendRoundDetail, roundLabel, transcTextOfRow,
   ROUNDS_DIR, EXPORTS_DIR,

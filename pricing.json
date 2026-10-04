@@ -1,5 +1,5 @@
 {
-  "date": "2026-10-03",
+  "date": "2026-10-04",
   "currency": "CNY",
   "unit": "元/百万 tokens",
   "usd_cny_rate": 7.2,
@@ -210,13 +210,13 @@
     }
   },
   "last_source": "multi-source",
-  "last_refresh_note": "2026-10-02T16:05:43.062Z 多源刷新：llmabacus(国内·人民币·主)✓ | llm-prices-cn(国内·人民币·备)✓ | openrouter(USD)✓ | litellm(USD)✓ | portkey(USD)✓；人民币主价更新 9 个，USD参考 0 个，region 设定 0 个（汇率 7.2）；DeepSeek官方价✓；⚠️模糊匹配歧义: deepseek-v4.1-flash: USD源 模糊命中 11 个不同价候选(sail/deepseek-ai/DeepSeek-V4.1-Flash,nebius/deepseek-ai/DeepSeek-V4.1-Flash,openrouter/deepseek/deepseek-v4.1-flash)，已放弃；deepseek-v4-flash-vision-exp: 国内源 唯一模糊命中 deepseek-v4-flash（与被查键不同名，已采用但需人工核验）；deepseek-v4-flash-vision-exp: USD源 唯一模糊命中 deepseek-v4-flash（与被查键不同名，已采用但需人工核验）；hy4-preview: 国内源 唯一模糊命中 hunyuan-hy4-preview（与被查键不同名，已采用但需人工核验）；hy4-preview: USD源 唯一模糊命中 tencent/hy4-preview（与被查键不同名，已采用但需人工核验）；hy4-preview: USD源 模糊命中 2 个不同价候选(aihubmix/hy4-preview,openrouter/tencent/hy4-preview)，已放弃；kimi-k3: USD源 模糊命中 2 个不同价候选(moonshotai/kimi-k3,moonshotai/kimi-k3:batch)，已放弃；kimi-k3: USD源 模糊命中 23 个不同价候选(azure_ai/FW-Kimi-K3,databricks/databricks-kimi-k3,sail/moonshotai/Kimi-K3)，已放弃；glm-4.7-flash: 国内源 唯一模糊命中 glm-4-7（与被查键不同名，已采用但需人工核验）；glm-4.7-flash: USD源 唯一模糊命中 z-ai/glm-4.7-flash（与被查键不同名，已采用但需人工核验）；glm-4.7-flash: USD源 模糊命中 5 个不同价候选(cloudflare/@cf/zai-org/glm-4.7-flash,openrouter/z-ai/glm-4.7-flash,zai.glm-4.7-flash)，已放弃；kimi-k2.5: USD源 模糊命中 19 个不同价候选(azure_ai/FW-Kimi-K2.5,azure_ai/kimi-k2.5,bedrock/ap-northeast-1/moonshotai.kimi-k2.5)，已放弃；minimax-m3: USD源 模糊命中 12 个不同价候选(azure_ai/FW-MiniMax-M3,fireworks_ai/accounts/fireworks/models/minimax-m3,fireworks_ai/minimax-m3)，已放弃；minimax-m2.7: USD源 唯一模糊命中 minimax/minimax-m2.7（与被查键不同名，已采用但需人工核验）；minimax-m2.7: USD源 模糊命中 9 个不同价候选(sambanova/MiniMax-M2.7,pinstripes/ps/minimax-m2.7,novita/minimax/minimax-m2.7-highspeed)，已放弃；minimax-m2.7-highspeed: USD源 唯一模糊命中 novita/minimax/minimax-m2.7-highspeed（与被查键不同名，已采用但需人工核验）；hunyuan-a13b-instruct: USD源 唯一模糊命中 openrouter/tencent/hunyuan-a13b-instruct（与被查键不同名，已采用但需人工核验）；deepseek-flash: USD源 唯一模糊命中 ~deepseek/deepseek-flash-latest（与被查键不同名，已采用但需人工核验）；glm-5.3-flash: USD源 模糊命中 3 个不同价候选(z-ai/glm-5.3-flashx,z-ai/glm-5.3-flash,z-ai/glm-5.3-flash:batch)，已放弃；glm-5.3-flash: USD源 模糊命中 14 个不同价候选(databricks/databricks-glm-5-3-flash,sail/zai-org/GLM-5.3-Flash,friendliai/zai-org/GLM-5.3-Flash)，已放弃",
+  "last_refresh_note": "2026-10-03T16:07:37.710Z 多源刷新：llmabacus(国内·人民币·主)✓ | llm-prices-cn(国内·人民币·备)✓ | openrouter(USD)✓ | litellm(USD)✗(This operation was aborted) | portkey(USD)✓；人民币主价更新 9 个，USD参考 0 个，region 设定 0 个（汇率 7.2）；DeepSeek官方价✓；⚠️模糊匹配歧义: deepseek-v4-flash-vision-exp: 国内源 唯一模糊命中 deepseek-v4-flash（与被查键不同名，已采用但需人工核验）；deepseek-v4-flash-vision-exp: USD源 唯一模糊命中 deepseek-v4-flash（与被查键不同名，已采用但需人工核验）；hy4-preview: 国内源 唯一模糊命中 hunyuan-hy4-preview（与被查键不同名，已采用但需人工核验）；hy4-preview: USD源 唯一模糊命中 tencent/hy4-preview（与被查键不同名，已采用但需人工核验）；kimi-k3: USD源 模糊命中 2 个不同价候选(moonshotai/kimi-k3,moonshotai/kimi-k3:batch)，已放弃；glm-4.7-flash: 国内源 唯一模糊命中 glm-4-7（与被查键不同名，已采用但需人工核验）；glm-4.7-flash: USD源 唯一模糊命中 z-ai/glm-4.7-flash（与被查键不同名，已采用但需人工核验）；minimax-m2.7: USD源 唯一模糊命中 minimax/minimax-m2.7（与被查键不同名，已采用但需人工核验）；deepseek-flash: USD源 唯一模糊命中 ~deepseek/deepseek-flash-latest（与被查键不同名，已采用但需人工核验）；glm-5.3-flash: USD源 模糊命中 3 个不同价候选(z-ai/glm-5.3-flashx,z-ai/glm-5.3-flash,z-ai/glm-5.3-flash:batch)，已放弃",
   "deepseek_rules": {
     "peak_schedule": "9:00 - 12:00、14:00 - 18:00",
     "weekend_off_peak": true,
     "weekend_off_peak_fallback": false,
     "effective_at": null,
-    "updated_at": "2026-10-02T16:05:41.498Z"
+    "updated_at": "2026-10-03T16:07:25.608Z"
   },
   "_manual_audit": [
     {
@@ -239,7 +239,7 @@
         "cached_pct": 0,
         "output_pct": 0
       },
-      "adopted_at": "2026-10-02T16:05:41.497Z",
+      "adopted_at": "2026-10-03T16:07:25.607Z",
       "official_id": "deepseek-flash",
       "official_version": "DeepSeek-V4.1-Flash",
       "matched_by": "key-version"
@@ -250,25 +250,15 @@
     "deepseek-v4-flash-vision-exp: 已标记 retired 但 lock=true，价格永久冻结在 1.5/4.5 —— 不会被刷新、不会被清理、也不会被标记不可用；若该模型确已下线请人工核验"
   ],
   "_ambig_warnings": [
-    "deepseek-v4.1-flash: USD源 模糊命中 11 个不同价候选(sail/deepseek-ai/DeepSeek-V4.1-Flash,nebius/deepseek-ai/DeepSeek-V4.1-Flash,openrouter/deepseek/deepseek-v4.1-flash)，已放弃",
     "deepseek-v4-flash-vision-exp: 国内源 唯一模糊命中 deepseek-v4-flash（与被查键不同名，已采用但需人工核验）",
     "deepseek-v4-flash-vision-exp: USD源 唯一模糊命中 deepseek-v4-flash（与被查键不同名，已采用但需人工核验）",
     "hy4-preview: 国内源 唯一模糊命中 hunyuan-hy4-preview（与被查键不同名，已采用但需人工核验）",
     "hy4-preview: USD源 唯一模糊命中 tencent/hy4-preview（与被查键不同名，已采用但需人工核验）",
-    "hy4-preview: USD源 模糊命中 2 个不同价候选(aihubmix/hy4-preview,openrouter/tencent/hy4-preview)，已放弃",
     "kimi-k3: USD源 模糊命中 2 个不同价候选(moonshotai/kimi-k3,moonshotai/kimi-k3:batch)，已放弃",
-    "kimi-k3: USD源 模糊命中 23 个不同价候选(azure_ai/FW-Kimi-K3,databricks/databricks-kimi-k3,sail/moonshotai/Kimi-K3)，已放弃",
     "glm-4.7-flash: 国内源 唯一模糊命中 glm-4-7（与被查键不同名，已采用但需人工核验）",
     "glm-4.7-flash: USD源 唯一模糊命中 z-ai/glm-4.7-flash（与被查键不同名，已采用但需人工核验）",
-    "glm-4.7-flash: USD源 模糊命中 5 个不同价候选(cloudflare/@cf/zai-org/glm-4.7-flash,openrouter/z-ai/glm-4.7-flash,zai.glm-4.7-flash)，已放弃",
-    "kimi-k2.5: USD源 模糊命中 19 个不同价候选(azure_ai/FW-Kimi-K2.5,azure_ai/kimi-k2.5,bedrock/ap-northeast-1/moonshotai.kimi-k2.5)，已放弃",
-    "minimax-m3: USD源 模糊命中 12 个不同价候选(azure_ai/FW-MiniMax-M3,fireworks_ai/accounts/fireworks/models/minimax-m3,fireworks_ai/minimax-m3)，已放弃",
     "minimax-m2.7: USD源 唯一模糊命中 minimax/minimax-m2.7（与被查键不同名，已采用但需人工核验）",
-    "minimax-m2.7: USD源 模糊命中 9 个不同价候选(sambanova/MiniMax-M2.7,pinstripes/ps/minimax-m2.7,novita/minimax/minimax-m2.7-highspeed)，已放弃",
-    "minimax-m2.7-highspeed: USD源 唯一模糊命中 novita/minimax/minimax-m2.7-highspeed（与被查键不同名，已采用但需人工核验）",
-    "hunyuan-a13b-instruct: USD源 唯一模糊命中 openrouter/tencent/hunyuan-a13b-instruct（与被查键不同名，已采用但需人工核验）",
     "deepseek-flash: USD源 唯一模糊命中 ~deepseek/deepseek-flash-latest（与被查键不同名，已采用但需人工核验）",
-    "glm-5.3-flash: USD源 模糊命中 3 个不同价候选(z-ai/glm-5.3-flashx,z-ai/glm-5.3-flash,z-ai/glm-5.3-flash:batch)，已放弃",
-    "glm-5.3-flash: USD源 模糊命中 14 个不同价候选(databricks/databricks-glm-5-3-flash,sail/zai-org/GLM-5.3-Flash,friendliai/zai-org/GLM-5.3-Flash)，已放弃"
+    "glm-5.3-flash: USD源 模糊命中 3 个不同价候选(z-ai/glm-5.3-flashx,z-ai/glm-5.3-flash,z-ai/glm-5.3-flash:batch)，已放弃"
   ]
 }
