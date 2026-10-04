@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.32.1-blue)
+![Version](https://img.shields.io/badge/version-v3.33.0-blue)
 
 > 在每次回答后显示 **Token 消耗 / 耗时 / 折算费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -93,14 +93,15 @@ node recalc-day.js              # 不带参数即当天；历史多天需逐日�
 
 > 注意：`backfill --write` 是**全量重建替换**，不是 merge——用它回填会抹掉压缩窗口外的历史账，**不要为回填目的跑它**（详见 `TROUBLESHOOTING.md` 与 KNOWN-ISSUES KI-5）。
 
-### ⚠️ 弹窗标注速查：`⚠未计价` / `⚠账缺` / `⚠价核验`
+### ⚠️ 弹窗标注速查：`⚠未计价` / `⚠账缺` / `⚠缓存价未知` / `⚠价核验`
 
-弹窗正文行（行2）末尾偶尔会出现 `｜⚠未计价` / `｜⚠账缺` / `｜⚠价核验`。它们和你直接能在弹窗里看到的 `（估算）` 一样，是**有意暴露的数据缺口提示**，不是渲染错误；`｜⚠无公开价` 见上一节。含义各不相同：
+弹窗正文行（行2）末尾偶尔会出现 `｜⚠未计价` / `｜⚠账缺` / `｜⚠缓存价未知` / `｜⚠价核验`。它们和你直接能在弹窗里看到的 `（估算）` 一样，是**有意暴露的数据缺口提示**，不是渲染错误；`｜⚠无公开价` 见上一节。含义各不相同：
 
 | 标注 | 出现位置 | 含义（触发条件） | 你该怎么办 |
 |---|---|---|---|
 | `｜⚠未计价` | 行2 末尾 | **本轮有 token 消耗、但金额算不出来**：该模型在 `pricing.json` 里查不到匹配（未收录 / `findModel` 未命中），或混合轮里**部分模型无价** → 金额位显示 `未收录`（混合轮为有价部分的**部分和**） | 「这轮金额缺了一块」。补 `pricing.json` 该条目价 → `node recalc-day.js <日期>` 回算历史；**不要用 `backfill --write`**（会抹历史账）。无输入/输出的空轮不会标 |
 | `｜⚠账缺` | 行2 末尾 | 平台**压缩 / 重写过 transcript**，文件完整行数少于水位线 → 压缩窗口之后**可能静默少计**。v3.25.0 起新消耗已自动恢复记账，但**被压缩掉的历史行本地不可恢复**（见 `KNOWN-ISSUES.md` KI-5） | 对账时这段历史缺口**以服务商账单为准**；旗标（`.transcript-truncated.json`）7 天自动过期，**不要用 `backfill --write`** |
+| `｜⚠缓存价未知` | 行2 末尾 | **v3.31.0 起**（此前无任何提示）。该模型**有输入/输出单价、金额算得出来**，但**厂商没公布"缓存命中"的单价** → 缓存 token 只能按 **0 元**计。本技能场景下缓存占比常达 ~97%，故金额是**系统性低估**（实测低估区间 45%~86%），而弹窗看上去完全正常 | 不是故障、是**口径偏低的可见化**。金额位**照常显示、不隐藏**；要精确对账请以服务商账单为准。若厂商后续公布缓存价，跑 `node refresh-prices.js` 补录后 `node recalc-day.js <日期>` 回算 |
 | `价⚠️` / `官价⚠️` | 行2 末尾 | 价格多源刷新**全源失败** / DeepSeek **官方价抓取失败** → 本轮金额按上一次的价格估算 | 属刷新失败的可见化；看 `pricing.json` 的 `last_refresh_error` / `deepseek_refresh_error`，稍后重刷即可 |
 | `｜⚠价核验` | 行2 末尾 | `pricing.json` 里存在**待人工核验**的告警条目（`_price_audit.warnings` 价格一致性自检 / `_ambig_warnings` 模糊匹配歧义）**且点名了本轮这个模型** → 该模型计价可能不准。**v3.30.0 起才会这样**：之前它读的是 `last_refresh_note`（刷新操作流水账），历史告警会永久留在文本里 → 每条弹窗都挂标签、永远消不掉 | 跑 `node refresh-prices.js` 重刷一次价库（干净则告警字段被删、标签自动消失）。详细条目在 `pricing.json` 的 `_price_audit` / `_ambig_warnings`，**每次刷新进程的 stderr 也会全量打印**（含与本轮无关的告警） |
 
@@ -123,9 +124,10 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 | 📊 **今日累计消费** | toast 行1 显示当天总消费 `今日¥X.XX`（读取每日账本 total.cost） |
 | 📓 **每日分模型账本** | 每轮 Stop 自动把消耗**按模型**累计进 `daily-usage.json`（本地日期分桶）：`{日期:{models:{模型:{in,out,cached,total,cost,hit}}, total:{...}}}`——每个模型一行（输入/输出/缓存命中/总 token/金额）+ 不分模型的当日总合计；`hit` 为该模型当日**缓存命中率**（百分比，`v3.30.0+` 落盘；旧数据由展示层现算兜底）；**长期保存不裁剪**，历史天仅保留各模型 + 合计，文件紧凑。查看：`--report`（今天）/ `--report all`（全部天）/ `--report <日期>`（明细+合计）；`--report summary [all|<日期>]` 只看每天**总合计**一行 |
 | 📅 **区间报表**（v3.20.0） | `--report week`（近 7 天）/ `--report month`（本月至今）/ `--report 2026-09-01..2026-09-30`（任意闭区间）→ 输出**一张按模型的汇总表**（列结构与单日完全一致）+ 合计行。区间命中率按 **Σ缓存/Σ输入 重算**，不是各天均值（跨天 token 量差 100 倍时均值毫无意义）；起止写反自动纠正；**既有四个入口的输出逐字节不变** |
-| 📤 **CSV 导出**（v3.20.0） | `--report week --csv` / `--report all --csv` / `--report 2026-09-30 --csv` → 落盘到 `exports/report-<范围>-<时间戳>.csv`（**逐日 × 逐模型**明细 + `ALL` 合计行，可在 Excel 里自行透视）。带 **UTF-8 BOM**，中文列头不乱码；命令只回一行路径，不把几十行数据灌进对话 |
+| 📤 **CSV 导出**（v3.20.0；`summary` 出口 v3.33.0 补） | `--report week --csv` / `--report all --csv` / `--report 2026-09-30 --csv` → 落盘到 `exports/report-<范围>-<时间戳>.csv`（**逐日 × 逐模型**明细 + `ALL` 合计行，可在 Excel 里自行透视）。**只要每天合计、不要模型明细**时用 `--report summary all --csv`（`summary` / `totals` 同义；也可指定单日）→ 每天一行 + `ALL`，并多出 `no_price_models` / `unpriced_models` 两列（**无公开价 / 未收录单价**的模型个数，否则那个金额会被当成完整金额）。带 **UTF-8 BOM**，中文列头不乱码；命令只回一行路径，不把几十行数据灌进对话 |
 | 📈 **消耗外推**（v3.20.0） | `--report forecast` → 今日 token 速率外推 + 近 7 日实测均值对照。**只推 token，不推金额**（金额本身是折算值，再外推一次只会制造"这个月要花多少钱"的错觉）；样本不足 2 天时拒绝计算 |
-| 🧾 **轮次明细留档**（v3.20.0） | 每轮向 `rounds/rounds-YYYY-MM.jsonl` 追加一条：分模型 token 明细、耗时、主/子代理模型、子代理数、来源标记，以及**自动从本轮首条用户消息提取的可读标签**——用来回答「哪一轮异常大 / 子代理占了多少」这类每日账本答不了的问题。写入点选在记账唯一入口（账本确认落盘之后），所以同轮重复 Stop **不会重复落档**；保留最近 6 个月，过期的由 `--report` 顺带清理 |
+| 🩺 **只读体检**（v3.33.0） | `--doctor` → 一屏看清 7 项链路健康度：**账本**（可读性/天数/模型数/脏条目）· **状态文件**（水位线/快照/合并文件/锁的堆积与滞留）· **价库**（最后刷新距今、0 价与未公布价条目、歧义告警、折算汇率）· **假日**（今年/明年是已确认还是未知）· **hooks**（两者是否配、`lastHookAt` 距今多久 → 把"配了但不工作"暴露出来）· **日志**（体积/行数）· **版本**。**全程只读**：不联网、不写文件、不触发刷新，退出码恒为 0。**排查任何"数据不对"之前先跑它** |
+| 🧾 **轮次明细留档**（v3.20.0） | 每轮向 `rounds/rounds-YYYY-MM.jsonl` 追加一条：分模型 token 明细、耗时、主/子代理模型、子代理数、来源标记，以及**自动从本轮首条用户消息提取的可读标签**——用来回答「哪一轮异常大 / 子代理占了多少」这类每日账本答不了的问题。写入点选在记账唯一入口（账本确认落盘之后），所以同轮重复 Stop **不会重复落档**——若本轮没有新增用量，账本根本不会写盘，也就走不到落档（v3.33.0 起措辞精确化）。**注意**：同一用户轮若被上下文压缩拆成多次写入，会落**多条**记录且 `roundStart` 可能不同（按 `sid` 求和正确，按 `(sid, roundStart)` 归并会漏并）——金额之和仍等于该轮总量，不会翻倍，详见 [KNOWN-ISSUES.md](KNOWN-ISSUES.md) KI-9。保留最近 6 个月，过期的由 `--report` 顺带清理 |
 | 🔔 **版本更新提示**（v3.21.0 起，v3.22.0 补覆盖） | 每 **7 天**匿名查一次仓库版本（只读、零密钥、不带任何本地数据），发现新版本时**由模型在回答末尾提一句**（如「本技能有新版本，可更新」）——**不占 toast 空间**，也不反复打扰：同一版本最多提示 2 次、两次至少隔 24h。**检测点同时查两处并取较大版本**：`releases/latest` + 全部 tag（`git/matching-refs/tags/v`）——只查 release 时，万一某次「只打了 tag 没发 release」就会漏报。失败**静默退避**（1h→6h→1d，连败 3 次当周不再试）。**只配了 Stop、没配 `UserPromptSubmit` hook 的用户**走弹窗兜底：弹窗第一行尾部加一个 `｜⬆v3.22.0`（**放不下就整个不显示**，绝不挤压模型名与耗时/今日/余额）；已配 hook 的用户**永远不会**看到这个标记。升级方法见下方「如何升级」。⚠️ 该功能**帮不了已安装旧版的用户**——检查逻辑在被安装的那份代码里，只从 v3.21.0 起生效 |
 | 🧠 **专家团全量聚合** | WorkBuddy 专家团（多个子代理并行 + 主理人汇总）的全部模型调用，一次性聚合成整轮真实消耗——**平台不把子代理调用落盘 traces，本技能直接从主会话 + `subagents/*.jsonl` transcript 读取**，跑完一个专家团弹**一条**整轮汇总，不会弹 N 次 |
 | 🧩 **异步子代理识别** | 专家团子代理是异步 spawn，文件比 Agent 调用晚落盘——检测主会话是否有 `Agent`/`TeamCreate` 等团队活动，未落盘也能判定"这是专家团"→ 走合并延迟弹，不误判为普通轮 |
@@ -177,7 +179,36 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 | `ENABLE_MODEL_LOOKUP` | `true` | 新模型价格自动补录 | 同上（llmabacus 优先，OpenRouter 兜底） | 否 |
 | `ENABLE_UPDATE_CHECK` | `true` | 版本更新检查（**每 7 天最多 1 次**） | 仅 `https://api.github.com/repos/abc1317679842-ui/workbuddy-token-tracker` 的 `releases/latest` 与 `git/matching-refs/tags/v`（两个端点取较大版本） | 否 |
 
-**默认配置 = 零密钥联网**：唯一携带 API key 的请求（余额查询）默认关闭；其余联网均为**公开价格源、无需任何密钥**，失败自动降级为本地价，不影响统计与 toast。
+**默认配置 = 零密钥联网**：唯一携带 API key 的请求（余额查询）默认关闭；其余联网均为**公开价格源 / 公开仓库，不要求任何密钥**，失败自动降级为本地价，不影响统计与 toast。**例外（不是要求，是"已有就用"）**：若你的环境已经设了 `GH_TOKEN` / `GITHUB_TOKEN`，假日表刷新会自动带上它以放宽 GitHub 限流（**不设也完全可用**，匿名限流 60 次/小时对本技能绰绰有余）；代码**不读任何本地凭据文件**。
+
+### 环境变量清单（v3.33.0 补全——此前文档只提了 3 个，代码实际读 20 个）
+
+**全部可选**，不设一律走默认值；日常使用**不需要设任何一个**。列全是为了"文档不撒谎"，不是为了让你去调。
+
+| 变量 | 默认 | 作用 | 什么时候才会用到 |
+|---|---|---|---|
+| `WB_ROOT` | 自动探测 | 指定 WorkBuddy 根目录（账本/快照/日志都挂在它下面） | 多环境、测试隔离 |
+| `WB_NO_NET` / `WB_DISABLE_NET` | 未设 | 任一为 `1` = **全局关闭联网**（主脚本 + 价库/假日刷新全遵从） | 离线自测 / 完全不想出网 |
+| `TOKEN_TRACKER_NO_TOAST` | 未设 | `1` = 不弹 Windows 通知，其余照常 | 自动化 / CI |
+| `WB_DS_KEY` | 未设 | 余额查询用的 DeepSeek key（经**环境变量**传入子进程，不进命令行） | 开了余额查询但不想写进 `models.json` |
+| `WB_NO_SUB_WAIT` | 未设 | `1` = 不等待子代理，Stop 端直接结算 | 子代理异常长挂时的应急 |
+| `WB_TEAM_SPLIT` | 开 | `0` = 关闭"专家团拆分弹"链路 | 关掉合并弹窗行为 |
+| `WB_TEAM_SPLIT_STALE_MS` | `600000`（10min） | 合并文件滞留多久后判定团队轮已死并结算 | 调快/调慢自愈节奏 |
+| `SUBAGENT_IDLE_MS` | `20000` | 子代理"停更多久算结束"的判定窗口 | 子代理结束后弹窗太慢/太早 |
+| `WATCH_BUSY_MAX_MS` | `120000`（2min） | watcher 在"末行恒 busy"下的绝对上限 | 想更快兜底弹窗 |
+| `WATCH_DEBUG` | 未设 | `1` = 写 watcher 轮询调试日志（`.watch-debug*`） | 排查"为什么没弹/弹晚了" |
+| `COMPACTION_MARKER_TTL_MS` | `600000` | compression 标记的有效期 | 压缩频繁时减少误判 |
+| `CN_PRICE_DB_DIR` | 自动发现 | 本地官方价库目录（`prices/index.json`） | 自定义价库位置 / 测试隔离 |
+| `CN_PRICE_PIPELINE_DIR` | 技能目录 | Python 价源流水线所在目录 | 脚本被移出技能目录时 |
+| `CN_PYTHON` | 自动探测 | 指定跑流水线的 Python 解释器 | 机器上有多个 Python |
+| `GH_TOKEN` / `GITHUB_TOKEN` | 未设 | 仅用于放宽 GitHub 限流（**不要求**） | 频繁刷新被限流时 |
+| `DS_OFFICIAL_URL` | 官方定价页 | 覆盖 DeepSeek 官方价抓取的 URL | 代理 / 镜像 / 测试 |
+| `DS_OFFICIAL` | `./deepseek-official.js` | 覆盖官方价抓取脚本路径 | 测试 / 镜像 |
+| `DS_RETRIES` / `DS_RETRY_DELAY_MS` | `2` / `60000` | 官方价抓取的重试次数与间隔 | 网络抖动时加大重试 |
+| `ROUND_WATCH_POLL_MS` / `ROUND_WATCH_QUIET_MS` / `ROUND_WATCH_ADAPT_QUIET_MS` / `ROUND_WATCH_MAX_MS` | `2000` / `8000` / `2000` / `3h` | 轮级 watcher（手动取消补弹）的轮询、静默窗、自适应静默窗与生命上限 | 排查取消补弹时机 |
+| `ENABLE_NETWORK` / `ENABLE_PRICE_REFRESH` / `ENABLE_MODEL_LOOKUP` / `ENABLE_HOLIDAY_REFRESH` / `ENABLE_BALANCE_QUERY` / `ENABLE_UPDATE_CHECK` | 见上表 | **这 6 个是 `local-config.json` 里的配置项，不是环境变量**（`ENABLE_NETWORK` 亦可用 `WB_NO_NET` 从环境强制关） | — |
+
+> 自我核对：`grep -rhoE 'process\.env\.[A-Z_]+' *.js | sort -u` 的结果应全部落在上表内（v3.33.0 起建立此对照，防"代码读了、文档不认"）。
 
 ### 如何更改
 
@@ -197,7 +228,7 @@ const ENABLE_UPDATE_CHECK = loadLocalFlag('enable_update_check', true);    // �
 
 ## 🔐 隐私与数据安全
 
-**出网主机清单（全部匿名只读，除余额查询外零密钥；完整的本地写盘位置、诊断日志内容、已知限制见 [CHANGELOG.md](CHANGELOG.md) 的「隐私与安全」章节）**：
+**出网主机清单（全部匿名只读，除余额查询外零密钥；本地落盘位置与诊断日志内容见本节末尾，完整已知限制见 [CHANGELOG.md](CHANGELOG.md) 的「隐私与安全」章节）**：
 
 | 主机 | 用途 | 密钥 |
 |---|---|---|
@@ -205,11 +236,32 @@ const ENABLE_UPDATE_CHECK = loadLocalFlag('enable_update_check', true);    // �
 | `api-docs.deepseek.com` | DeepSeek 官方定价页解析 | 无 |
 | `www.llmabacus.com` | 聚合价源（国内·人民币·主） | 无 |
 | `raw.githubusercontent.com` | `szp2005/llm-prices-cn`（国内备）、`BerriAI/litellm`（USD）、`NateScarlet/holiday-cn` + `HankAviator/china-holiday-calendar`（法定假日表） | 无 |
-| `api.github.com` | 假日表 contents API（v3.32.0 起每日链路自适应触发）、版本更新检查（每 7 天） | 无 |
+| `api.github.com` | 假日表 contents API（v3.32.0 起每日链路自适应触发）、版本更新检查（每 7 天） | **不要求**；若环境已设 `GH_TOKEN` / `GITHUB_TOKEN` 会自动带上（仅用于提高限流额度），不读任何本地凭据文件 |
 | `openrouter.ai` | 聚合价源（USD） | 无 |
 | `configs.portkey.ai` | 聚合价源（USD） | 无 |
+| `platform.minimaxi.com` · `platform.stepfun.com` · `docs.bigmodel.cn` · `platform.moonshot.cn` · `platform.kimi.com` | **国内厂商官方定价页**（Python 侧 `fetch-cn-prices.py` 解析，v3.33.0 补入本清单——此前只声明了上面 7 个，这 5 个漏声明） | 无 |
+| `cloud.tencent.com` | 腾讯云 TokenHub 定价页（Python 侧 `parse_tokenhub.py`） | 无 |
 
 请求内容一律不含本地对话/账本数据；假日与版本检查只读公开仓库。
+**Python 侧（`fetch-cn-prices.py` / `parse_tokenhub.py`）为可选增强**：需要本机有 Python 与 `requests`（无则自动回退 `urllib`），缺失时这些源直接跳过、不影响其余价源与统计。
+
+**本地落盘位置**（v3.33.0 补全声明。全部为本机**明文**文件，只写本机、不上传；无遥测、无埋点、无第三方统计）：
+
+| 位置 | 内容 |
+|---|---|
+| 技能目录 | `daily-usage.json` 每日账本 · `.ledger-watermark.json` 记账水位线 · 会话快照/合并文件 · `.balance.json` 余额缓存（**不存 key**）· `rounds/rounds-YYYY-MM.jsonl` 轮次明细 · `exports/*.csv` 导出 |
+| `~/.workbuddy/token-tracker-toast.log` | **弹窗诊断日志**（v2.63 起）：每次弹窗追加一行 JSON——会话 id、行数等状态 + **弹窗完整文案**（`toastText`，截断至 200 字符）+ transcript 尾部**指纹**（sha1 短哈希 + 长度，v3.18 起不存对话原文）。达 5 MB 自动清空重写 |
+| `~/.workbuddy/token-tracker-compaction.log` | **压缩事件快照**：行数 / mtime / 末行类型 / 压缩标记 id——只存**形态与指纹**，不存对话原文 |
+| `~/WorkBuddy/<工作区>/prices/` | 价格库抓取工作区（第三方价源的原始响应缓存） |
+
+**弹窗文案里到底有什么**（逐字段实测，1779 条真实记录全扫描）：模型名 / 耗时 / 输入·输出·缓存 token 数 / 金额 / 缓存命中率 / 价格标注。开了余额查询且**余额发生变动**时，多一个「余额¥X」数字。**不含你的消息正文、不含文件路径、不含任何对话内容**——它就是你眼睛已经看到过的那两行字。
+
+**`rounds/*.jsonl` 的 `label` 字段是本技能唯一会落盘你输入文本的地方**（v3.33.0 逐条实测声明）：
+
+- **存什么**：本轮首条用户消息的**前 40 字符**（压缩空白后），用于回答"这一轮到底在干什么"——没有标签的明细只是一堆数字。
+- **存哪里**：只在本机技能目录 `rounds/rounds-YYYY-MM.jsonl`，**明文、不上传**；随该文件按 **6 个月**保留期清理（`--report` 顺带执行；v3.33.0 前该清理只在 forecast/区间/CSV 三个冷门入口触发，最常用的 `--report` 反而不清——已修）。
+- **不存什么**：不含 file 路径、不含工具调用内容、不含模型回复。**注入型 user 行不当标签**——客户端 / 钩子 / 队友消息塞进来的伪 user 消息（`task-notification`、`conversation_history_summary`、`cb_summary`、`system-reminder`、`user-context`、`teammate-message`）一律写成 `[注入] <类型>`。实测本机 219 条明细中 181 条无标签、32 条为注入型（v3.33.0 前 `teammate-message` 未被识别、被截成一段 XML 开头当标签）、6 条为真实提问。
+- **想彻底不留**：删除 `rounds/` 目录即可，功能不受影响（该目录只服务于"单轮明细"这一个用途，`--report` 全部入口都不依赖它）。
 
 ## 🔐 余额查询安全性说明
 
@@ -256,6 +308,7 @@ DeepSeek-V4 Flash 高峰双倍
 | 「照这速度还能用多久」「估一下后面的消耗」 | `--report forecast` | **只推 token、不推金额**的速率外推（样本不足 2 天会拒绝算） |
 | 「导个 CSV」「要能在 Excel 里打开的」 | `--report <范围> --csv` | **不贴表格**，只回**一行文件路径** |
 | 「上一轮用了多少」 | 手动模式（无参数） | 一行：上一轮的模型 / 耗时 / 输入输出 token |
+| 「怎么没记账」「是不是坏了」「帮我查一下」 | `--doctor` | 7 项链路体检（账本/状态文件/价库/假日/hooks/日志/版本），**只读不写**。排查前先跑它 |
 
 > 表格列固定 **7 列**：`模型 | 输入 | 输出 | 缓存 | 缓存命中 | 总 token | 金额`。模型**必须原样贴出脚本输出**——不许自己重排、不许改成列表、不许精简列。原因很实在：空格对齐依赖字体宽度、不同环境必歪，Markdown 表格才不会。
 
@@ -429,6 +482,17 @@ v3.23.0 把 `SKILL.md` 从 **76.2 KB（≈18,400 token）精简到 42.4 KB（≈
 
 - **`UserPromptSubmit`**：你提交下一条消息时自动注入「上一轮」用量（不依赖模型自觉）
 - **`Stop`**：每次回答结束后自动触发，弹 Windows 系统通知显示**本条**消耗
+
+> **两个 hook 各自管什么、少配一个会怎样（v3.33.0 起）**
+>
+> | 只配了 | 弹窗（toast） | 每日账本 `daily-usage.json` | 上下文注入 |
+> |---|---|---|---|
+> | 两个都配（推荐） | ✅ 每轮 | ✅ 每轮 | ✅ 下一轮注入上一轮用量 |
+> | **只配 `Stop`** | ✅ 每轮 | ✅ 每轮（**v3.33.0 起**） | ❌ 无注入通道（`--report` / 手动 `--stop` 仍可查） |
+> | 只配 `UserPromptSubmit` | ❌ | ❌ | ✅ |
+>
+> 历史背景：`Stop` 端的记账窗口起点（`roundStart`）原本**只由 `--hook` 写入快照**。在没有 `UserPromptSubmit` 的机器上这个起点恒为 `0`，记账整段被跳过 —— 表现为**弹窗正常但账本永远是空的**（且 traces 兜底那条路径把 `tsPath` 漏传，等于双封死）。v3.33.0 起 `Stop` 端在起点缺失时**从 transcript 反推**（取本会话最后一条真实用户提问的时间戳，跳过系统注入型 user 行），因此**只配 `Stop` 也能正确记账**；两条路径也都补上了 `tsPath`。
+> 结论：**配 `Stop` 是记账的充分条件**；配 `UserPromptSubmit` 额外换来"起点由 hook 精确写入"与上下文注入，仍是推荐配置。
 
 ### 手动使用（不想配 hook 时）
 

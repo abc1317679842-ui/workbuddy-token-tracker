@@ -203,7 +203,7 @@ else {
     ok('T6-U2 stderr 含 ⚠价库 告警', errs.join('').indexOf('⚠价库') >= 0);
     ok('T6-U3 _shrink_note 已落盘（G3）', Boolean(after._shrink_note), String(after._shrink_note || ''));
     ok('T6-U4 dbStaleTag 显示 ⚠价库缩水', mod.dbStaleTag(after) === '⚠价库缩水', mod.dbStaleTag(after));
-    try { fs.unlinkSync(bakPath); } catch (e) {}
+    try { fs.unlinkSync(bakPath); } catch (e) {} // silent-ok:清理 — 测试用临时文件清理
   }
   if (savedEnv === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv;
 }
@@ -1103,7 +1103,7 @@ else {
     ok('T14-d2 ★残留锁清理：过期锁被删、当天锁保留、当前会话锁即使过期也保留',
       !has(old1) && !has(old2) && has(fresh) && has(cur),
       `old1=${has(old1)} old2=${has(old2)} fresh=${has(fresh)} cur=${has(cur)}`);
-    for (const p of [old1, old2, fresh, cur]) { try { fs.unlinkSync(p); } catch (e) {} }
+    for (const p of [old1, old2, fresh, cur]) { try { fs.unlinkSync(p); } catch (e) {} } // silent-ok:清理 — 测试用临时文件清理
   }
 
   // ── T15：v3.24.0 修复守卫（R8/R9 审计 13 条级联链择要）─────────────────────────
@@ -1173,7 +1173,7 @@ else {
           const m = day && day.models && day.models['ki5-model'];
           if (m) return m.in || 0;
         }
-      } catch (e) {}
+      } catch (e) {} // silent-ok:清理 — 测试夹具清理
       return 0;
     };
     const readWm16 = () => JSON.parse(fs.readFileSync(wmFile16, 'utf-8'));
@@ -1324,7 +1324,7 @@ else {
       && Math.abs(snapE.lastStopAt - snapE.lastUserMsgAt) < 5000,
       `exit=${r17.status} coalGone=${coalGone} snap=${snapE ? JSON.stringify({ u: snapE.lastUserMsgAt, s: snapE.lastStopAt }) : 'null'}`);
     ok('T17-c2 ⑨端到端：stderr 有结算告警', (r17.stderr || '').indexOf('补弹链路已死亡') >= 0);
-    try { fs.unlinkSync(path.join(skillDir, '.snapshot-' + SID17 + '.json')); } catch (e) {}
+    try { fs.unlinkSync(path.join(skillDir, '.snapshot-' + SID17 + '.json')); } catch (e) {} // silent-ok:清理 — 测试用快照清理
   }
 }
 
@@ -1658,6 +1658,16 @@ else {
       && stripComments(main21).includes('priceRefreshModule.DEFAULT_RATE')
       && (stripComments(main21).match(/: 7\.2(?!\d)/g) || []).length === 0,
       '红 = 两处兜底汇率改不同步会静默跑偏（P1-3）');
+
+    // ── e. v3.33.0（第四轮审计 补-S1）：清标判据必须是 > 0 —— 0 价不算"已公布" ──
+    //   病灶：v3.32.0 写的判据是 `!= null`，而 `0 != null` 为真 → space-bunny（in/out 同为 0 =
+    //   厂商未公布）下次刷新就丢标记 → 账本不打 no_price → 四出口显示 ¥0.00（读成"免费"）→
+    //   合计偏低告警消失 = v3.27.0 修掉的 KI-7 病根从另一扇门回来。
+    ok('T21-e1 ★补价清标判据为 > 0（0 价 = 仍未公布，清掉标记会把 KI-7 病根放回来）',
+      rf21.includes('m.input_price > 0 && m.output_price > 0'),
+      '红 = 判据回退，0 价条目下次刷新丢 unpublished → 出口显示 ¥0.00 被读成免费');
+    ok('T21-e2 ★全文件不得残留 `!= null` 形式的清标判据（0 != null 为真 = 原病灶形态）',
+      !/m\.input_price != null\s*&&\s*m\.output_price != null/.test(rf21));
   }
 }
 
@@ -1753,6 +1763,599 @@ else {
   }
 }
 
+// ===== T23：v3.33.0 第四轮审计——S3 尾部窗口治本 + S1 起点推断（Stop-only 记账）=====
+// 病根 A（S3）：三处各自硬编码"从文件尾读多少字节"（65536/8192/4096），实测真实 transcript 平均行长
+//   4.3KB、最大 206KB、30% 的行 >4KB → ① 超长行整行消失；② 64KB 窗口只够约 15 行而调用方按行数要
+//   （400 行）→ 行数严重不足。治本：单点块回溯 eachTailLineReverse + 三个读者复用。
+// 病根 B（S1）：lastUserMsgAt 只在 --hook 分支写 → 只配 Stop 的机器恒 0 → 记账整段跳过。
+{
+  const tt23 = (() => { try { return require(path.join(SRC, 'token-tracker.js')); } catch (e) { return null; } })();
+  if (!tt23) {
+    ok('T23 模块加载', false, 'token-tracker.js require 失败');
+  } else {
+    const src23 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+    ok('T23-a1 ★三处尾部窗口硬编码已消除（65536/8192/4096 → 单点块回溯）',
+      !/sz > 65536 \? 65536/.test(src23) && !/sz > 8192 \? 8192/.test(src23) && !/sz > 4096 \? 4096/.test(src23),
+      '红 = 又按字节划窗口，长行整行消失 / 行数不足会复发');
+    const n23 = (src23.match(/eachTailLineReverse\(/g) || []).length;
+    ok('T23-a2 三个读者（readTailRaw/lastTranscLine/readTailRawLines）统一走 eachTailLineReverse',
+      n23 >= 4, `实际出现 ${n23} 次（定义 1 + 调用 ≥3）`);
+    ok('T23-a3 ★S1 起点兜底：inferRoundStartFromText 在两条 asStop 路径都被调用',
+      (src23.match(/inferRoundStartFromText\(/g) || []).length >= 3,
+      '红 = "只配 Stop 账本永不写"的病灶回归');
+    ok('T23-a4 ★traces 兜底 writeCoalesce 必须带 tsPath（不带 → watcher 永不记账）',
+      src23.includes('{ traceFile: tf, tsPath: tsPathT, roundStart }'));
+
+    const dir23 = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-tail-'));
+    try {
+      const f23 = path.join(dir23, 'mix.jsonl');
+      const big23 = 'z'.repeat(200 * 1024); // 200KB 单行（贴近实测最大真实行 206KB）
+      fs.writeFileSync(f23, [
+        JSON.stringify({ type: 'message', role: 'user', timestamp: 1000, content: [{ type: 'text', text: '第一问' }] }),
+        JSON.stringify({ type: 'message', role: 'assistant', timestamp: 2000, content: [{ type: 'text', text: big23 }] }),
+        JSON.stringify({ type: 'message', role: 'user', timestamp: 3000, content: [{ type: 'text', text: '<system-reminder>注入</system-reminder>' }] }),
+        JSON.stringify({ type: 'message', role: 'user', timestamp: 4000, content: [{ type: 'text', text: '真正的问题' }] }),
+        JSON.stringify({ type: 'message', role: 'assistant', timestamp: 5000, content: [{ type: 'text', text: '答' }] }),
+      ].join('\n') + '\n');
+      const got23 = tt23.readTailRawLines(f23, 5);
+      ok('T23-b1 ★含 200KB 超长行的文件：尾部 5 行全部完整可 parse（不再整行消失）',
+        got23.length === 5 && got23.every((l) => { try { JSON.parse(l); return true; } catch (e) { return false; } }),
+        `got=${got23.length} 各行长度=${got23.map((l) => l.length).join('/')}`);
+      const rs23 = tt23.inferRoundStartFromText(f23);
+      ok('T23-b2 ★起点推断跳过注入型 user 行，取最后一条真实提问（4000）',
+        rs23 === 4000, `实际 ${rs23}`);
+      const tl23 = tt23.lastTranscLine(f23);
+      ok('T23-b3 lastTranscLine 末行可解析（超长行场景不再恒 null）',
+        !!tl23 && tl23.timestamp === 5000, JSON.stringify(tl23).slice(0, 80));
+      const onlyBig = path.join(dir23, 'big.jsonl');
+      fs.writeFileSync(onlyBig, JSON.stringify({ type: 'message', role: 'assistant', timestamp: 9, content: [{ type: 'text', text: 'w'.repeat(200 * 1024) }] }) + '\n');
+      const g2 = tt23.readTailRawLines(onlyBig, 1);
+      ok('T23-b4 ★单行即超窗（旧实现只能返回残片）：现能完整读回该行',
+        g2.length === 1 && (() => { try { JSON.parse(g2[0]); return true; } catch (e) { return false; } })(),
+        `len=${g2.length ? g2[0].length : 0}`);
+      ok('T23-b5 无 user 行 / 不存在 / null / 空串 → 0 且不抛异常',
+        tt23.inferRoundStartFromText(onlyBig) === 0
+        && tt23.inferRoundStartFromText(path.join(dir23, 'nope.jsonl')) === 0
+        && tt23.inferRoundStartFromText(null) === 0
+        && tt23.inferRoundStartFromText('') === 0);
+    } finally { fs.rmSync(dir23, { recursive: true, force: true }); }
+  }
+}
+
+// ===== T24：v3.33.0 第四轮审计——补-S2 守卫半边（null 模型条目让区间/CSV 崩） =====
+// 病根：v3.24.0 只给 dayTotalOf 加了 null 守卫（"账本一条 null 条目曾让 --report/区间/CSV/外推全线
+//   TypeError"），**aggregateRangeModels 漏了** → 守卫只加半边。实测症状（本机复现）：账本里一条
+//   `"某模型": null` 时，`--report <起>..<止>` 与 `--report all --csv` 直接 TypeError、rc=1；
+//   而单日表 / summary 因 `{...null}` 是合法的空展开（ES2018）而**幸免** → 表现为"只有区间和 CSV 打不开"。
+{
+  const tt24 = (() => { try { return require(path.join(SRC, 'token-tracker.js')); } catch (e) { return null; } })();
+  if (!tt24) {
+    ok('T24 模块加载', false, 'token-tracker.js require 失败');
+  } else {
+    const src24 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+    const bodyOf = (name) => {
+      const i = src24.indexOf('function ' + name);
+      if (i < 0) return '';
+      const j = src24.indexOf('\nfunction ', i + 1);
+      return src24.slice(i, j < 0 ? src24.length : j);
+    };
+    const GUARD = 'if (!m || typeof m !== \'object\') continue;';
+    ok('T24-a1 ★aggregateRangeModels 也带 null 守卫（此前只有 dayTotalOf 有 → 守卫只加半边）',
+      bodyOf('aggregateRangeModels').includes(GUARD),
+      '红 = 账本一条 null 条目就能让区间报表与 CSV 整体崩掉');
+    ok('T24-a2 ★dayTotalOf 与 aggregateRangeModels 守卫同口径（两处判定必须一致）',
+      bodyOf('dayTotalOf').includes(GUARD) && bodyOf('aggregateRangeModels').includes(GUARD),
+      '红 = 又变成"改一处漏一处"');
+
+    const d24 = {
+      '2026-10-03': {
+        models: {
+          hy3: { in: 1000, out: 100, cached: 0, total: 1100, cost: 0.01 },
+          broken: null,              // 真崩的那形态
+          weird: 'not-an-object',    // 同族：非对象
+        },
+        total: { in: 1000, out: 100, cached: 0, total: 1100, cost: 0.01 },
+      },
+    };
+    let agg24 = null; let threw24 = '';
+    try { agg24 = tt24.aggregateRangeModels(d24, '2026-10-01', '2026-10-05'); } catch (e) { threw24 = String(e && e.message); }
+    ok('T24-b1 ★含 null / 非对象模型条目的账本：aggregateRangeModels 不抛异常且跳过该条目',
+      !!agg24 && !threw24
+      && Object.keys(agg24.models).join(',') === 'hy3'
+      && agg24.models.hy3.in === 1000 && agg24.models.hy3.total === 1100,
+      threw24 ? ('抛了：' + threw24) : ('models=' + Object.keys(agg24 ? agg24.models : {}).join(',')));
+    let dt24 = null; let threwDt = '';
+    try { dt24 = tt24.dayTotalOf(d24['2026-10-03'].models); } catch (e) { threwDt = String(e && e.message); }
+    ok('T24-b2 dayTotalOf 对同数据同样不抛（两出口口径对齐，不再"一个能开一个崩"）',
+      !!dt24 && !threwDt && dt24.in === 1000 && dt24.total === 1100,
+      threwDt ? ('抛了：' + threwDt) : ('in=' + (dt24 && dt24.in)));
+  }
+}
+
+// ===== T25：v3.33.0 第四轮审计——A7 pruneRoundFiles 下沉统一出口 =====
+// 病根：`ROUNDS_KEEP_MONTHS` 注释写着"--report 运行时顺带清理"，实现却只在 forecast / 区间 / --csv
+//   三个后加的子分支各插一次 → **最常用的 `--report`（今天）与 `--report summary` 从不触发**
+//   → 文档意图与实现不符，且"最常跑的入口不清、偶尔跑的才清"完全反了。
+{
+  const src25 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  const calls25 = (src25.match(/pruneRoundFiles\(\);/g) || []).length;
+  ok('T25-a1 ★pruneRoundFiles 只在 --report 入口调用一次（三处子分支重复调用已合并）',
+    calls25 === 1, `实际 ${calls25} 处（应恰为 1：下沉到统一入口）`);
+  const iEntry = src25.indexOf("if (process.argv.includes('--report')) {");
+  const iCall = src25.indexOf('pruneRoundFiles();');
+  const iForecast = src25.indexOf('reportForecastTxt(', iEntry); // 必须从入口之后搜——否则会命中函数定义处
+  ok('T25-a2 ★清理位于 --report 入口（在 forecast/区间/csv 各分支 return 之前）→ 所有变体都被覆盖',
+    iEntry >= 0 && iCall > iEntry && iForecast > iCall,
+    `entry=${iEntry} call=${iCall} forecast=${iForecast}`);
+}
+
+// ===== T26：v3.33.0 第四轮审计——新增 --doctor 只读体检 =====
+// 存在意义：本技能的缺陷几乎全是"静默失效"型（配了 hook 不工作、价库/假日陈旧、账本被污染、锁与合并
+//   文件堆积），都不报错。--doctor 把它们变成"一眼可见"，同时是 P4 拆分的前置条件。
+// 硬约束（下面 a1/a2/b2 就是这三条的可检查形式）：
+//   ① 只读——不联网、不写文件、不触发刷新；② 不调 loadPricing/loadDailyUsage（前者联网+spawn，后者在
+//   账本损坏时会改名隔离 = 写操作）；③ 退出码恒 0（它是手动命令，不该让 hook/CI 变红）。
+{
+  const src26 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  const body26 = (() => {
+    const i = src26.indexOf('function doctorTxt');
+    if (i < 0) return '';
+    const j = src26.indexOf('\nfunction ', i + 1);
+    return src26.slice(i, j < 0 ? src26.length : j);
+  })();
+  ok('T26-a0 ★--doctor 存在且有 CLI 入口', body26.length > 0 && src26.includes("process.argv.includes('--doctor')"));
+  ok('T26-a1 ★doctorTxt 内不得调用 loadPricing()（它会触发联网刷新 + detach spawn）',
+    body26.length > 0 && !body26.includes('loadPricing('), '红 = 体检命令产生了副作用');
+  ok('T26-a2 ★doctorTxt 内不得调用 loadDailyUsage()（账本损坏时它会改名隔离 = 写操作）',
+    body26.length > 0 && !body26.includes('loadDailyUsage('));
+
+  // 运行态：隔离环境下调用 doctorTxt()，前后目录指纹必须完全一致
+  const savedEnv26 = process.env.WB_ROOT;
+  process.env.WB_ROOT = tmp;
+  let mod26 = null;
+  try { mod26 = require(path.join(skillDir, 'token-tracker.js')); } catch (e) { mod26 = null; }
+  const snap26 = () => {
+    const out = [];
+    const walk = (d) => {
+      let es = [];
+      try { es = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
+      for (const e of es) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) walk(p);
+        else { try { const st = fs.statSync(p); out.push(p + '|' + st.size + '|' + st.mtimeMs); } catch (e2) { out.push(p + '|err'); } }
+      }
+    };
+    walk(tmp);
+    return out.sort().join('\n');
+  };
+  if (!mod26 || typeof mod26.doctorTxt !== 'function') {
+    ok('T26 模块加载', false, mod26 ? '缺少 doctorTxt 导出' : 'require 失败');
+  } else {
+    const before26 = snap26();
+    let txt26 = '', threw26 = '';
+    try { txt26 = mod26.doctorTxt(); } catch (e) { threw26 = String(e && e.message); }
+    const after26 = snap26();
+    ok('T26-b1 doctorTxt() 不抛异常且输出 7 个体检段落',
+      !threw26 && ['账本', '状态文件', '价库', '假日', 'hooks', '日志', '版本'].every((t) => txt26.includes('[' + t + ']')),
+      threw26 ? ('抛了：' + threw26) : txt26.split('\n')[1]);
+    ok('T26-b2 ★只读：调用前后隔离目录内所有文件的尺寸/mtime 完全一致（体检=体检，零写入）',
+      before26 === after26, before26 === after26 ? `已核对 ${before26.split('\n').length} 个文件` : '有文件被改动');
+  }
+  if (savedEnv26 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv26;
+}
+
+// ===== T27：v3.33.0 第四轮审计——补-S5 toast 诊断日志的明文声明与截断 =====
+// 病根：`writeToastLog` 把**弹窗完整文案**（toastText）以明文写进 `~/.workbuddy/token-tracker-toast.log`，
+//   而文档原先只声明"诊断日志含 sessionId 与 transcript 末行指纹"——读者会以为日志里没有可读文本。
+// 实测裁决（本机 1779 条真实记录全字段扫描）：toastText 只含 模型名/耗时/输入·输出·缓存 token 数/金额/
+//   缓存命中率/价格标注，**不含用户消息正文、文件路径、对话内容**；长度 p50=69 / p90=76 / max=87，
+//   **恰好触顶 200 的 0 条 → 从未发生截断**（cap = 实测最大值的 2.3 倍）。
+// 故处置 = **声明**（README 本地落盘表 + CHANGELOG 隐私章节 + 源码注释写明依据），cap 保留不动。
+// 审计原话把它与 rounds 的「用户消息前 40 字明文」并列 —— 实为两类数据，后者才真的含用户文本。
+// 下面 a1/a2/a3 锁"声明与截断不被静默删除"，b1/b2 锁"截断行为本身"。
+{
+  const raw27 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const src27 = stripComments(raw27);
+  const iW = raw27.indexOf('function writeToastLog');
+  const jW = iW < 0 ? -1 : raw27.indexOf('\nfunction ', iW + 1);
+  const bodyRaw27 = iW < 0 ? '' : raw27.slice(iW, jW < 0 ? raw27.length : jW);
+  ok('T27-a1 ★toastText 仍截断至 200（去掉它 = 日志随文案无上限膨胀）',
+    /toastText:\s*st\.toastText\s*!=\s*null\s*\?\s*String\(st\.toastText\)\.slice\(0,\s*200\)/.test(src27),
+    '未匹配到 slice(0, 200)');
+  ok('T27-a2 ★writeToastLog 内保留声明性注释（只写本地 / 从未截断 的依据，防被静默删除）',
+    bodyRaw27.includes('只写本地') && bodyRaw27.includes('从未发生截断'),
+    iW < 0 ? '函数未找到' : '红 = 补-S5 的声明注释被删掉了');
+  ok('T27-a3 ★文档如实声明该日志：README 本地落盘表出现文件名 + CHANGELOG 隐私章节点名 toastText',
+    fs.readFileSync(path.join(SRC, 'README.md'), 'utf-8').includes('token-tracker-toast.log')
+    && fs.readFileSync(path.join(SRC, 'CHANGELOG.md'), 'utf-8').includes('toastText'));
+
+  // 运行态：真调 showToast（临时打 NO_TOAST 开关 → 只写日志、不弹系统通知），核对落盘文案的长度契约。
+  //   注意 in-process 的 NO_TOAST 默认**未设**（只有 spawn 子进程的 env 里设了），故此处必须自行开关 ——
+  //   否则在真机上跑 selftest 会真的弹出一个系统通知（违反"测试禁止真弹窗"硬规矩）。
+  const savedEnv27 = process.env.WB_ROOT;
+  const savedNoToast27 = process.env.TOKEN_TRACKER_NO_TOAST;
+  process.env.WB_ROOT = tmp;
+  process.env.TOKEN_TRACKER_NO_TOAST = '1';
+  let mod27 = null;
+  try { mod27 = require(path.join(skillDir, 'token-tracker.js')); } catch (e) { mod27 = null; }
+  const logPath27 = path.join(tmp, 'token-tracker-toast.log');
+  if (!mod27 || typeof mod27.showToast !== 'function') {
+    ok('T27 模块加载', false, mod27 ? '缺少 showToast 导出' : 'require 失败');
+  } else {
+    const readLast27 = () => {
+      try {
+        const ls = fs.readFileSync(logPath27, 'utf-8').split('\n').filter(Boolean);
+        return ls.length ? JSON.parse(ls[ls.length - 1]) : null;
+      } catch (e) { return null; }
+    };
+    let threw27 = '';
+    try { mod27.showToast('A'.repeat(300), 'B', 't27-long'); } catch (e) { threw27 = String(e && e.message); }
+    const long27 = readLast27();
+    ok('T27-b1 ★超长文案落盘后被截到恰好 200 字符（日志膨胀的行为契约）',
+      !threw27 && long27 && long27.toastText === 'A'.repeat(200),
+      threw27 ? ('抛了：' + threw27) : (long27 && long27.toastText ? ('落盘长度=' + long27.toastText.length) : '日志未写入'));
+    let threw27b = '';
+    try { mod27.showToast('短文案', 'B', 't27-short'); } catch (e) { threw27b = String(e && e.message); }
+    const short27 = readLast27();
+    ok('T27-b2 未超 200 的文案原样落盘（line1 + " | " + line2，一字不改）',
+      !threw27b && short27 && short27.toastText === '短文案 | B',
+      threw27b ? ('抛了：' + threw27b) : (short27 ? JSON.stringify(short27.toastText) : '日志未写入'));
+  }
+  if (savedEnv27 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv27;
+  if (savedNoToast27 === undefined) delete process.env.TOKEN_TRACKER_NO_TOAST;
+  else process.env.TOKEN_TRACKER_NO_TOAST = savedNoToast27;
+}
+
+// ===== T28：v3.33.0 第四轮审计——A2 已 lock 条目的歧义告警不再挂弹窗 =====
+// 病根：`m.lock === true` 的模型，三个写价分支**全部跳过**（CN 812 / US 843），即模糊匹配的结果
+//   根本没被采用；但 looseFind 仍把「唯一模糊命中…需人工核验」写进 `_ambig_warnings`，而该字段被
+//   priceAuditTag 直接翻成弹窗标签「⚠价核验」→ lock 不会自己消失，告警也就**永不消失** = 永久误报。
+// 本机实测（真实联网刷新，双臂隔离 A/B，见 plan §7）：17 模型 / 6 个 lock 条目，其中 4 个 lock 条目
+//   （含用户日常追踪的 hy4-preview、glm-5.3-flash）贡献了 10 条告警里的 **6 条**。
+// 处置（沿用同文件 A-7 对 `_retired_locked` 的既有先例：独立字段 + stderr，刻意不进驱动弹窗的字段）：
+//   lock 条目（且 region≠US —— US 的 `usd_*` 参考字段在分支之前就会被写，匹配结果**仍被消费**）
+//   的告警落入 `_ambig_warnings_locked`：不上弹窗，但 `--doctor` 可见 → 消除误报 ≠ 隐藏信息。
+// a1/a2 锁"判据与调用点"，a3 锁"信息不丢"，b1/b2 锁告警路由，b3 锁**返回值一字不改**（本次只动路由）。
+{
+  const src28 = stripComments(fs.readFileSync(path.join(SRC, 'refresh-prices.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  ok('T28-a1 ★lock 判据同时排除 region=US（US 的 usd_* 在分支前就被写 → 匹配仍被消费，不该静音）',
+    /const\s+isLocked\s*=\s*m\.lock\s*===\s*true\s*&&\s*m\.region\s*!==\s*'US'/.test(src28),
+    '未匹配到 isLocked 判据');
+  const nCn28 = (src28.match(/cnFind\([^)]*isLocked\)/g) || []).length;
+  const nUsd28 = (src28.match(/usdFind\([^)]*isLocked\)/g) || []).length;
+  ok('T28-a2 ★全部查找调用点都传了 isLocked（cnFind 2 处 / usdFind 3 处）',
+    nCn28 === 2 && nUsd28 === 3, `cnFind=${nCn28} usdFind=${nUsd28}`);
+  ok('T28-a3 ★lock 告警落独立字段（不删信息）且 --doctor 能读到（消除误报 ≠ 隐藏信息）',
+    src28.includes('pricing._ambig_warnings_locked = [...AMBIG_WARNINGS_LOCKED]')
+    && stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8')).includes('_ambig_warnings_locked'));
+
+  // 运行态：直接单测 looseFind（纯函数、无副作用、不联网）
+  const savedEnv28 = process.env.WB_ROOT;
+  process.env.WB_ROOT = tmp;
+  let rp28 = null;
+  try { rp28 = require(path.join(skillDir, 'refresh-prices.js')); } catch (e) { rp28 = null; }
+  if (!rp28 || typeof rp28.looseFind !== 'function') {
+    ok('T28 模块加载', false, rp28 ? '缺少 looseFind 导出' : 'require 失败');
+  } else {
+    // 造"子串撞名"场景：查 glm-5.3-flash（归一化 glm53flash），索引里只有 z-ai/glm-5.3-flashx
+    //   （归一化 zaiglm53flashx）→ 唯一模糊命中且与被查键不同名 → 必然产生一条告警
+    const idx28 = { 'z-ai/glm-5.3-flashx': { in: 1, out: 2 } };
+    const qn28 = rp28.norm('glm-5.3-flash');
+    const n028 = rp28.AMBIG_WARNINGS.size, l028 = rp28.AMBIG_WARNINGS_LOCKED.size;
+    let rN28 = null, rL28 = null, threw28 = '';
+    try {
+      rN28 = rp28.looseFind(idx28, qn28, '国内源', 'glm-5.3-flash', false);
+      rL28 = rp28.looseFind(idx28, qn28, '国内源', 'glm-5.3-flash', true);
+    } catch (e) { threw28 = String(e && e.message); }
+    const dN28 = rp28.AMBIG_WARNINGS.size - n028;
+    const dL28 = rp28.AMBIG_WARNINGS_LOCKED.size - l028;
+    ok('T28-b1 ★未锁条目：告警进 _ambig_warnings（对照组，原行为不变）', !threw28 && dN28 === 1, threw28 || `新增 ${dN28} 条`);
+    ok('T28-b2 ★已锁条目：告警**不进** _ambig_warnings（dN 仍=1，只来自未锁那次）、改记 _ambig_warnings_locked',
+      !threw28 && dL28 === 1 && dN28 === 1, threw28 || `_ambig_warnings 共新增 ${dN28} 条、locked 新增 ${dL28} 条`);
+    ok('T28-b3 ★返回值一字不改（本次只动告警路由，绝不动匹配结果与价格）',
+      !threw28 && rN28 === rL28 && !!rN28 && rN28.in === 1,
+      `normal=${JSON.stringify(rN28)} locked=${JSON.stringify(rL28)}`);
+  }
+  if (savedEnv28 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv28;
+}
+
+// ===== T29：v3.33.0 第四轮审计——A5 timestamp 口径统一（防静默丢账） =====
+// 病根：记账的两个"孪生"入口（弹窗聚合 `aggregateTranscLines` / 账本 `perModelFromRows`，注释自称
+//   "完全一致的去重口径"）用 `typeof ts === 'number'` **硬判**——平台若把 timestamp 换成数字字符串，
+//   整行用量被**静默丢弃**（该行明明有 usage，账本却少记），零提示；而本文件其他 10+ 处早就用
+//   `Number(...)` 强制转换。同一字段两种判据 = 迟早分叉。
+// **实测裁决（诚实声明）**：310 份真实 transcript、抽样 34,960 行 → timestamp **100% 为 number**，
+//   含 usage 的 8,987 行无一例外 ⇒ **该缺陷从未在真实数据上触发，属潜伏型**。本次修的不是"不存在的
+//   场景"，而是（a）统一口径、（b）把将来的静默丢账改成有痕。
+// 零噪音（本项最关键）：40 份最大的真实 transcript 上一一跑 aggregateTranscript + perModelFromRows，
+//   HEAD vs WORK 输出**逐字节一致（27,172 字节）**——因为 Number() 作用于 number 是恒等变换。
+// a1/a2 锁口径统一与不可回退，b1-b4 锁行为（含 null/''/ISO 语义**不变**）。
+{
+  const src29 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  ok('T29-a1 ★两个记账入口都改走 numTs（不再各自硬判 typeof）',
+    (src29.match(/const ts = numTs\(r\.timestamp\);/g) || []).length === 2,
+    'numTs 调用点数=' + (src29.match(/const ts = numTs\(r\.timestamp\);/g) || []).length + '（应为 2）');
+  ok('T29-a2 ★记账入口内不得再出现 `typeof ts === \'number\'` 硬判（防回退）',
+    !/if \(!\(typeof ts === 'number'\) \|\| ts <= fromTs\) continue;/.test(src29));
+  ok('T29-a3 ★决策类站点未被顺手改动（hasTeamActivity / hasNewTranscSince 仍保守硬判）',
+    /if \(!\(typeof ts === 'number'\) \|\| ts <= roundStartMs\) continue;/.test(src29)
+    && /if \(typeof ts === 'number' && ts > roundStartMs && ts > sinceMs/.test(src29));
+
+  const savedEnv29 = process.env.WB_ROOT;
+  process.env.WB_ROOT = tmp;
+  let mod29 = null;
+  try { mod29 = require(path.join(skillDir, 'token-tracker.js')); } catch (e) { mod29 = null; }
+  if (!mod29 || typeof mod29.numTs !== 'function') {
+    ok('T29 模块加载', false, mod29 ? '缺少 numTs 导出' : 'require 失败');
+  } else {
+    const N = mod29.numTs;
+    ok('T29-b1 numTs 对 number 是恒等变换（零噪音的根因）',
+      N(1759600000000) === 1759600000000 && N(0) === 0 && Object.is(N(-1), -1),
+      `${N(1759600000000)} / ${N(0)}`);
+    ok('T29-b2 ★数字字符串被正确解析（本次修复点：HEAD 会整行丢弃）',
+      N('1759600000000') === 1759600000000 && N('123') === 123);
+    ok('T29-b3 ★null / undefined / 空串 / ISO 串仍返回 NaN（不因 Number(null)===0 被放行，原语义不变）',
+      [null, undefined, '', '2026-10-05T12:00:00.000Z'].every((v) => Number.isNaN(N(v))),
+      [null, undefined, '', 'iso'].map((v) => String(N(v))).join(' / '));
+    // 端到端（账本入口）：同一批行，timestamp 用数字字符串 → 必须被计入
+    const rowsNum = [
+      { type: 'message', role: 'assistant', timestamp: 1759600000000, id: 'a1', providerData: { model: 'hy3', usage: { inputTokens: 1000, outputTokens: 100 } } },
+      { type: 'message', role: 'assistant', timestamp: 1759600100000, id: 'a2', providerData: { model: 'hy3', usage: { inputTokens: 2000, outputTokens: 200 } } },
+    ];
+    const rowsStr = rowsNum.map((r) => Object.assign({}, r, { timestamp: String(r.timestamp) }));
+    const sum = (rows) => { const m = mod29.perModelFromRows(rows, 0); return Object.values(m).reduce((s, b) => s + b.total, 0); };
+    let threw29 = '';
+    let sNum = 0, sStr = 0, sNull = 0;
+    try { sNum = sum(rowsNum); sStr = sum(rowsStr); sNull = sum(rowsNum.map((r) => Object.assign({}, r, { timestamp: null }))); }
+    catch (e) { threw29 = String(e && e.message); }
+    ok('T29-b4 ★账本入口：数字字符串 timestamp 的整行用量不再被丢弃（HEAD=0，现=3300）',
+      !threw29 && sStr === 3300 && sNum === 3300 && sNull === 0,
+      threw29 || `num=${sNum} str=${sStr} null=${sNull}`);
+  }
+  if (savedEnv29 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv29;
+}
+
+// ===== T30：v3.33.0 第四轮审计——B 系列：`--report summary --csv` 补出口 =====
+// 病根：`summary` 是**唯一**没有 CSV 出口的 `--report` 入口。实测 `--report summary --csv` 得到
+//   「无法识别的参数：summary」——合法参数被判成非法，而且**那句错误文案自己就漏列了 summary**
+//   （原文案只有 week / month / <起>..<止> / all / <日期> / forecast）→ 用户敲对命令反被误导，
+//   而其他所有 `--report` 形态（今天 / all / 单日 / 区间 / forecast）都早已有 CSV 出口。
+// 处置：新增 `exportSummaryCsv()` + CLI 分支 `summary|totals --csv`（totals 是同一入口的别名，
+//   行为必须一致）+ 补全错误文案。
+// 口径：与文本版 `reportSummaryTxt` 同口径——每天一行、只出总合计（不出模型明细）、末尾 ALL 合计；
+//   多出 `no_price_models` / `unpriced_models` 两列（**模型个数**），否则 Excel 里那个金额会被当成
+//   完整金额（与文本版那两行 `⚠` 同义：合计只含已知部分）。两处计数滤条件刻意逐字对齐文本版，
+//   而**不**改用 `costCellKind`——后者在"两个标记同时置位"时只归一类，与文本版把同一模型计入两栏不一致。
+// 一处**刻意**差异（权衡过，不是遗漏）：请求的日期不在账本里时，文本版打「（无记录）」，
+//   这里打**整行空白**而不是数值 0——0 会被读成"那天零用量/免费"，与"没有这天的记录"是两回事。
+//   实测 `summary all` 只遍历账本里已有的日期，永不产生这种行；只有显式点一个账本外的日期才命中，
+//   且空白行对 ALL 合计的贡献恰为 0（口径正确）。
+// a1-a4 锁源码结构（出口函数 / CLI 分支 / 错误文案 / 空白行），b1-b5 锁行为。
+{
+  const src30 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  ok('T30-a1 ★存在 exportSummaryCsv（此前 summary 是唯一没有 CSV 出口的 --report 形态）',
+    /function exportSummaryCsv\(arg\) \{/.test(src30));
+  ok('T30-a2 ★CLI 分支：summary|totals 走 CSV 出口，且取 pos[1] 作为子参数（别名行为必须一致）',
+    /if \(wantCsv && \(rArg === 'summary' \|\| rArg === 'totals'\)\) \{/.test(src30)
+    && /exportSummaryCsv\(pos\[1\] \|\| ''\)/.test(src30));
+  ok('T30-a3 ★错误文案补全 summary（原文案"可用"列表自己就漏列了这个合法参数）',
+    /可用：week \/ month \/ <起>\.\.<止> \/ all \/ <日期> \/ summary \[all\|<日期>\] \/ forecast/.test(src30));
+  ok('T30-a4 ★账本外日期写整行空白而非 0（0 会被读成"零用量/免费"，与"无记录"不是一回事）',
+    /if \(!day\) \{ rows\.push\(\[date, '', '', '', '', '', '', ''\]\.join\(','\)\); continue; \}/.test(src30));
+
+  const savedEnv30 = process.env.WB_ROOT;
+  process.env.WB_ROOT = tmp;
+  const ledgerPath30 = path.join(skillDir, 'daily-usage.json');
+  const savedLedger30 = fs.existsSync(ledgerPath30) ? fs.readFileSync(ledgerPath30, 'utf-8') : null;
+  let mod30 = null;
+  try { mod30 = require(path.join(skillDir, 'token-tracker.js')); } catch (e) { mod30 = null; }
+  if (!mod30 || typeof mod30.exportSummaryCsv !== 'function') {
+    ok('T30 模块加载', false, mod30 ? '缺少 exportSummaryCsv 导出' : 'require 失败');
+  } else {
+    const readExport30 = (msg) => {
+      const f = (String(msg).match(/已导出：(.+?)（/) || [])[1] || '';
+      return f && fs.existsSync(f) ? fs.readFileSync(f, 'utf-8').replace(/^\uFEFF/, '') : '';
+    };
+    try {
+      fs.writeFileSync(ledgerPath30, JSON.stringify({
+        '2026-10-04': {
+          models: { hy3: { in: 1000, out: 200, cached: 0, total: 1200, cost: 0.01 }, 'space-bunny': { in: 50, out: 10, cached: 0, total: 60, cost: 0, no_price: true } },
+          total: { in: 1050, out: 210, cached: 0, total: 1260, cost: 0.01 },
+        },
+        '2026-10-05': {
+          models: { hy3: { in: 2000, out: 400, cached: 1000, total: 3400, cost: 0.02 }, 'some-unpriced': { in: 100, out: 20, cached: 0, total: 120, cost: 0, unpriced: true } },
+          total: { in: 2100, out: 420, cached: 1000, total: 3520, cost: 0.02 },
+        },
+      }), 'utf-8');
+      const snap30 = fs.readFileSync(ledgerPath30, 'utf-8');
+      const lines30 = readExport30(mod30.exportSummaryCsv('all')).split('\n').filter(Boolean);
+      ok('T30-b1 ★summary all --csv：表头 + 每天一行 + ALL，数字/计数与文本版同口径（含 UTF-8 BOM）',
+        lines30.length === 4
+        && lines30[0] === 'date,in,out,cached,total,cost_api_equiv,no_price_models,unpriced_models'
+        && lines30[1] === '2026-10-04,1050,210,0,1260,0.010000,1,0'
+        && lines30[2] === '2026-10-05,2100,420,1000,3520,0.020000,0,1'
+        && lines30[3] === 'ALL,3150,630,1000,4780,0.030000,,',
+        `行数=${lines30.length} 首行=${String(lines30[1]).slice(0, 40)}`);
+      const one30 = readExport30(mod30.exportSummaryCsv('2026-10-04')).split('\n').filter(Boolean);
+      ok('T30-b2 ★指定单日：只出该日 + ALL（ALL 与当日相同），不掺别的日期',
+        one30.length === 3 && one30[1] === '2026-10-04,1050,210,0,1260,0.010000,1,0'
+        && one30[2] === 'ALL,1050,210,0,1260,0.010000,,',
+        JSON.stringify(one30.slice(1)));
+      const miss30 = readExport30(mod30.exportSummaryCsv('2020-01-01')).split('\n').filter(Boolean);
+      ok('T30-b3 ★账本外日期：该行整行空白（不是 0），ALL 仍为真 0 —— 不把"无记录"伪装成"零用量"',
+        miss30.length === 3 && miss30[1] === '2020-01-01,,,,,,,' && miss30[2] === 'ALL,0,0,0,0,0.000000,,',
+        JSON.stringify(miss30.slice(1)));
+      ok('T30-b4 ★导出是只读操作：跑完 3 次导出（all / 单日 / 账本外日期）后账本文件逐字节不变',
+        fs.readFileSync(ledgerPath30, 'utf-8') === snap30);
+      fs.writeFileSync(ledgerPath30, '{}', 'utf-8');
+      ok('T30-b5 ★空账本 summary all --csv：与文本版同句「账本为空」，不给一份只有表头的空 CSV',
+        mod30.exportSummaryCsv('all') === '账本为空（暂无可导出数据）');
+    } catch (e) {
+      ok('T30 行为用例', false, String(e && e.message));
+    }
+    if (savedLedger30 === null) { try { fs.unlinkSync(ledgerPath30); } catch (e) { /* 无则忽略 */ } }
+    else { try { fs.writeFileSync(ledgerPath30, savedLedger30, 'utf-8'); } catch (e) { /* 恢复失败留给后续用例 */ } }
+  }
+  if (savedEnv30 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv30;
+}
+
+// ===== T31：v3.33.0 第四轮审计 B 系列——轮次标签的注入白名单收敛 + 明文落盘声明 + .bak 有界保留 =====
+// 病根（同一病根多处打补丁的又一例）：注入型 user 行的正则被**抄成两遍**（roundLabel / inferRoundStartFromText）。
+//   实测代价：本机 `rounds-2026-10.jsonl` 219 条里 **32 条**的 label 是 `<teammate-message teammate_id=…`
+//   开头 40 字符——白名单漏了 teammate-message，"这轮在干什么"的标签变成一段 XML。
+// 处置：收敛为单一定义 `injectionTagOf(txt, tags)` + 两张**刻意不同**的白名单：
+//   宽表（roundLabel：纯展示改写，无副作用）含 teammate-message；窄表（轮起点推断）**不含**——
+//   那里返回 0 会让 6041 的 `roundStart0 > 0` 不成立 → 整轮记账被跳过（S1 类静默丢账），
+//   团队模式下 user 行可能全是队友消息，排除它 = 丢账。a1-a3 锁结构，b1-b3 锁行为（含"不许回退"）。
+// 另：`roundLabel` 是本技能**唯一**会把用户自己敲的话落盘的地方（前 40 字符，本地明文，随 rounds 保留
+//   6 个月），已加源码声明 + README/CHANGELOG 声明（b4 锁声明不得被静默删除）。
+{
+  const src31 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  ok('T31-a1 ★注入白名单收敛为单一定义：源码里只剩一处标签字面量清单（旧的两份内联正则已删）',
+    (src31.match(/task-notification\|conversation_history_summary/g) || []).length === 0
+    && /const INJECTION_TAGS_ALL = \[/.test(src31)
+    && (src31.match(/injectionTagOf\(/g) || []).length >= 3);
+  ok('T31-a2 ★宽表含 teammate-message、窄表**不含**（轮起点推断返回 0 = 丢账，宁可取偏晚起点）',
+    /const INJECTION_TAGS_ALL = \[[^\]]*'teammate-message'[^\]]*\]/.test(src31)
+    && /const INJECTION_TAGS_NOT_SUBMIT = \[[^\]]*\]/.test(src31)
+    && !/const INJECTION_TAGS_NOT_SUBMIT = \[[^\]]*'teammate-message'/.test(src31));
+  // 注意：a3/b5 断言的是**注释本身的存在**（防后人删掉约束说明），故必须对**未剥注释**的原文匹配。
+  const raw31 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+  ok('T31-a3 ★两句"不许顺手统一"的约束注释仍在（防后人把两张表合成一张）',
+    /禁止"顺手统一"/.test(raw31)
+    && /整轮记账被跳过/.test(raw31));
+  ok('T31-a4 ★backfill 的 .bak 有界保留：只清本工具自己的前缀（严格 basename 前缀），不是通配删除',
+    /const KEEP_BAK = 5;/.test(stripComments(fs.readFileSync(path.join(SRC, 'backfill.js'), 'utf-8').replace(/\r\n/g, '\n')))
+    && /\.map\(\(b\) => b \+ '\.bak-backfill-'\)/.test(stripComments(fs.readFileSync(path.join(SRC, 'backfill.js'), 'utf-8').replace(/\r\n/g, '\n'))));
+
+  const savedEnv31 = process.env.WB_ROOT;
+  process.env.WB_ROOT = tmp;
+  let mod31 = null;
+  try { mod31 = require(path.join(skillDir, 'token-tracker.js')); } catch (e) { mod31 = null; }
+  if (!mod31 || typeof mod31.roundLabel !== 'function' || typeof mod31.inferRoundStartFromText !== 'function') {
+    ok('T31 模块加载', false, mod31 ? '缺少 roundLabel / inferRoundStartFromText 导出' : 'require 失败');
+  } else {
+    const transc31 = path.join(tmp, 't31-transc.jsonl');
+    const line = (role, ts, content) => JSON.stringify({ type: 'message', role, timestamp: ts, content }) + '\n';
+    try {
+      // 场景：真实提问（ts=1000，早于本轮起点）→ 队友消息（ts=3000，本轮内）
+      fs.writeFileSync(transc31,
+        line('user', 1000, '上一条真实提问')
+        + line('assistant', 2000, 'ok')
+        + line('user', 3000, '<teammate-message teammate_id="system" summary="s">hi</teammate-message>'), 'utf-8');
+      ok('T31-b1 ★teammate-message 不再被当成用户的话当标签（旧行为：label = `<teammate-message teammate_id="s`）',
+        mod31.roundLabel(transc31, 2500) === '[注入] teammate-message',
+        JSON.stringify(mod31.roundLabel(transc31, 2500)));
+      // 真实提问（本轮内）仍要被当标签，且截到 ROUND_LABEL_MAX(40)
+      const long31 = 'P'.repeat(60);
+      fs.writeFileSync(transc31,
+        line('assistant', 2000, 'ok') + line('user', 3000, long31), 'utf-8');
+      const lb31 = mod31.roundLabel(transc31, 2500);
+      ok('T31-b2 真实用户提问仍取前 40 字符作标签（该功能与截断长度都不得被顺手改掉）',
+        lb31 === 'P'.repeat(40) && lb31.length === 40, `len=${lb31.length}`);
+      // 轮起点推断：**只有**队友消息时也必须给非 0（否则 6041 整轮记账被跳过 = 丢账）
+      fs.writeFileSync(transc31,
+        line('user', 1000, '真实提问') + line('user', 3000, '<teammate-message teammate_id="a">x</teammate-message>'), 'utf-8');
+      ok('T31-b3 ★轮起点推断：整段只有队友消息时仍返回非 0（保守取偏晚起点，绝不因"排除注入"而归 0 丢账）',
+        mod31.inferRoundStartFromText(transc31) === 3000,
+        String(mod31.inferRoundStartFromText(transc31)));
+      // 有真实提问时优先真实提问（窄表排除项不含 teammate-message，故取最后一条 user 行）
+      fs.writeFileSync(transc31,
+        line('user', 2000, '真实提问') + line('user', 3000, '<teammate-message teammate_id="a">x</teammate-message>'), 'utf-8');
+      ok('T31-b4 轮起点推断对已有行为零变化：仍取尾部最后一条 user 行（本项只动标签、不动起点）',
+        mod31.inferRoundStartFromText(transc31) === 3000);
+      ok('T31-b5 ★明文落盘处有源码声明（说明这是唯一一处存用户原话的地方、40 字、本地、6 个月清理）',
+        /唯一一处会把用户自己敲的话落盘的地方/.test(raw31));
+      try { fs.unlinkSync(transc31); } catch (e) { /* 清理失败留给收尾 rmSync */ }
+    } catch (e) {
+      ok('T31 行为用例', false, String(e && e.message));
+    }
+  }
+  if (savedEnv31 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv31;
+}
+
+// ===== T32：v3.33.0 瘦身①——头注释版本日记迁出（防回涨） =====
+// 病根：`token-tracker.js` 头部曾是 CHANGELOG 的逐版镜像（v2.61 … v3.32.1 共 254 行），
+//   **永不参与运行**却常驻文件头——任何人/模型读这个文件都要先越过两百多行历史。
+//   与 SKILL.md v3.23.0 那次瘦身是同一个病根：把"历史"当"上下文"。
+// 处置：整段迁到 `docs/version-diary.md`（默认不加载），头部只留参与运行/供人定位的内容
+//   （版本号行 + 用法 + 轮次语义 + 测试开关）。实测 6710 → 6463 行（净 −247；含新增的 7 行迁出说明）。
+// a1 是**防回涨**守卫（不带上限的话，下一个人继续在头部堆版本要点，一年后又回到 250 行）。
+{
+  const raw32 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const ls32 = raw32.split('\n');
+  const iFirstCode = ls32.findIndex((l) => /^const fs = require\('fs'\);/.test(l));
+  // 上限 80 行：迁出前是 279 行。**真正的判据不是行数，而是"头注释里有没有版本日记"**——
+  //   行数上限只是兜底（运行/约定类说明多写几行不算病，反倒是好事）。所以另加一道直接判据：
+  //   头注释里形如 `// v3.xx` 的**逐版要点行**不得 > 2（迁移后为 0）。
+  const headLines = ls32.slice(0, iFirstCode);
+  const diaryLines = headLines.filter((l) => /^\/\/ v\d+\.\d+/.test(l)).length;
+  ok('T32-a1 ★头注释区不得回涨（≤80 行；迁出前是 279 行）—— 防"历史当上下文"复发',
+    iFirstCode >= 0 && iFirstCode <= 80, `头注释 ${iFirstCode} 行（应为 1..80）`);
+  ok('T32-a1b ★头注释里不得再出现逐版要点行（`// vX.Y` ≤2 行；这是"版本日记"的直接判据）',
+    diaryLines <= 2, `实测 ${diaryLines} 行`);
+  ok('T32-a2 ★版本号行仍在头部（T12-i4 的锚点，迁出时最容易顺手删掉）',
+    /^\/\/ token-usage-tracker v\d/.test(ls32[1] || ''));
+  const diaryPath = path.join(SRC, 'docs', 'version-diary.md');
+  const hasDiary = fs.existsSync(diaryPath);
+  const diary = hasDiary ? fs.readFileSync(diaryPath, 'utf-8') : '';
+  ok('T32-a3 ★迁出件真实存在且**两端齐全**（不是"删掉了事"：v2.61 与 v3.32.1 都在）',
+    hasDiary && diary.indexOf('v2.61') >= 0 && diary.indexOf('v3.32.1') >= 0
+    && diary.split('\n').length > 200,
+    hasDiary ? `${diary.split('\n').length} 行` : 'docs/version-diary.md 不存在');
+  ok('T32-a4 头部保留迁出说明（指出权威记录是 CHANGELOG.md，避免读者以为历史被丢失）',
+    /已迁出本文件/.test(raw32) && /以 CHANGELOG\.md 为准/.test(raw32));
+  // a5：**推送白名单缺口**守卫。docs/ 整目录被 .gitignore 屏蔽（只放行 3 个公开 md）——
+  //   迁出件若忘了加 `!` 例外，本地测试全绿、GitHub 用户却拿到一个指向不存在文件的指路牌
+  //   （T32-a3 只查本地存在，天然查不出"推送时被忽略"）。这类"本地绿、分发缺"的缺口
+  //   正是 v3.32.1 CI 红那类问题的同族，故单列一条。
+  const gi32 = fs.existsSync(path.join(SRC, '.gitignore')) ? fs.readFileSync(path.join(SRC, '.gitignore'), 'utf-8') : '';
+  ok('T32-a5 ★docs/version-diary.md 必须在 .gitignore 里被显式放行（本地存在 ≠ 会推送到 GitHub）',
+    /^!docs\/version-diary\.md\s*$/m.test(gi32), gi32 ? '未找到例外行' : '.gitignore 不存在');
+}
+
+// ===== T33：v3.33.0 瘦身②——裸 catch 白名单化（防"顺手吞错"） =====
+// 病根：全仓 36 处 `catch (x) {}`（审计报 34，实测 36——报告数字也不准）。它们**不是**都该修：
+//   toast/诊断/清理失败的静默本来就是正确设计（给它们加日志 = 把噪音写进日志本身，
+//   而且这些路径每次运行都走到）。真问题是对读者/复审者而言，"刻意静默"与"忘了写处理"
+//   **长得一模一样**，无法据此判断哪一处是缺陷。
+// 处置：不改行为，改为**可核对**——全仓裸 catch 行尾必须带 `// silent-ok:<类别> — <理由>`，
+//   类别仅允许 诊断 / 清理 / 探测 / 降级 四种（约定写在 token-tracker.js 头部）。
+//   T33 就是那条守卫：新增一处没写理由的裸 catch → 直接红。**这是把"约定"变成"约束"的那一步。**
+{
+  const FILES33 = ['token-tracker.js', 'backfill.js', 'recalc-day.js', 'refresh-holidays.js', 'refresh-prices.js', 'selftest.js'];
+  const BARE33 = /catch \([a-z_]+\)\s*\{\}/;
+  const KINDS33 = ['诊断', '清理', '探测', '降级'];
+  let nAll = 0, nBad = 0, nKind = 0;
+  const badSamples = [];
+  for (const f of FILES33) {
+    const fp = path.join(SRC, f);
+    if (!fs.existsSync(fp)) continue;
+    const ls = fs.readFileSync(fp, 'utf-8').split('\n');
+    for (let i = 0; i < ls.length; i++) {
+      const ix = ls[i].search(BARE33);
+      // 只认真代码里的裸 catch：`catch (x) {}` 出现在 `//` 之后的一律是在注释里被**引用**
+      // （本守卫自己的约定注释就要引用它，否则会把自己数进去）。
+      if (ix < 0) continue;
+      const cmtAt = ls[i].indexOf('//');
+      if (cmtAt >= 0 && cmtAt < ix) continue;
+      nAll++;
+      const m = /\/\/\s*silent-ok:(\S+)/.exec(ls[i]);
+      if (!m) { nBad++; if (badSamples.length < 3) badSamples.push(`${f}:${i + 1}`); continue; }
+      if (KINDS33.indexOf(m[1]) < 0) { nKind++; if (badSamples.length < 3) badSamples.push(`${f}:${i + 1}=${m[1]}`); }
+    }
+  }
+  ok('T33-a1 ★裸 catch 总数与基线一致（36；新增/删除必须显式改这里，防"顺手吞一个错"）',
+    nAll === 36, `实测 ${nAll} 处`);
+  ok('T33-a2 ★每一处裸 catch 都带 silent-ok:<类别> — <理由>（无标记即红）',
+    nBad === 0, nBad ? `${nBad} 处无标记：${badSamples.join(', ')}` : '');
+  ok('T33-a3 ★类别必须落在白名单四类（诊断/清理/探测/降级）内——写个别的不算数',
+    nKind === 0, badSamples.join(', '));
+  ok('T33-a4 ★约定本身有出处（头部注释写清"不在这四类里的静默 = 缺陷"）',
+    /静默 catch 约定/.test(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8'))
+    && /不在这四类里的静默 = 缺陷/.test(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8')));
+}
+
 // ===== 导出一致性（A-16）：自动推导，替代"手工清单"的兜底 =====
 // 病根：selftest 里"新增导出必须存在"是**三张手工清单**（T8-N1g/N2 的 typeof 检查、T11-a 的 `exported`、
 //   T12-a 的 `ex12`），全靠人记得往里加。`cleanupCoalesceLocks` 三张都不含 → 一旦它"定义还在、导出没了"，
@@ -1763,7 +2366,13 @@ else {
 {
   const selfCode = stripComments(fs.readFileSync(path.join(SRC, 'selftest.js'), 'utf-8'));
   // 被测主模块在 selftest 里的全部局部变量名（grep 得来，勿漏；均为 require(skillDir/token-tracker.js) 的别名）
-  const MOD_VARS = ['mod', 'ttMod', 'tt2', 'mod16', 'mod17', 'mod18', 'mod19', 'mod20', 'mod21'];
+  // v3.33.0：补 mod26（T26 --doctor）/ mod27（T27 补-S5）/ mod29（T29 numTs）/ mod30（T30 exportSummaryCsv）
+  //   —— 本节注释自己就写着"勿漏"，而这些别名正是后来逐个新增的、当时都没往里加 → 它们引用的成员
+  //   （doctorTxt / showToast / numTs / exportSummaryCsv）此前**不受本守卫覆盖**，新增导出漏了就查不出来。
+  //   注意本守卫只核对 `token-tracker.js` 的导出：`rp28`（T28 用到的 refresh-prices.js）**刻意不列**，
+  //   因为 ttAll 是主脚本的导出表，把它列进来会对 looseFind 这类"兄弟模块导出"产生**假失败**；
+  //   那条路径由 T28 自己的 `typeof rp28.looseFind !== 'function'` 前置守卫覆盖。
+  const MOD_VARS = ['mod', 'ttMod', 'tt2', 'mod16', 'mod17', 'mod18', 'mod19', 'mod20', 'mod21', 'mod26', 'mod27', 'mod29', 'mod30', 'mod31'];
   const memberRe = new RegExp('\\b(?:' + MOD_VARS.join('|') + ')\\.([A-Za-z_$][A-Za-z0-9_$]*)', 'g');
   const referenced = new Set();
   let mm;
@@ -1786,7 +2395,21 @@ else {
   }
 }
 
-fs.rmSync(tmp, { recursive: true, force: true });
+// 隔离目录清理（v3.33.0 加固）：**有界重试**。
+//   为什么需要：主脚本在被 require 时会跑 loadPricing → maybeRefreshHolidays（每进程一次、四条件命中即
+//   **detach** spawn 一个 refresh-holidays.js 子进程并往 SNAP_DIR 写 `.holidays-refresh.json`）。该子进程
+//   存活到测试结束之后，恰好与这里的 rmSync 抢同一批文件 → Windows 上 rimraf 报
+//   `ENOTEMPTY: directory not empty, rmdir ...`，整个 selftest 以非零码崩掉、连结果汇总都打不出来。
+//   实测症状是"断言全绿但 exit 1"，且**偶发**（`%TEMP%` 里有 2026-10-04 的历史残留，早于本轮改动 → 既有隐患）。
+//   注意：这不是断言失败，也不能靠忽略错误掩盖（ENOTEMPTY 之外的错误照旧抛出）。
+for (let i = 0; i < 5; i++) {
+  try { fs.rmSync(tmp, { recursive: true, force: true }); break; }
+  catch (e) {
+    if ((e && e.code !== 'ENOTEMPTY') || i === 4) throw e;
+    // 子进程写完最后一批文件即退出，短暂退避后重试足够（5 次 × 200ms ≈ 1s 上限）
+    try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200); } catch (e2) { /* 退避失败直接重试 */ }
+  }
+}
 // v3.24.0（审计⑤）：skip 数显式化 —— 「138 全绿」曾掩盖 26 条端到端用例全部 SKIP 的事实
 // （SPAWN_OK=false 的沙箱环境里绿 ≠ 真跑过）。
 // v3.29.0（A-3）：**退出码语义修正** —— 只有真失败才 exit 1；envSkip 是"环境能力受限"（沙箱禁 spawn、

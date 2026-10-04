@@ -150,7 +150,7 @@ if (require.main === module) (async () => {
   const years = arg ? [Number(arg)] : [nowY - 1, nowY, nowY + 1];
   const tok = ghToken();
   let old = { years: {} };
-  try { old = JSON.parse(fs.readFileSync(OUT, 'utf-8')); } catch (e) {}
+  try { old = JSON.parse(fs.readFileSync(OUT, 'utf-8')); } catch (e) {} // silent-ok:降级 — 旧年表读取失败即视为空（随后会按新表写）
   const yearsMap = Object.assign({}, old.years || {});
   const cross = Object.assign({}, old.cross_check || {});
   // v3.29.0（C-5）：两源差异单独留一份**浅层、按年**的清单，供排查与文档直接引用

@@ -1,5 +1,5 @@
 {
- "updated_at": "2026-10-04 07:58:45",
+ "updated_at": "2026-10-05 02:43:19",
  "note": "只列「放假」日期；峰谷判定用它排除法定假日。双源交叉验证，不一致时取交集。年份值三态：[日期…]=已确认；null/键缺失=未知；见 _stale/stale_years=陈旧。",
  "sources": {
   "primary": "NateScarlet/holiday-cn",
@@ -11,7 +11,7 @@
  ],
  "stale_detail": {
   "2027": {
-   "since": "2026-10-04",
+   "since": "2026-10-05",
    "reason": "获取失败: B/2027: HTTP 404 @ HankAviator/china-holiday-calendar/data/years/2027.json"
   }
  },

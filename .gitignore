@@ -46,6 +46,10 @@ docs/*
 !docs/balance.md
 !docs/pricing-refresh.md
 !docs/windows-notification.md
+# v3.33.0：头注释版本日记迁出件——**必须入库**：token-tracker.js 头部与 KNOWN-ISSUES 都指向它，
+#   不放行的话从 GitHub 安装的用户会看到一个指向不存在文件的指路牌（且 T32-a3 只查本地存在，
+#   查不出"推送时被忽略"这种缺口）。已扫描确认无个人路径（纯逐版要点，与 CHANGELOG 同源）。
+!docs/version-diary.md
 # 模型已查列表（本地运行时，不入库）
 .lookedup-models.json
 

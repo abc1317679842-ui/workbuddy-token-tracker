@@ -249,7 +249,7 @@ function discoverCnPriceDb() {
   } catch (e) { /* ~/WorkBuddy 不存在 → 跳过该级 */ }
   cands.push(path.join(SKILL_DIR, 'prices', 'index.json'));
   for (const c of cands) {
-    try { if (c && fs.existsSync(c)) return c; } catch (e) {}
+    try { if (c && fs.existsSync(c)) return c; } catch (e) {} // silent-ok:探测 — Python 候选探测，未命中即试下一个
   }
   return null;
 }
@@ -319,7 +319,7 @@ function main() {
 
   // 合并旧水位线（max，防回退）
   let oldWm = {};
-  try { oldWm = JSON.parse(fs.readFileSync(WATERMARK, 'utf-8')); } catch (e) {}
+  try { oldWm = JSON.parse(fs.readFileSync(WATERMARK, 'utf-8')); } catch (e) {} // silent-ok:降级 — 旧水位线读取失败即视为空（下面会重建）
   const mergedWm = Object.assign({}, oldWm);
   for (const [k, v] of Object.entries(newWm)) {
     const o = mergedWm[k] || { main: 0, subs: {} };
@@ -343,7 +343,7 @@ function main() {
   // 组装新账本（v3.19.0/P4：不再继承 _instructions——M3 已关闭"数据→指令"通道，旧账本残留字段
   // 会被原样带进新账本，等于把通道又开回来）
   let oldDaily = {};
-  try { oldDaily = JSON.parse(fs.readFileSync(DAILY, 'utf-8')); } catch (e) {}
+  try { oldDaily = JSON.parse(fs.readFileSync(DAILY, 'utf-8')); } catch (e) {} // silent-ok:降级 — 旧账本读取失败即视为空（上面已确认存在才进这里）
   const newDaily = {};
   const dates = Object.keys(acc).sort();
   for (const date of dates) {
@@ -400,8 +400,8 @@ function main() {
       return { aborted: true };
     }
     // 指纹一致：确认扫描窗口内无人改动，再备份 + 合并写入
-    try { if (fs.existsSync(DAILY)) fs.copyFileSync(DAILY, bak1); } catch (e) {}
-    try { if (fs.existsSync(WATERMARK)) fs.copyFileSync(WATERMARK, bak2); } catch (e) {}
+    try { if (fs.existsSync(DAILY)) fs.copyFileSync(DAILY, bak1); } catch (e) {} // silent-ok:清理 — 备份失败不阻断回填（备份是尽力而为）
+    try { if (fs.existsSync(WATERMARK)) fs.copyFileSync(WATERMARK, bak2); } catch (e) {} // silent-ok:清理 — 同上
     let cur = {};
     try { cur = JSON.parse(fs.readFileSync(DAILY, 'utf-8')); } catch (e) { cur = {}; }
     const mergedDaily = Object.assign({}, cur, newDaily); // newDaily 覆盖同日期，cur 的其余日期保留
@@ -457,6 +457,23 @@ function main() {
     console.error('[backfill] 水位线正被占用，账本已写入但水位线未推进；请退出 WorkBuddy 后重跑（水位线不改不会重复计费，安全）');
     process.exit(1);
   }
+  // v3.33.0（第四轮审计 B 系列）：`.bak-backfill-*` **有界保留**。
+  //   病根：每次 --write 落一对备份（账本 + 水位线），文件名带 ISO 时间戳 → **线性堆积**、全仓无任何清理。
+  //   虽非高频操作，但确实没有上界。账本本身只有几十 KB，留最近 5 对足够回溯（真要反查更早状态，
+  //   用最近一次即可；再往前的备份只会无限占位）。
+  //   只清理**本工具自己产生**的文件名（严格前缀匹配 DAILY / WATERMARK 的 basename），不碰用户其他文件；
+  //   时间戳里的 `:`/`.` 已被替换成 `-` → 文件名字典序 == 时间序，直接 sort 取尾部即可。
+  //   任何失败一律静默：清理失败不影响"本次回填已成功"这一事实，下次运行会再清。
+  try {
+    const KEEP_BAK = 5;
+    const dir = path.dirname(DAILY);
+    for (const prefix of [path.basename(DAILY), path.basename(WATERMARK)].map((b) => b + '.bak-backfill-')) {
+      const olds = fs.readdirSync(dir).filter((f) => f.startsWith(prefix)).sort();
+      for (const f of olds.slice(0, Math.max(0, olds.length - KEEP_BAK))) {
+        try { fs.unlinkSync(path.join(dir, f)); } catch (e) { /* 占用/权限：静默，下次再清 */ }
+      }
+    }
+  } catch (e) { /* 清理失败不影响回填结果 */ }
   console.log('');
   console.log(`✅ 已写入账本：${DAILY}`);
   console.log(`✅ 已推满水位线：${WATERMARK}（${Object.keys(wmRes.result).length} 个会话键，逐键取 max 防回退）`);

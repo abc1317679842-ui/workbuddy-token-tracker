@@ -8,6 +8,16 @@
 >
 > 日常回答消耗查询**不需要**读本文件——那只涉及 `--report` 系列命令。
 
+## 🔎 第一步永远先跑 `--doctor`（v3.33.0）
+
+```
+node "C:/Users/<你的用户名>/.workbuddy/skills/token-usage-tracker/token-tracker.js" --doctor
+```
+
+**只读**（不联网、不写文件、不触发刷新，退出码恒 0），一屏给出 7 段：**账本**（可读性/天数/模型数/脏条目）· **状态文件**（水位线/快照/合并文件/锁的堆积与滞留）· **价库**（最后刷新距今/未公布价/0 价/歧义告警）· **假日**（今年明年已确认还是未知）· **hooks**（是否配 + `lastHookAt` 距今多久）· **日志** · **版本**。
+
+为什么强制放第一步：下面表里的条目**大多数是本文件事后补写的**，而用户往往只给一句"没记账/数字不对"。先体检能把症状**落到具体一段**（例如 `[hooks] Stop 已配，但 lastHookAt 3 天前` → 直接指向 hook 配置问题，而不是去翻账本）。**先有体检结论再查表**，别越过它猜。
+
 ## 弹窗诊断日志
 
 - 每次弹窗时，代码**自动**向 `~/.workbuddy/token-tracker-toast.log` 追加一行 JSON 诊断记录（无需任何开关，默认开启）。
@@ -34,6 +44,7 @@
 | 压缩期间连弹多条「本轮无 token 消耗记录」 | `token-tracker-compaction.log` | 查 `stop-no-token-compaction-skip` 是否存在：存在说明豁免已生效；缺失则说明末尾 30 行未命中标记或标记已超 10 分钟 TTL（`COMPACTION_MARKER_TTL_MS` 可调） |
 | 弹窗内容异常（会话错乱） | `token-tracker-toast.log` + trace 文件 | 查看 `sessionId` 是否为空或与实际会话不一致；检查 trace 的 `sessionId` 字段 |
 | 账本数据未更新 | `daily-usage.json`（mtime）、`.ledger-watermark.json` | 若 mtime 停在某时间，说明 Stop 路径未执行；结合 probe 判断 |
+| **弹窗一直正常、但账本永远是空的**（配置里只有 `Stop`、没有 `UserPromptSubmit`） | `settings.json` 是否配了 `--hook`；`.snapshot-<sid>.json` 的 `lastUserMsgAt` | **v3.33.0 前的结构性缺陷**（不是配置错）：`Stop` 端记账窗口的起点 `roundStart` **只由 `--hook` 写快照**。没配 `UserPromptSubmit` 的机器 `lastUserMsgAt` 恒为缺失 → `roundStart0 = 0` → `if (tsPath && roundStart0 > 0)` 整段记账被跳过；且 traces 兜底那条路径 `writeCoalesce` **漏传 `tsPath`** → watcher 侧 `if (info.tsPath)` 恒假 → **双封死**。症状因此长这样：**弹窗照弹（走的是不依赖起点的分支）、账本 / `--report` 永远是"暂无记录"**。v3.33.0 起：起点缺失时从 transcript 反推（取本会话最后一条真实用户提问时间戳、跳过系统注入型 user 行），两条兜底路径也都补上了 `tsPath`。**若用户跑的是 ≤v3.32.1 的版本 → 让他补配 `UserPromptSubmit`（或升级）；不要按"数据源坏了"排查** |
 | 弹窗频繁重复 | `.ledger-watermark.json` + `token-tracker-toast.log` | 查看 watermark 去重是否生效，以及 toast.log 中同一 `reason` 是否反复出现 |
 | 弹窗提示「⚠价库8/31」/ 价库不刷新 | `WorkBuddy\2026-08-30-22-25-15\prices\.refresh.lock`（失败会常驻）+ `.refresh.error`（v2.82 起失败留档）+ `binaries/python/envs/default`（venv 是否有 requests） | 刷新失败首查 `.refresh.error` 内容；「python 环境」问题查 resolvePython 是否命中 venv（v2.82 根修：候选表必须含 venv 路径）。**v3.23.4 起 requests 已非必需**：无 requests 的解释器会自动回退 urllib，不再一进文件就 ImportError；若看到 `pip install brotli` 提示，说明站点用了 br 压缩 |
 | 弹窗**正文行**出现 `｜⚠未计价` | 本轮模型名 + `pricing.json` 是否有对应条目 + `.lookedup-models.json` | 含义 = **本轮有 token 消耗、但金额算不出来**：该模型在 `pricing.json` 里查不到匹配（未收录 / `findModel` 未命中），或混合轮里**部分模型无价**（`toastLine2` 的 `partUnknown`）——金额位显示 `未收录`，混合轮则显示有价部分的**部分和**。处理：补 `pricing.json` 该条目价 → `node recalc-day.js <日期>` 回算；**不要跑 `backfill --write`**（全量重建会抹历史账，见 KI-5）。无 in/out 的空轮不标 |
@@ -53,7 +64,8 @@
 | 区间汇总的「缓存命中」与各天百分比对不上 | `--report <起>..<止>` 的输出 | **设计如此，不是 bug**：命中率是比率，区间值按 `Σ缓存 / Σ输入` **重算**（按 token 量加权），不是各天 hit 的算术平均——跨天量级差 100 倍时均值会严重偏离。要核对请手算 `Σ缓存/Σ输入` |
 | CSV 用 Excel 打开中文列头乱码 | `exports/report-*.csv` 前 3 字节是否为 `EF BB BF` | 必须带 UTF-8 BOM，否则 Excel 按 GBK 解码必乱码。`--report --csv` 已固定写入 BOM；若仍乱码，先确认该文件是否被别的工具改写过 |
 | 轮次明细里同一轮出现多条 | 各条的 `roundStart` 与 `source` | **正常**：同一轮可能分多批落盘（如 Stop 记一批、`--flush-delayed` 再补一批），`source` 区分来源。被幂等拦掉的只有「无新增用量」的重复 Stop。按轮聚合请用 `sid + roundStart` 分组 |
-| 明细 `label` 为空 | 该轮 `roundStart` 与 transcript 中 user 行的 timestamp | `roundLabel` 只取 **timestamp ≥ roundStart** 的 user 行，且只扫 transcript **尾部 400 行**；取不到就留空（不编造）。常见原因：本轮很长、首行已被挤出尾部窗口；或测试夹具用了与真实时间不符的 `roundStart` |
+| 明细 `label` 为空 | 该轮 `roundStart` 与 transcript 中 user 行的 timestamp | `roundLabel` 只取 **timestamp ≥ roundStart** 的 user 行，且只扫 transcript **尾部 400 行**；取不到就留空（不编造）。常见原因：本轮很长、首行已被挤出尾部窗口；或测试夹具用了与真实时间不符的 `roundStart`。**v3.33.0 起**这 400 行是**真的 400 行**——此前按「末尾 64KB 字节」取窗口，真实 transcript 平均行长 4.3KB（30% 的行 >4KB）→ 实际只够约 15 行，且超长行会整行解析失败，故该原因在旧版命中率高得多 |
+| 尾部超长行被当成不存在 / 末行指纹恒定 | 该会话 transcript 的最后一行长度 | **v3.33.0 前的第二个结构性缺陷**：三处尾部读取各自硬编码「从文件尾读多少字节」（65536 / 8192 / 4096）。真实 transcript 实测最大行长 **210KB**、>64KB 有 19 行 → 超长末行落在窗口外 → 窗口内无换行符 → 只剩残片 → 解析失败被**静默丢弃**（`lastTranscLine` 恒 `null` → 判态退化、`roundLabel` 取不到 label）；`readTailRaw` 返回空串还会让**末行指纹恒定** → watcher 误判"文件无变化"→ 提前 idle 弹窗。v3.33.0 起统一走块回溯（`eachTailLineReverse`），按行数而非字节数取，超长行跨块拼回后完整 |
 | 回答末尾出现「本技能有新版本」 | `.update-check.json` 的 `latestVersion` / `notifyCount` | **正常**（v3.21.0 版本更新提示）。`notifyCount ≥ 2` 后自动静默；升级后本地版本 ≥ 远端即不再提示。想彻底关：`local-config.json` 写 `{"enable_update_check": false}` |
 | 从没见过更新提示（但确实有新版本） | `.update-check.json`（是否存在 / `lastCheckAt` 是否在 7 天内 / `failCount`） | ① 检查在 `--hook` 触发（用户提问时）；`--stop` **仅在 hookIdle 时**预检查一次并走 toast 标记兜底；手动模式（`--report`/`--flush-delayed`）不查（v3.22.0 起 `--stop` 兜底链路，旧文档"永远不提示"口径已过时）；② 7 天闸门内不重复查；③ `failCount ≥ 3` 会当周停止重试；④ `ENABLE_UPDATE_CHECK` 或 `ENABLE_NETWORK` 关掉时静默跳过。**注意：装了旧版的用户根本不会有这个文件——检查逻辑在被安装的那份代码里** |
 | 更新提示重复出现很多次 | `.update-check.json` 的 `notifiedVersion` / `notifyCount` / `lastNotifyAt` | 设计上限是**同一版本最多 2 次、间隔 ≥24h**。若远超此数：确认状态文件是否可写（写失败会导致次数不累计），或每次都在换技能目录（状态文件跟着目录走） |

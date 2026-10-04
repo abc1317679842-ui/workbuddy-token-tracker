@@ -127,7 +127,7 @@ function backupDaily() {
   try {
     fs.copyFileSync(DAILY, `${DAILY}.bak-recalc-${Date.now()}`);
     const baks = fs.readdirSync(SKILL_DIR).filter((f) => f.startsWith('daily-usage.json.bak-recalc-')).sort();
-    for (const f of baks.slice(0, Math.max(0, baks.length - 3))) { try { fs.unlinkSync(path.join(SKILL_DIR, f)); } catch (e) {} }
+    for (const f of baks.slice(0, Math.max(0, baks.length - 3))) { try { fs.unlinkSync(path.join(SKILL_DIR, f)); } catch (e) {} } // silent-ok:清理 — 旧备份有界保留，删不掉就留着
   } catch (e) { /* 备份失败不阻塞（写盘本身仍是原子的） */ }
 }
 

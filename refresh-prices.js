@@ -139,7 +139,7 @@ function withPricingLock(fn) {
     return alive;
   };
   const acquire = () => {
-    try { fs.mkdirSync(path.dirname(PRICING_LOCK_FILE), { recursive: true }); } catch (e) {}
+    try { fs.mkdirSync(path.dirname(PRICING_LOCK_FILE), { recursive: true }); } catch (e) {} // silent-ok:清理 — 建价库锁目录；真失败会在随后的建锁处报错
     // 1) 锁不存在 → 创建
     if (tryCreate()) return true;
     let mine = null;
@@ -420,7 +420,20 @@ function parsePortkey(j) {
 // （下次刷新进程重启即丢）。现在由 main() 在写盘前落成 pricing._ambig_warnings（纯字符串数组，
 // 不带时间戳对象，便于 token-tracker.js 或其他脚本直接读取消费）。
 const AMBIG_WARNINGS = new Set();
-function looseFind(index, localNorm, kind, forKey) {
+// v3.33.0（A2 治本）：**已 lock 条目**的歧义告警单独归集，不进 `_ambig_warnings`。
+//   病根：`m.lock === true` 的模型，主价分支本就整段跳过（CN 分支 812 行 / US 分支 843 行 `lockKept++`），
+//   即 **模糊匹配的结果根本没被用上**；但 looseFind 仍把"唯一模糊命中…需人工核验"塞进 `_ambig_warnings`，
+//   而该字段被 token-tracker.js 的 priceAuditTag 直接翻成弹窗标签「⚠价核验」→ **常用模型每条弹窗都挂**。
+//   这不是"某次误报"，是**永久误报**（lock 不会自己消失，告警也就永不消失）→ 告警疲劳，
+//   把 ⚠价核验 对"可修复异常"的警示价值稀释掉。用户原话："明明有价格，为什么又在报价核验？"
+//   处置沿用同一文件里 A-7 对 `_retired_locked` 的既有先例（937 行注释：**刻意不进 _price_audit**，
+//   改为独立字段 + stderr 留痕）——信息不丢，只是不再驱动弹窗。
+const AMBIG_WARNINGS_LOCKED = new Set();
+function ambigAdd(msg, locked) {
+  if (locked) AMBIG_WARNINGS_LOCKED.add(msg);
+  else AMBIG_WARNINGS.add(msg);
+}
+function looseFind(index, localNorm, kind, forKey, locked) {
   if (!index) return null;
   let hits = [];
   for (const k of Object.keys(index)) {
@@ -437,29 +450,31 @@ function looseFind(index, localNorm, kind, forKey) {
     // 处理策略（保守）：仍采用该候选（不放价，避免误伤正常命中的源），但记入 AMBIG_WARNINGS，
     // 由 main() 在写盘时落到 pricing._ambig_warnings，让人工核验时能看见。
     if (norm(hits[0]) !== localNorm) {
-      AMBIG_WARNINGS.add(`${forKey}: ${kind} 唯一模糊命中 ${hits[0]}（与被查键不同名，已采用但需人工核验）`);
+      ambigAdd(`${forKey}: ${kind} 唯一模糊命中 ${hits[0]}（与被查键不同名，已采用但需人工核验）`, locked);
     }
     return index[hits[0]];
   }
   const priceSig = (v) => JSON.stringify([v.usdIn != null ? v.usdIn : v.in, v.usdOut != null ? v.usdOut : v.out]);
   const sigs = new Set(hits.map((k) => priceSig(index[k])));
   if (sigs.size === 1) return index[hits[0]];
-  AMBIG_WARNINGS.add(`${forKey}: ${kind} 模糊命中 ${hits.length} 个不同价候选(${hits.slice(0, 3).join(',')})，已放弃`);
+  ambigAdd(`${forKey}: ${kind} 模糊命中 ${hits.length} 个不同价候选(${hits.slice(0, 3).join(',')})，已放弃`, locked);
   return null;
 }
 
-function usdFind(usdIndex, localKey, orId, localNorm) {
+// v3.33.0（A2）：末位 `locked` 由调用方传 `m.lock === true`——已锁条目的匹配结果不会被采用（见上方注释），
+//   故其歧义只记入 `_ambig_warnings_locked`（独立字段 + stderr），不再挂弹窗「⚠价核验」。
+function usdFind(usdIndex, localKey, orId, localNorm, locked) {
   if (!usdIndex) return null;
   if (usdIndex[localKey]) return usdIndex[localKey];
   if (orId && usdIndex[orId]) return usdIndex[orId];
-  return looseFind(usdIndex, localNorm, 'USD源', localKey);
+  return looseFind(usdIndex, localNorm, 'USD源', localKey, locked);
 }
 
 // 在人民币源索引里找模型：先 srcId（归一化），再精确，再模糊（带歧义防护）
-function cnFind(cnIndex, srcId, localNorm, forKey) {
+function cnFind(cnIndex, srcId, localNorm, forKey, locked) {
   if (!cnIndex) return null;
   if (srcId && cnIndex[srcId]) return cnIndex[srcId];
-  return looseFind(cnIndex, localNorm, '国内源', forKey || localNorm);
+  return looseFind(cnIndex, localNorm, '国内源', forKey || localNorm, locked);
 }
 
 // v3.24（F2·A-4c）：USD 系（US 模型 + CN 的 auto_converted 估算分支）缓存价写入策略。
@@ -754,8 +769,16 @@ async function main() {
 
     const localNorm = norm(key);
     const srcId = SRC_ID_MAP[key] || null;
-    const llmaHit = llma ? cnFind(llma, srcId, localNorm, key) : null;
-    const llcHit = llc ? cnFind(llc, srcId, localNorm, key) : null;
+    // v3.33.0（A2）：lock 条目下面三个写价分支**全部跳过**（CN: 812 / US: 843），匹配结果不被采用
+    //   → 其歧义告警只留痕不挂弹窗（避免"永久误报"稀释 ⚠价核验 的警示价值）。
+    //   为何还要求 `region !== 'US'`：region=US 的条目**在分支之前**就会把匹配值写进 `usd_*` 参考字段
+    //   （见上方 780 行 `if (m.region === 'US' && ...)`），那段写入并**没有** lock 守卫 → 此时匹配结果
+    //   确实仍被消费，告警不该静音。判据精确到"匹配结果真的没人用"才静音。
+    //   本机实测：17 模型中 6 个 lock 条目，**region 全为 CN**（lock 且 US 的 0 个）；现有 10 条歧义告警里
+    //   **6 条挂在 lock 条目上**（含用户日常追踪的 hy4-preview / glm-5.3-flash）→ 正是"常年挂 ⚠价核验"的来源。
+    const isLocked = m.lock === true && m.region !== 'US';
+    const llmaHit = llma ? cnFind(llma, srcId, localNorm, key, isLocked) : null;
+    const llcHit = llc ? cnFind(llc, srcId, localNorm, key, isLocked) : null;
 
     // region 推断：模型无 region 字段时，优先用 llmabacus vendors country（US→US，其余→CN）
     // v3.24（F2·缺陷5）：**判定行为保持不变**（改了会影响计价口径），仅增加可观测性——
@@ -769,11 +792,11 @@ async function main() {
     }
 
     // USD 参考价：三 USD 源中位数
-    const usdIn = median(usdSources.map((u) => usdFind(u, key, m.or_id, localNorm)?.usdIn));
-    const usdOut = median(usdSources.map((u) => usdFind(u, key, m.or_id, localNorm)?.usdOut));
+    const usdIn = median(usdSources.map((u) => usdFind(u, key, m.or_id, localNorm, isLocked)?.usdIn));
+    const usdOut = median(usdSources.map((u) => usdFind(u, key, m.or_id, localNorm, isLocked)?.usdOut));
     // v3.24（F2·A-4c）：USD 缓存命中价（三源中位数，USD/1M tokens 口径）。无任何源提供时为 null，
     // 交由 applyUsdCachedPrice 决定「沿用本地 / 退回 10% 估算并打标记」。
-    const cacheUsd = median(usdSources.map((u) => usdFind(u, key, m.or_id, localNorm)?.cacheUsd));
+    const cacheUsd = median(usdSources.map((u) => usdFind(u, key, m.or_id, localNorm, isLocked)?.cacheUsd));
     // v3.18（H3）：usd_* 参考字段只对 region=US 模型写盘——region=CN 的人民币主价是权威口径，
     // 计费从不读 usd_*，留着只会与主价互相矛盾（实测偏差 -78%~+8%）并污染人工对账。
     // CN 模型的 usdIn/usdOut 仍保留在循环变量里，供下方 auto_converted 估算兜底使用。
@@ -871,8 +894,13 @@ async function main() {
     //   那个 'unpublished' 标记还挂在模型上 → 账本侧 addModelUsage 继续打 no_price=true（cost 已被算出 > 0），
     //   于是四出口一律把**已算出来的真金额**盖成「无公开价」。靠人记得手动删字段，等于没有这道保障。
     //   放在 gate 之后：价被 sanity 拦下并回退时（gate.main）说明新价不可信，**不许**顺手清标记。
+    // v3.33.0（第四轮审计 补-S1 修复）：判据必须是 **> 0**，不能是 `!= null`。
+    //   病根：0 != null 为真 → space-bunny 这类「输入输出同为 0 = 厂商未公布」的条目，下一次刷新就把
+    //   unpublished 标记删掉 → 账本不再打 no_price → 四出口显示 ¥0.00（用户读成"免费"）→ 合计偏低告警消失。
+    //   这正是 v3.27.0 修掉的 KI-7 病根（$0 与真免费不可区分）从另一扇门回来。
+    //   语义界定：**0 价一律视为"仍未公布"**（宁可标「无公开价」，也不显示一个会被误读的 ¥0.00）。
     if (!gate.main && m.pricing_status === 'unpublished'
-        && m.input_price != null && m.output_price != null) {
+        && m.input_price > 0 && m.output_price > 0) {
       delete m.pricing_status;
       delete m.pricing_status_note;
       unpublishedCleared++;
@@ -949,6 +977,17 @@ async function main() {
   if (AMBIG_WARNINGS.size) pricing._ambig_warnings = [...AMBIG_WARNINGS];
   else delete pricing._ambig_warnings;
 
+  // v3.33.0（A2）：lock 条目的歧义告警落**独立字段** `_ambig_warnings_locked` —— 沿用 A-7 对
+  //   `_retired_locked` 的同一处置（见上方 937 行注释：刻意不进 `_price_audit`，改为独立字段 + stderr 留痕）。
+  //   理由：`m.lock === true` 是**人工/官方已裁决**的价，其匹配结果根本不参与写价 → 该告警永远无法被消除，
+  //   挂上弹窗就是**永久噪音**（会把 ⚠价核验 对"可修复异常"的警示价值稀释掉）。
+  //   信息不丢：本字段可被 token-tracker.js 的 `--doctor` 读到（计入体检展示，不上弹窗）。
+  if (AMBIG_WARNINGS_LOCKED.size) pricing._ambig_warnings_locked = [...AMBIG_WARNINGS_LOCKED];
+  else delete pricing._ambig_warnings_locked;
+  if (AMBIG_WARNINGS_LOCKED.size) {
+    process.stderr.write(`[refresh-prices] 已 lock 条目的模糊匹配告警 ${AMBIG_WARNINGS_LOCKED.size} 条（价已人工冻结、匹配结果不被采用 → 不挂弹窗，仅留痕于 pricing._ambig_warnings_locked）: ${[...AMBIG_WARNINGS_LOCKED].map((s) => s.split(':')[0]).join('、')}\n`);
+  }
+
   // v3.24（F2·缺陷5）：靠推断得到 region 的模型清单（可观测性；判定行为本身未改）。
   if (regionInferred.length) pricing._region_inferred = [...regionInferred];
   else delete pricing._region_inferred;
@@ -967,7 +1006,7 @@ async function main() {
     pricing.deepseek_refresh_error = `DeepSeek 官方定价抓取失败（${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}），DeepSeek 系价格沿用本地/聚合源价`;
     // 失败不阻塞整体刷新：其余模型照常更新
   }
-  pricing.last_refresh_note = `${new Date().toISOString()} 多源刷新：${noteParts.join(' | ')}；人民币主价更新 ${updatedMain} 个${autoConverted ? `，USD换算 ${autoConverted} 个` : ''}，USD参考 ${usdUpdated} 个，region 设定 ${regionSet} 个${lockKept ? `，lock 价保留 ${lockKept} 个` : ''}（汇率 ${rate}）${bigDiff.length ? `；⚠️峰谷模型价差>60%需核验：${bigDiff.join('、')}` : ''}${officialOk ? '；DeepSeek官方价✓' : '；DeepSeek官方价✗(回落聚合源)'}${AMBIG_WARNINGS.size ? `；⚠️模糊匹配歧义: ${[...AMBIG_WARNINGS].join('；')}` : ''}${auditWarnings.length ? `；⚠️价格一致性自检: ${auditWarnings.join('；')}` : ''}`;
+  pricing.last_refresh_note = `${new Date().toISOString()} 多源刷新：${noteParts.join(' | ')}；人民币主价更新 ${updatedMain} 个${autoConverted ? `，USD换算 ${autoConverted} 个` : ''}，USD参考 ${usdUpdated} 个，region 设定 ${regionSet} 个${lockKept ? `，lock 价保留 ${lockKept} 个` : ''}（汇率 ${rate}）${bigDiff.length ? `；⚠️峰谷模型价差>60%需核验：${bigDiff.join('、')}` : ''}${officialOk ? '；DeepSeek官方价✓' : '；DeepSeek官方价✗(回落聚合源)'}${AMBIG_WARNINGS.size ? `；⚠️模糊匹配歧义: ${[...AMBIG_WARNINGS].join('；')}` : ''}${AMBIG_WARNINGS_LOCKED.size ? `；已 lock 条目的歧义 ${AMBIG_WARNINGS_LOCKED.size} 条（不挂弹窗，见 _ambig_warnings_locked）` : ''}${auditWarnings.length ? `；⚠️价格一致性自检: ${auditWarnings.join('；')}` : ''}`;
 
   // v3.24（F2·缺陷3）：接收 save() 返回值。false = 抢锁超时、本次未落盘（date/价格都没更新）。
   // 用 process.exitCode=1 而非 process.exit(1)：不中断后续汇总输出与 atexit 清理，
@@ -995,4 +1034,4 @@ if (require.main === module) {
 // v3.24（F2）：新增导出 isFreeVariant / parse* / mergeWithDisk / applyUsdCachedPrice /
 // retiredLockWarnings / applyRetiredLocked，供单元测试直接验证（纯函数，无副作用）
 // v3.31.0（P0-5 / P1-7）：导出价格体检纯函数与阈值，供 selftest 离线单测（行为可验证，不靠源码守卫）
-module.exports = { save, load, todayStr, PRICING, usdFind, cnFind, looseFind, norm, median, AMBIG_WARNINGS, isFreeVariant, parseLlma, parseLlc, parseOr, parseLitellm, parsePortkey, mergeWithDisk, applyUsdCachedPrice, retiredLockWarnings, applyRetiredLocked, priceGate, restoreBlock, restoreCached, PRICE_SANITY, DEFAULT_RATE };
+module.exports = { save, load, todayStr, PRICING, usdFind, cnFind, looseFind, norm, median, AMBIG_WARNINGS, AMBIG_WARNINGS_LOCKED, isFreeVariant, parseLlma, parseLlc, parseOr, parseLitellm, parsePortkey, mergeWithDisk, applyUsdCachedPrice, retiredLockWarnings, applyRetiredLocked, priceGate, restoreBlock, restoreCached, PRICE_SANITY, DEFAULT_RATE };
