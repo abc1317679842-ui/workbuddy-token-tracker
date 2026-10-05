@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.33.0 (2026-10-05)
+// token-usage-tracker v3.34.0 (2026-10-06)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -253,6 +253,9 @@ function writeCoalesce(sid, agg, meta) {
     if (meta.byModel) payload.byModel = meta.byModel;       // v2.39：专家团按模型分桶明细（watcher 记账用）
     if (meta.terminalError) payload.terminalError = meta.terminalError; // v2.57：主模型终态错误标记（429/5xx/timeout），供 watcher 首查感知
     if (typeof meta.mainToastedAt === 'number') payload.mainToastedAt = meta.mainToastedAt; // v3.12：异常轮主模型已先弹标记（供补弹判断不重复）
+    // v3.34.0（P0-1）：本轮用量**在写 coalesce 之前已经入账**的标记。
+    //   只写 true（false/缺省不写字段 → 与旧格式逐字节一致，零噪音）。
+    if (meta.alreadyRecorded === true) payload.alreadyRecorded = true;
   }
   try { fs.writeFileSync(coalescePath(sid), JSON.stringify(payload)); }
   catch (e) { process.stderr.write(`[token-tracker] 合并文件写入失败: ${e.message}\n`); }
@@ -426,6 +429,11 @@ const ROUNDS_DIR = path.join(__dirname, 'rounds');
 const ROUNDS_KEEP_MONTHS = 6;          // 保留最近 N 个月，--report 运行时顺带清理
 const ROUND_LABEL_MAX = 40;            // 轮次标签（本轮首条 user 消息）截断长度
 const EXPORTS_DIR = path.join(__dirname, 'exports'); // v3.20.0：--report --csv 落盘目录（已 gitignore）
+// v3.34.0（A2·第五轮审计 P1）：exports/ 此前**零清理**——每次 `--report --csv` 都按秒级时间戳新建
+//   一个 CSV，目录只增不减（rounds/ 至少有保留期，exports/ 连保留期都没有）。
+//   与 rounds/ 同款：只在 --report 入口跑，不引入常驻任务；按文件 mtime 保留最近 N 天。
+//   ⚠️ 只认 `report-*.csv` 前缀——目录里若有用户手放的别的文件，一律不动（绝不误删）。
+const EXPORTS_KEEP_DAYS = 30;
 
 // ===== v2.66 通用工具：模型名归一化 + 文件锁 + 原子写 =====
 // 账本文件曾损坏 → 本轮禁止写回空对象以免覆盖历史（损坏文件已备份为 .corrupt）
@@ -3845,12 +3853,20 @@ function doctorTxt() {
       const fs2 = fs.readdirSync(ROUNDS_DIR).filter((f) => /^rounds-\d{4}-\d{2}\.jsonl$/.test(f)).sort();
       rounds = fs2.length; roundsOld = fs2[0] || '—';
     } catch (e) { /* 目录不存在 */ }
+    // v3.34.0（A2）：CSV 导出目录同样纳入体检（只读列举，绝不删）。
+    let expN = 0, expOld = '';
+    try {
+      const fe = fs.readdirSync(EXPORTS_DIR).filter((f) => /^report-.*\.csv$/.test(f)).sort();
+      expN = fe.length; expOld = fe[0] || '';
+    } catch (e) { /* 目录不存在 */ }
     const st = loadUpdateState();
     const latest = st.latestVersion || '';
     const outdated = latest && cmpVersion(latest, SKILL_VERSION) > 0;
     sec('版本', outdated ? 'warn' : 'ok',
       `本地 ${SKILL_VERSION}${latest ? ` ｜ 远端已知 ${latest}${outdated ? '（**有新版本**）' : '（已是最新）'}` : ' ｜ 远端未知（未查到）'}`
-      + ` ｜ 轮次明细 ${rounds} 个月（最早 ${roundsOld}，保留 ${ROUNDS_KEEP_MONTHS} 个月，--report 时清理）`);
+      + ` ｜ 轮次明细 ${rounds} 个月（最早 ${roundsOld}，保留 ${ROUNDS_KEEP_MONTHS} 个月，--report 时清理）`
+      // v3.34.0（A2）：把"exports/ 也有保留期"变成可见——此前该目录连保留期都没有，且体检里根本不出现。
+      + ` ｜ CSV 导出 ${expN} 个${expOld ? `（最早 ${expOld}）` : ''}，保留 ${EXPORTS_KEEP_DAYS} 天，--report 时清理`);
   } catch (e) { sec('版本', 'bad', `检查异常：${(e && e.message) || e}`); }
 
   lines.push('');
@@ -3875,6 +3891,27 @@ function pruneRoundFiles(keepMonths) {
       const m = /^rounds-(\d{4}-\d{2})\.jsonl$/.exec(f);
       if (!m || keep.has(m[1])) continue;
       try { fs.unlinkSync(path.join(ROUNDS_DIR, f)); removed++; } catch (e) { /* 单个失败不影响其它 */ }
+    }
+    return removed;
+  } catch (e) { return 0; }
+}
+
+// v3.34.0（A2）：清理超过保留期的 CSV 导出。与 pruneRoundFiles 同款——只在 --report 入口跑，
+//   不引入常驻任务；单个文件删除失败不影响其它；目录不存在直接返回 0。
+//   ⚠️ 只删 `report-*.csv`：目录里非本技能产出的文件一律不动（用户手动放进来的 Excel/笔记绝不能被误删）。
+//   失败一律吞掉：清理是附带动作，绝不能让 `--report` 因为清不掉一个旧文件而失败。
+function pruneExports(keepDays) {
+  try {
+    if (!fs.existsSync(EXPORTS_DIR)) return 0;
+    const n = Number(keepDays) > 0 ? Number(keepDays) : EXPORTS_KEEP_DAYS;
+    const cutoff = Date.now() - n * 86400000;
+    let removed = 0;
+    for (const f of fs.readdirSync(EXPORTS_DIR)) {
+      if (!/^report-.*\.csv$/.test(f)) continue;
+      let st = null;
+      try { st = fs.statSync(path.join(EXPORTS_DIR, f)); } catch (e) { continue; }
+      if (!st || !st.isFile() || st.mtimeMs >= cutoff) continue;
+      try { fs.unlinkSync(path.join(EXPORTS_DIR, f)); removed++; } catch (e) { /* 单个失败不影响其它 */ }
     }
     return removed;
   } catch (e) { return 0; }
@@ -5122,7 +5159,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.33.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.34.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -5322,6 +5359,10 @@ function main() {
     //   最常用的 `--report`（今天）与 `--report summary` 反而**从不触发** → 文档意图与实现不符，
     //   且"最常跑的入口不清、偶尔跑的入口才清"完全反了。三处重复调用一并删除，改为入口一次。
     pruneRoundFiles();
+    // v3.34.0（A2·第五轮审计 P1）：exports/ 与 rounds/ 同病——注释承诺 / 实现缺失。
+    //   挂在**同一个入口**：无论是 `--report`、`--report all`、`--report --csv` 还是 forecast，都会清。
+    //   （清理发生在本次导出**之前**，刚写出来的 CSV 不会被自己删掉。）
+    pruneExports();
     const ri = process.argv.indexOf('--report');
     const rest = process.argv.slice(ri + 1);
     const wantCsv = rest.includes('--csv');           // v3.20.0：CSV 导出血开关
@@ -6026,7 +6067,9 @@ function main() {
           out({ hookSpecificOutput: {} });
           return;
         }
-        writeCoalesce(effSid, agg, { tsPath, roundStart: aggStart0, byModel, terminalError: teAtStop || undefined, traceFile });
+        // v3.34.0（P0-1）：本分支上方（transcript 块的 incrementalRecord）**已经跑过记账**（transcript 路径无条件记账），
+        //   本轮用量已入账 → 标 alreadyRecorded，供 --hook 兜底补弹时只显示、**不二次记账**。
+        writeCoalesce(effSid, agg, { tsPath, roundStart: aggStart0, byModel, terminalError: teAtStop || undefined, traceFile, alreadyRecorded: true });
         // 专家团/多子回合：仍需 watcher（要等子代理落盘后才汇总），启动并校验是否接管；
         // 未接管 → 立即降级为同步弹窗，保证**任何情况下至少弹一次**。
         if (!startWatcherVerified(effSid)) {
@@ -6219,7 +6262,10 @@ function main() {
         saveSnapshot({ file: tf, stat: ts, lastUserMsgAt: prevSnap.lastUserMsgAt || 0, lastStopAt: prevSnap.lastStopAt || 0 }, sid);
         // v3.33.0（S1 修复）：traces 兜底必须把 tsPath/roundStart 一并交给 watcher ——
         //   此前只带 traceFile → watcher 的 `if (info.tsPath)` 不成立 → **永不记账**（双封死第二重）。
-        writeCoalesce(sid, ts, { traceFile: tf, tsPath: tsPathT, roundStart });
+        // v3.34.0（P0-1）：alreadyRecorded **显式为 false** —— 本 traces 兜底路径在 Stop 端**没有**跑
+        //   incrementalRecord（transcript 块没进），pendInfo.tsPath 为空或 watcher 未跑时，--hook 兜底补弹处（pendToday）的
+        //   recordUsage 是**唯一**记账点。**绝不能**跟着 P0-1 一起改成"只显示"——那会让这些轮永不入账。
+        writeCoalesce(sid, ts, { traceFile: tf, tsPath: tsPathT, roundStart, alreadyRecorded: false });
         spawnFlushWatcher(sid);
       } else {
         // R2 修复（2026-08-23）：单 trace 普通轮原 0ms 确认窗立即弹并推进 lastStopAt，存在 Premature
@@ -6228,7 +6274,10 @@ function main() {
         saveSnapshot({ file: tf, stat: ts, lastUserMsgAt: prevSnap.lastUserMsgAt || 0, lastStopAt: prevSnap.lastStopAt || 0 }, sid);
         // v3.33.0（S1 修复）：traces 兜底必须把 tsPath/roundStart 一并交给 watcher ——
         //   此前只带 traceFile → watcher 的 `if (info.tsPath)` 不成立 → **永不记账**（双封死第二重）。
-        writeCoalesce(sid, ts, { traceFile: tf, tsPath: tsPathT, roundStart });
+        // v3.34.0（P0-1）：alreadyRecorded **显式为 false** —— 本 traces 兜底路径在 Stop 端**没有**跑
+        //   incrementalRecord（transcript 块没进），pendInfo.tsPath 为空或 watcher 未跑时，--hook 兜底补弹处（pendToday）的
+        //   recordUsage 是**唯一**记账点。**绝不能**跟着 P0-1 一起改成"只显示"——那会让这些轮永不入账。
+        writeCoalesce(sid, ts, { traceFile: tf, tsPath: tsPathT, roundStart, alreadyRecorded: false });
         spawnFlushWatcher(sid);
       }
     }
@@ -6272,7 +6321,16 @@ function main() {
         const pendModelBase = shortModelName(pendAgg, pricing);
         const pendEntry = pendSubModels.get(normalizeModelName(pendAgg.model || ''));
         const pendModel = pendEntry ? pendModelBase + subagentTagOf(pendEntry) : pendModelBase;
-        showToast(toastLine1(pendAgg, pendModel, periodNote(pendAgg, pricing), bal, todayDisplay(pendAgg, pricing), noPriceTag1(pendAgg, pricing)), toastLine2(pendAgg, pricing), 'hook-fallback');
+        // v3.34.0（第五轮审计 P0-1 修复）：此处原本**无条件** `todayDisplay()`（= recordUsage + 读当日累计）。
+        //   recordUsage **没有水位线去重**（水位线只在 incrementalRecord 里推进），于是：
+        //     coalesce 由本处（subCount>0 且 teamActive≠true 且子代理未收尾）写出时，Stop 端 transcript 块
+        //     已跑过 incrementalRecord —— 本轮用量**已入账**；watcher 一旦被宿主收割，下次 --hook 走到
+        //     本分支再记一次 → **整轮用量重复计费**（账本虚高一倍，且不可自愈）。
+        //   但 traces 兜底路径（本文件下方两处 writeCoalesce）在 Stop 端**没有**记账，本处的 recordUsage 是**唯一**记账点
+        //   —— 删掉会让这些轮**永不入账**（v3.33.0 S1 刚修好的"双封死"会原样复发）。
+        //   故按 coalesce 元信息分岔：alreadyRecorded → 只显示；否则照旧记账。
+        const pendToday = (pendInfo && pendInfo.alreadyRecorded === true) ? todayUsageTxt() : todayDisplay(pendAgg, pricing);
+        showToast(toastLine1(pendAgg, pendModel, periodNote(pendAgg, pricing), bal, pendToday, noPriceTag1(pendAgg, pricing)), toastLine2(pendAgg, pricing), 'hook-fallback');
         clearCoalesce(sid);
         // v2.27：兜底补弹完成 → 该轮已结束，标记 lastStopAt（供下轮起点刷新判断）
         const psnap = loadSnapshot(sid) || {};
@@ -6473,5 +6531,10 @@ module.exports = {
   mergeEstIntoModels, // v3.26.0（KI-6 ⑧）：估算段并入分模型明细（selftest 单测）
   // v3.23.5：残留锁清理导出（KI-3 副产物；selftest 可直接单测"删旧留新、当前会话锁不动"）
   cleanupCoalesceLocks, coalescePath,
+  // v3.34.0（P0-1）：合并文件的读写导出——selftest 可直接断言「alreadyRecorded 标记写进去了 / 没写进去
+  //   时与旧格式逐字节一致」，不必靠 spawn 全链路复现"watcher 被宿主收割"这一不可控场景。
+  writeCoalesce, readCoalesce, readCoalesceInfo,
   SKILL_VERSION, UPDATE_CHECK_FILE, UPDATE_INTERVAL_MS, UPDATE_MAX_NOTIFY, UPDATE_NOTIFY_GAP_MS, HOOK_IDLE_MS,
+  // v3.34.0（A2）：exports/ 清理导出——与 pruneRoundFiles 同款，selftest 直接单测保留期与目录边界。
+  pruneExports, EXPORTS_KEEP_DAYS,
 };

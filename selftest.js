@@ -974,9 +974,18 @@ else {
     overviewHead.indexOf('当前功能总览') >= 0 && !/^##\s*当前功能总览（\s*v\d/.test(overviewHead),
     overviewHead.slice(0, 70));
   // i6：SKILL.md 里 Read 指向的旁支文件必须真实存在（防引用了不存在的文件，模型 Read 时扑空）
-  const SIDE_FILES = ['TROUBLESHOOTING.md', 'docs/balance.md', 'docs/pricing-refresh.md', 'docs/windows-notification.md'];
+  // v3.34.0（A5·修既有假绿）：**自动提取**替代手写清单。手写清单正是这条守卫的假绿之源——
+  //   SKILL.md 实际反引号指向 7 个 md（TROUBLESHOOTING / docs×4 / CHANGELOG / KNOWN-ISSUES），
+  //   而这里原先手写只列 **4 个** → 另外 3 个"指了但文件不存在"**完全查不出来**（守卫只守半边）。
+  //   这与 T24（null 守卫只加半边）是同一个病根：清单靠人记得往里加，就一定会漏。
+  const skillRaw12 = fs.readFileSync(path.join(SRC, 'SKILL.md'), 'utf-8');
+  const SIDE_FILES = [...new Set((skillRaw12.match(/`([A-Za-z0-9_][A-Za-z0-9_./-]*\.md)`/g) || [])
+    .map((s) => s.slice(1, -1))
+    .filter((f) => f !== 'SKILL.md'))].sort(); // 排除自指（SKILL.md 自己当然存在，且它不在"旁支"语义里）
+  ok(`T12-i6a ★旁支文件清单是自动提取的且非空（提取器退化 = 守卫变假绿）`,
+    SIDE_FILES.length >= 6, `实际提取 ${SIDE_FILES.length} 个：${SIDE_FILES.join(', ')}`);
   const missingSide = SIDE_FILES.filter((f) => !fs.existsSync(path.join(SRC, f)));
-  ok(`T12-i6 SKILL.md 指向的旁支文件全部存在（${SIDE_FILES.length} 个）`,
+  ok(`T12-i6 SKILL.md 指向的旁支文件全部存在（${SIDE_FILES.length} 个，自动提取）`,
     missingSide.length === 0, missingSide.join(', ') || '全部存在');
 
   // j：端到端（spawn）—— 预置「有新版」状态跑 --hook，提示必须出现在注入里
@@ -1784,7 +1793,12 @@ else {
       (src23.match(/inferRoundStartFromText\(/g) || []).length >= 3,
       '红 = "只配 Stop 账本永不写"的病灶回归');
     ok('T23-a4 ★traces 兜底 writeCoalesce 必须带 tsPath（不带 → watcher 永不记账）',
-      src23.includes('{ traceFile: tf, tsPath: tsPathT, roundStart }'));
+      src23.includes('{ traceFile: tf, tsPath: tsPathT, roundStart, alreadyRecorded: false }'));
+    // v3.34.0（P0-1 连锁）：traces 兜底路径**没有** Stop 端记账，它的 alreadyRecorded 必须是 false。
+    //   若被"统一改成 true"，:6294 会退化成 todayUsageTxt → 这些轮**永不入账**（v3.33.0 S1 的双封死复发）。
+    ok('T23-a5 ★traces 兜底的 alreadyRecorded 必须显式为 false（真值 → 该路径永不记账）',
+      (src23.match(/tsPath: tsPathT, roundStart, alreadyRecorded: false/g) || []).length === 2,
+      `实际 ${(src23.match(/tsPath: tsPathT, roundStart, alreadyRecorded: false/g) || []).length} 处（应恰为 2：多子回合 + 单 trace）`);
 
     const dir23 = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-tail-'));
     try {
@@ -2356,6 +2370,201 @@ else {
     && /不在这四类里的静默 = 缺陷/.test(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8')));
 }
 
+// ===== T36：v3.34.0 A6/A7 —— 文档分发缺口泛化 + 防回涨守卫 =====
+// A6 病根：T32-a5 只守 `docs/version-diary.md` 一个文件的 .gitignore 放行。而 `docs/*` 是
+//   **整目录被屏蔽 + 逐个加 `!` 例外**的机制——每新增一个被 SKILL.md 指向的 docs 文件都要加例外，
+//   否则"本地绿、分发缺"（用户拿到一份指向不存在文件的指路牌）。守一个 = 守不住下一个。
+// A7 病根：v3.32.1 把主脚本 254 行版本日记迁走时，只给**主脚本**加了 T32-a1/a1b 防回涨；
+//   SKILL.md 的同类问题（堆 6 个历史版本要点块 = 19% 体积的陈旧常驻上下文）**没有任何守卫**
+//   → 下次改版本时又会顺手往里堆。这里补上，且照 T32 的双层做法：直接判据 + 体积代理。
+{
+  const raw36 = fs.readFileSync(path.join(SRC, 'SKILL.md'), 'utf-8');
+  const refs36 = [...new Set((raw36.match(/`([A-Za-z0-9_][A-Za-z0-9_./-]*\.md)`/g) || [])
+    .map((s) => s.slice(1, -1))
+    .filter((f) => f !== 'SKILL.md'))].sort();
+  const gi36 = fs.existsSync(path.join(SRC, '.gitignore')) ? fs.readFileSync(path.join(SRC, '.gitignore'), 'utf-8') : '';
+  const underDocs = refs36.filter((f) => f.startsWith('docs/'));
+  const esc36 = (f) => f.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const noExcept = underDocs.filter((f) => !new RegExp(`^!${esc36(f)}\\s*$`, 'm').test(gi36));
+  ok('T36-a1 ★SKILL.md 指向的 docs/ 文件**逐个**在 .gitignore 里显式放行（泛化 T32-a5）',
+    underDocs.length > 0 && noExcept.length === 0,
+    `已核对 ${underDocs.length} 个：${underDocs.join(', ')}${noExcept.length ? `；缺例外：${noExcept.join(', ')}` : ''}`);
+  ok('T36-a2 ★docs/ 整目录仍被屏蔽 + 逐个放行（确认机制没被"顺手放开整个 docs/"破坏）',
+    /^docs\/\*\s*$/m.test(gi36) && !/^!docs\/\s*$/m.test(gi36), '红 = 整目录放开，以后新增文件都不再需要例外、守卫失效');
+
+  // A7：防回涨（双层，照 T32-a1 + T32-a1b 的做法）
+  const vLines36 = raw36.split('\n').filter((l) => /^>\s*\*\*v\d+\.\d+(\.\d+)?\s*要点/.test(l));
+  ok('T36-b1 ★SKILL.md「版本要点」块 ≤2 行（**直接判据**：逐版历史归 CHANGELOG，不回堆本文件）',
+    vLines36.length <= 2, `实测 ${vLines36.length} 行`);
+  const bytes36 = Buffer.byteLength(raw36);
+  ok('T36-b2 ★SKILL.md ≤48KB（**代理判据**：v3.34.0 由 61,371 B 瘦到 ~43.8KB，留 4KB 余量）',
+    bytes36 <= 48 * 1024, `实测 ${bytes36} B（${(bytes36 / 1024).toFixed(1)} KB）`);
+  ok('T36-b3 ★「逐版细节查 CHANGELOG」的指路牌仍在（只删内容不删导航 = 读者会以为历史丢了）',
+    /逐版细节/.test(raw36) && raw36.includes('CHANGELOG.md'));
+}
+
+// ===== T34：v3.34.0 第五轮审计 P0-1 —— --hook 兜底补弹不得二次记账 =====
+// 病根：`--hook` 的兜底补弹分支无条件调 `todayDisplay()` = `recordUsage()` + 读当日累计。
+//   而 `recordUsage` **没有水位线去重**（水位线只在 incrementalRecord 里推进），于是
+//   「Stop 端 transcript 块已记账 → watcher 被宿主收割 → 下次 --hook 兜底」这条真实链路上，
+//   整轮用量被**记两遍**（账本虚高一倍且不可自愈）。
+// 修复的两难（这也是必须同时锁住两端的原因）：
+//   traces 兜底路径（拿不到 transcript、只靠 trace 文件）在 Stop 端**没有**记账，
+//   它的 `recordUsage` 是**唯一**记账点 —— 一刀切改成"只显示"会让这些轮**永不入账**
+//   （正是 v3.33.0 S1 刚修好的"双封死"原样复发）。故按 coalesce 元信息 alreadyRecorded 分岔。
+{
+  const src34 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  ok('T34-a1 ★writeCoalesce 支持 alreadyRecorded 标记（无此字段 → --hook 无法区分两条路径）',
+    src34.includes('if (meta.alreadyRecorded === true) payload.alreadyRecorded = true;'));
+  ok('T34-a2 ★transcript 路径（Stop 端已记账）写 coalesce 时必须带 alreadyRecorded: true',
+    /traceFile, alreadyRecorded: true \}/.test(src34),
+    '红 = 已记账的那条路径没打标记 → 重复记账复发');
+  ok('T34-a3 ★--hook 兜底补弹按 alreadyRecorded 分岔（已记→只显示 / 未记→照旧记账）',
+    src34.includes('const pendToday = (pendInfo && pendInfo.alreadyRecorded === true) ? todayUsageTxt() : todayDisplay(pendAgg, pricing);'),
+    '红 = 要么是"整轮重复计费"，要么是"traces 兜底永不入账"');
+  const nDisp34 = (src34.match(/todayDisplay\(/g) || []).length;
+  ok('T34-a4 ★todayDisplay 调用点没有变多（定义 1 + 调用 1 = 2；修复不得靠新增记账路径实现）',
+    nDisp34 === 2, `实际 ${nDisp34} 处（应为 2：定义 1 + 调用 1；导出行无括号不计）`);
+
+  // ── 行为验证（真跑 --hook，看账本增量）──
+  const savedEnv34 = process.env.WB_ROOT;
+  process.env.WB_ROOT = tmp;
+  let mod34 = null;
+  try { mod34 = require(path.join(skillDir, 'token-tracker.js')); } catch (e) { mod34 = null; }
+  if (!mod34) {
+    ok('T34 模块加载', false, 'token-tracker.js require 失败');
+  } else {
+    const sid34 = 't34-sid';
+    const coal34 = mod34.coalescePath(sid34);
+    const ledger34 = path.join(skillDir, 'daily-usage.json');
+    // tryUnlink/重置失败一律吞掉（T33 约定：裸 catch 必须带 silent-ok）——清理类失败不该让测试变红。
+    const rm34 = (p) => { try { fs.unlinkSync(p); } catch (e) { /* silent-ok:清理 — 文件本就可能不存在 */ } };
+    const resetLedger34 = () => { try { fs.writeFileSync(ledger34, JSON.stringify({})); } catch (e) { /* silent-ok:清理 — 写不进就按空账本继续 */ } };
+    const todayIn34 = () => {
+      try {
+        const j = JSON.parse(fs.readFileSync(ledger34, 'utf-8'));
+        const d = j[mod34.todayStr()];
+        return d && d.total ? Number(d.total.in || 0) : 0;
+      } catch (e) { return 0; }
+    };
+    rm34(coal34);
+
+    // b1/b2：写入端——标记真的落盘；false/缺省时字段不出现（与旧格式逐字节一致 → 零兼容风险）
+    mod34.writeCoalesce(sid34, { in: 1 }, { tsPath: 'x', roundStart: 0, alreadyRecorded: true });
+    let ci34 = null;
+    try { ci34 = JSON.parse(fs.readFileSync(coal34, 'utf-8')); } catch (e) { ci34 = null; }
+    ok('T34-b1 ★alreadyRecorded:true 真的落进 coalesce 文件（--hook 靠它区分两条路径）',
+      !!ci34 && ci34.alreadyRecorded === true, JSON.stringify(ci34).slice(0, 80));
+    mod34.writeCoalesce(sid34, { in: 1 }, { tsPath: 'x', roundStart: 0, alreadyRecorded: false });
+    const raw34b = (() => { try { return fs.readFileSync(coal34, 'utf-8'); } catch (e) { return ''; } })();
+    ok('T34-b2 ★alreadyRecorded:false 不写字段（JSON 与旧格式完全一致 → 老版本读它不会误解）',
+      raw34b.length > 0 && !raw34b.includes('alreadyRecorded'), raw34b.slice(0, 80));
+
+    if (!SPAWN_OK) {
+      envSkip('T34-b3 ★已记账路径：--hook 兜底补弹账本增量 0（旧行为 = 整轮重复计费）', SPAWN_SKIP_REASON);
+      envSkip('T34-b4 ★traces 兜底路径：--hook 兜底补弹**仍必须记账**（增量 = 整轮用量）', SPAWN_SKIP_REASON);
+    } else {
+      const ts34 = path.join(tmp, 't34-transcript.jsonl');
+      fs.writeFileSync(ts34, JSON.stringify({ type: 'message', role: 'user', timestamp: Date.now() - 2000, content: [{ type: 'text', text: 'hi' }] }) + '\n');
+      // ⚠️ 夹具陷阱（v3.12 就踩过一次，排查花了很久）：**必须造一条有效 trace**。
+      //   否则 --hook 会在「暂无 trace 数据」那条早退分支 return，根本走不到兜底补弹分支
+      //   → b3 假绿（0 本来就是 0）、b4 假红（应记 5000 却得 0）。缺夹具的"补弹不触发"是假象，不是代码缺陷。
+      const trDir34 = path.join(tmp, 'traces', '1000');
+      fs.mkdirSync(trDir34, { recursive: true });
+      fs.writeFileSync(path.join(trDir34, 'trace_1.json'), JSON.stringify({
+        trace: {
+          modelInfo: { models: [{ name: 'hy3' }], totalInputTokens: 100, totalOutputTokens: 50, totalCachedTokens: 10, totalTokens: 150 },
+          duration: 1000, startedAt: new Date(Date.now() - 3000).toISOString(), endedAt: new Date(Date.now() - 2000).toISOString(),
+        },
+      }));
+      const PAY34 = JSON.stringify({ session_id: sid34, transcript_path: ts34, cwd: tmp });
+      const agg34 = { in: 5000, out: 500, cached: 0, total: 5500, model: 'hy3', durMs: 1000, subCount: 0, teamActive: false };
+      const runHook34 = () => spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'],
+        { input: PAY34, env, timeout: 60000, windowsHide: true });
+
+      // b3：已记账（transcript 路径）→ 兜底补弹只显示、**账本增量必须为 0**
+      resetLedger34();
+      mod34.writeCoalesce(sid34, agg34, { tsPath: ts34, roundStart: 0, alreadyRecorded: true });
+      const r34a = runHook34();
+      const in34a = todayIn34();
+      ok('T34-b3 ★已记账路径：--hook 兜底补弹账本增量 0（旧行为 = 整轮 5000 再记一遍）',
+        r34a.status === 0 && in34a === 0,
+        `exit=${r34a.status} 账本 in=${in34a}（v3.33.0 HEAD 实测 = 5000，即整轮被记两遍）`);
+
+      // b4：未记账（traces 兜底路径）→ 兜底补弹**必须仍然记账**（这是它的唯一记账点）
+      resetLedger34();
+      mod34.writeCoalesce(sid34, agg34, { tsPath: ts34, roundStart: 0, alreadyRecorded: false });
+      const r34b = runHook34();
+      const in34b = todayIn34();
+      ok('T34-b4 ★traces 兜底路径：--hook 兜底补弹**仍必须记账**（增量 = 整轮 5000）',
+        r34b.status === 0 && in34b === 5000,
+        `exit=${r34b.status} 账本 in=${in34b}（应为 5000；若为 0 = 这些轮永不入账，v3.33.0 S1「双封死」复发）`);
+      rm34(coal34);
+    }
+  }
+  if (savedEnv34 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv34;
+}
+
+// ===== T35：v3.34.0 第五轮审计 P1 —— exports/ 必须有保留期（此前零清理） =====
+// 病根：`--report --csv` 每次都按**秒级时间戳**新建一个 CSV（`report-<label>-<YYYYMMDD-HHMMSS>.csv`），
+//   而 `exports/` 目录**没有任何清理**——rounds/ 至少还有 ROUNDS_KEEP_MONTHS，exports/ 连保留期都没有，
+//   目录只增不减。与 v3.33.0 A7（rounds 清理只插在三个后加子分支里）是同一类"注释承诺 / 实现缺失"。
+{
+  const src35 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  ok('T35-a0 ★pruneExports 存在且 EXPORTS_KEEP_DAYS 有定义',
+    src35.includes('function pruneExports(') && /const EXPORTS_KEEP_DAYS = \d+;/.test(src35));
+  const calls35 = (src35.match(/pruneExports\(\);/g) || []).length;
+  ok('T35-a1 ★pruneExports 只在 --report 入口调用一次（与 pruneRoundFiles 同款，不散落子分支）',
+    calls35 === 1, `实际 ${calls35} 处（应恰为 1）`);
+  const iEntry35 = src35.indexOf("if (process.argv.includes('--report')) {");
+  const iCall35 = src35.indexOf('pruneExports();');
+  const iForecast35 = src35.indexOf('reportForecastTxt(', iEntry35);
+  ok('T35-a2 ★清理位于 --report 统一入口（在 forecast/区间/csv 各分支 return 之前）→ 所有变体都覆盖',
+    iEntry35 >= 0 && iCall35 > iEntry35 && iForecast35 > iCall35,
+    `entry=${iEntry35} call=${iCall35} forecast=${iForecast35}`);
+  ok('T35-a3 ★只删 `report-*.csv`：目录里用户手放的文件绝不能被误删',
+    /if \(!\/\^report-\.\*\\\.csv\$\/\.test\(f\)\) continue;/.test(src35));
+
+  const savedEnv35 = process.env.WB_ROOT;
+  process.env.WB_ROOT = tmp;
+  let mod35 = null;
+  try { mod35 = require(path.join(skillDir, 'token-tracker.js')); } catch (e) { mod35 = null; }
+  if (!mod35) {
+    ok('T35 模块加载', false, 'token-tracker.js require 失败');
+  } else {
+    const dir35 = mod35.EXPORTS_DIR;
+    try { fs.mkdirSync(dir35, { recursive: true }); } catch (e) { /* silent-ok:清理 — 已存在或被占用 */ }
+    const mk35 = (name, ageDays) => {
+      const p = path.join(dir35, name);
+      fs.writeFileSync(p, 'a,b\n1,2\n');
+      const t = new Date(Date.now() - ageDays * 86400000);
+      fs.utimesSync(p, t, t);
+      return p;
+    };
+    const old1 = mk35('report-summary-20260101-010101.csv', 400);
+    const old2 = mk35('report-week-20260202-020202.csv', 200);
+    const fresh = mk35('report-summary-20990101-010101.csv', 0);
+    const alien = mk35('我的手工笔记.csv', 900);   // 非本技能产出 → 绝不能删
+    const alien2 = mk35('keep.txt', 900);
+    let removed35 = -1;
+    try { removed35 = mod35.pruneExports(); } catch (e) { removed35 = -1; }
+    const ex = (p) => { try { fs.existsSync(p); return fs.existsSync(p); } catch (e) { return false; } };
+    ok('T35-b1 ★超保留期的旧 CSV 被清理，保留期内的不动（返回值 = 实际删除数 2）',
+      removed35 === 2 && !ex(old1) && !ex(old2) && ex(fresh),
+      `removed=${removed35} old1=${ex(old1)} old2=${ex(old2)} fresh=${ex(fresh)}`);
+    ok('T35-b2 ★非 `report-*.csv` 的文件一律保留（用户手放的 Excel/笔记绝不能被误删）',
+      ex(alien) && ex(alien2), `alien=${ex(alien)} txt=${ex(alien2)}`);
+    ok('T35-b3 目录不存在 / 空目录 → 返回 0 且不抛异常',
+      (() => {
+        const emptyDir = path.join(tmp, 't35-empty-exports');
+        try { fs.rmSync(emptyDir, { recursive: true, force: true }); } catch (e) { /* silent-ok:清理 — 目录本就可能不存在 */ }
+        return mod35.pruneExports() >= 0;
+      })());
+    for (const p of [old1, old2, fresh, alien, alien2]) { try { fs.unlinkSync(p); } catch (e) { /* silent-ok:清理 — 已被清掉的文件本就不存在 */ } }
+  }
+  if (savedEnv35 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv35;
+}
+
 // ===== 导出一致性（A-16）：自动推导，替代"手工清单"的兜底 =====
 // 病根：selftest 里"新增导出必须存在"是**三张手工清单**（T8-N1g/N2 的 typeof 检查、T11-a 的 `exported`、
 //   T12-a 的 `ex12`），全靠人记得往里加。`cleanupCoalesceLocks` 三张都不含 → 一旦它"定义还在、导出没了"，
@@ -2372,7 +2581,8 @@ else {
   //   注意本守卫只核对 `token-tracker.js` 的导出：`rp28`（T28 用到的 refresh-prices.js）**刻意不列**，
   //   因为 ttAll 是主脚本的导出表，把它列进来会对 looseFind 这类"兄弟模块导出"产生**假失败**；
   //   那条路径由 T28 自己的 `typeof rp28.looseFind !== 'function'` 前置守卫覆盖。
-  const MOD_VARS = ['mod', 'ttMod', 'tt2', 'mod16', 'mod17', 'mod18', 'mod19', 'mod20', 'mod21', 'mod26', 'mod27', 'mod29', 'mod30', 'mod31'];
+  // v3.34.0：补 mod34（T34 P0-1 记账去重）/ mod35（T35 exports 保留期）—— 同上，本节注释自己写着"勿漏"。
+  const MOD_VARS = ['mod', 'ttMod', 'tt2', 'mod16', 'mod17', 'mod18', 'mod19', 'mod20', 'mod21', 'mod26', 'mod27', 'mod29', 'mod30', 'mod31', 'mod34', 'mod35'];
   const memberRe = new RegExp('\\b(?:' + MOD_VARS.join('|') + ')\\.([A-Za-z_$][A-Za-z0-9_$]*)', 'g');
   const referenced = new Set();
   let mm;

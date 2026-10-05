@@ -1,5 +1,5 @@
 {
-  "date": "2026-10-05",
+  "date": "2026-10-06",
   "currency": "CNY",
   "unit": "元/百万 tokens",
   "usd_cny_rate": 7.2,
@@ -210,13 +210,13 @@
     }
   },
   "last_source": "multi-source",
-  "last_refresh_note": "2026-10-04T18:43:29.410Z 多源刷新：llmabacus(国内·人民币·主)✓ | llm-prices-cn(国内·人民币·备)✓ | openrouter(USD)✓ | litellm(USD)✗(This operation was aborted) | portkey(USD)✓；人民币主价更新 9 个，USD参考 0 个，region 设定 0 个（汇率 7.2）；DeepSeek官方价✓；⚠️模糊匹配歧义: deepseek-v4-flash-vision-exp: 国内源 唯一模糊命中 deepseek-v4-flash（与被查键不同名，已采用但需人工核验）；deepseek-v4-flash-vision-exp: USD源 唯一模糊命中 deepseek-v4-flash（与被查键不同名，已采用但需人工核验）；hy4-preview: 国内源 唯一模糊命中 hunyuan-hy4-preview（与被查键不同名，已采用但需人工核验）；hy4-preview: USD源 唯一模糊命中 tencent/hy4-preview（与被查键不同名，已采用但需人工核验）；kimi-k3: USD源 模糊命中 2 个不同价候选(moonshotai/kimi-k3,moonshotai/kimi-k3:batch)，已放弃；glm-4.7-flash: 国内源 唯一模糊命中 glm-4-7（与被查键不同名，已采用但需人工核验）；glm-4.7-flash: USD源 唯一模糊命中 z-ai/glm-4.7-flash（与被查键不同名，已采用但需人工核验）；minimax-m2.7: USD源 唯一模糊命中 minimax/minimax-m2.7（与被查键不同名，已采用但需人工核验）；deepseek-flash: USD源 唯一模糊命中 ~deepseek/deepseek-flash-latest（与被查键不同名，已采用但需人工核验）；glm-5.3-flash: USD源 模糊命中 3 个不同价候选(z-ai/glm-5.3-flashx,z-ai/glm-5.3-flash,z-ai/glm-5.3-flash:batch)，已放弃",
+  "last_refresh_note": "2026-10-05T16:44:50.784Z 多源刷新：llmabacus(国内·人民币·主)✓ | llm-prices-cn(国内·人民币·备)✗(fetch failed) | openrouter(USD)✓ | litellm(USD)✗(fetch failed) | portkey(USD)✓；人民币主价更新 9 个，USD参考 0 个，region 设定 0 个（汇率 7.2）；DeepSeek官方价✓；⚠️模糊匹配歧义: glm-4.7-flash: 国内源 唯一模糊命中 glm-4-7（与被查键不同名，已采用但需人工核验）；glm-4.7-flash: USD源 唯一模糊命中 z-ai/glm-4.7-flash（与被查键不同名，已采用但需人工核验）；minimax-m2.7: USD源 唯一模糊命中 minimax/minimax-m2.7（与被查键不同名，已采用但需人工核验）；deepseek-flash: USD源 唯一模糊命中 ~deepseek/deepseek-flash-latest（与被查键不同名，已采用但需人工核验）；已 lock 条目的歧义 6 条（不挂弹窗，见 _ambig_warnings_locked）",
   "deepseek_rules": {
     "peak_schedule": "9:00 - 12:00、14:00 - 18:00",
     "weekend_off_peak": true,
     "weekend_off_peak_fallback": false,
     "effective_at": null,
-    "updated_at": "2026-10-04T18:43:17.321Z"
+    "updated_at": "2026-10-05T16:44:40.027Z"
   },
   "_manual_audit": [
     {
@@ -239,7 +239,7 @@
         "cached_pct": 0,
         "output_pct": 0
       },
-      "adopted_at": "2026-10-04T18:43:17.320Z",
+      "adopted_at": "2026-10-05T16:44:40.026Z",
       "official_id": "deepseek-flash",
       "official_version": "DeepSeek-V4.1-Flash",
       "matched_by": "key-version"
@@ -250,15 +250,17 @@
     "deepseek-v4-flash-vision-exp: 已标记 retired 但 lock=true，价格永久冻结在 1.5/4.5 —— 不会被刷新、不会被清理、也不会被标记不可用；若该模型确已下线请人工核验"
   ],
   "_ambig_warnings": [
+    "glm-4.7-flash: 国内源 唯一模糊命中 glm-4-7（与被查键不同名，已采用但需人工核验）",
+    "glm-4.7-flash: USD源 唯一模糊命中 z-ai/glm-4.7-flash（与被查键不同名，已采用但需人工核验）",
+    "minimax-m2.7: USD源 唯一模糊命中 minimax/minimax-m2.7（与被查键不同名，已采用但需人工核验）",
+    "deepseek-flash: USD源 唯一模糊命中 ~deepseek/deepseek-flash-latest（与被查键不同名，已采用但需人工核验）"
+  ],
+  "_ambig_warnings_locked": [
     "deepseek-v4-flash-vision-exp: 国内源 唯一模糊命中 deepseek-v4-flash（与被查键不同名，已采用但需人工核验）",
     "deepseek-v4-flash-vision-exp: USD源 唯一模糊命中 deepseek-v4-flash（与被查键不同名，已采用但需人工核验）",
     "hy4-preview: 国内源 唯一模糊命中 hunyuan-hy4-preview（与被查键不同名，已采用但需人工核验）",
     "hy4-preview: USD源 唯一模糊命中 tencent/hy4-preview（与被查键不同名，已采用但需人工核验）",
     "kimi-k3: USD源 模糊命中 2 个不同价候选(moonshotai/kimi-k3,moonshotai/kimi-k3:batch)，已放弃",
-    "glm-4.7-flash: 国内源 唯一模糊命中 glm-4-7（与被查键不同名，已采用但需人工核验）",
-    "glm-4.7-flash: USD源 唯一模糊命中 z-ai/glm-4.7-flash（与被查键不同名，已采用但需人工核验）",
-    "minimax-m2.7: USD源 唯一模糊命中 minimax/minimax-m2.7（与被查键不同名，已采用但需人工核验）",
-    "deepseek-flash: USD源 唯一模糊命中 ~deepseek/deepseek-flash-latest（与被查键不同名，已采用但需人工核验）",
     "glm-5.3-flash: USD源 模糊命中 3 个不同价候选(z-ai/glm-5.3-flashx,z-ai/glm-5.3-flash,z-ai/glm-5.3-flash:batch)，已放弃"
   ]
 }
