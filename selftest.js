@@ -43,6 +43,17 @@ const stripComments = (s) => s.replace(/\r\n/g, '\n')
   .map((l) => l.replace(/(^|[^:])\/\/.*$/, '$1').replace(/\/\*[^*]*\*\//g, ''))
   .join('\n');
 
+// v3.35.0（B2）：Stop 端（--stop）处理已整块迁到 stop-handler.js。凡是守「Stop 端行为」的源码断言
+//   都必须扫**主脚本 + stop-handler.js 的并集**——只扫主脚本的话，代码一迁走断言就假红；
+//   更糟的是有人能靠"把代码迁出主脚本"绕过守卫。这里给一个统一的取值器，避免各处各扫各的。
+//   文件缺失时返回空串（不抛），保证 selftest 自身不因部署缺件而崩。
+const UNION_FILES = ['token-tracker.js', 'stop-handler.js'];
+const readUnion = (x) => UNION_FILES
+  .map((f) => { try { return x(fs.readFileSync(path.join(SRC, f), 'utf-8').replace(/\r\n/g, '\n')); } catch (e) { return ''; } })
+  .join('\n');
+const srcUnion = () => readUnion(stripComments);   // 剥注释后的并集（行为断言用）
+const srcUnionRaw = () => readUnion((s) => s);     // 未剥注释的并集（注释/约定断言用）
+
 // 环境能力探测：部分沙箱禁止 node→node 子进程（spawnSync 报 EBUSY）。只有需 spawn 的用例受影响。
 function canSpawn() {
   try {
@@ -51,8 +62,10 @@ function canSpawn() {
   } catch (e) { return false; }
 }
 const SPAWN_OK = canSpawn();
+// v3.35.0（B2）：stop-handler.js 拆出后必须跟兄弟脚本同等待遇——语法检查与裸 catch 扫描都要覆盖，
+//   否则"迁出去就没人扫了"会静默削弱 T33 的守卫面（裸 catch 总数基线 36 是按这些文件的**总和**定的）。
 const SYNTAX_FILES = ['token-tracker.js', 'refresh-prices.js', 'deepseek-official.js', 'refresh-holidays.js',
-  'backfill.js', 'recalc-day.js', 'peak-rules.js', 'selftest.js'];
+  'backfill.js', 'recalc-day.js', 'peak-rules.js', 'selftest.js', 'stop-handler.js'];
 
 // ── T0：语法检查 ───────────────────────────────────────────────────────────
 for (const f of SYNTAX_FILES) {
@@ -67,7 +80,11 @@ const skillDir = path.join(tmp, 'skills', 'token-usage-tracker');
 fs.mkdirSync(skillDir, { recursive: true });
 // v3.32.0：refresh-holidays.js 必须随行——主脚本 v3.32.0 起 require('./refresh-holidays.js')
 //   （方案 H：触发判定共用同一实现），隔离目录缺它 = 主模块 MODULE_NOT_FOUND，整段测试全炸。
-for (const f of ['token-tracker.js', 'refresh-prices.js', 'deepseek-official.js', 'refresh-holidays.js', 'pricing.json', 'holidays.json', 'peak-rules.js', 'recalc-day.js']) {
+// v3.35.0（B2）：stop-handler.js 必须随行——主脚本顶层 require 它，隔离目录缺它 = MODULE_NOT_FOUND，
+//   整段测试全炸（v3.32.0 缺 refresh-holidays.js 时踩过同一坑）。此清单由下方 T37-a2 自动校验。
+const RUNTIME_COMPANIONS = ['refresh-prices.js', 'deepseek-official.js', 'refresh-holidays.js',
+  'pricing.json', 'holidays.json', 'peak-rules.js', 'recalc-day.js', 'stop-handler.js'];
+for (const f of ['token-tracker.js', ...RUNTIME_COMPANIONS]) {
   fs.copyFileSync(path.join(SRC, f), path.join(skillDir, f));
 }
 // v3.18.4（G2）：隔离本地官方价库——autoDiscoverCnPriceDir 第②级会扫 ~/WorkBuddy/*/prices/index.json
@@ -494,7 +511,8 @@ else {
   // 剥掉注释后再做"残留引用"检查——本版在注释里保留了大量历史说明，直接对源码文本做正则会被
   // 注释误判（教训：守卫测试必须只看代码，不看注释）。用**全局共享**的行级 stripComments
   // （此前 T10/T14/T17 各有一份、行为不一，同一段代码会被"看"成不同内容）。
-  const codeOnly = stripComments(src('token-tracker.js'));
+  // v3.35.0（B2）：Stop 端已迁到 stop-handler.js → 改扫并集（否则 T10-h/i 因代码搬家而假红）。
+  const codeOnly = srcUnion();
 
   // a：新判据已导出
   ok('T10-a freshCompactionMarker / compactionMarkerId 已导出',
@@ -1299,7 +1317,7 @@ else {
   // 跨行吞掉真实代码（本版实测吞掉 1 处调用 → 守卫假红），故不跨行匹配）。
   // 用全局共享的 stripComments（同一份实现，T10/T14/T17 不再各写各的）。
   {
-    const src17 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8'));
+    const src17 = srcUnion(); // v3.35.0（B2）：Stop 端已迁出 → 守 Stop 行为的断言改扫并集
     ok('T17-b1 ★⑨结算分支推进的 stopAtH 必须存活到最终快照写入（L5543 整文件覆盖曾把它打回旧值）',
       /stopAtH = nowH;/.test(src17) && /lastStopAt: stopAtH/.test(src17));
     ok('T17-b2 ★旧缺陷写法不得回归（lastStopAt: psnap2.lastStopAt || 0）',
@@ -1782,7 +1800,7 @@ else {
   if (!tt23) {
     ok('T23 模块加载', false, 'token-tracker.js require 失败');
   } else {
-    const src23 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+    const src23 = srcUnion(); // v3.35.0（B2）：同上，S1 起点兜底的调用点已随 Stop 端迁走
     ok('T23-a1 ★三处尾部窗口硬编码已消除（65536/8192/4096 → 单点块回溯）',
       !/sz > 65536 \? 65536/.test(src23) && !/sz > 8192 \? 8192/.test(src23) && !/sz > 4096 \? 4096/.test(src23),
       '红 = 又按字节划窗口，长行整行消失 / 行数不足会复发');
@@ -2337,7 +2355,9 @@ else {
 //   类别仅允许 诊断 / 清理 / 探测 / 降级 四种（约定写在 token-tracker.js 头部）。
 //   T33 就是那条守卫：新增一处没写理由的裸 catch → 直接红。**这是把"约定"变成"约束"的那一步。**
 {
-  const FILES33 = ['token-tracker.js', 'backfill.js', 'recalc-day.js', 'refresh-holidays.js', 'refresh-prices.js', 'selftest.js'];
+  // v3.35.0（B2）：Stop 端整块迁到 stop-handler.js → 它带走的裸 catch 也必须继续被扫，
+  //   否则总数会从 36 掉下去而 T33-a1 却"因为数字变小"报错、或者更糟：有人靠"迁出去"绕过约定。
+  const FILES33 = ['token-tracker.js', 'backfill.js', 'recalc-day.js', 'refresh-holidays.js', 'refresh-prices.js', 'selftest.js', 'stop-handler.js'];
   const BARE33 = /catch \([a-z_]+\)\s*\{\}/;
   const KINDS33 = ['诊断', '清理', '探测', '降级'];
   let nAll = 0, nBad = 0, nKind = 0;
@@ -2413,7 +2433,7 @@ else {
 //   它的 `recordUsage` 是**唯一**记账点 —— 一刀切改成"只显示"会让这些轮**永不入账**
 //   （正是 v3.33.0 S1 刚修好的"双封死"原样复发）。故按 coalesce 元信息 alreadyRecorded 分岔。
 {
-  const src34 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  const src34 = srcUnion(); // v3.35.0（B2）：P0-1 的 writeCoalesce 调用点已随 Stop 端迁走
   ok('T34-a1 ★writeCoalesce 支持 alreadyRecorded 标记（无此字段 → --hook 无法区分两条路径）',
     src34.includes('if (meta.alreadyRecorded === true) payload.alreadyRecorded = true;'));
   ok('T34-a2 ★transcript 路径（Stop 端已记账）写 coalesce 时必须带 alreadyRecorded: true',
@@ -2603,6 +2623,72 @@ else {
       missing.length === 0,
       '缺失: ' + missing.join(', ') + `（已核对 ${referenced.size} 个引用成员）`);
   }
+}
+
+// ===== T37：v3.35.0 B 组 —— main() 拆分（Stop 端 → stop-handler.js）=====
+// 病根：main() 曾 1151 行，把「CLI 分发 / --hook 路径 / --stop 路径」三件语义不同的事压在一个函数里，
+//   v3.34.0 修的 P0-1 正是「同一段代码服务两个相反契约」的结构孕育出来的。
+// 拆法：stop-handler.js **不反向 require 主脚本**（单向依赖），所需 46 个只读能力由调用点显式注入。
+//   这套做法的两个真实风险必须各有一道守卫：①漏传/改名/拼错 → 运行时才炸；②有人靠"迁出主脚本"
+//   绕过 T10/T17/T23/T33 这类只扫主脚本的守卫。
+{
+  const src = (f) => fs.readFileSync(path.join(SRC, f), 'utf-8');
+  const srcT = src('token-tracker.js');
+  const srcH = src('stop-handler.js');
+  const sh = (() => { try { return require(path.join(SRC, 'stop-handler.js')); } catch (e) { return null; } })();
+
+  ok('T37-a1 stop-handler.js 导出 handleStopEnd 与注入清单 STOP_TX_NAMES',
+    !!sh && typeof sh.handleStopEnd === 'function' && Array.isArray(sh.STOP_TX_NAMES) && sh.STOP_TX_NAMES.length > 0,
+    sh ? `STOP_TX_NAMES=${sh.STOP_TX_NAMES.length} 项` : 'require 失败');
+
+  // a2：主脚本 require 的**每一个**兄弟模块都必须进隔离目录随行清单（自动提取，非手工清单）。
+  //   v3.35.0 拆分当天就踩了：stop-handler.js 没进清单 → 隔离目录 MODULE_NOT_FOUND → 整段 selftest 全炸
+  //   （v3.32.0 缺 refresh-holidays.js 时踩过同一个坑，说明手工清单守不住）。
+  const requiredSiblings = [...srcT.matchAll(/require\('\.\/([A-Za-z0-9_.-]+\.js)'\)/g)].map((m) => m[1]);
+  const missingCompanions = [...new Set(requiredSiblings)].filter((f) => RUNTIME_COMPANIONS.indexOf(f) < 0);
+  ok('T37-a2 ★主脚本 require 的兄弟模块全部在隔离目录随行清单里（自动提取，缺一个 = 整段 selftest 崩）',
+    requiredSiblings.length > 0 && missingCompanions.length === 0,
+    `require ${[...new Set(requiredSiblings)].length} 个；缺失：${missingCompanions.join(',') || '无'}`);
+
+  if (!sh) {
+    ok('T37-a3 注入清单三处一致（STOP_TX_NAMES / 调用点 / 解构点）', false, '模块加载失败');
+    ok('T37-a4 每个注入名在主脚本里真的有顶层定义（拼错 = 运行时 undefined）', false, '模块加载失败');
+  } else {
+    // a3：三处必须逐项相同——只改一边会让注入静默少一项（漏传的那项在函数体里是 undefined）。
+    const names = sh.STOP_TX_NAMES;
+    const callBlock = (srcT.match(/tx: \{([\s\S]*?)\} \}\)\)/) || ['', ''])[1];
+    const atCall = [...callBlock.matchAll(/^\s*([A-Za-z_$][\w$]*),$/gm)].map((m) => m[1]);
+    const destrBlock = (srcH.match(/const \{([\s\S]*?)\} = tx;/) || ['', ''])[1];
+    const atDestr = [...destrBlock.matchAll(/^\s*([A-Za-z_$][\w$]*),?$/gm)].map((m) => m[1]);
+    const eq = (a, b) => a.length === b.length && a.every((n, i) => n === b[i]);
+    ok('T37-a3 ★注入清单三处一致（STOP_TX_NAMES / 主脚本调用点 / stop-handler 解构点）',
+      eq(names, atCall) && eq(names, atDestr),
+      `清单 ${names.length} / 调用点 ${atCall.length} / 解构点 ${atDestr.length}；`
+      + `差集=${[...new Set([...names, ...atCall, ...atDestr])].filter((n) => names.indexOf(n) < 0 || atCall.indexOf(n) < 0 || atDestr.indexOf(n) < 0).join(',') || '无'}`);
+
+    // a4：注入名必须在主脚本里真有顶层定义（const/let/var/function），否则注入的是 undefined。
+    const undef = names.filter((n) => !new RegExp(`^(?:const|let|var|function|async function)\\s+${n}\\b`, 'm').test(srcT));
+    ok('T37-a4 ★每个注入名在主脚本里真的有顶层定义（拼错 = 运行时 undefined，弹窗/记账会静默走空）',
+      undef.length === 0, undef.length ? `未找到定义：${undef.join(',')}` : `46 项全部命中`);
+  }
+
+  // a5：单向依赖——stop-handler 不得反向 require 主脚本（循环依赖会让"谁依赖谁"失去方向，
+  //   且主脚本被 require 时的副作用会变得不可预测）。
+  ok('T37-a5 ★单向依赖：stop-handler.js 不反向 require 主脚本（无循环依赖）',
+    !/require\(['"]\.\/token-tracker\.js['"]\)/.test(srcH), '红 = 循环依赖回来了');
+
+  // b1：防回涨（直接判据：main() 不得重新长回去）
+  const lines = srcT.replace(/\r\n/g, '\n').split('\n');
+  const mStart = lines.findIndex((l) => /^function main\(\)/.test(l));
+  let mEnd = mStart + 1;
+  for (; mEnd < lines.length; mEnd++) if (/^\}/.test(lines[mEnd])) break;
+  ok('T37-b1 ★main() 行数未回涨（拆分后 878 行，上限 950）',
+    mStart >= 0 && (mEnd - mStart) <= 950, `实测 ${mEnd - mStart} 行`);
+
+  // b2：Stop 块特征行必须已离开主脚本（在 stop-handler.js 里）——防止"两边各留一份"。
+  const MARK = "/\\bsubagents\\b/i.test(tsPath.replace";
+  ok('T37-b2 ★Stop 端子代理路径守卫已迁走且**只有一份**',
+    srcT.indexOf(MARK) < 0 && srcH.indexOf(MARK) > 0, '红 = 主脚本里还有一份 → 两边会漂移');
 }
 
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。
