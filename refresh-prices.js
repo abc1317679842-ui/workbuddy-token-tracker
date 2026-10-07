@@ -52,6 +52,16 @@ const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
 const PRICING_LOCK_FILE = path.join(WB, 'skills', 'token-usage-tracker', '.pricing.lock'); // 修复6：pricing 并发写锁（与 token-tracker.js 共用）
 const DS_OFFICIAL = process.env.DS_OFFICIAL || path.join(__dirname, 'deepseek-official.js'); // 可覆盖（测试/镜像）
 const TIMEOUT_MS = 12000;
+// v3.37.0（L1'）：**大载荷源的单独超时预算**。
+// 背景：`litellm` 的 model_prices_and_context_window.json 实测 3,003 KB，是其余四个源
+// （88KB / 62KB / 756KB / 2KB）的 4~34 倍，而 TIMEOUT_MS 罩住的是「DNS+TLS+响应头+**整段
+// body 下载**+JSON 解析」——3MB 的下载时间才是大头。
+// 实测 5 轮（凌晨空闲时段）：0.74 / 1.39 / 0.74 / 5.51 / 3.14 s，**波动 7.5×**；
+// 历史 6 次真实刷新里 litellm 有 4 次失败，其中 3 次错误是 `This operation was aborted`
+// （= 我们自己的 12s 超时器触发，不是源不可达）。晚间拥塞时段 12s 会被轻松突破。
+// 30s 相对实测最慢值留约 5× 余量；总耗时仍远低于 token-tracker.js 侧
+// REFRESH_TIMEOUT_MS=180000 的整进程上限（五源是 Promise.all 并行，只取最慢那个）。
+const BIG_SOURCE_TIMEOUT_MS = 30000;
 const DEFAULT_RATE = 7.2; // v3.32.0（P1-3）：USD→CNY 兜底汇率的**单一真源**，token-tracker.js 新模型补录兜底处引用本导出（selftest T21-d 断言两侧一致）
 const FORCE = process.argv.includes('--force');
 const NO_NET = process.env.WB_NO_NET === '1';
@@ -60,7 +70,8 @@ const SOURCES = {
   llma: { name: 'llmabacus(国内·人民币·主)', url: 'https://www.llmabacus.com/api/prices' },
   llc: { name: 'llm-prices-cn(国内·人民币·备)', url: 'https://raw.githubusercontent.com/szp2005/llm-prices-cn/main/prices.json' },
   or: { name: 'openrouter(USD)', url: 'https://openrouter.ai/api/v1/models' },
-  litellm: { name: 'litellm(USD)', url: 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json' },
+  // v3.37.0（L1'）：唯一的大载荷源 → 给它单独的超时预算（理由见 BIG_SOURCE_TIMEOUT_MS 注释）
+  litellm: { name: 'litellm(USD)', url: 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json', timeoutMs: BIG_SOURCE_TIMEOUT_MS },
   portkey: { name: 'portkey(USD)', url: 'https://configs.portkey.ai/pricing/deepseek.json' },
 };
 
@@ -281,9 +292,10 @@ function isFreeVariant(id) {
   return s.endsWith(':free') || s.endsWith('-free');
 }
 
-async function fetchJson(url) {
+// v3.37.0（L1'）：`timeoutMs` 参数——默认沿用全局 TIMEOUT_MS，大载荷源由 SOURCES 显式指定更大的值。
+async function fetchJson(url, timeoutMs = TIMEOUT_MS) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
       signal: ctrl.signal,
@@ -679,7 +691,7 @@ async function main() {
     ? Object.fromEntries(Object.keys(SOURCES).map((k) => [k, { ok: false, err: 'WB_NO_NET=1' }]))
     : await Promise.all(Object.entries(SOURCES).map(async ([k, s]) => {
         try {
-          const j = await fetchJson(s.url);
+          const j = await fetchJson(s.url, s.timeoutMs);
           const parsed = PARSERS[k](j);
           const n = Object.keys(parsed || {}).length;
           if (!n) throw new Error('解析出 0 个模型（上游 schema 可能已变更）');
@@ -1083,4 +1095,5 @@ if (require.main === module) {
 // v3.24（F2）：新增导出 isFreeVariant / parse* / mergeWithDisk / applyUsdCachedPrice /
 // retiredLockWarnings / applyRetiredLocked，供单元测试直接验证（纯函数，无副作用）
 // v3.31.0（P0-5 / P1-7）：导出价格体检纯函数与阈值，供 selftest 离线单测（行为可验证，不靠源码守卫）
-module.exports = { save, load, todayStr, PRICING, usdFind, cnFind, looseFind, norm, median, AMBIG_WARNINGS, AMBIG_WARNINGS_LOCKED, AMBIG_WARNINGS_OFFICIAL, isFreeVariant, parseLlma, parseLlc, parseOr, parseLitellm, parsePortkey, mergeWithDisk, applyUsdCachedPrice, retiredLockWarnings, applyRetiredLocked, priceGate, restoreBlock, restoreCached, PRICE_SANITY, DEFAULT_RATE };
+// v3.37.0（L1'）：导出 SOURCES / TIMEOUT_MS / BIG_SOURCE_TIMEOUT_MS，供 selftest T39 断言「大载荷源有独立超时预算」。
+module.exports = { save, load, todayStr, PRICING, usdFind, cnFind, looseFind, norm, median, AMBIG_WARNINGS, AMBIG_WARNINGS_LOCKED, AMBIG_WARNINGS_OFFICIAL, isFreeVariant, parseLlma, parseLlc, parseOr, parseLitellm, parsePortkey, mergeWithDisk, applyUsdCachedPrice, retiredLockWarnings, applyRetiredLocked, priceGate, restoreBlock, restoreCached, PRICE_SANITY, DEFAULT_RATE, SOURCES, TIMEOUT_MS, BIG_SOURCE_TIMEOUT_MS };

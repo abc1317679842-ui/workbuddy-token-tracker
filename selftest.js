@@ -2765,6 +2765,52 @@ else {
     !touchesPrice, 'AMBIG_SILENT 附近出现价格赋值 → 可能改变计价结果');
 }
 
+// ===== T39（v3.37.0·L1'）：大载荷源的独立超时预算 =====
+//   病根：litellm 的 JSON 实测 3,003 KB（其余四源 2~756 KB），而 TIMEOUT_MS 罩住的是
+//   「DNS+TLS+响应头+**整段 body 下载**+JSON 解析」。实测 5 轮耗时 0.74~5.51s（波动 7.5×），
+//   历史 6 次真实刷新里 4 次失败、3 次错误为 `This operation was aborted`（= 自家 12s 超时器）。
+//   修法不是"换源"（源实测可达），而是给大载荷源单独的预算。
+//   三道守卫：①预算确实更大；②确实被调用方传下去（否则改了个没人用的常量）；③不得误伤其他源。
+{
+  const srcR39 = fs.readFileSync(path.join(SRC, 'refresh-prices.js'), 'utf-8');
+  const rp39 = (() => { try { return require(path.join(SRC, 'refresh-prices.js')); } catch (e) { return null; } })();
+
+  // a1：只有显式声明的大载荷源拿到更大预算，且预算必须严格大于全局默认（否则等于没改）
+  ok('T39-a1 ★litellm 声明了独立超时预算且严格大于全局 TIMEOUT_MS',
+    !!rp39 && rp39.SOURCES && rp39.SOURCES.litellm
+    && rp39.SOURCES.litellm.timeoutMs === rp39.BIG_SOURCE_TIMEOUT_MS
+    && rp39.BIG_SOURCE_TIMEOUT_MS > rp39.TIMEOUT_MS,
+    rp39 ? `litellm.timeoutMs=${rp39.SOURCES.litellm && rp39.SOURCES.litellm.timeoutMs} BIG=${rp39.BIG_SOURCE_TIMEOUT_MS} 默认=${rp39.TIMEOUT_MS}` : 'require 失败');
+
+  // a2：**必须真被消费**——fetchJson 要接 timeoutMs 参数，调用点要传 s.timeoutMs。
+  //     只改常量不传参 = 改了个没人用的常量（最常见的假修复）。
+  ok('T39-a2 ★fetchJson 接收 timeoutMs 且调用点传入 s.timeoutMs（不是改了没人用的常量）',
+    /async function fetchJson\(url, timeoutMs = TIMEOUT_MS\)/.test(srcR39)
+    && /await fetchJson\(s\.url, s\.timeoutMs\)/.test(srcR39),
+    '常量没接到调用点 → 假修复');
+
+  // a3：定时器必须用的是**传入的** timeoutMs，不是写死的 TIMEOUT_MS
+  ok('T39-a3 ★setTimeout 用的是参数 timeoutMs（不是写死 TIMEOUT_MS）',
+    /setTimeout\(\(\) => ctrl\.abort\(\), timeoutMs\)/.test(srcR39),
+    '仍写死 TIMEOUT_MS → 参数白传');
+
+  // a4：**不误伤**——其余四个源不得被顺手改预算（保持原 12s，避免整体刷新被拖长）
+  const overBudget = !!rp39 && rp39.SOURCES
+    ? Object.entries(rp39.SOURCES).filter(([k, s]) => k !== 'litellm' && s.timeoutMs != null).map(([k]) => k)
+    : ['<require 失败>'];
+  ok('T39-a4 ★其余四个源未被顺手改预算（保持全局默认）',
+    overBudget.length === 0, `被改的源：${overBudget.join('、')}`);
+
+  // a5：**总耗时仍在整进程上限内**——token-tracker.js 侧 REFRESH_TIMEOUT_MS 是硬闸，
+  //     大源预算必须留足余量（五源 Promise.all 并行，最坏 = 最大单个预算）。
+  const srcT39 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8');
+  const capM = srcT39.match(/REFRESH_TIMEOUT_MS\s*=\s*(\d+)/);
+  const cap = capM ? Number(capM[1]) : 0;
+  ok('T39-a5 ★最大单个超时预算 < 整进程上限（不会撞 token-tracker 的 kill 闸）',
+    !!rp39 && cap > 0 && rp39.BIG_SOURCE_TIMEOUT_MS < cap,
+    `BIG=${rp39 && rp39.BIG_SOURCE_TIMEOUT_MS} 上限=${cap}`);
+}
+
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。
 //   为什么需要：主脚本在被 require 时会跑 loadPricing → maybeRefreshHolidays（每进程一次、四条件命中即
 //   **detach** spawn 一个 refresh-holidays.js 子进程并往 SNAP_DIR 写 `.holidays-refresh.json`）。该子进程

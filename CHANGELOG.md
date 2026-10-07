@@ -3,6 +3,67 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.37.0（2026-10-08）—— 大载荷价格源拿到独立的超时预算（并撤销上一条误判的待办）
+
+### 背景：撤销 v3.36.0 遗留的三条待办
+
+v3.36.0 发版时留了三条待办（`plan-v3.36.0.md §5.1`）：换 jsdelivr 源 / 核查 `litellm(USD)✓` 判据 / 评估 jsdelivr 首轮 27s。
+**本轮复核后三条的依据全部不成立**：
+
+| 项 | 原主张 | 复核结论 |
+|---|---|---|
+| L1 | `raw.githubusercontent.com` **不可达** → 换 jsdelivr | ❌ 两轮复测**全 HTTP 200**（litellm 3003KB/0.7s、llm-prices-cn 88KB/0.3s）。同在该域的 `llm-prices-cn` 历史 6 次里 5 次 ✓ |
+| L2 | `last_refresh_note` 标 `litellm(USD)✓` 是判据误报 | ❌ `:1047` 是 `${s.name}${r.ok ? '✓' : '✗(...)'}`，**逐源**取自己的 `r.ok`。那几次 ✗ 是真失败 |
+| L3 | jsdelivr 首轮 27s | ❌ 本轮 0.5s；且 jsdelivr 同样 3MB，换源不解决载荷问题 |
+
+> **给自己的教训**：上一轮把「3MB 大文件**下载超时**」误判成「host 不可达」。同批还误判过 `portkey` 的 `ECONNRESET`（二轮复测两次 200）。
+> 同一条纪律踩了两次 —— 大载荷 + 短超时时，`... aborted` 一律先当**超时预算问题**看。
+
+### 修复：按源给超时预算（而非一刀切 12s）
+
+`fetchJson()` 的 `AbortController` 罩住「DNS+TLS+响应头+**整段 body 下载**+JSON 解析」。载荷差 34 倍却共用同一预算：
+
+| 源 | 体积 | 预算（改后） |
+|---|---|---|
+| portkey / llmabacus / llm-prices-cn / openrouter | 2 / 62 / 88 / 756 KB | 12s（不变） |
+| **litellm** | **3,003 KB** | **30s** ← 本版唯一改动 |
+
+**证据链**：
+1. 历史 6 次真实刷新：litellm **4 次失败**，其中 3 次错误 = `This operation was aborted`（自家 12s 超时器），1 次 `fetch failed`（同日 `llm-prices-cn` 也挂 = 整体网络）
+2. 实测 5 轮（凌晨空闲）耗时 `0.74 / 1.39 / 0.74 / 5.51 / 3.14 s` → **波动 7.5×**；失败全落在 16:05~18:43（晚间拥塞）
+3. 源本身 HTTP 200，是"取慢了"不是"取不到"
+
+**影响面**：17 个模型里走官方价 9 个，**真正吃 USD 源的只有 `space-bunny` 一个**（region=US + auto_converted）。
+litellm 掉线会让 USD 中位数从「三源」降成「两源」→ 它的价随当天哪些源碰巧成功而日间漂移。
+
+### 改动
+
+- `refresh-prices.js`：新增 `BIG_SOURCE_TIMEOUT_MS = 30000`；`SOURCES.litellm.timeoutMs` 指向它；
+  `fetchJson(url, timeoutMs = TIMEOUT_MS)` + `setTimeout(..., timeoutMs)` + 调用点 `fetchJson(s.url, s.timeoutMs)`；
+  导出 `SOURCES / TIMEOUT_MS / BIG_SOURCE_TIMEOUT_MS`
+- `selftest.js`：新增 **T39-a1..a5**
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| selftest | **363 过 / 0 败 / 21 跳过**（基线 358/0/21，纯增 5，零回归）；**T38 ×10 + T39 ×5 全绿** |
+| 五源可达性（两轮） | 全 200 |
+| 真实刷新 `--force` | **5/5 源成功**，rc=0 |
+| 取值不变 | 刷新前后 9 个价格/属性字段 **差异 0** |
+| **v3.36.0 弹窗修复复验** | `priceAuditTag` 对 `deepseek-v4.1-flash` / `deepseek-flash`：`⚠价核验` → `""`（用 v3.36.0 修复前的真基线对照） |
+
+### 已知边界（未修，记录在案）
+
+**官方价抓取失败时，v3.36.0 的静音会关闭** —— `officialHitPre` 依赖本轮 `officialOk`；官方抓取失败 → 不为任何模型静音 → 备用源歧义回到 `_ambig_warnings` → 弹窗标签复现。
+- 频率极低：历史 **12 次刷新官方价全部 ✓**（0 失败）
+- 不修的原因：`officialHitPre` 同时被 `officialBlk`（写价用）消费，官方失败时 `official` 为 null，
+  若让静音判据走"本地标记"兜底而 `officialBlk` 仍去读 `official.official[key]` → **直接 TypeError 崩溃**。
+  要修必须先把"静音判据"与"取价块"两个关注点拆开，属独立改动，不在本版范围。
+- 观察项记录于 `plan-v3.37.0.md §9`
+
+---
+
 ## v3.36.0（2026-10-07）—— 官方价已命中的模型不再挂「⚠价核验」（判据顺序修正）
 
 ### 修复（P0 · 消除永久误报）
