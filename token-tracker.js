@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.35.0 (2026-10-06)
+// token-usage-tracker v3.36.0 (2026-10-07)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -3781,11 +3781,15 @@ function doctorTxt() {
       // v3.33.0（A2）：已 lock 条目的歧义告警不进 `_ambig_warnings`（不挂弹窗），但**必须在体检里可见**，
       //   否则 A2 的处置就从"消除误报"变成"隐藏信息"。两者分开列，看到的人自己能判断该不该管。
       const ambLocked = Array.isArray(p._ambig_warnings_locked) ? p._ambig_warnings_locked.length : 0;
+      // v3.36.0（P0）：官方价已命中模型的**备用源**歧义同样不进 `_ambig_warnings`（不挂弹窗），
+      //   但信息不能丢——否则"静音误报"就变成"隐藏信息"。与 ambLocked 同款处置：独立列出、体检可见。
+      const ambOfficial = Array.isArray(p._ambig_warnings_official) ? p._ambig_warnings_official.length : 0;
       const lvl = (age === null || age > 14 || zero) ? 'warn' : 'ok';
       sec('价库', lvl,
         `最后刷新 ${p.date || '未知'}${age === null ? '' : `（${age} 天前${age > 14 ? '，**建议手动跑 refresh-prices.js**' : ''}）`}`
         + ` ｜ 收录 ${keys.length} 个 ｜ 厂商未公布价 ${unpublished} 个 ｜ 0 价 ${zero} 个 ｜ 歧义告警 ${amb} 条`
         + (ambLocked ? `（另有已 lock 条目 ${ambLocked} 条，价已人工冻结、匹配结果不被采用 → 不上弹窗）` : '')
+        + (ambOfficial ? `（另有官方价已命中模型 ${ambOfficial} 条，写价走官方价、备用源结果未被采用 → 不上弹窗）` : '')
         + ` ｜ 美元折算汇率 ${p.usd_cny_rate || DEFAULT_RATE}（仅在"模型只有美元源"时参与折算，误差主源是拿不到官网人民币价）`);
     }
   } catch (e) { sec('价库', 'bad', `检查异常：${(e && e.message) || e}`); }
@@ -5165,7 +5169,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.35.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.36.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

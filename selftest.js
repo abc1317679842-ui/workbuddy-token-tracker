@@ -2691,6 +2691,80 @@ else {
     srcT.indexOf(MARK) < 0 && srcH.indexOf(MARK) > 0, '红 = 主脚本里还有一份 → 两边会漂移');
 }
 
+// ── T38（v3.36.0 P0）：官方价命中模型的备用源歧义必须**静音但不丢信息** ─────────────────────
+//   病根：refresh-prices.js 主循环里 usdFind/cnFind 在**官方价判定之前**无条件执行，
+//         于是已有 DeepSeek 官方价的模型（deepseek-v4.1-flash / deepseek-flash），
+//         仍会把「USD源 模糊命中 N 个不同价候选，已放弃」记进 `_ambig_warnings`
+//         → token-tracker.js 的 priceAuditTag 把它翻成弹窗标签「⚠价核验」→ 常用模型条条挂。
+//   用户原话：「官方价格源已经命中的情况下，后面备用源的那些，刷新到还是没刷新到，都已经是无关紧要的东西了」。
+//   两道守卫缺一不可：①必须真静音（否则用户还在看噪音）；②必须真留痕（否则从"误报"变成"隐藏信息"）。
+{
+  const src = (f) => fs.readFileSync(path.join(SRC, f), 'utf-8');
+  const srcR = src('refresh-prices.js');
+  const srcT2 = src('token-tracker.js');
+  const rp = (() => { try { return require(path.join(SRC, 'refresh-prices.js')); } catch (e) { return null; } })();
+
+  // a1：新字段必须存在且已导出（否则 token-tracker 的体检读不到、信息就真丢了）
+  ok('T38-a1 refresh-prices.js 导出 AMBIG_WARNINGS_OFFICIAL（独立归集备用源歧义）',
+    !!rp && rp.AMBIG_WARNINGS_OFFICIAL instanceof Set,
+    rp ? 'Set 未导出' : 'require 失败');
+
+  // a2：静音开关**只能**来自 officialHitPre，不得出现硬编码 true（硬编码 = 无条件静音 = 漏报）
+  const assigns = [...srcR.matchAll(/AMBIG_SILENT\s*=\s*([^;]+);/g)].map((m) => m[1].trim());
+  ok('T38-a2 ★AMBIG_SILENT 只被赋 false / officialHitPre（绝无硬编码 true）',
+    assigns.length > 0 && assigns.every((a) => a === 'false' || a === 'officialHitPre'),
+    `实际赋值：${JSON.stringify(assigns)}`);
+
+  // a3：循环开头必须**无条件复位**——模块级变量若跨轮残留，会把无官方价模型的告警一起静音（漏报）
+  //   注意：不能用 indexOf('AMBIG_SILENT = false;')——它会撞上模块级 `let AMBIG_SILENT = false;` 定义行。
+  //   改为**逐行定位**：找到主循环行，其后的第一条 `AMBIG_SILENT = false;` 必须是「复位」，且早于赋值行。
+  const rLines = srcR.replace(/\r\n/g, '\n').split('\n');
+  const mainLoopLine = rLines.findIndex((l) => /^\s{2}for \(const key of Object\.keys\(models\)\) \{$/.test(l));
+  const resetLine = rLines.findIndex((l, i) => i > mainLoopLine && /^\s*AMBIG_SILENT = false;$/.test(l));
+  const setLine = rLines.findIndex((l) => /^\s*AMBIG_SILENT = officialHitPre;$/.test(l));
+  ok('T38-a3 ★复位早于赋值、且都在主循环体内（防跨轮残留 → 静音泄漏到下一个模型）',
+    mainLoopLine >= 0 && resetLine > mainLoopLine && setLine > resetLine,
+    `主循环@${mainLoopLine + 1} 复位@${resetLine + 1} 赋值@${setLine + 1}`);
+
+  // a4：officialBlk 必须复用 officialHitPre —— 两处判据各写一份必然漂移（改 A 忘改 B 就静音错人）
+  ok('T38-a4 ★officialBlk 复用 officialHitPre（单一判据来源，不允许重复表达式）',
+    /const officialBlk = officialHitPre \?/.test(srcR),
+    '两处判据会各改各的 → 漂移');
+
+  // a5：**信息不丢**——静音条目必须落独立字段，且带 delete 反向清理（避免空数组残留）
+  ok('T38-a5 ★静音告警落盘 _ambig_warnings_official 且有 delete 反向清理',
+    /pricing\._ambig_warnings_official = \[\.\.\.AMBIG_WARNINGS_OFFICIAL\]/.test(srcR)
+    && /delete pricing\._ambig_warnings_official/.test(srcR),
+    '信息丢失 = 从"误报"变成"隐藏信息"');
+
+  // a6：**不驱动弹窗**——priceAuditTag 只能读 _ambig_warnings / _price_audit.warnings 两源，
+  //     绝不能把 _ambig_warnings_official 并进来（并进来 = 静音白做，弹窗照挂）
+  const patBlock = (srcT2.match(/function priceAuditTag\(stat, pricing\) \{([\s\S]*?)\n\}/) || ['', ''])[1];
+  ok('T38-a6 ★priceAuditTag 不读 _ambig_warnings_official（静音才算真生效）',
+    patBlock.length > 0 && patBlock.indexOf('_ambig_warnings_official') < 0,
+    patBlock.length ? '弹窗标签仍会消费静音字段 → 静音无效' : '未定位到 priceAuditTag 函数体');
+
+  // a7：**信息可见**——体检（--doctor）必须计数新字段，否则留痕等于没人看得见
+  ok('T38-a7 ★--doctor 体检已计入 _ambig_warnings_official（留痕必须可见）',
+    /_ambig_warnings_official/.test(srcT2.slice(srcT2.indexOf('function doctorTxt'), srcT2.indexOf('function doctorTxt') + 12000)),
+    '留痕不可见 = 与直接丢弃等价');
+
+  // a8：stderr 必须留痕（诊断不减）——刷新时就要能在日志里看到静音了几条
+  ok('T38-a8 ★refresh-prices 静音时写 stderr（诊断链路不断）',
+    /官方价已命中模型的备用源歧义 \$\{AMBIG_WARNINGS_OFFICIAL\.size\} 条/.test(srcR));
+
+  // a9：last_refresh_note 汇总行必须带上新字段（否则"这次刷新静音了什么"在价库里查不到）
+  ok('T38-a9 ★last_refresh_note 已并入 _ambig_warnings_official 计数',
+    /AMBIG_WARNINGS_OFFICIAL\.size \? `；官方价已命中模型的备用源歧义/.test(srcR));
+
+  // a10：**取值不变**——静音只动告警集合，不得碰任何价格写入语句。
+  //      直接判据：AMBIG_SILENT 只出现在 ambigAdd 与被赋值处，不得出现在任何 m.xxx_price = 的赋值里。
+  const silentUses = [...srcR.matchAll(/AMBIG_SILENT/g)].map((m) => srcR.slice(Math.max(0, m.index - 60), m.index + 90));
+  const touchesPrice = silentUses.some((s) => /m\.\w*price\w*\s*=/.test(s));
+  ok('T38-a10 ★静音逻辑不触碰任何价格赋值（红线：只静音不改变取值）',
+    !touchesPrice, 'AMBIG_SILENT 附近出现价格赋值 → 可能改变计价结果');
+}
+
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。
 //   为什么需要：主脚本在被 require 时会跑 loadPricing → maybeRefreshHolidays（每进程一次、四条件命中即
 //   **detach** spawn 一个 refresh-holidays.js 子进程并往 SNAP_DIR 写 `.holidays-refresh.json`）。该子进程

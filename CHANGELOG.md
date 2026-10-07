@@ -3,6 +3,68 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.36.0（2026-10-07）—— 官方价已命中的模型不再挂「⚠价核验」（判据顺序修正）
+
+### 修复（P0 · 消除永久误报）
+
+> **用户可见效果**：`deepseek-v4.1-flash` 这类**已有 DeepSeek 官方价**的模型，弹窗不再挂「⚠价核验」。
+> 实测同一模型、同一天、同一价库文件：`10:41:35 … ¥0.06`（无标签）与 `10:42:21 … ¥0.02｜⚠价核验`
+> （有标签）交替出现 —— 标签的出现与否只取决于**行宽是否恰好放得下**，而非有没有真问题。
+
+- **病根：判据顺序错了。** `refresh-prices.js` 主循环里 `cnFind`/`usdFind`（共 11 次备用源匹配）
+  在**官方价判定之前**无条件执行：
+  - `cnFind` ×2（`:781-782`）→ `usdFind` ×9（`:795-799`）→ `region=US` 写 `usd_*`（`:803-805`）→
+    **官方价判定 `officialBlk`（`:824`）**。
+  于是官方价早已命中的 `deepseek-v4.1-flash`（`alias_of: deepseek-flash`、`price_source: deepseek官方`），
+  仍会把备用源的「USD源 模糊命中 11 个不同价候选，已放弃」记进 `_ambig_warnings`，
+  再被 `token-tracker.js` 的 `priceAuditTag` 翻成弹窗标签。
+- **修复：把官方命中判定提前到源匹配之前**，命中即把该模型的备用源歧义**静音**（不进 `_ambig_warnings`）。
+  用户原话：「官方价格源已经命中的情况下，后面备用源的那些，刷新到还是没刷新到，都已经是无关紧要的东西了」。
+
+### 设计要点
+
+| | 情形 | 官方价命中 | 处置 |
+|---|---|---|---|
+| A | 官方价命中（含别名命中） | ✓ | **短路**：备用源歧义进 `_ambig_warnings_official`，不挂弹窗 |
+| B | 未命中 + 走国内源 | ✗ | 保持原状（歧义照旧进 `_ambig_warnings`） |
+| C | 未命中 + USD 兜底 | ✗ | 保持原状（`auto_converted` 依赖 `usdIn/usdOut`，静音不得影响取值） |
+
+- **只静音告警，取值一个字节都不改**：备用源匹配照常执行，返回值照常喂 `region=US` 的 `usd_*` 参考字段
+  与 `auto_converted` 兜底换算。
+- **信息不丢**：静音条目落独立字段 `pricing._ambig_warnings_official`，`--doctor` 可见、stderr 留痕
+  （沿用 v3.33.0 对 `_ambig_warnings_locked` 的既有先例）。
+- **防跨轮残留**：`AMBIG_SILENT` 是模块级开关，在每轮循环**开头无条件复位**，
+  避免某轮 `continue`/异常跳出后把无官方价模型的告警一起静音（漏报）。
+- **单一判据来源**：`officialBlk` 改为复用提前算好的 `officialHitPre`，杜绝两处判据各改各的而漂移。
+
+### 影响面（实测清点：17 个模型）
+
+- 官方价命中 **5 个**，其中 **2 个**（`deepseek-v4.1-flash`、`deepseek-flash`）当前挂 `_ambig_warnings`
+  → 本版静音目标。
+- 非官方命中且挂 `_ambig_warnings` **6 个** → **必须保持原样**（已断言）。
+- 挂 `_ambig_warnings_locked` **6 条** → v3.33.0 既有静音，不受影响。
+
+### 验证（不省一步）
+
+- **取值不变**：修复前 vs 修复后两次真实刷新的 `pricing.json`，全模型 15 个价格/属性字段
+  加顶层字段（剔除时间戳）**逐字节 0 差异**。
+- **零噪音**：HEAD 版 vs 工作版五出口（`--report all` / `<day>` / `summary all` / `<range>` / `--csv`）
+  逐字节相同；CSV 内容 11,302 B 相同（唯一差异是导出文件名内嵌时间戳）。
+- **弹窗标签**：`priceAuditTag` 对 `deepseek-v4.1-flash` 的取值由 `⚠价核验` → `""`（16 过 / 0 败）。
+- **B/C 路径不受影响**：非官方命中仍进 `_ambig_warnings`；`space-bunny`（唯一 `region=US`）不被静音（7 过 / 0 败）。
+- **端到端**：注入真实官方价后 `--force` 刷新，stderr 打出「官方价已命中模型的备用源歧义 1 条…
+  仅留痕于 `pricing._ambig_warnings_official`: deepseek-flash」，`_ambig_warnings` 11→3 条。
+- **selftest**：新增 `T38-a1..a10`（10 条，含「静音逻辑不触碰任何价格赋值」「`priceAuditTag` 不读新字段」两道红线守卫），
+  **358 过 / 0 败 / 21 环境受限跳过**（基线 348/0/21，纯增 10 条，零回归）。
+
+### 已知边界
+
+- 本版**未**更换备用源。备用源健康度调查另存待办：`litellm` 源走 `raw.githubusercontent.com`
+  在部分地区持续不可达（`ENOENT`/超时），jsdelivr 镜像可用但首轮偶发 27s；
+  以及 `last_refresh_note` 在源不可达时仍标 `litellm(USD)✓` 的判据疑点。
+- 为在沙箱中端到端复现 A 路径，`refresh-prices.js` 增设 `DS_OFFICIAL_JSON` **测试专用**读取钩子；
+  不设置该环境变量时生产路径逐字节不变。
+
 ## v3.35.0（2026-10-06）—— 拆 `main()`：Stop 端处理迁出到 `stop-handler.js`（纯结构，行为零变化）
 
 > **对使用者无感**：本次是纯结构改动。零噪音三臂回归 **16 个出口（含 4 个 CSV）逐字节一致**，

@@ -429,8 +429,22 @@ const AMBIG_WARNINGS = new Set();
 //   处置沿用同一文件里 A-7 对 `_retired_locked` 的既有先例（937 行注释：**刻意不进 _price_audit**，
 //   改为独立字段 + stderr 留痕）——信息不丢，只是不再驱动弹窗。
 const AMBIG_WARNINGS_LOCKED = new Set();
+// v3.36.0（P0）：**官方价已命中**的模型，其备用源（国内源 / USD 源）的歧义告警单独归集。
+//   病根（用户 2026-10-07 指出）：主循环里 `usdFind`/`cnFind` 在**官方价判定之前**无条件执行，
+//   于是已有 DeepSeek 官方价的模型（如 deepseek-v4.1-flash，price_source='deepseek官方'），
+//   仍会把「USD源 模糊命中 N 个不同价候选，已放弃」记进 `_ambig_warnings` → 弹窗挂「⚠价核验」。
+//   用户原话：「官方价格源已经命中的情况下，后面备用源的那些，刷新到还是没刷新到，都已经是无关紧要的东西了」。
+//   处置：官方价命中 → 备用源匹配结果**根本不被采用**（写价走 officialBlk 分支）→ 其歧义不驱动弹窗，
+//   但**信息不丢**：落独立字段 `_ambig_warnings_official`，`--doctor` 可见、stderr 留痕。
+//   ⚠️ 关键：**只静音告警，绝不改变取到的值** —— usdFind 的返回值仍照常喂
+//   `region=US` 的 usd_* 参考字段（:803）与 `auto_converted` 兜底分支（:856），否则会误伤无官方价的模型。
+const AMBIG_WARNINGS_OFFICIAL = new Set();
+// 本模型此刻是否处于「官方价已命中」状态（由主循环按模型设置/复位）。
+//   用模块级开关而非给 looseFind 加参数：调用点（usdFind ×9、cnFind ×2）一行都不用改，改动面最小。
+let AMBIG_SILENT = false;
 function ambigAdd(msg, locked) {
   if (locked) AMBIG_WARNINGS_LOCKED.add(msg);
+  else if (AMBIG_SILENT) AMBIG_WARNINGS_OFFICIAL.add(msg);
   else AMBIG_WARNINGS.add(msg);
 }
 function looseFind(index, localNorm, kind, forKey, locked) {
@@ -618,11 +632,22 @@ async function main() {
   let official = null; // { official: {模型:{input_price,cached_price,output_price,peak_multiplier}}, weekend_off_peak }
   if (!NO_NET) {
     try {
-      const sp = spawnSync(process.execPath, [DS_OFFICIAL], {
-        encoding: 'utf-8',
-        timeout: 120000, // 含重试（2 次 × 60s）
-        env: { ...process.env, DS_RETRIES: '0' }, // 本次外部已整体由 refresh 控制节奏，子进程不再追加重试，避免重复 60s
-      });
+      // v3.36.0（测试钩子）：DS_OFFICIAL_JSON 指向一份已抓好的官方价 JSON 时直接读取，
+      //   跳过 spawnSync。**仅用于测试**：沙箱里 node spawn node 恒 EBUSY，
+      //   导致 officialOk 永远为 false，A 路径（官方价命中）无法端到端复现。
+      //   生产路径不受影响（该环境变量不设置时行为与旧版逐字节一致）。
+      let sp;
+      if (process.env.DS_OFFICIAL_JSON) {
+        const fs = require('fs');
+        const raw = fs.readFileSync(process.env.DS_OFFICIAL_JSON, 'utf-8');
+        sp = { status: 0, stdout: raw, stderr: '' };
+      } else {
+        sp = spawnSync(process.execPath, [DS_OFFICIAL], {
+          encoding: 'utf-8',
+          timeout: 120000, // 含重试（2 次 × 60s）
+          env: { ...process.env, DS_RETRIES: '0' }, // 本次外部已整体由 refresh 控制节奏，子进程不再追加重试，避免重复 60s
+        });
+      }
       if (sp.status === 0) {
         const j = JSON.parse(sp.stdout);
         if (j.ok && j.official) {
@@ -766,6 +791,9 @@ async function main() {
   for (const key of Object.keys(models)) {
     const m = models[key];
     if (!m || typeof m !== 'object') continue;
+    // v3.36.0：每轮循环开头无条件复位静音开关——防止上一轮的 true 残留到本轮
+    //   （模块级变量，若某轮走 continue/异常跳出而漏复位，会把无官方价模型的告警一起静音 = 漏报）。
+    AMBIG_SILENT = false;
 
     const localNorm = norm(key);
     const srcId = SRC_ID_MAP[key] || null;
@@ -777,6 +805,16 @@ async function main() {
     //   本机实测：17 模型中 6 个 lock 条目，**region 全为 CN**（lock 且 US 的 0 个）；现有 10 条歧义告警里
     //   **6 条挂在 lock 条目上**（含用户日常追踪的 hy4-preview / glm-5.3-flash）→ 正是"常年挂 ⚠价核验"的来源。
     const isLocked = m.lock === true && m.region !== 'US';
+
+    // v3.36.0（P0）：**官方价命中判定提前到源匹配之前**（原在 :824，晚于 usdFind → 造成永久噪音）。
+    //   判据与 :824 的 officialBlk **完全一致**（纯读，无副作用），故提前不改变任何取值：
+    //     officialOk（官方价抓取成功） && （本 key 在官方清单里 || 别名在官方清单里）
+    //   命中即为真 → 下面 11 次源匹配（cnFind ×2 + usdFind ×9）产生的歧义**只留痕不挂弹窗**。
+    //   ⚠️ 仅静音告警：匹配照常执行、返回值照常被 :803（region=US 参考字段）与 :856（USD 兜底换算）消费。
+    const officialHitPre = !!(officialOk && official
+      && (official.official[key] || (m.alias_of ? official.official[m.alias_of] : null)));
+    AMBIG_SILENT = officialHitPre;
+
     const llmaHit = llma ? cnFind(llma, srcId, localNorm, key, isLocked) : null;
     const llcHit = llc ? cnFind(llc, srcId, localNorm, key, isLocked) : null;
 
@@ -821,7 +859,8 @@ async function main() {
       // 官方没有的 DeepSeek 系（如已下线 V3 系列）→ 回落聚合源。
       // v3.07（2026-09-16）：别名条目（本地 key 与官方 ID 不同名，如 deepseek-v4.1-flash ↔ deepseek-flash）
       // 也必须走官方价——否则会落进下面的聚合源分支，用 llmabacus 价覆盖掉 deepseek-official.js 刚写入的官方价。
-      const officialBlk = officialOk && (official.official[key] || (m.alias_of ? official.official[m.alias_of] : null));
+      // v3.36.0：复用循环开头提前算好的 officialHitPre（判据完全相同）——避免两处判据各改各的而漂移。
+      const officialBlk = officialHitPre ? (official.official[key] || (m.alias_of ? official.official[m.alias_of] : null)) : null;
       if (officialBlk) {
         m.input_price = officialBlk.input_price;
         m.cached_price = officialBlk.cached_price;
@@ -988,6 +1027,16 @@ async function main() {
     process.stderr.write(`[refresh-prices] 已 lock 条目的模糊匹配告警 ${AMBIG_WARNINGS_LOCKED.size} 条（价已人工冻结、匹配结果不被采用 → 不挂弹窗，仅留痕于 pricing._ambig_warnings_locked）: ${[...AMBIG_WARNINGS_LOCKED].map((s) => s.split(':')[0]).join('、')}\n`);
   }
 
+  // v3.36.0（P0）：**官方价已命中**模型的备用源歧义告警落独立字段 `_ambig_warnings_official`。
+  //   与 `_ambig_warnings_locked` 同款处置（信息不丢、不驱动弹窗）：写价走官方价分支，
+  //   备用源（国内源 / USD 源）的匹配结果**根本不被采用**，其歧义永远无法被用户修复 → 挂弹窗即永久噪音。
+  //   消费方：token-tracker.js 的 `--doctor` 计入体检展示；stderr 全量留痕（见下）。
+  if (AMBIG_WARNINGS_OFFICIAL.size) pricing._ambig_warnings_official = [...AMBIG_WARNINGS_OFFICIAL];
+  else delete pricing._ambig_warnings_official;
+  if (AMBIG_WARNINGS_OFFICIAL.size) {
+    process.stderr.write(`[refresh-prices] 官方价已命中模型的备用源歧义 ${AMBIG_WARNINGS_OFFICIAL.size} 条（写价走官方价、备用源结果不被采用 → 不挂弹窗，仅留痕于 pricing._ambig_warnings_official）: ${[...AMBIG_WARNINGS_OFFICIAL].map((s) => s.split(':')[0]).join('、')}\n`);
+  }
+
   // v3.24（F2·缺陷5）：靠推断得到 region 的模型清单（可观测性；判定行为本身未改）。
   if (regionInferred.length) pricing._region_inferred = [...regionInferred];
   else delete pricing._region_inferred;
@@ -1006,7 +1055,7 @@ async function main() {
     pricing.deepseek_refresh_error = `DeepSeek 官方定价抓取失败（${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}），DeepSeek 系价格沿用本地/聚合源价`;
     // 失败不阻塞整体刷新：其余模型照常更新
   }
-  pricing.last_refresh_note = `${new Date().toISOString()} 多源刷新：${noteParts.join(' | ')}；人民币主价更新 ${updatedMain} 个${autoConverted ? `，USD换算 ${autoConverted} 个` : ''}，USD参考 ${usdUpdated} 个，region 设定 ${regionSet} 个${lockKept ? `，lock 价保留 ${lockKept} 个` : ''}（汇率 ${rate}）${bigDiff.length ? `；⚠️峰谷模型价差>60%需核验：${bigDiff.join('、')}` : ''}${officialOk ? '；DeepSeek官方价✓' : '；DeepSeek官方价✗(回落聚合源)'}${AMBIG_WARNINGS.size ? `；⚠️模糊匹配歧义: ${[...AMBIG_WARNINGS].join('；')}` : ''}${AMBIG_WARNINGS_LOCKED.size ? `；已 lock 条目的歧义 ${AMBIG_WARNINGS_LOCKED.size} 条（不挂弹窗，见 _ambig_warnings_locked）` : ''}${auditWarnings.length ? `；⚠️价格一致性自检: ${auditWarnings.join('；')}` : ''}`;
+  pricing.last_refresh_note = `${new Date().toISOString()} 多源刷新：${noteParts.join(' | ')}；人民币主价更新 ${updatedMain} 个${autoConverted ? `，USD换算 ${autoConverted} 个` : ''}，USD参考 ${usdUpdated} 个，region 设定 ${regionSet} 个${lockKept ? `，lock 价保留 ${lockKept} 个` : ''}（汇率 ${rate}）${bigDiff.length ? `；⚠️峰谷模型价差>60%需核验：${bigDiff.join('、')}` : ''}${officialOk ? '；DeepSeek官方价✓' : '；DeepSeek官方价✗(回落聚合源)'}${AMBIG_WARNINGS.size ? `；⚠️模糊匹配歧义: ${[...AMBIG_WARNINGS].join('；')}` : ''}${AMBIG_WARNINGS_LOCKED.size ? `；已 lock 条目的歧义 ${AMBIG_WARNINGS_LOCKED.size} 条（不挂弹窗，见 _ambig_warnings_locked）` : ''}${AMBIG_WARNINGS_OFFICIAL.size ? `；官方价已命中模型的备用源歧义 ${AMBIG_WARNINGS_OFFICIAL.size} 条（备用源结果不被采用 → 不挂弹窗，见 _ambig_warnings_official）` : ''}${auditWarnings.length ? `；⚠️价格一致性自检: ${auditWarnings.join('；')}` : ''}`;
 
   // v3.24（F2·缺陷3）：接收 save() 返回值。false = 抢锁超时、本次未落盘（date/价格都没更新）。
   // 用 process.exitCode=1 而非 process.exit(1)：不中断后续汇总输出与 atexit 清理，
@@ -1034,4 +1083,4 @@ if (require.main === module) {
 // v3.24（F2）：新增导出 isFreeVariant / parse* / mergeWithDisk / applyUsdCachedPrice /
 // retiredLockWarnings / applyRetiredLocked，供单元测试直接验证（纯函数，无副作用）
 // v3.31.0（P0-5 / P1-7）：导出价格体检纯函数与阈值，供 selftest 离线单测（行为可验证，不靠源码守卫）
-module.exports = { save, load, todayStr, PRICING, usdFind, cnFind, looseFind, norm, median, AMBIG_WARNINGS, AMBIG_WARNINGS_LOCKED, isFreeVariant, parseLlma, parseLlc, parseOr, parseLitellm, parsePortkey, mergeWithDisk, applyUsdCachedPrice, retiredLockWarnings, applyRetiredLocked, priceGate, restoreBlock, restoreCached, PRICE_SANITY, DEFAULT_RATE };
+module.exports = { save, load, todayStr, PRICING, usdFind, cnFind, looseFind, norm, median, AMBIG_WARNINGS, AMBIG_WARNINGS_LOCKED, AMBIG_WARNINGS_OFFICIAL, isFreeVariant, parseLlma, parseLlc, parseOr, parseLitellm, parsePortkey, mergeWithDisk, applyUsdCachedPrice, retiredLockWarnings, applyRetiredLocked, priceGate, restoreBlock, restoreCached, PRICE_SANITY, DEFAULT_RATE };
