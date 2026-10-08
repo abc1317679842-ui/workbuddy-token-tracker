@@ -452,9 +452,22 @@ function main() {
     return out;
   }, { ttl: 300000, retries: 50 });
   if (!wmRes || !wmRes.ok) {
-    // 账本此刻**已经写入**。此处绝不回滚账本：回滚只会制造「账本没写、水位线没推」之外的新不一致；
-    // 且水位线未推进是安全态——下轮主链路会从旧偏移重读、把增量补记（少记可恢复，不重复计费）。
-    console.error('[backfill] 水位线正被占用，账本已写入但水位线未推进；请退出 WorkBuddy 后重跑（水位线不改不会重复计费，安全）');
+    // v3.39.0（A1）：**旧注释是错的，行为方向是"多收钱"**。
+    //   旧注释称"水位线未推进是安全态——下轮会把增量补记（少记可恢复，不重复计费）"，
+    //   该推理只在「主链路按增量追加」时成立；而 backfill 的账本是**整体替换为全量重建值**：
+    //   水位线停在旧偏移 → 下轮主链路把旧偏移之后的**全部行**再累加一遍 → 重建值 + 重放增量 = 重复计费。
+    //   反向闸门：把账本回滚到写入前备份（bak1）、水位线回滚到 bak2，再退出。
+    //   安全方向：少记可恢复（重跑 backfill 即可），重复计费不可恢复。
+    let restoredLedger = false;
+    try { if (fs.existsSync(bak1)) { fs.copyFileSync(bak1, DAILY); restoredLedger = true; } } catch (e) {} // silent-ok:降级 — 回滚是尽力而为，失败由下方「回滚失败！请手动用 .bak 还原」告警兜底
+    if (!restoredLedger) {
+      // 写入前账本不存在（首次回填）：写回空账本，**不删文件**（删除不可逆，空账本与缺失对读侧等价）
+      try { fs.writeFileSync(DAILY, '{}'); restoredLedger = true; } catch (e) {} // silent-ok:降级 — 同上，写不回空账本也只是降级为人工告警，不二次补救
+    }
+    try { if (fs.existsSync(bak2)) fs.copyFileSync(bak2, WATERMARK); } catch (e) {} // silent-ok:降级 — 水位线回滚失败同理：下方告警已指明 .bak 路径，人工可恢复
+    console.error('[backfill] 水位线正被占用：本次回填已作废，账本'
+      + (restoredLedger ? '已回滚到写入前状态' : '回滚失败！请手动用 .bak-backfill-* 还原')
+      + '（否则下轮会把重建值再累加一遍 = 重复计费）；请退出 WorkBuddy 后重跑');
     process.exit(1);
   }
   // v3.33.0（第四轮审计 B 系列）：`.bak-backfill-*` **有界保留**。

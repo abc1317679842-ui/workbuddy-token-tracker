@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.38.2 (2026-10-09)
+// token-usage-tracker v3.39.0 (2026-10-09)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -3387,7 +3387,58 @@ function saveLedgerWatermark(wm) {
   } catch (e) {
     try { fs.unlinkSync(tmp); } catch (e2) {}
     process.stderr.write(`[token-tracker] 水位线写入失败: ${e.message}\n`);
+    // v3.39.0（A2）：返回 false 供调用方回滚账本。改前静默返回 undefined —— 账本已写入、
+    // 水位线没推进 → 下轮从旧偏移重读同一批行再累加一遍 = **重复计费**（不可恢复地多收钱）。
+    return false;
   }
+  // v3.39.0（A2）：写后校验。磁盘满 / 权限 / 被别的进程覆盖都可能「没抛异常但内容不对」，
+  // 只靠 try/catch 抓不到。只校验本次涉及的键（别的会话键可能是别的进程写的，不算失败）。
+  try {
+    const back = JSON.parse(fs.readFileSync(LEDGER_WATERMARK_FILE, 'utf-8'));
+    for (const k of Object.keys(wm || {})) {
+      const a = wm[k] || {};
+      const b = (back && back[k]) || null;
+      if (!b) return false;
+      if ((a.main || 0) !== (b.main || 0)) return false;
+      if ((a.lastTs || 0) !== (b.lastTs || 0)) return false;
+    }
+  } catch (e) {
+    return false;
+  }
+  return true;
+}
+
+// v3.39.0（A2 反向闸门）：「账本已写入、水位线没落盘」的回滚。
+// 只做文件层恢复、不做任何计算 → 保持确定性，可单测（不靠"我觉得回滚了"）。
+// snap = { ledgerPath, preLedger(Buffer|null), roundsPath, preSize, postSize }
+// 安全方向：回滚后水位线仍是旧值 → 下轮重新记账（少记可恢复）；不回滚 = 重复计费（不可恢复）。
+function rollbackLedgerAfterWatermarkFailure(snap) {
+  const out = { ledger: false, rounds: false };
+  if (!snap) return out;
+  try {
+    // 只有「回滚前确为合法 JSON 对象」才原样写回。preLedger 是损坏内容时（本轮记账里
+    // loadDailyUsage 已把它改名隔离成 .corrupt-<ts> 并另起新账本）原样写回 = 把损坏内容塞回去，
+    // 下轮又要重新隔离一遍。此时写 '{}' 才是真正的「回到记账前」（历史仍在 .corrupt 备份里）。
+    let restore = null;
+    if (snap.preLedger !== null && snap.preLedger !== undefined) {
+      try {
+        const parsed = JSON.parse(Buffer.from(snap.preLedger).toString('utf-8'));
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) restore = snap.preLedger;
+      } catch (e) { restore = null; } // 损坏内容 → 落到下面的 '{}'
+    }
+    // 原本不存在 / 原本损坏 → 写回空账本，**不删文件**（删除是不可逆动作，且空账本与缺失对读侧等价）
+    fs.writeFileSync(snap.ledgerPath, restore !== null ? restore : '{}');
+    out.ledger = true;
+  } catch (e) { /* 回滚失败也不再补救：下面只如实告警 */ }
+  try {
+    if (snap.roundsPath && Number.isFinite(snap.preSize)) {
+      const now = fs.statSync(snap.roundsPath).size;
+      // 期间有别的进程追加过 → 不截断（truncate 会误删别人的行，宁可留一条多余明细）
+      if (Number.isFinite(snap.postSize) && now !== snap.postSize) out.rounds = false;
+      else { fs.truncateSync(snap.roundsPath, snap.preSize); out.rounds = true; }
+    }
+  } catch (e) { /* 明细回滚失败不影响金额正确性 */ }
+  return out;
 }
 // 增量记账：累加主 transcript + 各子代理文件中"水位线之后"的新 usage 行，并推进水位线。
 // v2.82.1：整个「读水位线→算增量→记账→推进」序列放入水位线锁（.ledger-watermark.lock）——
@@ -3502,15 +3553,36 @@ function incrementalRecord(tsPath, sid, meta) {
   }
   // 3. 累加进账本（loadDailyUsage + addModelUsage + saveDailyUsage）
   //    无用量的轮次视为成功（无需落盘，推进水位线无害）；有用量时必须确认真的写进去了。
+  const willRecord = Object.keys(byModel).length > 0;
+  // v3.39.0（A2）：记账前快照，供水位线落盘失败时回滚（只有真要记账才需要）。
+  //   顺序刻意保持「先记账、后水位线」：反过来（先水位线）在账本写失败时会**静默永久少记**，
+  //   而少记本可由「不推进水位线 + 下轮重记」自动补回，不该退化成丢数据。
+  //   代价就是必须补这道反向闸门——记账成功但水位线没落盘 = 下轮重复计费。
+  let snap = null;
+  if (willRecord) {
+    let preLedger = null;
+    try { preLedger = fs.existsSync(DAILY_USAGE_FILE) ? fs.readFileSync(DAILY_USAGE_FILE) : null; } catch (e) { preLedger = null; }
+    let roundsPath = null;
+    let preSize = null;
+    try {
+      roundsPath = path.join(ROUNDS_DIR, 'rounds-' + todayStr().slice(0, 7) + '.jsonl');
+      preSize = fs.statSync(roundsPath).size;
+    } catch (e) { roundsPath = null; preSize = null; }
+    snap = { ledgerPath: DAILY_USAGE_FILE, preLedger, roundsPath, preSize, postSize: null };
+  }
   let recorded = true;
-  if (Object.keys(byModel).length) recorded = recordUsage({}, loadPricing(), byModel, peakTs || undefined, meta);
+  if (willRecord) recorded = recordUsage({}, loadPricing(), byModel, peakTs || undefined, meta);
   if (!recorded) {
     // 记账失败（账本损坏 / 锁获取失败 / 写盘失败）→ 绝不推进水位线，
     // 否则这些用量再也不会被补记 = 永久丢失。保持旧水位线，下轮重新记账。
     process.stderr.write(`[token-tracker] 本轮用量未落盘，水位线保持 ${entry.main} 不推进（下轮重试，避免用量永久丢失）\n`);
     return;
   }
+  if (willRecord && snap && snap.roundsPath) {
+    try { snap.postSize = fs.statSync(snap.roundsPath).size; } catch (e) { snap.postSize = null; }
+  }
   // 4. 记账成功 → 推进水位线
+  const prevMain = entry.main || 0; // v3.39.0：回滚告警要用旧值（下一行就把 entry.main 改掉了）
   entry.main = nextMain;
   for (const f of Object.keys(nextSubs)) entry.subs[f] = nextSubs[f];
   // v3.25.0（KI-5）：持久化各文件「已消费最大时间戳」——截断恢复（水位重置 + 时间戳去重）的判据。
@@ -3523,7 +3595,14 @@ function incrementalRecord(tsPath, sid, meta) {
       if (t > (Number(entry.subTs[f]) || 0)) entry.subTs[f] = t;
     }
   }
-  saveLedgerWatermark(wm);
+  const wmOk = saveLedgerWatermark(wm);
+  // v3.39.0（A2 反向闸门）：记账成功、但水位线没落盘 → 下轮从旧偏移重读同一批行再累加 = **重复计费**。
+  //   回滚本轮账本（+轮次明细），水位线保持旧值 → 下轮重记（少记可恢复，重复不可恢复）。
+  if (willRecord && !wmOk) {
+    const rb = rollbackLedgerAfterWatermarkFailure(snap);
+    process.stderr.write(`[token-tracker] ⚠ 水位线落盘失败，已回滚本轮账本${rb.ledger ? '' : '（回滚失败！请人工核对 daily-usage.json）'}，水位线保持 ${prevMain} 不推进（下轮重记，避免重复计费）\n`);
+    return;
+  }
   }, { ttl: 300000, retries: 30, retryDelay: 100 }); // v2.82.1：水位线锁；拿不到锁 → 本轮跳过，下轮补记
 }
 
@@ -5311,7 +5390,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.38.2'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.39.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -6459,6 +6538,8 @@ module.exports = {
   splitByModelStats, showToastsSplitByModel, // v3.38.0：按模型分条（拆分 / 弹窗），selftest 可直接单测
   interruptedRowsAfter,
   incrementalRecord, loadLedgerWatermark, saveLedgerWatermark,
+  // v3.39.0（A2）：「记账成功但水位线没落盘」的回滚（纯文件层、可单测，避免只能靠注释自证）
+  rollbackLedgerAfterWatermarkFailure,
   estimateInterrupted, estimateInterruptedInc,
   extractUsageFromRow, terminalErrorFromRow, terminalError, freshCompactionMarker, compactionMarkerId,
   showToast, toastLineTagged,

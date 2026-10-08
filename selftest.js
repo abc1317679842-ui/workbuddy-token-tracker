@@ -63,7 +63,7 @@ function canSpawn() {
 }
 const SPAWN_OK = canSpawn();
 // v3.35.0（B2）：stop-handler.js 拆出后必须跟兄弟脚本同等待遇——语法检查与裸 catch 扫描都要覆盖，
-//   否则"迁出去就没人扫了"会静默削弱 T33 的守卫面（裸 catch 总数基线 36 是按这些文件的**总和**定的）。
+//   否则"迁出去就没人扫了"会静默削弱 T33 的守卫面（裸 catch 基线是按这些文件的**总和**定的，当前值见 T33-a1）。
 const SYNTAX_FILES = ['token-tracker.js', 'refresh-prices.js', 'deepseek-official.js', 'refresh-holidays.js',
   'backfill.js', 'recalc-day.js', 'peak-rules.js', 'selftest.js', 'stop-handler.js'];
 
@@ -2383,8 +2383,11 @@ else {
   //   （token-tracker.js 心跳接管分支，已按约定带 `// silent-ok:清理` 标记）。
   //   之所以显式改基线而不是绕开：本守卫的语义就是"新增静默必须留痕"，T33-a2/a3 仍守
   //   "必须带标记 + 类别落在四类白名单"，所以改数字不会削弱守卫生效面。
-  ok('T33-a1 ★裸 catch 总数与基线一致（37；新增/删除必须显式改这里，防"顺手吞一个错"）',
-    nAll === 37, `实测 ${nAll} 处`);
+  // v3.39.0：37 → 41 —— 水位线反向闸门（plan-B A1/A2）新增 4 处清理/降级型裸 catch：
+  //   backfill.js ×3（水位线落盘失败后的账本/水位线回滚，失败统一降级为人工告警）、
+  //   selftest.js ×1（T41 夹具清场）。均按约定带 `// silent-ok:<类别>` 标记。
+  ok('T33-a1 ★裸 catch 总数与基线一致（41；新增/删除必须显式改这里，防"顺手吞一个错"）',
+    nAll === 41, `实测 ${nAll} 处`);
   ok('T33-a2 ★每一处裸 catch 都带 silent-ok:<类别> — <理由>（无标记即红）',
     nBad === 0, nBad ? `${nBad} 处无标记：${badSamples.join(', ')}` : '');
   ok('T33-a3 ★类别必须落在白名单四类（诊断/清理/探测/降级）内——写个别的不算数',
@@ -2960,6 +2963,194 @@ else {
     envSkip('T40-c1 ★心跳锁端到端：kill watcher 后 15s 内新 watcher 接管（改前：pid 被复用 → 永不接管）', SPAWN_SKIP_REASON);
     envSkip('T40-c2 ★端到端：异模型轮弹窗条数 = 模型数，且逐条金额与账本同口径', SPAWN_SKIP_REASON);
   }
+}
+
+// ===== T41（v3.39.0 / plan-B A1+A2）：水位线反向闸门 —— 「账本已写、水位线没落盘」必须回滚 =====
+//   病根（本轮审计致命 2 条）：记账与水位线是**两次独立落盘**，中间没有反向闸门。
+//     A2（主链路 incrementalRecord）：saveLedgerWatermark 改前**静默返回 undefined** —— 水位线没推进
+//       而账本已写入 → 下轮从旧偏移重读同一批行再累加一遍 = **重复计费**（多收钱，不可恢复）。
+//     A1（backfill）：旧注释称"水位线不改不会重复计费，安全"——该推理只在「主链路按增量追加」时成立；
+//       而 backfill 的账本是**整体替换为全量重建值**，水位线停旧偏移 = 重建值 + 重放增量 = 重复计费。
+//       即：注释自辩与真实行为**方向相反**，是本次最危险的一条（错的是安全方向判断）。
+//   修法：① saveLedgerWatermark 返回布尔 + 写后校验（抓"没抛异常但内容不对"）；
+//        ② 主链路失败则回滚账本与轮次明细、水位线不推进；③ backfill 同样回滚到写入前备份再 exit 1。
+//   安全方向全程一致：**少记可恢复（下轮补记），重复计费不可恢复**。
+{
+  const rawTT = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const rawBF = fs.readFileSync(path.join(SRC, 'backfill.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const rawRC = fs.readFileSync(path.join(SRC, 'recalc-day.js'), 'utf-8').replace(/\r\n/g, '\n');
+  // 取单个函数体（到下一个顶层 function 为止）——断言要钉在函数内部，不能用"全文出现过"蒙混
+  const grabFn = (src, name) => {
+    const i = src.indexOf('function ' + name + '(');
+    if (i < 0) return '';
+    const j = src.indexOf('\nfunction ', i + 1);
+    return j < 0 ? src.slice(i) : src.slice(i, j);
+  };
+  const saveWmSrc = stripComments(grabFn(rawTT, 'saveLedgerWatermark'));
+  const incSrc = stripComments(grabFn(rawTT, 'incrementalRecord'));
+
+  // a1/a2：backfill 的水位线锁失败分支必须**回滚**（改前只打印一句"安全"就 exit 1）
+  const bfWmBranch = stripComments(rawBF.slice(rawBF.indexOf('if (!wmRes || !wmRes.ok) {')));
+  ok('T41-a1 ★backfill 水位线落盘失败 → 账本回滚到写入前备份 bak1（改前只打印不回滚）',
+    /copyFileSync\(bak1, DAILY\)/.test(bfWmBranch), '缺回滚 = 重建值 + 下轮重放增量 = 重复计费');
+  ok('T41-a2 ★同分支水位线回滚到 bak2，且仍以 exit 1 退出（不留"半套"状态）',
+    /copyFileSync\(bak2, WATERMARK\)/.test(bfWmBranch) && /process\.exit\(1\)/.test(bfWmBranch));
+  // a3：那条方向错误的自辩注释必须消失——留着会误导后人把"重复计费"当"安全态"
+  ok('T41-a3 ★backfill 不得再出现「水位线不改不会重复计费，安全」这句错误自辩',
+    rawBF.indexOf('水位线不改不会重复计费') < 0, '该注释把多收钱的方向写成了安全方向');
+  // a4：saveLedgerWatermark 必须三态可判：写异常 / 写后校验不符 / 成功
+  ok('T41-a4 ★saveLedgerWatermark 返回布尔：写失败 return false（≥2 处）+ 成功 return true',
+    (saveWmSrc.match(/return false;/g) || []).length >= 2 && /return true;/.test(saveWmSrc),
+    `return false 处数=${(saveWmSrc.match(/return false;/g) || []).length}（改前静默返回 undefined）`);
+  ok('T41-a5 ★saveLedgerWatermark 有写后校验（回读比对，抓"没抛异常但内容不对"）',
+    /JSON\.parse\(fs\.readFileSync\(LEDGER_WATERMARK_FILE, 'utf-8'\)\)/.test(saveWmSrc),
+    '磁盘满 / 被别的进程覆盖都不会抛异常，只有回读比对能抓到');
+  // a6：主链路必须"先回滚、后 return"，且 return 与回滚同一分支（否则水位线照推 = 洞还在）
+  ok('T41-a6 ★incrementalRecord 用 wmOk 判定，失败时同一分支内先回滚再 return（不推进水位线）',
+    /const wmOk = saveLedgerWatermark\(wm\)/.test(incSrc)
+    && /if \(willRecord && !wmOk\)[\s\S]{0,400}?rollbackLedgerAfterWatermarkFailure\(snap\)[\s\S]{0,500}?return;/.test(incSrc),
+    '回滚与 return 不在同一分支 = 水位线照推，洞仍在');
+  // a7：导出一致性 —— 没导出的函数只能靠注释自证（本项目 v3.29 起的老规矩）
+  ok('T41-a7 ★rollbackLedgerAfterWatermarkFailure 已导出（否则本组行为断言无处可挂）',
+    /module\.exports = \{[\s\S]*?rollbackLedgerAfterWatermarkFailure,/.test(rawTT));
+  // a8：基线钉死 —— recalc-day.js 不碰水位线。哪天给它加记账，A1/A2 的洞会同步出现，这里会红。
+  ok('T41-a8 基线：recalc-day.js 不读写水位线（给它加记账前必须先补同一道反向闸门）',
+    !/watermark/i.test(rawRC), 'recalc 一旦开始动水位线，本组 a1~a6 的守卫面对应补上');
+
+  // ── b 组：rollbackLedgerAfterWatermarkFailure 行为夹具（纯文件层，可确定性单测） ──
+  const savedEnv41 = process.env.WB_ROOT;
+  process.env.WB_ROOT = tmp;
+  const mod41 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  if (!mod41 || typeof mod41.rollbackLedgerAfterWatermarkFailure !== 'function') {
+    ok('T41 模块加载', false, mod41 ? '缺少 rollbackLedgerAfterWatermarkFailure 导出' : 'require 失败');
+  } else {
+    const RB = mod41.rollbackLedgerAfterWatermarkFailure;
+    const D41 = path.join(tmp, 't41');
+    fs.mkdirSync(D41, { recursive: true });
+    const lg = path.join(D41, 'ledger.json');
+    const rd = path.join(D41, 'rounds.jsonl');
+
+    // b1：账本回滚到记账前内容（这是"不重复计费"的落点）
+    const pre1 = JSON.stringify({ '2026-10-09': { models: {}, total: { in: 10, out: 1, cached: 0, total: 11, cost: 0 } } });
+    fs.writeFileSync(lg, pre1);
+    const post1 = JSON.stringify({ '2026-10-09': { models: {}, total: { in: 910, out: 91, cached: 0, total: 1001, cost: 0 } } });
+    fs.writeFileSync(lg, post1);
+    const r1 = RB({ ledgerPath: lg, preLedger: Buffer.from(pre1), roundsPath: null, preSize: null, postSize: null });
+    ok('T41-b1 ★账本回滚到记账前内容（记账后的增量被撤掉 = 下轮重记而非重复计费）',
+      r1.ledger === true && fs.readFileSync(lg, 'utf-8') === pre1,
+      `回滚后=${fs.readFileSync(lg, 'utf-8').slice(0, 60)}`);
+    // b2：原本不存在 → 写回空账本，**不删文件**
+    fs.writeFileSync(lg, post1);
+    const r2 = RB({ ledgerPath: lg, preLedger: null, roundsPath: null, preSize: null, postSize: null });
+    ok('T41-b2 ★原本无账本 → 回滚写回 {} 且不删文件（删除不可逆，空账本与缺失对读侧等价）',
+      r2.ledger === true && fs.existsSync(lg) && fs.readFileSync(lg, 'utf-8') === '{}');
+    // b3：原本是损坏内容 → 写 '{}'，绝不把损坏内容原样塞回去（否则下轮又要重新隔离一遍）
+    const corrupt1 = '{"2026-10-09": {"total": ';
+    fs.writeFileSync(lg, corrupt1);
+    const r3 = RB({ ledgerPath: lg, preLedger: Buffer.from(corrupt1), roundsPath: null, preSize: null, postSize: null });
+    ok('T41-b3 ★原账本已损坏 → 回滚写 {} 而不是把损坏内容写回（历史已在 .corrupt 备份里）',
+      r3.ledger === true && fs.readFileSync(lg, 'utf-8') === '{}',
+      `回滚后=${fs.readFileSync(lg, 'utf-8').slice(0, 40)}`);
+    // b4：轮次明细回滚到记账前长度
+    fs.writeFileSync(rd, '{"n":1}\n');
+    const preSize = fs.statSync(rd).size;
+    fs.appendFileSync(rd, '{"n":2}\n');
+    const postSize = fs.statSync(rd).size;
+    const r4 = RB({ ledgerPath: lg, preLedger: Buffer.from('{}'), roundsPath: rd, preSize, postSize });
+    ok('T41-b4 ★轮次明细回滚到记账前长度（不多留一条已撤销的明细）',
+      r4.rounds === true && fs.readFileSync(rd, 'utf-8') === '{"n":1}\n',
+      `回滚后=${JSON.stringify(fs.readFileSync(rd, 'utf-8'))}`);
+    // b5：记账期间**别的进程**追加过明细 → 不截断（truncate 会误删别人的行，宁可留一条多余明细）
+    fs.writeFileSync(rd, '{"n":1}\n');
+    const preSize5 = fs.statSync(rd).size;
+    fs.appendFileSync(rd, '{"n":2}\n');
+    const postSize5 = fs.statSync(rd).size;
+    fs.appendFileSync(rd, '{"n":3}\n'); // 别人的行
+    const r5 = RB({ ledgerPath: lg, preLedger: Buffer.from('{}'), roundsPath: rd, preSize: preSize5, postSize: postSize5 });
+    ok('T41-b5 ★明细期间被别的进程追加 → 不截断（保别人的行，宁可多留一条）',
+      r5.rounds === false && fs.readFileSync(rd, 'utf-8') === '{"n":1}\n{"n":2}\n{"n":3}\n',
+      `rounds=${r5.rounds} 内容=${JSON.stringify(fs.readFileSync(rd, 'utf-8'))}`);
+    // b6/b7：防御——入参异常 / 路径不可写都不得抛出（本函数跑在"已经很糟"的路径上，再抛会把进程带崩）
+    let r6 = null, threw6 = '';
+    try { r6 = RB(null); } catch (e) { threw6 = String(e && e.message); }
+    ok('T41-b6 snap=null → 不抛且返回 {ledger:false, rounds:false}',
+      !threw6 && !!r6 && r6.ledger === false && r6.rounds === false, threw6);
+    let r7 = null, threw7 = '';
+    try { r7 = RB({ ledgerPath: path.join(D41, 'no', 'such', 'dir', 'x.json'), preLedger: Buffer.from('{}'), roundsPath: null, preSize: null, postSize: null }); } catch (e) { threw7 = String(e && e.message); }
+    ok('T41-b7 回滚路径不可写 → 不抛且 ledger=false（由调用方如实告警，不再层层补救）',
+      !threw7 && !!r7 && r7.ledger === false, threw7);
+
+    // ── c 组：saveLedgerWatermark 三态（真落盘，隔离目录内） ──
+    const WM41 = path.join(skillDir, '.ledger-watermark.json');
+    const quiet = (fn) => {
+      const old = process.stderr.write.bind(process.stderr);
+      const buf = [];
+      process.stderr.write = (s) => { buf.push(String(s)); return true; };
+      let v = null;
+      try { v = fn(); } finally { process.stderr.write = old; }
+      return { v, err: buf.join('') };
+    };
+    const clearWm = () => { try { fs.rmSync(WM41, { recursive: true, force: true }); } catch (e) {} }; // silent-ok:清理 — 测试夹具清场，水位线文件本就可能不存在
+    // c1：正常 → true，且落盘内容与写入对象一致（顺带证明写后校验不会误判）
+    clearWm();
+    const wm1 = { 'sid-c1': { main: 7, subs: {}, lastTs: 111, subTs: {} } };
+    const c1 = quiet(() => mod41.saveLedgerWatermark(wm1));
+    ok('T41-c1 ★正常写入 → 返回 true，落盘内容与写入对象一致（写后校验不误判）',
+      c1.v === true && JSON.parse(fs.readFileSync(WM41, 'utf-8'))['sid-c1'].main === 7,
+      `返回=${c1.v}`);
+    // c2：写盘抛异常（把目标占位成目录 → renameSync 失败）→ 必须返回 false
+    clearWm();
+    fs.mkdirSync(WM41, { recursive: true });
+    const c2 = quiet(() => mod41.saveLedgerWatermark({ 'sid-c2': { main: 3, subs: {}, lastTs: 0, subTs: {} } }));
+    ok('T41-c2 ★写盘抛异常 → 返回 false（改前返回 undefined，调用方无从判断）',
+      c2.v === false && c2.err.indexOf('水位线写入失败') >= 0, `返回=${c2.v}`);
+    clearWm();
+    // c3：写盘没抛异常、但回读内容被篡改（模拟磁盘满/被别的进程覆盖）→ 写后校验必须抓到并返回 false。
+    //   这是 A2 里 try/catch **抓不到**的那一类，只能靠回读比对；本用例是它唯一的实证防线。
+    const origRead = fs.readFileSync;
+    fs.readFileSync = function (p) {
+      const res = origRead.apply(fs, arguments);
+      if (String(p) === WM41) {
+        try {
+          const j = JSON.parse(res.toString('utf-8'));
+          j['sid-c3'] = { main: 1, subs: {}, lastTs: 0, subTs: {} }; // 篡改本次写的键
+          return Buffer.from(JSON.stringify(j));
+        } catch (e) { return res; }
+      }
+      return res;
+    };
+    let c3v = null;
+    try { c3v = mod41.saveLedgerWatermark({ 'sid-c3': { main: 999, subs: {}, lastTs: 123, subTs: {} } }); }
+    finally { fs.readFileSync = origRead; }
+    ok('T41-c3 ★写后校验：回读 main 与写入不符（磁盘满/被覆盖，不抛异常）→ 返回 false',
+      c3v === false, `返回=${c3v}（返回 true = 静默重复计费）`);
+    clearWm();
+
+    // ── d 组：正常路径回归（新加的快照/回滚代码不得破坏"正常记账"这一主路径） ──
+    const P41 = path.join(tmp, 'projects', 't41d');
+    fs.mkdirSync(P41, { recursive: true });
+    const ts41 = path.join(P41, 's41.jsonl');
+    const T41 = Date.now() - 3600000;
+    const row41 = (ts, model, i, o) => JSON.stringify({ type: 'message', role: 'assistant',
+      id: 'r' + Math.random().toString(36).slice(2), timestamp: ts, status: 'completed',
+      providerData: { model, messageId: 'm' + Math.random().toString(36).slice(2), usage: { input_tokens: i, output_tokens: o } } });
+    fs.writeFileSync(ts41, [row41(T41, 'hy4-preview', 1000, 100), row41(T41 + 2000, 'hy4-preview', 500, 50)].join('\n') + '\n');
+    const DAILY41 = path.join(skillDir, 'daily-usage.json');
+    const dErr = quiet(() => mod41.incrementalRecord(ts41, 's41', { sid: 's41', model: 'hy4-preview', source: 'selftest' }));
+    const after41 = (() => { try { return JSON.parse(fs.readFileSync(DAILY41, 'utf-8')); } catch (e) { return {}; } })();
+    const day41 = after41[Object.keys(after41).sort().pop()] || {}; // 今日键（隔离账本里日期最大的那个）
+    const wm41 = (() => { try { return JSON.parse(fs.readFileSync(WM41, 'utf-8')); } catch (e) { return {}; } })();
+    const inAfter = (day41.total || {}).in || 0;
+    ok('T41-d1 ★正常路径未回归：账本今日条目已记入本轮 1500 in / 150 out（快照代码没挡住记账）',
+      inAfter >= 1500 && (day41.total || {}).out >= 150,
+      `今日 in=${inAfter} out=${(day41.total || {}).out}（期望 ≥1500 / ≥150）`);
+    ok('T41-d2 ★正常路径未回归：水位线推进到 2 行（新加的 wmOk 判定没误触发回滚）',
+      !!wm41['s41'] && wm41['s41'].main === 2,
+      `水位线=${JSON.stringify(wm41).slice(0, 120)} stderr=${dErr.err.slice(0, 80)}`);
+    ok('T41-d3 ★正常路径不产生"回滚"告警（误回滚会让账本永不增长 = 永久少记）',
+      dErr.err.indexOf('已回滚本轮账本') < 0, dErr.err.slice(0, 160));
+  }
+  if (savedEnv41 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv41;
 }
 
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。
