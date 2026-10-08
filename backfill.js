@@ -30,18 +30,8 @@ const peakRules = require('./peak-rules.js'); // v3.19.0（P1）：峰谷判定�
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const { detectWorkBuddyRoot } = require('./wb-root.js'); // v3.42.0（plan-B B1）：数据根探测单点实现，已抽到 wb-root.js
 
-// v3.16：数据根智能探测（与 token-tracker.js 同口径）
-function detectWorkBuddyRoot() {
-  const h = os.homedir();
-  const cands = [path.join(h, '.workbuddy-ai'), path.join(h, '.workbuddy')];
-  for (const c of cands) {
-    try {
-      if (fs.existsSync(path.join(c, 'traces')) || fs.existsSync(path.join(c, 'settings.json'))) return c;
-    } catch (e) { /* 单个候选探测失败不影响下一个 */ }
-  }
-  return path.join(h, '.workbuddy');
-}
 const WB = process.env.WB_ROOT || detectWorkBuddyRoot();
 const SKILL_DIR = path.join(WB, 'skills', 'token-usage-tracker');
 const DAILY = path.join(SKILL_DIR, 'daily-usage.json');
@@ -129,10 +119,8 @@ function rowCost(pricing, modelName, u, tsMs) {
   const mult = isPeakBeijingTs(tsMs) ? peakMult : 1;
   const inT = u.in || 0, cached = Math.min(u.cached || 0, inT), outT = u.out || 0;
   const uncached = Math.max(0, inT - cached);
-  const c = (uncached / 1e6) * Number(m.input_price || 0) * mult
-    + (cached / 1e6) * Number(m.cached_price || 0) * mult
-    + (outT / 1e6) * Number(m.output_price || 0) * mult;
-  return Math.round(c * 1e6) / 1e6;
+  // v3.42.0（plan-B B1）：收敛到 token-tracker.js 单点实现 triPriceRounded（带 1e-6 四舍五入）
+  return tt.triPriceRounded(inT, cached, outT, m, mult);
 }
 function hitRate(inTok, cachedTok) {
   const denom = inTok || 0;

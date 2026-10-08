@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.41.0 (2026-10-10)
+// token-usage-tracker v3.42.0 (2026-10-10)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -63,21 +63,13 @@ const priceRefreshModule = require('./refresh-prices.js');
 //   单向依赖：**本脚本 → stop-handler.js**，stop-handler 不反向 require 主脚本（无循环），
 //   它需要的 46 个只读能力由调用点显式注入（漏传/改名 → selftest T37 立刻红）。
 const { handleStopEnd, STOP_TX_NAMES } = require('./stop-handler.js');
+const { detectWorkBuddyRoot } = require('./wb-root.js'); // v3.42.0（plan-B B1）：数据根探测单点实现，已抽到 wb-root.js
 
 // v3.16（2026-09-28，外部用户 PR#2 要点采纳）：数据根智能探测。
 // 背景：较新版本 WorkBuddy 客户端可能把数据根迁移到 ~/.workbuddy-ai（~/.workbuddy 仅剩
 // device-id/logs），此时写死 ~/.workbuddy 会读不到任何 trace → 记账全 0、弹窗空。
 // 探测顺序：WB_ROOT 环境变量（测试/隔离用，最高优先）> ~/.workbuddy-ai > ~/.workbuddy（兜底）。
-function detectWorkBuddyRoot() {
-  const h = os.homedir();
-  const cands = [path.join(h, '.workbuddy-ai'), path.join(h, '.workbuddy')];
-  for (const c of cands) {
-    try {
-      if (fs.existsSync(path.join(c, 'traces')) || fs.existsSync(path.join(c, 'settings.json'))) return c;
-    } catch (e) { /* 单个候选探测失败不影响下一个 */ }
-  }
-  return path.join(h, '.workbuddy'); // 两个都判不出 → 旧默认，行为向后兼容
-}
+// 实现（detectWorkBuddyRoot）现已抽到 wb-root.js（v3.42.0 plan-B B1 单点实现），改那里即可，本脚本不再抄。
 const WB = process.env.WB_ROOT || detectWorkBuddyRoot();
 const TRACE_DIR = path.join(WB, 'traces');
 
@@ -1054,13 +1046,40 @@ function readTranscLinesFrom(tsPath, fromLine) {
     }
     off = nl + 1;
   }
-  // 只解析完整行：最后一个 '\n' 之后是半写行，留给下一轮
+  // v3.42.0（plan-B A19）：修复「末尾无 '\n' 的残行永久丢弃」。
+  //   病根：原实现只解析 [off, lastNl] 之间的"完整行"（含 '\n' 的行），把最后一个 '\n' 之后到文件末尾
+  //   的残余文本一刀切当作"半写行"永远留给下一轮。若 transcript 末尾本就**没有 trailing '\n'**（写入已完成、
+  //   最后一行后无换行），该行从本函数视角永远等不到 '\n' → 永久丢弃 = 漏一条 usage = 漏 token；
+  //   若恰是会话最后一轮 → 永久少计。
+  //   修复：把"最后一个 '\n' 之后到 EOF 的残余文本"也尝试解析——若它是**合法完整 JSON**（JSON.parse 成功）
+  //   就收下这一行（它只是缺尾换行，内容已完整）；若是**残缺 JSON**（parse 失败）则安全跳过（保持原半写行语义，
+  //   留给下一轮文件长全再读）。判据**必须真 JSON.parse**，不能用"看最后字符是不是 }"之类脆弱判据
+  //   （字符串里可能含 }）。
+  //   ⚠ 计数同步：收下残行必须把 totalLines 也 +1，否则水位线算少 → 下一轮 fromLine 偏小 → 重读该行 → 重复计费
+  //   （最危险后果）。下一轮 fromLine = 新 totalLines = 完整行数 + 1（残行计入），其偏移定位会越过该残行，
+  //   不会再被读第二次（见下轮 off 跳过逻辑）。
   const lastNl = buf.lastIndexOf(0x0a);
-  if (lastNl < off) return { rows: [], totalLines: start };
-  // 统计本轮新增的完整行数（[off, lastNl] 内的 '\n' 个数）
+  // 残余段起点：最后一个 '\n' 之后；若 lastNl 在 off 之前（off 之后已无任何 '\n'），
+  // 则 off 到末尾整体都是残余段。
+  const tailStart = (lastNl >= off) ? lastNl + 1 : off;
+  // 统计 [off, tailStart) 内（即最后一个 '\n' 之前）的完整行数 = '\n' 个数
   let added = 0;
-  for (let p = buf.indexOf(0x0a, off); p !== -1 && p <= lastNl; p = buf.indexOf(0x0a, p + 1)) added++;
-  const rows = parseTranscChunk(buf.toString('utf-8', off, lastNl + 1));
+  for (let p = buf.indexOf(0x0a, off); p !== -1 && p < tailStart; p = buf.indexOf(0x0a, p + 1)) added++;
+  // 残余段：最后 '\n' 之后到 EOF。若它是合法完整 JSON（如末尾无 trailing '\n' 的已写完行）则收下，
+  // 否则（半写残缺行）安全跳过，等下一轮文件长全再读。
+  const tail = buf.toString('utf-8', tailStart);
+  const tailTrim = tail.trim();
+  let tailRow = null;
+  if (tailTrim) {
+    try { tailRow = JSON.parse(tailTrim); } catch (e) { /* 残缺 JSON → 安全跳过 */ }
+  }
+  // 拼装解析输入：完整行段 + 末尾残行（若有）。用同一个 parseTranscChunk 保证行结构完全一致。
+  let chunk = buf.toString('utf-8', off, tailStart);
+  if (tailRow !== null) {
+    chunk += '\n' + tail; // 以换行拼入残行，parseTranscChunk 按行 split 可正确解析出该残行
+    added++;              // ⚠ 残行计入水位线（见上方计数同步说明），避免下一轮重读重复计费
+  }
+  const rows = parseTranscChunk(chunk);
   return { rows, totalLines: start + added };
 }
 
@@ -3052,6 +3071,28 @@ function isPeakHour(rules, now) {
   return peakRules.isPeakAt(t.getTime(), { deepseek_rules: rules }, HOLIDAYS_FILE);
 }
 
+// v3.42.0（plan-B B1）：三项计价公式的单点实现（收敛 calcCost / backfill.rowCost / recalc-day.costOf 三份复制）。
+//   参数一律用 Number() 取价（null/undefined → 0），与各调用点原语义一致。
+//   ⚠️ 本函数**刻意不做 cached ≤ in 的上钳**（只保证 cached ≥ 0），因为主链路 calcCost 的回退路径
+//      原本就不钳 cached 上限：脏数据 cached > in 时，原实现按「全部 cached 计价」，triPrice 必须逐字节一致
+//      （deepseek-v4.1-flash 的 cached_price=0.02 非零，加钳会让脏数据金额改变 → 改前/改后比对不过）。
+//      调用方若需要「缓存不超过输入」语义（如 backfill.rowCost），请在传参前自行 Math.min(cached, in)。
+//   返回值**不四舍五入**（由调用方决定要不要 round），避免改变主链路既有精度。
+function triPrice(inTok, cachedTok, outTok, m, mult) {
+  const inT = Math.max(0, Number(inTok) || 0);
+  const cached = Math.max(0, Number(cachedTok) || 0);
+  const uncached = Math.max(0, inT - cached);
+  const outT = Math.max(0, Number(outTok) || 0);
+  const k = Number(mult) || 0;
+  return (uncached / 1e6) * Number(m.input_price || 0) * k
+       + (cached / 1e6) * Number(m.cached_price || 0) * k
+       + (outT / 1e6) * Number(m.output_price || 0) * k;
+}
+// 与 triPrice 同源、带 1e-6 四舍五入的变体（backfill / recalc 两个历史口径要 round）。
+function triPriceRounded(inTok, cachedTok, outTok, m, mult) {
+  return Math.round(triPrice(inTok, cachedTok, outTok, m, mult) * 1e6) / 1e6;
+}
+
 // cost = 未命中输入×输入价 + 命中输入×缓存价 + 输出×输出价（元），按当前时段取倍率
 function calcCost(stat, pricing, tsMs) {
   if (!pricing || !stat) return null;
@@ -3132,9 +3173,7 @@ function calcCost(stat, pricing, tsMs) {
          + (oc / 1e6) * (m.cached_price || 0)
          + (oOut / 1e6) * (m.output_price || 0);
   }
-  return (uncached / 1e6) * (m.input_price || 0) * mult
-       + (cached / 1e6) * (m.cached_price || 0) * mult
-       + (outTok / 1e6) * (m.output_price || 0) * mult;
+  return triPrice(stat.in, cached, outTok, m, mult);
 }
 function fmtCost(cost) {
   if (cost == null || !Number.isFinite(cost)) return null; // v3.24.0：NaN 也返回 null（原只挡 null → NaN 会直出「¥NaN」上 toast）
@@ -3899,6 +3938,23 @@ function monthStartStr() {
 }
 // 解析区间参数：week / month / <起>..<止>；非区间写法（'' / all / 具体日期 / summary）→ null。
 // 起止写反时自动纠正（`2026-09-30..2026-09-01` 不该报错，用户意图显然）。
+// v3.42.0（plan-B A17）：**日历级日期校验**——格式对不等于日期真实存在。
+//   病根：`parseReportRange` 原来只过 `^\d{4}-\d{2}-\d{2}$` 这个格式正则就放行，
+//   `2026-13-45` / `2026-02-30` / `2026-00-00` 全部被当成合法端点 → 区间聚合按**字典序**
+//   比较账本键（`k >= from && k <= to`）→ `from='2026-13-45'` 这类**排到所有真实日期之后**，
+//   区间被静默扩展到"全部历史"（或空），报表数字离谱且**零提示**。
+//   判据：拆出 y/m/d，逐项校验 range + 用 Date 构造后**回读比对**（时间戳反推 y/m/d 必须等于输入）
+//   —— 这一步同时吃掉 2 月 30 日、平年 2 月 29 日这类"格式对、日历错"的输入（Date 会自动进位到 3 月）。
+//   与账本键的产生口径一致：账本键恒由 todayStr()/daysAgoStr()/monthStartStr() 产出（本地时区 YYYY-MM-DD），
+//   本校验只做"真实性"判定，不改任何口径。
+function isRealDateStr(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || ''));
+  if (!m) return false;
+  const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return false;
+  const dt = new Date(y, mo - 1, d); // 本地时区构造（与账本键同口径）
+  return dt.getFullYear() === y && dt.getMonth() === mo - 1 && dt.getDate() === d;
+}
 function parseReportRange(arg) {
   const a0 = String(arg || '');
   if (a0 === 'week') return { from: daysAgoStr(6), to: todayStr(), label: 'week' };
@@ -3906,9 +3962,28 @@ function parseReportRange(arg) {
   const m = /^(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})$/.exec(a0);
   if (m) {
     const a = m[1], b = m[2];
+    // v3.42.0（A17）：端点必须是**真实存在的日期**，否则整个区间静默失真（见 isRealDateStr 注释）。
+    //   任一端点非法 → 返回 null（调用方按"非区间写法"处理 = 退化为按日期/全部的单点语义），
+    //   不在这里抛错——保持"解析器只回答能不能解析"的单一职责。
+    if (!isRealDateStr(a) || !isRealDateStr(b)) return null;
     return { from: a <= b ? a : b, to: a <= b ? b : a, label: 'range' };
   }
   return null;
+}
+// v3.42.0（plan-B A17 收口）：区间参数**语法像区间但端点日期不存在**时的用户提示。
+//   返回值 = 该输出的提示文本；不是这种情形 → null（调用方照旧往下走）。
+//   为什么要单独一个函数：`--report` 的分支体在 main() 里，T37-b1 守着 main() ≤950 行
+//   （拆分成果不许回涨）；把这段判定+文案搬出来，main() 只留一行调用。
+//   判据：形如 `<日期>..<日期>`（两端各自都长得像日期）却没能解析出合法区间 ⇒ 端点非法。
+//   不做静默降级的原因见调用点注释（会输出「===== 非法日期 =====（无记录）」骗人）。
+function reportRangeArgError(arg) {
+  const a0 = String(arg || '');
+  if (!/^\d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2}$/.test(a0)) return null;
+  const parts = a0.split('..');
+  const bad = parts.filter((x) => !isRealDateStr(x));
+  if (!bad.length) return null; // 格式与日历都合法（真不该走到这，防御性放行）
+  return `区间端点不是真实存在的日期：${bad.join('、')}`
+    + `（区间写法须为 <起>..<止>，两端都是存在的日期，如 2026-10-01..2026-10-09）`;
 }
 // 区间聚合：只做两件事——按字段求和（token/金额）、按 Σin/Σcached **重算** hit。
 //   为什么必须重算 hit：它是比率。跨天 token 量可能差 100 倍，取各天 hit 的算术均值毫无意义。
@@ -4378,7 +4453,13 @@ function pruneExports(keepDays) {
     const cutoff = Date.now() - n * 86400000;
     let removed = 0;
     for (const f of fs.readdirSync(EXPORTS_DIR)) {
-      if (!/^report-.*\.csv$/.test(f)) continue;
+      // v3.42.0（plan-B A23）：收窄匹配到本技能**自己生成**的精确格式 `report-<label>-YYYYMMDD-HHMMSS.csv`。
+      //   病根：旧正则 /^report-.*\.csv$/ 太宽——用户往 exports/ 放 report-去年数据.csv、report-backup.csv，
+      //   只要 mtime 超保留期就被静默删除；清理自家产物不该殃及用户文件。
+      //   本技能两处写入点（exportReportCsv @4125、exportSummaryCsv @4176）生成的文件名固定以
+      //   "-YYYYMMDD-HHMMSS" 时间戳后缀结尾（stamp = 年月日-时分秒，零填充），用此锚点区分自家产物与用户文件：
+      //   用户文件几乎不可能精确撞上这个 14 位数字时间戳后缀，故不会误删。
+      if (!/^report-.*-\d{8}-\d{6}\.csv$/.test(f)) continue;
       let st = null;
       try { st = fs.statSync(path.join(EXPORTS_DIR, f)); } catch (e) { continue; }
       if (!st || !st.isFile() || st.mtimeMs >= cutoff) continue;
@@ -5711,7 +5792,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.41.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.42.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -5922,16 +6003,12 @@ function main() {
     const rArg = pos[0] || '';
 
     // v3.20.0：--report forecast —— 纯 token 外推（不含金额，理由见 reportForecastTxt 注释）
-    if (rArg === 'forecast') {
-      process.stdout.write(reportForecastTxt() + '\n');
-      return;
-    }
+    if (rArg === 'forecast') { process.stdout.write(reportForecastTxt() + '\n'); return; }
     // v3.20.0：区间模式（week / month / <起>..<止>）—— 全新分支，不影响下方既有四个入口
     const range = parseReportRange(rArg);
-    if (range) {
-      process.stdout.write((wantCsv ? exportReportCsv(range) : reportRangeTxt(range.from, range.to)) + '\n');
-      return;
-    }
+    if (range) { process.stdout.write((wantCsv ? exportReportCsv(range) : reportRangeTxt(range.from, range.to)) + '\n'); return; }
+    // v3.42.0（A17）：区间端点非法（如 `2026-13-45..`）→ 显式报错，不静默降级成"（无记录）"。判定见 reportRangeArgError。
+    const rangeErr = reportRangeArgError(rArg); if (rangeErr) { process.stdout.write(rangeErr + '\n'); return; }
     // v3.33.0（B 系列）：`--report summary [all|<日期>] --csv` —— 此前落到下方 else 分支报
     //   「无法识别的参数：summary」（把合法参数判成非法）。注意 summary 的第二个位置参数是
     //   "all / 日期"，故这里取 pos[1]（下方通用分支只认 pos[0]）。
@@ -6840,12 +6917,12 @@ function main() {
 if (require.main === module) main();
 module.exports = {
   todayStr, dateStrOfTs, loadDailyUsage, saveDailyUsage, recordUsage, dayTotalOf, hitRate,
-  calcCost, findModel, isLocalModel, fmtCost, cleanModelName,
+  calcCost, triPrice, triPriceRounded, findModel, isLocalModel, fmtCost, cleanModelName,
   readTranscLines, parseTranscChunk, readTranscLinesFrom, extractUsage, perModelFromRows, aggregatePerModel,
   aggregateMainOnly, aggregateSubsOnly, aggregateTranscript,
   todayDisplay, reportTxt, reportSummaryTxt, normalizeDailyUsage,
   // v3.20.0：--report 区间 / CSV / 外推 + 轮次明细留档（selftest 直接单测，不再只能靠 spawn 看 stdout）
-  formatUsageRow, costCellKind, aggregateRangeModels, parseReportRange, reportRangeTxt,
+  formatUsageRow, costCellKind, aggregateRangeModels, parseReportRange, isRealDateStr, reportRangeTxt,
   exportReportCsv, reportForecastTxt, pruneRoundFiles,
   // v3.33.0（B 系列）：summary 的 CSV 出口（此前唯一没有 CSV 出口的 --report 形态）
   exportSummaryCsv,

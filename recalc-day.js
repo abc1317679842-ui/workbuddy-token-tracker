@@ -21,18 +21,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const peakRules = require('./peak-rules.js'); // v3.19.0（P1）：峰谷判定单一实现（原先硬编码时段，与官方动态时段脱节）
+const { detectWorkBuddyRoot } = require('./wb-root.js'); // v3.42.0（plan-B B1）：数据根探测单点实现，已抽到 wb-root.js
 
-// v3.16：数据根智能探测（与 token-tracker.js 同口径）：WB_ROOT > ~/.workbuddy-ai（新版客户端）> ~/.workbuddy
-function detectWorkBuddyRoot() {
-  const h = os.homedir();
-  const cands = [path.join(h, '.workbuddy-ai'), path.join(h, '.workbuddy')];
-  for (const c of cands) {
-    try {
-      if (fs.existsSync(path.join(c, 'traces')) || fs.existsSync(path.join(c, 'settings.json'))) return c;
-    } catch (e) { /* 单个候选探测失败不影响下一个 */ }
-  }
-  return path.join(h, '.workbuddy');
-}
 const WB = process.env.WB_ROOT || detectWorkBuddyRoot();
 const SKILL_DIR = path.join(WB, 'skills', 'token-usage-tracker');
 const DAILY = path.join(SKILL_DIR, 'daily-usage.json');
@@ -105,11 +95,8 @@ function roundHoursOf(date, model, allModels) {
 }
 
 function costOf(m, inTok, cachedTok, outTok, mult) {
-  const uncached = Math.max(0, inTok - cachedTok);
-  const c = (uncached / 1e6) * Number(m.input_price || 0) * mult
-    + (cachedTok / 1e6) * Number(m.cached_price || 0) * mult
-    + (outTok / 1e6) * Number(m.output_price || 0) * mult;
-  return Math.round(c * 1e6) / 1e6;
+  // v3.42.0（plan-B B1）：收敛到 token-tracker.js 单点实现 triPriceRounded（带 1e-6 四舍五入）
+  return tt.triPriceRounded(inTok, cachedTok, outTok, m, mult);
 }
 
 // v3.40.0（plan-B A3）：**按行精确的峰谷合计**——比"轮次数占比折算"高一个量级的口径。

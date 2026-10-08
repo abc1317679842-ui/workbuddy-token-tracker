@@ -65,7 +65,7 @@ const SPAWN_OK = canSpawn();
 // v3.35.0（B2）：stop-handler.js 拆出后必须跟兄弟脚本同等待遇——语法检查与裸 catch 扫描都要覆盖，
 //   否则"迁出去就没人扫了"会静默削弱 T33 的守卫面（裸 catch 基线是按这些文件的**总和**定的，当前值见 T33-a1）。
 const SYNTAX_FILES = ['token-tracker.js', 'refresh-prices.js', 'deepseek-official.js', 'refresh-holidays.js',
-  'backfill.js', 'recalc-day.js', 'peak-rules.js', 'selftest.js', 'stop-handler.js'];
+  'backfill.js', 'recalc-day.js', 'peak-rules.js', 'selftest.js', 'stop-handler.js', 'wb-root.js'];
 
 // ── T0：语法检查 ───────────────────────────────────────────────────────────
 for (const f of SYNTAX_FILES) {
@@ -82,8 +82,10 @@ fs.mkdirSync(skillDir, { recursive: true });
 //   （方案 H：触发判定共用同一实现），隔离目录缺它 = 主模块 MODULE_NOT_FOUND，整段测试全炸。
 // v3.35.0（B2）：stop-handler.js 必须随行——主脚本顶层 require 它，隔离目录缺它 = MODULE_NOT_FOUND，
 //   整段测试全炸（v3.32.0 缺 refresh-holidays.js 时踩过同一坑）。此清单由下方 T37-a2 自动校验。
+// v3.42.0（plan-B B1）：wb-root.js 必须随行——数据根探测抽成单点实现后，主脚本/backfill/recalc/
+//   refresh-prices 四个文件顶层都 require 它；隔离目录缺它 = 全段 MODULE_NOT_FOUND（同上两坑的第三次）。
 const RUNTIME_COMPANIONS = ['refresh-prices.js', 'deepseek-official.js', 'refresh-holidays.js',
-  'pricing.json', 'holidays.json', 'peak-rules.js', 'recalc-day.js', 'stop-handler.js'];
+  'pricing.json', 'holidays.json', 'peak-rules.js', 'recalc-day.js', 'stop-handler.js', 'wb-root.js'];
 for (const f of ['token-tracker.js', ...RUNTIME_COMPANIONS]) {
   fs.copyFileSync(path.join(SRC, f), path.join(skillDir, f));
 }
@@ -2565,8 +2567,8 @@ else {
   ok('T35-a2 ★清理位于 --report 统一入口（在 forecast/区间/csv 各分支 return 之前）→ 所有变体都覆盖',
     iEntry35 >= 0 && iCall35 > iEntry35 && iForecast35 > iCall35,
     `entry=${iEntry35} call=${iCall35} forecast=${iForecast35}`);
-  ok('T35-a3 ★只删 `report-*.csv`：目录里用户手放的文件绝不能被误删',
-    /if \(!\/\^report-\.\*\\\.csv\$\/\.test\(f\)\) continue;/.test(src35));
+  ok('T35-a3 ★只删本技能自己生成的 `report-*-YYYYMMDD-HHMMSS.csv`：用户手放的文件绝不能被误删',
+    /if \(!\/\^report-\.\*-\\d\{8\}-\\d\{6\}\\\.csv\$\/\.test\(f\)\) continue;/.test(src35));
 
   const savedEnv35 = process.env.WB_ROOT;
   process.env.WB_ROOT = tmp;
@@ -3448,11 +3450,18 @@ else {
     /dateStrOfTs\(t\)\.slice\(0, 7\)/.test(snSrc43) && /ROUNDS_DIR/.test(snSrc43));
 
   // d：A13 语义守卫 —— 三项各自带倍率（结构不许退化成"只乘一项"）
-  ok('T43-a6 ★calcCost 三项（未命中/缓存/输出）各自带 mult（结构上三项都随峰谷）',
-    /\(uncached \/ 1e6\) \* \(m\.input_price \|\| 0\) \* mult/.test(calcSrc43)
-    && /\(cached \/ 1e6\) \* \(m\.cached_price \|\| 0\) \* mult/.test(calcSrc43)
-    && /\(outTok \/ 1e6\) \* \(m\.output_price \|\| 0\) \* mult/.test(calcSrc43),
+  // v3.42.0（plan-B B1）：判据位置**跟着实现走** —— 三项公式已从 calcCost 内联式收敛到单点 `triPrice`
+  //   （B1 治"同一公式抄 3 份"）。故断言改查 triPrice 的函数体，并**加一条**"calcCost 回退路径确实调
+  //   triPrice"（否则公式搬家时可能把调用点漏改、留一段死代码）。三项同乘的语义不变。
+  const triSrc43 = stripComments(grab43(rawTT43, 'triPrice'));
+  ok('T43-a6 ★三项计价公式（未命中/缓存/输出）各自带 mult（结构上三项都随峰谷）',
+    /\(uncached \/ 1e6\) \* Number\(m\.input_price \|\| 0\) \* k/.test(triSrc43)
+    && /\(cached \/ 1e6\) \* Number\(m\.cached_price \|\| 0\) \* k/.test(triSrc43)
+    && /\(outT \/ 1e6\) \* Number\(m\.output_price \|\| 0\) \* k/.test(triSrc43),
     '三项同乘是**当前官方事实**（缓存命中价高峰同样是空闲的 2 倍），不是 bug；但结构不能漏项');
+  ok('T43-a6b ★calcCost 无分桶回退路径调用单点 triPrice（公式搬家后调用点不能漏改）',
+    /return triPrice\(stat\.in, cached, outTok, m, mult\);/.test(calcSrc43),
+    '公式已抽到 triPrice；calcCost 回退路径必须调它，否则是两套并存（B1 病根复发）');
   ok('T43-a7 ★「三项同乘」的官方依据写在注释里（防后人当 bug 改成"只乘 input"而漏收缓存费）',
     /三项同乘是当前官方事实/.test(rawTT43) && /不要\*\*?把它"修"成只乘 input|不要.{0,6}把它.{0,4}修.{0,4}成只乘 input/.test(rawTT43),
     '缺这段依据，后人很可能把"三项同乘"当 bug 摘掉缓存项的倍率');
@@ -3653,6 +3662,259 @@ else {
   } catch (e) {
     ok('T44-b 夹具构建', false, (e && e.message) || String(e));
   }
+}
+
+// ===== T45（v3.42.0 / plan-B A17）：区间端点必须「日期真实存在」=====
+//   A17 病根：`parseReportRange` 原来只过 `^\d{4}-\d{2}-\d{2}$` 格式正则就放行区间端点，
+//     `2026-13-45` / `2026-02-30` / `2026-00-00` 全被当成合法端点 → 区间聚合按**字典序**比较账本键
+//     （`k >= from && k <= to`）→ 非法端点排到所有真实日期之后 → 区间被**静默扩展成"全部历史"**，
+//     报表数字离谱且**零提示**。这是"静默错"里最坏的一类：数字看着像真的。
+//   本组钉住两层：① `isRealDateStr` 的日历级判定（真调）；② 调用点对"看似区间但端点非法"**必须显式报错**
+//     （不许静默退化到 `reportTxt` 的单点语义，那会输出「===== 2026-13-45 =====（无记录）」骗人）。
+{
+  const savedEnv45 = process.env.WB_ROOT;
+  process.env.WB_ROOT = tmp;
+  let tt45 = null;
+  try { tt45 = require(path.join(skillDir, 'token-tracker.js')); } catch (e) { tt45 = null; }
+  if (!tt45 || typeof tt45.isRealDateStr !== 'function' || typeof tt45.parseReportRange !== 'function') {
+    ok('T45 模块加载（需要 isRealDateStr / parseReportRange 导出）', false, '缺少导出');
+  } else {
+    const R = tt45.isRealDateStr;
+    // a 组：「格式对、日历对」必须放行
+    ok('T45-a1 isRealDateStr 正常日期放行（2026-10-09 / 2026-02-28）',
+      R('2026-10-09') === true && R('2026-02-28') === true);
+    // b 组：「格式对、日历错」必须拦（这是 A17 的核心）
+    ok('T45-b1 ★isRealDateStr 拦住月份越界（2026-13-45 / 2026-00-00）',
+      R('2026-13-45') === false && R('2026-00-00') === false,
+      '月份/日越界必须判假，否则区间字典序比较会静默扩窗');
+    ok('T45-b2 ★isRealDateStr 拦住"格式对但日历不存在"（2026-02-30 / 2025-02-29 平年）',
+      R('2026-02-30') === false && R('2025-02-29') === false,
+      'Date 会把 2/30 自动进位到 3/2 —— 回读比对必须能识破');
+    ok('T45-b3 isRealDateStr 拦住闰年 2/29 的真实存在日（2024-02-29 应放行）',
+      R('2024-02-29') === true && R('2026-02-29') === false);
+    // c 组：格式非法也必须判假
+    ok('T45-c1 isRealDateStr 拦住格式非法（空串 / 2026-1-9 / 20261009 / 带时间）',
+      R('') === false && R('2026-1-9') === false && R('20261009') === false && R('2026-10-09T00:00') === false);
+    // d 组：parseReportRange 对非法端点**必须返回 null**（而不是"凑合出一个区间"）
+    ok('T45-d1 ★parseReportRange 端点非法 → null（2026-13-45..2026-13-46）',
+      tt45.parseReportRange('2026-13-45..2026-13-46') === null);
+    ok('T45-d2 ★parseReportRange 一端非法 → null（2026-10-01..2026-02-30）',
+      tt45.parseReportRange('2026-10-01..2026-02-30') === null);
+    ok('T45-d3 parseReportRange 合法区间仍正常（含起止写反自动纠正）',
+      (() => {
+        const r1 = tt45.parseReportRange('2026-10-01..2026-10-09');
+        const r2 = tt45.parseReportRange('2026-10-09..2026-10-01');
+        return r1 && r1.from === '2026-10-01' && r1.to === '2026-10-09'
+          && r2 && r2.from === '2026-10-01' && r2.to === '2026-10-09';
+      })(), '合法区间不得被日历校验误伤');
+    // e 组：调用点必须对"看似区间但端点非法"显式报错（源码级守卫 —— 行为断言要 spawn 太重）
+    //   注意正则转义：源码里是 `\d{4}`，在 JS 正则字面量里要写成 `\\d\{4\}`（两条反斜杠 = 匹配一个 `\`）。
+    const rawTT45 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+    const hasBadMsg = rawTT45.indexOf('区间端点不是真实存在的日期') >= 0;
+    const hasShape = /\\d\{4\}-\\d\{2\}-\\d\{2\}\\\.\\.\\d\{4\}-\\d\{2\}-\\d\{2\}/.test(rawTT45);
+    const nearCall = /parseReportRange\(rArg\)[\s\S]{0,1500}?reportRangeArgError\(rArg\)/.test(rawTT45);
+    ok('T45-e1 ★--report 调用点在区间解析失败后显式识别"看似区间"并报错（不许静默落到单点语义）',
+      hasBadMsg && hasShape && nearCall,
+      `静默退化成 reportTxt 单点 → 输出「（无记录）」骗人，比报错更危险（msg=${hasBadMsg} shape=${hasShape} near=${nearCall}）`);
+  }
+  if (savedEnv45 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv45;
+}
+
+// ===== T46（v3.42.0 / plan-B B1）：文件锁 withFileLock 守卫测试 =====
+//   B1 着眼点：withFileLock 是跨进程互斥核心原语（原子 openSync 'wx' + pid 探活 + TTL 退化 + 重试 +
+//     finally 释放），三处独立锁（watcher 心跳锁 / CN 价库刷新锁 / refresh-prices PRICING_LOCK_FILE）都依赖
+//     其语义正确性。本组钉住六条关键不变量，纯 require 单测、不 spawn、不碰真实账本。
+{
+  const savedEnv46 = process.env.WB_ROOT;
+  process.env.WB_ROOT = tmp; // 照抄既有模式：require 前固定隔离目录
+  const ttMod = require(path.join(skillDir, 'token-tracker.js'));
+  if (!ttMod || typeof ttMod.withFileLock !== 'function') {
+    ok('T46 模块加载（需要 withFileLock 导出）', false, '缺少导出');
+  } else {
+    const withFileLock = ttMod.withFileLock;
+    try {
+      // T46-1 正常加锁-释放
+      {
+        const p = path.join(os.tmpdir(), 'tt46-' + process.pid + '-' + Date.now() + '.lock');
+        try {
+          const r = withFileLock(p, () => 42);
+          ok('T46-1 正常加锁-释放：返回 {ok:true, result:42} 且锁文件已删除',
+            r && r.ok === true && r.result === 42 && fs.existsSync(p) === false,
+            'expected {ok:true,result:42} & 锁文件不存在，got ' + JSON.stringify(r) + ' exists=' + fs.existsSync(p));
+        } catch (e) {
+          ok('T46-1 正常加锁-释放', false, e.message);
+        } finally {
+          try { fs.unlinkSync(p); } catch (e) { /* silent-ok:清理 — T46 临时锁文件收尾，删不掉不影响断言 */ }
+        }
+      }
+      // T46-2 持锁期间他人拿不到（外部以自身 pid 占锁 → 必然存活）
+      {
+        const p = path.join(os.tmpdir(), 'tt46-' + process.pid + '-' + Date.now() + '.lock');
+        try {
+          fs.writeFileSync(p, JSON.stringify({ at: Date.now(), pid: process.pid }));
+          let called = false;
+          const fn = () => { called = true; return 'should-not-run'; };
+          const r = withFileLock(p, fn, { retries: 2, retryDelay: 10 });
+          ok('T46-2 持锁期间他人拿不到：{ok:false, skipped:true} 且 fn 未执行',
+            r && r.ok === false && r.skipped === true && called === false,
+            'expected {ok:false,skipped:true} & fn 未调用，got ' + JSON.stringify(r) + ' called=' + called);
+        } catch (e) {
+          ok('T46-2 持锁期间他人拿不到', false, e.message);
+        } finally {
+          try { fs.unlinkSync(p); } catch (e) { /* silent-ok:清理 — T46 临时锁文件收尾，删不掉不影响断言 */ }
+        }
+      }
+      // T46-3 死 pid 可被接管
+      {
+        const p = path.join(os.tmpdir(), 'tt46-' + process.pid + '-' + Date.now() + '.lock');
+        try {
+          let deadPid = 999999;
+          try { process.kill(999999, 0); deadPid = null; } // 若 999999 存活 → 需另寻死 pid
+          catch (e) {
+            if (e.code !== 'ESRCH') { // 非 ESRCH（权限等）→ 循环找一个确认死亡的 pid
+              deadPid = null;
+              for (let probe = 990000; probe < 999999; probe++) {
+                try { process.kill(probe, 0); }
+                catch (e2) { if (e2.code === 'ESRCH') { deadPid = probe; break; } }
+              }
+            }
+          }
+          if (!deadPid) {
+            ok('T46-3 死 pid 可被接管', false, '未能确认一个死 pid（环境异常，跳过）');
+          } else {
+            fs.writeFileSync(p, JSON.stringify({ at: Date.now(), pid: deadPid }));
+            const r = withFileLock(p, () => 'ok');
+            ok('T46-3 死 pid 可被接管：返回 {ok:true, result:"ok"}',
+              r && r.ok === true && r.result === 'ok',
+              'expected {ok:true,result:"ok"}，got ' + JSON.stringify(r));
+          }
+        } catch (e) {
+          ok('T46-3 死 pid 可被接管', false, e.message);
+        } finally {
+          try { fs.unlinkSync(p); } catch (e) { /* silent-ok:清理 — T46 临时锁文件收尾，删不掉不影响断言 */ }
+        }
+      }
+      // T46-4 fn 抛异常也必须释放锁（finally 核心保证，防死锁）
+      {
+        const p = path.join(os.tmpdir(), 'tt46-' + process.pid + '-' + Date.now() + '.lock');
+        try {
+          let threw = false;
+          try { withFileLock(p, () => { throw new Error('boom'); }); }
+          catch (e) { threw = (e && e.message === 'boom'); }
+          ok('T46-4 fn 抛异常也释放锁：boom 被抛出且锁文件已删除',
+            threw === true && fs.existsSync(p) === false,
+            'expected boom 被抛出 & 锁文件不存在，threw=' + threw + ' exists=' + fs.existsSync(p));
+        } catch (e) {
+          ok('T46-4 fn 抛异常也释放锁', false, e.message);
+        } finally {
+          try { fs.unlinkSync(p); } catch (e) { /* silent-ok:清理 — T46 临时锁文件收尾，删不掉不影响断言 */ }
+        }
+      }
+      // T46-5 解析不出 pid 时按 TTL 判定（at 很久前 → 接管）
+      {
+        const p = path.join(os.tmpdir(), 'tt46-' + process.pid + '-' + Date.now() + '.lock');
+        try {
+          fs.writeFileSync(p, JSON.stringify({ at: Date.now() - 10 * 60 * 1000 }));
+          const r = withFileLock(p, () => 'ok', { ttl: 1000, retries: 2, retryDelay: 10 });
+          ok('T46-5 解析不出 pid 按 TTL 接管：at 已超 ttl → {ok:true, result:"ok"}',
+            r && r.ok === true && r.result === 'ok',
+            'expected {ok:true,result:"ok"}，got ' + JSON.stringify(r));
+        } catch (e) {
+          ok('T46-5 解析不出 pid 按 TTL 接管', false, e.message);
+        } finally {
+          try { fs.unlinkSync(p); } catch (e) { /* silent-ok:清理 — T46 临时锁文件收尾，删不掉不影响断言 */ }
+        }
+      }
+      // T46-6 无 pid 且 at 新鲜（未超 ttl）→ 不接管
+      {
+        const p = path.join(os.tmpdir(), 'tt46-' + process.pid + '-' + Date.now() + '.lock');
+        try {
+          fs.writeFileSync(p, JSON.stringify({ at: Date.now() }));
+          let called = false;
+          const r = withFileLock(p, () => { called = true; }, { ttl: 60000, retries: 2, retryDelay: 10 });
+          ok('T46-6 新鲜锁不接管：{ok:false, skipped:true} 且 fn 未执行',
+            r && r.ok === false && r.skipped === true && called === false,
+            'expected {ok:false,skipped:true} & fn 未调用，got ' + JSON.stringify(r) + ' called=' + called);
+        } catch (e) {
+          ok('T46-6 新鲜锁不接管', false, e.message);
+        } finally {
+          try { fs.unlinkSync(p); } catch (e) { /* silent-ok:清理 — T46 临时锁文件收尾，删不掉不影响断言 */ }
+        }
+      }
+    } catch (e) {
+      ok('T46 组异常', false, e.message);
+    }
+  }
+  if (savedEnv46 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv46;
+}
+
+// ===== T47（v3.42.0 / plan-B A19）：transcript 末尾无 '\n' 的残行不得永久丢弃 =====
+//   病根：`readTranscLinesFrom` 原实现只解析 `[off, lastNl]` 内的"完整行"（带 '\n'），把最后一个 '\n'
+//   之后到 EOF 的残余一刀切当"半写行"留给下一轮 → 若文件末尾**本就无 trailing '\n'**（写入已完成），
+//   该行永久等不到 '\n' → **永久漏计**（恰是会话最后一轮时 = 永久少 token）。
+//   修法：残余段若是**合法完整 JSON** 就收下（只是缺尾换行）；残缺 JSON 仍安全跳过。
+//   ⚠ 本组最关键的断言是 **c1**（第二遍不能重读该行）——多收一行若不把 totalLines 同步 +1，
+//      水位线会算少 → 下一轮重读 → **重复计费**（比漏计更危险）。这正是 A19 的修复红线。
+{
+  const savedEnv47 = process.env.WB_ROOT;
+  process.env.WB_ROOT = tmp;
+  let tt47 = null;
+  try { tt47 = require(path.join(skillDir, 'token-tracker.js')); } catch (e) { tt47 = null; }
+  if (!tt47 || typeof tt47.readTranscLinesFrom !== 'function') {
+    ok('T47 模块加载（需要 readTranscLinesFrom 导出）', false, '缺少导出');
+  } else {
+    const fs2 = require('fs'), os2 = require('os');
+    const dataDir = fs2.mkdtempSync(path.join(os2.tmpdir(), 'tt-a19-'));
+    const L = (n) => JSON.stringify({
+      type: 'assistant',
+      providerData: { model: 'deepseek-v4.1-flash', usage: { inputTokens: n, outputTokens: 0 } },
+      timestamp: 1759900000000,
+    });
+    const R = tt47.readTranscLinesFrom;
+    try {
+      // 用例1：三行合法 JSON，末行**无 trailing '\n'**
+      const p1 = path.join(dataDir, 'tail-nonl.jsonl');
+      fs2.writeFileSync(p1, L(100) + '\n' + L(200) + '\n' + L(300));
+      const r1 = R(p1, 0);
+      ok('T47-a1 ★末尾无换行的完整 JSON 行被收下（不再永久丢弃）',
+        r1.rows.length === 3 && r1.totalLines === 3, `rows=${r1.rows.length} totalLines=${r1.totalLines}`);
+      // ★c1：再读一遍（fromLine = 上一轮 totalLines）→ 必须零新行（否则下一轮重复计费）
+      const r1b = R(p1, r1.totalLines);
+      ok('T47-a2 ★★收下残行后 totalLines 同步 +1 → 下一轮不重读该行（防重复计费，A19 红线）',
+        r1b.rows.length === 0, `重读 rows=${r1b.rows.length}（必须 0）`);
+      // 用例2：末行为**残缺 JSON**（半写）→ 必须安全跳过（保持"留给下一轮"语义）
+      const p2 = path.join(dataDir, 'tail-broken.jsonl');
+      fs2.writeFileSync(p2, L(100) + '\n' + '{"type":"assist');
+      const r2 = R(p2, 0);
+      ok('T47-a3 残缺 JSON 尾行安全跳过（不解析、不抛、水位线只算完整行）',
+        r2.rows.length === 1 && r2.totalLines === 1, `rows=${r2.rows.length} totalLines=${r2.totalLines}`);
+      // 用例3：末行无 '\n'，随后追加新行 → 只读新的那一行（残行不得被重读）
+      const p3 = path.join(dataDir, 'append.jsonl');
+      fs2.writeFileSync(p3, L(100) + '\n' + L(200) + '\n' + L(300));
+      const r3a = R(p3, 0);
+      fs2.appendFileSync(p3, '\n' + L(400));
+      const r3b = R(p3, r3a.totalLines);
+      ok('T47-a4 ★残行被收下后再追加新行：只读新增的 1 行（残行不重读、新行不漏）',
+        r3b.rows.length === 1 && r3b.totalLines === 4, `rows=${r3b.rows.length} totalLines=${r3b.totalLines}`);
+      // 用例4：文件只有一行且无 '\n'
+      const p4 = path.join(dataDir, 'single.jsonl');
+      fs2.writeFileSync(p4, L(500));
+      const r4 = R(p4, 0);
+      ok('T47-a5 单行文件无换行 → 仍被收下（rows=1 / totalLines=1）',
+        r4.rows.length === 1 && r4.totalLines === 1, `rows=${r4.rows.length} totalLines=${r4.totalLines}`);
+      // 用例5：正常带尾换行的文件行为必须不变（多行 + 末行有 '\n'）
+      const p5 = path.join(dataDir, 'normal.jsonl');
+      fs2.writeFileSync(p5, L(1) + '\n' + L(2) + '\n');
+      const r5 = R(p5, 0);
+      ok('T47-a6 正常（末行带换行）行为不变：两行都收下、totalLines=2',
+        r5.rows.length === 2 && r5.totalLines === 2, `rows=${r5.rows.length} totalLines=${r5.totalLines}`);
+    } catch (e) {
+      ok('T47 组异常', false, (e && e.message) || String(e));
+    } finally {
+      try { fs2.rmSync(dataDir, { recursive: true, force: true }); } catch (e) { /* silent-ok:清理 — T47 临时夹具目录收尾 */ }
+    }
+  }
+  if (savedEnv47 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv47;
 }
 
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。
