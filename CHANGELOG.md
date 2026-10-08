@@ -3,6 +3,37 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.38.1（2026-10-09）—— 修复：Stop 端"团队数据已就绪"快速路径漏接按模型分条（真机复现）
+
+> v3.38.0 发版后 40 分钟即被真机打脸：用户派 2×hy3 + 1×default 子代理做实测，Stop 弹出的是**单条**
+> `hy4-preview（子代理 hy3）`（toast 日志 `reason=plain-immediate`），分条逻辑被整个绕过。
+> 本修复由**主代理自己派子代理的端到端实测**发现并复现——不再依赖用户跑真实任务。
+
+### 根因（三段叠加）
+
+| # | 事实 |
+|---|---|
+| 1 | Stop 端有个 v3.09 加的快速路径：`teamDataReady = subagentPending().length===0 && !hasSubagentsRecentlyActive(20s)`，**先于** TEAM_SPLIT 与 watcher 执行，命中即同步单条弹（`plain-immediate`） |
+| 2 | v3.38.0 只改了「拆分弹默认关（C2）」和「watcher 收口分条（C3③）」，**漏了这条更早的出口** |
+| 3 | 时序洞：子代理 00:50:23 写完 → 主模型继续写回复 110s → 00:52:1x Stop 时 `hasSubagentsRecentlyActive(20s)=false`（mtime 已出窗）→ `teamDataReady=true` → 单条弹（旧标注 + **跨模型混合计价**），watcher 从未启动 |
+
+### 修法
+
+- `stop-handler.js`：快速路径弹窗段改为——团队轮（`!isPlainRound`）**先试 `showToastsSplitByModel(agg, …)`**（与 watcher 收口同一实现，≥2 模型 → 分条各自计价）；返回 false（单模型）→ 回落原单条路径，**输出逐字节不变**。真普通轮不试分条（无子代理，白扫盘）。
+- tx 注入链补 `showToastsSplitByModel`（token-tracker 构造点 + stop-handler 解构 + `STOP_TX_NAMES`，T37 完整性守卫覆盖）。
+- `selftest.js`：新增 **T40-a7**（快速路径必须先走分条，源码守卫）；T40-a5 调用点计数 5 → 6。
+
+### 验证
+
+- selftest 全量：**380 过 / 0 败 / 23 环境受限跳过**（v3.38.0 基线 379 → 380）。
+- 真机复测（修复版）：主代理再次派 2×hy3 + 1×default → **本轮结束后核对 toast 日志**，预期 2 条（`hy4-preview` 主条 + `hy3` 条标「（子代理使用）」，间隔 0）。结果见下轮会话记录。
+
+### 本版没验的
+
+- V9/V10/V11（kill watcher 后 15s 接管、兜底分条）仍需真机 spawn（`SPAWN_OK=false` 占位不变）。
+
+---
+
 ## v3.38.0（2026-10-09）—— 子代理弹窗：中间不弹、主任务结束时按模型分条弹（并修掉 watcher 锁的 pid 复用坑）
 
 > 本版来自 2026-10-08 第六轮审计的 **plan-A**（弹窗体感优先）。同批的 **plan-B**（其余 26 条：财务正确性 / 架构债 / 测试网）**本版未动**，排期在后。

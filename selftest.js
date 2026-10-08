@@ -2839,11 +2839,17 @@ else {
     && /Date\.now\(\) - Number\(mine\.at\)\) < WATCH_LOCK_HB_MS/.test(src40)
     && /心跳/.test(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8')),
     'pid 探活在 Windows 上必踩 PID 复用 → 锁被判"存活"→ 该 sid 永久失去 watcher');
-  ok('T40-a5 ★按模型分条：三处出口共用 showToastsSplitByModel（watcher / hook 兜底 / v3.12 补弹 ×2）',
-    (src40.match(/showToastsSplitByModel\(/g) || []).length >= 5, // 1 处定义 + 4 处调用
-    `出现次数=${(src40.match(/showToastsSplitByModel\(/g) || []).length}（低于 5 = 有出口漏改）`);
+  ok('T40-a5 ★按模型分条：三处出口共用 showToastsSplitByModel（watcher / hook 兜底 / v3.12 补弹 ×2 / Stop 快速路径）',
+    (src40.match(/showToastsSplitByModel\(/g) || []).length >= 6, // 1 处定义 + 5 处调用
+    `出现次数=${(src40.match(/showToastsSplitByModel\(/g) || []).length}（低于 6 = 有出口漏改）`);
   ok('T40-a6 ★v3.12 硬编码文案「（子代理）」已全部换成 v2.98 的 subagentTagOf（专家团/子代理分得开）',
     !/toastLineTagged\([^)]*'（子代理）'/.test(src40));
+  // a7（v3.38.1，2026-10-09 真机复现）：Stop 端 teamDataReady 快速路径（v3.09 加）在 v3.38.0 漏改——
+  //   子代理写完后主模型继续写回复 >20s → hasSubagentsRecentlyActive(20s)=false → teamDataReady=true
+  //   → 单条弹（「hy4-preview（子代理 hy3）」+ 跨模型混合计价），把分条整个绕过。用户截图质问后定位。
+  ok('T40-a7 ★Stop 端 teamDataReady 快速路径必须先走按模型分条（团队轮不得直接单条弹）',
+    /!isPlainRound && showToastsSplitByModel\(agg/.test(src40),
+    '快速路径直接单条弹 = 分条被绕过（真机 00:52 复现：异模型轮只弹 1 条「hy4-preview（子代理 hy3）」）');
 
   const mod40 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
   if (!mod40) ok('T40 行为验证（主模块加载失败）', false, 'token-tracker.js require 失败 —— CI 正常环境下这必是代码回归，不允许静默跳过');

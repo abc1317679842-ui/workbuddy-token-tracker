@@ -60,6 +60,7 @@ function handleStopEnd(ctx) {
     saveSnapshot,
     shortModelName,
     showToast,
+    showToastsSplitByModel,
     sleep,
     sleepSync,
     startWatcherVerified,
@@ -238,12 +239,28 @@ function handleStopEnd(ctx) {
         if (isPlainRound || teamDataReady) {
           // 普通轮：同步立即弹（不 spawn、不等确认窗），并清掉 coalesce 以免被兜底二次补弹
           try {
-            showToast(
-              toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), balanceText(), todayUsageTxt(), noPriceTag1(agg, pricing)),
-              toastLine2(agg, pricing),
-              (typeof toastReason === 'string' && toastReason) ? toastReason + '+plain-immediate' : 'plain-immediate',
-              tsPath
-            );
+            // v3.38.1（真机复现 2026-10-09 00:52，用户截图质问「为什么还是合并了」）：
+            //   本快速路径（v3.09 加）在 v3.38.0 改造时**漏改**——它先于 TEAM_SPLIT 与 watcher 执行，
+            //   teamDataReady 时直接单条弹（旧标注「（子代理 hy3）」+ 跨模型混合计价），把 C3③ 的
+            //   按模型分条整个绕过。时序洞：子代理 00:50:23 写完 → 主模型继续写回复 110s → Stop 时
+            //   hasSubagentsRecentlyActive(20s)=false（mtime 已出窗）→ teamDataReady=true → 单条弹。
+            //   修法：团队轮（!isPlainRound）先试 showToastsSplitByModel——≥2 模型 → 分条弹
+            //   （与 watcher 收口同一实现）；单模型返回 false → 回落原单条，逐字节不变。
+            //   真普通轮（isPlainRound）不试分条：无子代理，models 必然单桶，白扫盘。
+            if (!isPlainRound && showToastsSplitByModel(agg, {
+              pricing, tsPath, roundStart: aggStart0,
+              bal: balanceText(), firstToday: todayUsageTxt(),
+              reason: (typeof toastReason === 'string' && toastReason) ? toastReason + '+plain-immediate' : 'plain-immediate',
+            })) {
+              appendCompactionLog('stop-plain-immediate-split', { sid: effSid, parts: Object.keys((agg && agg.models) || {}) });
+            } else {
+              showToast(
+                toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), balanceText(), todayUsageTxt(), noPriceTag1(agg, pricing)),
+                toastLine2(agg, pricing),
+                (typeof toastReason === 'string' && toastReason) ? toastReason + '+plain-immediate' : 'plain-immediate',
+                tsPath
+              );
+            }
             clearCoalesce(effSid);
             // v3.03（蝴蝶效应修复）：**普通轮必须自己推进 lastStopAt**。
             //   原设计里 lastStopAt 由 watcher 弹窗完成后推进（见 --flush-delayed 内注释）。
@@ -408,4 +425,4 @@ function handleStopEnd(ctx) {
   return false;
 }
 
-module.exports = { handleStopEnd, STOP_TX_NAMES: ["SUBAGENT_IDLE_MS","TOAST_LINE_MAX_W","aggregateMainOnly","aggregatePerModel","aggregateTranscript","allInRoundSubFilesTerminal","appendCompactionLog","balanceText","captureTranscShape","clearCoalesce","coalescePath","dispWidth","ensureNewModelPricing","estimateInterrupted","freshCompactionMarker","hasSubagentsRecentlyActive","incrementalRecord","inferRoundStartFromText","lastWatcherSpawnError","latestTraceFile","ledgerKey","lineFor","loadSnapshot","mergeEstIntoModels","noPriceTag1","periodNote","readCoalesceInfo","readTranscLines","roundLabel","saveSnapshot","shortModelName","showToast","sleep","sleepSync","startWatcherVerified","subagentPending","summarizePayload","terminalError","toastLine1","toastLine2","toastLineTagged","todayUsageTxt","traceWallDurMs","transcriptPathFromPayload","writeCoalesce","writeProbe"] };
+module.exports = { handleStopEnd, STOP_TX_NAMES: ["SUBAGENT_IDLE_MS","TOAST_LINE_MAX_W","aggregateMainOnly","aggregatePerModel","aggregateTranscript","allInRoundSubFilesTerminal","appendCompactionLog","balanceText","captureTranscShape","clearCoalesce","coalescePath","dispWidth","ensureNewModelPricing","estimateInterrupted","freshCompactionMarker","hasSubagentsRecentlyActive","incrementalRecord","inferRoundStartFromText","lastWatcherSpawnError","latestTraceFile","ledgerKey","lineFor","loadSnapshot","mergeEstIntoModels","noPriceTag1","periodNote","readCoalesceInfo","readTranscLines","roundLabel","saveSnapshot","shortModelName","showToast","showToastsSplitByModel","sleep","sleepSync","startWatcherVerified","subagentPending","summarizePayload","terminalError","toastLine1","toastLine2","toastLineTagged","todayUsageTxt","traceWallDurMs","transcriptPathFromPayload","writeCoalesce","writeProbe"] };
