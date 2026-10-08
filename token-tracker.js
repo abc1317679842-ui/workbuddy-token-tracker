@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.38.1 (2026-10-09)
+// token-usage-tracker v3.38.2 (2026-10-09)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -1120,9 +1120,12 @@ function aggregateTranscLines(rows, fromTs) {
     // v3.26.0（KI-6 ⑧）：同循环顺手产出**分模型明细**（与总量同一 seen 去重、同一口径）——
     // toastLine2 据此做分模型计价求和（混合模型轮不再整轮按单一主导价折算）。lastTs 供峰谷判定。
     const mkName = normalizeModelName(pd.model || pd.requestModelId || 'unknown');
-    const mb = models[mkName] || (models[mkName] = { in: 0, out: 0, cached: 0, total: 0, lastTs: 0 });
+    // v3.38.2：桶同时记 **firstTs** —— 供按模型分条时算"该模型自己的真实跨度"
+    //   （改前只有 lastTs，分条后每条只能照抄整轮 durMs → 子代理条显示成主轮时长，实测 hy3 显示 9m2s）。
+    const mb = models[mkName] || (models[mkName] = { in: 0, out: 0, cached: 0, total: 0, lastTs: 0, firstTs: 0 });
     mb.in += u.in; mb.out += u.out; mb.cached += u.cached; mb.total += u.in + u.out;
     if (ts > mb.lastTs) mb.lastTs = ts;
+    if (mb.firstTs === 0 || ts < mb.firstTs) mb.firstTs = ts;
     count++;
   }
   if (!count) {
@@ -1423,9 +1426,11 @@ function aggregateTranscript(tsPath, roundStartMs) {
   for (const part of [main, sub]) {
     if (!part || !part.models) continue;
     for (const [n, b] of Object.entries(part.models)) {
-      const t = res.models[n] || (res.models[n] = { in: 0, out: 0, cached: 0, total: 0, lastTs: 0 });
+      const t = res.models[n] || (res.models[n] = { in: 0, out: 0, cached: 0, total: 0, lastTs: 0, firstTs: 0 });
       t.in += b.in; t.out += b.out; t.cached += b.cached; t.total += b.total;
       if (b.lastTs > t.lastTs) t.lastTs = b.lastTs;
+      // v3.38.2：合并时也要带上 firstTs（否则主+子代理同名桶的首时间戳丢失 → 该条跨度算不出来）
+      if (b.firstTs && (!t.firstTs || b.firstTs < t.firstTs)) t.firstTs = b.firstTs;
     }
   }
   // v3.19.2（B10）：显式处理"两个 firstTs 都为空"——原 Math.min(...[]) = Infinity，
@@ -1524,7 +1529,13 @@ function splitByModelStats(agg) {
           model: n, modelMain: n, subModels: undefined,
           models: { [n]: b }, // 单桶 → 该条只按该模型计价
           count: b.count || 0,
-          durMs: agg.durMs, firstTs: b.firstTs || agg.firstTs, lastTs: b.lastTs || agg.lastTs,
+          // v3.38.2：耗时改用**该模型桶自己的跨度**（首行→末行），不再照抄整轮 durMs。
+          //   改前：每条 stat.durMs = agg.durMs → 主条与子代理条显示同一个整轮时长（实测两条都是 9m2s，
+          //   而 hy3 子代理实际只跑了 6.9s）。改后：子代理条显示真实跨度；主模型桶横跨全轮 → 主条基本不变。
+          //   口径说明（写进 CHANGELOG / SKILL 的已知局限）：跨度是**墙钟**口径——并行子代理不累加
+          //   （2 个并行各 4.0s / 6.9s → 显示 6.9s，不是 10.9s）；多批次（返回→主模型再派）含批间等待 → 偏大。
+          durMs: Math.max(0, (b.lastTs || agg.lastTs) - (b.firstTs || agg.firstTs)),
+          firstTs: b.firstTs || agg.firstTs, lastTs: b.lastTs || agg.lastTs,
         },
       };
     });
@@ -5300,7 +5311,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.38.1'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.38.2'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

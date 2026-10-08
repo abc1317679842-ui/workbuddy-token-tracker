@@ -2850,6 +2850,15 @@ else {
   ok('T40-a7 ★Stop 端 teamDataReady 快速路径必须先走按模型分条（团队轮不得直接单条弹）',
     /!isPlainRound && showToastsSplitByModel\(agg/.test(src40),
     '快速路径直接单条弹 = 分条被绕过（真机 00:52 复现：异模型轮只弹 1 条「hy4-preview（子代理 hy3）」）');
+  // a8（v3.38.2）：分条耗时必须取**该模型桶自己的跨度**，不能照抄整轮 durMs。
+  //   改前 `durMs: agg.durMs` → 主条与子代理条显示同一个整轮时长（真机实测两条都是 9m2s，
+  //   而 hy3 子代理实际只跑 6.9s）。修法两步：桶补记 firstTs + 跨度改 firstTs~lastTs。
+  //   注：不能断言"全文不含 durMs: agg.durMs"——记账路径（incrementalRecord 的 meta）仍合法地用它。
+  //   故这里只断言正向特征；真正的回归防线是 b11/b12 两条行为断言（主 10min / 子 5s、并行不累加）。
+  ok('T40-a8 ★分桶记 firstTs，且分条耗时用桶跨度（不再 durMs: agg.durMs 照抄整轮）',
+    /lastTs: 0, firstTs: 0/.test(src40)
+    && /durMs: Math\.max\(0, \(b\.lastTs \|\| agg\.lastTs\) - \(b\.firstTs \|\| agg\.firstTs\)\)/.test(src40),
+    '照抄整轮 → 子代理条显示主轮时长（真机 9m2s vs 实际 6.9s）');
 
   const mod40 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
   if (!mod40) ok('T40 行为验证（主模块加载失败）', false, 'token-tracker.js require 失败 —— CI 正常环境下这必是代码回归，不允许静默跳过');
@@ -2918,6 +2927,33 @@ else {
     ok('T40-b10 ★aggregateSubsOnly 带分模型明细（v3.12 补弹分支才能同样分条）',
       !!subAgg40 && !!subAgg40.models && Object.keys(subAgg40.models).length === 2,
       subAgg40 ? `桶数=${Object.keys(subAgg40.models || {}).length}` : 'null');
+    // b11（v3.38.2）：分条耗时 = 该模型桶自己的跨度，不是整轮时长。
+    //   夹具：主模型横跨 10 分钟（T0 ~ T0+600000），hy3 子代理只跑 5 秒（T0+300000 ~ T0+305000）。
+    //   改前两条都会是 600000（照抄整轮）；改后 hy3 条 = 5000、主条 = 600000。
+    fs.mkdirSync(path.join(P40, 's3', 'subagents'), { recursive: true });
+    const tp40c = path.join(P40, 's3.jsonl');
+    fs.writeFileSync(tp40c, [row40(T0, 'hy4-preview', 1000, 100), row40(T0 + 600000, 'hy4-preview', 500, 50)].join('\n') + '\n');
+    fs.writeFileSync(path.join(P40, 's3', 'subagents', 'agent-d.jsonl'),
+      [row40(T0 + 300000, 'hy3', 400, 40), row40(T0 + 305000, 'hy3', 300, 30)].join('\n') + '\n');
+    const parts40c = mod40.splitByModelStats(mod40.aggregateTranscript(tp40c, 0));
+    const hy3Part = parts40c.find((p) => p.model === 'hy3');
+    const mainPart40 = parts40c.find((p) => p.model === 'hy4-preview');
+    ok('T40-b11 ★分条耗时 = 该模型桶自己的跨度（主 10min / 子 5s，不再照抄整轮）',
+      !!hy3Part && hy3Part.stat.durMs === 5000 && !!mainPart40 && mainPart40.stat.durMs === 600000,
+      hy3Part ? `hy3 条 durMs=${hy3Part.stat.durMs}（期望 5000）；主条 durMs=${mainPart40 && mainPart40.stat.durMs}（期望 600000）` : '拿不到 hy3 条');
+    // b12：并行子代理**不累加** —— 2 个 hy3 分别 4.0s / 6.9s（首尾重叠）→ 桶跨度应是 6.9s 而非 10.9s
+    fs.mkdirSync(path.join(P40, 's4', 'subagents'), { recursive: true });
+    const tp40d = path.join(P40, 's4.jsonl');
+    fs.writeFileSync(tp40d, [row40(T0, 'hy4-preview', 1000, 100), row40(T0 + 600000, 'hy4-preview', 500, 50)].join('\n') + '\n');
+    fs.writeFileSync(path.join(P40, 's4', 'subagents', 'agent-e.jsonl'),
+      [row40(T0 + 300000, 'hy3', 400, 40), row40(T0 + 304000, 'hy3', 300, 30)].join('\n') + '\n');
+    fs.writeFileSync(path.join(P40, 's4', 'subagents', 'agent-f.jsonl'),
+      [row40(T0 + 301000, 'hy3', 350, 35), row40(T0 + 306900, 'hy3', 250, 25)].join('\n') + '\n');
+    const parts40d = mod40.splitByModelStats(mod40.aggregateTranscript(tp40d, 0));
+    const hy3Part2 = parts40d.find((p) => p.model === 'hy3');
+    ok('T40-b12 ★并行子代理耗时不累加（2 个并行 4.0s+6.9s → 显示 6.9s，不是 10.9s）',
+      !!hy3Part2 && hy3Part2.stat.durMs === 6900,
+      hy3Part2 ? `durMs=${hy3Part2.stat.durMs}（期望 6900 = 墙钟跨度；累加会是 10900）` : '拿不到 hy3 条');
   }
   // c 组（端到端，需 spawn）：kill watcher 后 15s 内新 watcher 接管 —— 沙箱 SPAWN_OK=false 时跳过，CI 真跑。
   if (!SPAWN_OK) {
