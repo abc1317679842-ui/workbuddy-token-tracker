@@ -153,6 +153,73 @@ b2 心跳新鲜+pid活→alive / b3 心跳过期→stale / b4 无 hb→stale / b
 若将来要统一，正确做法是让 `acquireWatchLock` 也复用 `classifyWatchLock`，且必须重新论证 PID 复用风险
 （心跳新鲜是强证据，叠加 pid 复核反而引入它本想避开的敞口）。**2026-10-10 评估：不修。**
 
+## KI-13 弹窗悬空第二触发点：spawn 后轮询只看锁 mtime（2026-10-09 发现）—— **v3.43.0 已修（方案 α）**
+
+> 现场：2026-10-09 事故 3。用户报告"轮次 04:25 结束，弹窗 04:26:58 才来，**延迟 1 分多钟**"。
+> **修复状态**：v3.43.0（2026-10-10）按方案 α 修复，守卫 selftest T49（b1 红线 + b5 源码级，已反向验证）。
+
+### 现象
+
+- 轮次结束（20:25:47.862）→ Stop 结算 → `startWatcherVerified` spawn watcher。
+- watcher 建锁成功（20:25:48.368，pid **24868**）→ **该 pid 之后再无任何日志**；锁 `at` 从未被
+  `touchWatchLock` 刷新（每 3s 应刷一次）→ 现查 pid 24868 **已 ESRCH**（秒死）。
+- 轮询 1.5s 内看到 `lockF.mtimeMs > lockBefore`（锁确实被新建）→ **误判"已接管" → `return true`**
+  → `stop-handler.js` 不降级 → **弹窗悬空**，直到 20:26:58.438 用户发下一条消息由 hook-fallback 补弹
+  （**悬空 ~70s**）。
+
+### 缺陷定位
+
+`startWatcherVerified()` 的 1.5s 轮询分支判据**只有锁 mtime**、**不复核持有者 pid**：
+```js
+if (fs.existsSync(lockF) && fs.statSync(lockF).mtimeMs > lockBefore) return true; // 锁新 → 认定接管
+```
+watcher 建完锁立刻死时，mtime 确实变新 → 误判接管。
+
+### 与 KI-12 的关系：同一病根族的两个触发点
+
+| 条目 | 触发时机 | 误判判据 | 已修于 |
+|---|---|---|---|
+| KI-12 | **后续** Stop 读锁判活 | 心跳新鲜但**不复核 pid** | v3.42.1（`classifyWatchLock` 读侧） |
+| KI-13 | **本次** Stop spawn 后轮询 | 锁 mtime 变新但**不复核 pid** | v3.43.0（轮询分支复用 `classifyWatchLock`） |
+
+两者共用 v3.42.1 抽出的三态纯判定 `classifyWatchLock`。
+
+### watcher 秒死根因（非本技能 bug，属宿主生命周期 —— 方案 α 不试图解决）
+
+WorkBuddy 客户端用 **Job Object** 管理进程树；Stop hook = 一回合结束的信号 → 客户端回收该回合 Job →
+**连带杀掉** hook 派生的 `--flush-delayed` 子进程。`detached:true` 在 Windows Job 下**挡不住**
+（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 会连 detach 子进程一起杀）。
+
+沙箱复现（3 组，**全部正常不秒死**，反证"非代码 bug"）：
+| 复现方式 | 结果 |
+|---|---|
+| 前台直跑 `--flush-delayed` 真实 sid | 正常运行到弹窗收口 |
+| 真实 15.7MB transcript 夹具 | 正常运行 |
+| 复刻 detached spawn + 父进程立即退出 | 存活到 6s 内自己收口 |
+
+对照：`--round-watch`（由 UserPromptSubmit hook 派生，那一刻用户正在发消息、Job 不回收）**至今存活**。
+故 α 只修"误判"这一个洞，**不**试图让 watcher 长生（那是 β/γ 的范畴）。
+
+### 修复（v3.43.0，方案 α）
+
+轮询分支里，锁 mtime 变新后**必须再过 `classifyWatchLock(sid, Date.now())`**，只认 `'alive'` 才
+`return true`；`'dead'`（锁新但 pid 死）或 `'stale'` 一律不认，继续轮询，耗尽 1.5s 后 `return false`
+→ 调用方按既定逻辑**降级为同步弹窗**（与 KI-12 同一条降级路径）。
+
+**未改动**：`spawnFlushWatcher`（spawn 方式未改）、watcher 主循环、`touchWatchLock` 写心跳、
+`acquireWatchLock` 抢锁语义全部未动，只改"轮询判活"这一个分支。**零账本影响**。
+
+守卫：selftest **T49**（5 条：b1 ★★红线「锁新但持有者 pid 死 → 必须 false」/ b2 正常接管不回归 /
+b3 无锁仍 false / b4 KI-12 路径不回归 / b5 ★源码级「mtime 判据后紧跟 classifyWatchLock」）。
+**反向验证**：隔离副本上把轮询回退为纯 mtime 判据 → **T49-b1 与 b5 变红**，b2/b3/b4 保持绿（不误伤）。
+
+### 未采纳候选（记录以备将来）
+
+- **β（治本）**：Stop 端**同步弹一次**（不等 watcher），watcher 退化为"后续有新增时再补"——可让弹窗时效与
+  watcher 死活**完全解耦**，但需重排 Stop 结算时序、改动面涉及账本主路径。本次经用户选择先用 α。
+- **γ**：换不受宿主 Job 管理的 spawn 方式（脱离进程组）——沙箱无法验证，且受红线限制（禁提权/禁 LOLBin），
+  宿主 Job 语义不可控，**风险高**。
+
 ---
 
 ## KI-11 第五轮（plan-B）剩余项 —— v3.42.0 登记，**已知、暂不修**

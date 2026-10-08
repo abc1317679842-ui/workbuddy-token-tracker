@@ -4039,6 +4039,102 @@ else {
   if (savedEnv48 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv48;
 }
 
+// ===== T49（v3.43.0 / KI-13 方案 α）：startWatcherVerified 轮询必须复核"新锁持有者 pid 仍存活" =====
+//   病根（2026-10-09 实测，事故 3：弹窗悬空 ~70s）：`startWatcherVerified` spawn 后的 1.5s 轮询
+//   **只看 `lockF.mtimeMs > lockBefore`**，不看新锁的 pid 死活。watcher 建完锁立刻被宿主 Job Object
+//   连带杀（Stop = 回合结束信号 → 客户端回收 Job；detached 在 Windows Job 下挡不住）→ mtime 确实新了
+//   → 误判"已接管" → return true → 调用方不降级 → 弹窗一直悬空到用户发下一条消息由 hook-fallback 补弹。
+//   与 T48（KI-12，读侧 classifyWatchLock）是**同一病根族的另一个触发点**。
+//   修法（方案 α）：轮询分支里，锁 mtime 变新后**必须再过 classifyWatchLock**，只认 'alive'。
+//   本组用 monkey-patch child_process.spawn 造"假 watcher"（不真起子进程），模拟三种落锁结局。
+{
+  const savedEnv49 = process.env.WB_ROOT;
+  process.env.WB_ROOT = tmp;
+  let tt49 = null;
+  try { tt49 = require(path.join(skillDir, 'token-tracker.js')); } catch (e) { tt49 = null; }
+  if (!tt49 || typeof tt49.startWatcherVerified !== 'function' || typeof tt49.coalescePath !== 'function') {
+    ok('T49 模块加载（需要 startWatcherVerified / coalescePath 导出）', false, '缺少导出');
+  } else {
+    const fs4 = require('fs');
+    const cp4 = require('child_process');
+    // 找一个确认死亡的 pid（ESRCH）——本机沙箱内 process.kill 对其他进程可能恒 ESRCH，故优先真实探测，
+    // 探不到也无妨：classifyWatchLock 对"pid 不存在"一律返回 dead，语义一致。
+    let deadPid4 = 987654;
+    for (let probe = 990000; probe < 999999; probe++) {
+      try { process.kill(probe, 0); }
+      catch (e) { if (e.code === 'ESRCH') { deadPid4 = probe; break; } }
+    }
+    const mkSid4 = (tag) => 'tt49-' + tag + '-' + process.pid + '-' + Date.now() + '-' + Math.floor(Math.random() * 1e6);
+
+    // 通用：patch child_process.spawn → 假 child（on/unref 空实现），并在 spawn 被调用时按 mode 落锁。
+    //   mode='die'   → 写 pid=deadPid4 的锁（心跳新鲜）——**事故 3 现场**：建锁后立刻死。
+    //   mode='alive' → 写 pid=process.pid 的锁（心跳新鲜）——正常接管。
+    //   mode='nolock'→ 什么也不写——spawn 无声失败 / watcher 没起来。
+    const runCase = (mode, sid) => {
+      const lockF4 = tt49.coalescePath(sid) + '.lock';
+      const origSpawn4 = cp4.spawn;
+      cp4.spawn = function fakeSpawn() {
+        // 模拟"watcher 启动后第一件事就是抢锁"，但落锁 pid 按 mode 决定
+        try {
+          if (mode === 'die') {
+            fs4.writeFileSync(lockF4, JSON.stringify({ at: Date.now(), pid: deadPid4, hb: 1 }));
+          } else if (mode === 'alive') {
+            fs4.writeFileSync(lockF4, JSON.stringify({ at: Date.now(), pid: process.pid, hb: 1 }));
+          }
+        } catch (e) { /* 落锁失败按 nolock 语义处理 */ }
+        return { on() {}, unref() {} };
+      };
+      try { return tt49.startWatcherVerified(sid); }
+      finally { cp4.spawn = origSpawn4; try { fs4.unlinkSync(lockF4); } catch (e) { /* silent-ok:清理 */ } }
+    };
+
+    try {
+      // b1 ★★红线：锁 mtime 变新但持有者 pid 已死 → 必须 false（旧实现只看 mtime → 误判 true → 弹窗悬空）
+      {
+        const sid1 = mkSid4('b1');
+        const r1 = runCase('die', sid1);
+        ok('T49-b1 ★★锁新但持有者 pid 已死 → false（不得 true，否则弹窗悬空）',
+          r1 === false, `got ${r1}（旧实现返回 true → 悬空 ~70s 直到下一条消息）`);
+      }
+      // b2：锁 mtime 变新且持有者 pid 存活 → true（正常接管语义不回归）
+      {
+        const sid2 = mkSid4('b2');
+        const r2 = runCase('alive', sid2);
+        ok('T49-b2 锁新且持有者 pid 存活 → true（正常接管不回归）', r2 === true, `got ${r2}`);
+      }
+      // b3：spawn 后根本没落锁（watcher 没起来）→ false（原有 spawn 失败降级语义不变）
+      {
+        const sid3 = mkSid4('b3');
+        const r3 = runCase('nolock', sid3);
+        ok('T49-b3 spawn 后无锁（watcher 未起）→ false（原降级语义不变）', r3 === false, `got ${r3}`);
+      }
+      // b4：不 spawn 即已有存活 watcher 持新鲜锁（T48/KI-12 路径）→ 直接 true，不回归
+      {
+        const sid4 = mkSid4('b4');
+        const lockF4b = tt49.coalescePath(sid4) + '.lock';
+        try {
+          fs4.writeFileSync(lockF4b, JSON.stringify({ at: Date.now(), pid: process.pid, hb: 1 }));
+          const r4 = tt49.startWatcherVerified(sid4); // 未 patch spawn：若判活分支失效会真 spawn（无锁定 → 1.5s 后 false）
+          ok('T49-b4 已有存活 watcher 持新鲜锁 → true（KI-12 路径不回归）', r4 === true, `got ${r4}`);
+        } catch (e) { ok('T49-b4 已有存活 watcher → true', false, e.message); }
+        finally { try { fs4.unlinkSync(lockF4b); } catch (e) { /* silent-ok:清理 */ } }
+      }
+      // b5 ★源码级兜底：轮询块内 mtime 判据之后必须紧跟 classifyWatchLock 复核（防空转成"只看 mtime"）
+      {
+        const src4 = fs4.readFileSync(path.join(skillDir, 'token-tracker.js'), 'utf-8');
+        const m = src4.match(/for \(let i = 0; i < 10; i\+\+\)[\s\S]{0,900}?return false;\s*\n\}/);
+        const blk = m ? m[0] : '';
+        ok('T49-b5★(源码级) 轮询块内 mtime 判据后紧跟 classifyWatchLock 复核',
+          /mtimeMs > lockBefore[\s\S]{0,300}classifyWatchLock\(sid/.test(blk),
+          '未在 mtime 判据后找到 classifyWatchLock 复核');
+      }
+    } catch (e) {
+      ok('T49 组异常', false, (e && e.message) || String(e));
+    }
+  }
+  if (savedEnv49 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv49;
+}
+
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。
 //   为什么需要：主脚本在被 require 时会跑 loadPricing → maybeRefreshHolidays（每进程一次、四条件命中即
 //   **detach** spawn 一个 refresh-holidays.js 子进程并往 SNAP_DIR 写 `.holidays-refresh.json`）。该子进程

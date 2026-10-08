@@ -39,10 +39,8 @@ type: skill
 
 ## 当前功能总览（版本以 manifest.yaml 为准）
 
+> **v3.43.0 要点（2026-10-10）：修 KI-13「弹窗悬空」第二触发点——spawn 后轮询接管判定必须复核 pid（锁 mtime 变新 ≠ watcher 还活着）。** `startWatcherVerified` 的 1.5s 轮询**只看 `lockF.mtimeMs > lockBefore`**；watcher 建完锁立刻被宿主 Job Object 连带杀（Stop = 回合结束信号 → 客户端回收 Job；`detached` 在 Windows Job 下挡不住）→ mtime 确实新了 → 误判"已接管" → 调用方不降级 → **弹窗悬空 ~70s**（直到用户发下一条消息由 hook-fallback 补弹）。修法（方案 α）：轮询里锁 mtime 变新后**必须再过 `classifyWatchLock`**，只认 `'alive'` 才返回 true，否则耗尽 1.5s 后返回 false 走降级弹窗。守卫 T49（b1 红线 + b5 源码级）。零账本影响。
 > **v3.42.1 要点（2026-10-10）：修 KI-12「弹窗悬空」——watcher 判活必须复核 pid（心跳新鲜 ≠ 还活着）。** `startWatcherVerified` 原判活只看心跳年龄 <15s；watcher 崩溃与末次心跳间隔很短时（实测 ~1s）会误判"已接管" → 调用方不降级 → **弹窗悬空**（实测 8 分钟）。修法：纯判定 `classifyWatchLock` 三态（alive/dead/stale），**心跳新鲜且 pid 存活**才认定接管，pid 死则删锁降级。守卫 T48（b1 红线）。零账本影响。
-> **v3.42.0 要点（2026-10-10）：区间端点加日历校验 + 末尾残行不再丢 + 导出清理不误删；技术债收敛（根探测 ×4 / 计价公式 ×3 收成单点）。**
-> ① **A17**：`2026-13-45..` 这类"格式对、日期不存在"的区间端点**显式报错**（原来被静默扩成"全部历史"）；`isRealDateStr` 日历级判定。② **A19**：transcript 末尾**无换行**的完整行不再永久丢弃（`totalLines` 同步 +1，防下一轮重复计费）。③ **A23**：`pruneExports` 只删自家 `report-<label>-YYYYMMDD-HHMMSS.csv`，不再误删用户放进 `exports/` 的文件。④ **B1**：`detectWorkBuddyRoot` ×4 → 新模块 `wb-root.js`；三项计价公式 ×3 → `triPrice`/`triPriceRounded`（**数值逐行比对完全相同**，`calcCost` 分桶路径未动）。A18（stdin 死等）经评估**不修**，理由见 KNOWN-ISSUES KI-11。
-> **逐版细节、动机、取舍一律查 `CHANGELOG.md`** —— 本文件不再堆版本要点；上面若与旧说法冲突，**以本条为准**。
 > **逐版细节、动机、取舍一律查 `CHANGELOG.md`** —— 本文件不再堆版本要点；上面若与旧说法冲突，**以本条为准**。
 
 > **⚠️ 强制（查询触发总纲）：所有统计查询必须调用 `--report` 命令并原样贴出脚本输出，禁止自行解析 JSON。** 无论用户问「今日消耗」「今天用了多少」「账本」「报告」「统计」「花费」还是历史某天，一律先跑 `node token-tracker.js --report`（或 `--report <日期>`），再把脚本打印的 Markdown 表格原文贴给用户；不得自行读取 `daily-usage.json`、不得自行汇总、不得转成列表/纯文本/代码块。详细规则见下方「查询触发规则（强制）」与「展示格式约束（强制）」。

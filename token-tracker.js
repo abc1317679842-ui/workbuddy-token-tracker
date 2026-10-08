@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.42.1 (2026-10-10)
+// token-usage-tracker v3.43.0 (2026-10-10)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -308,6 +308,7 @@ function spawnFlushWatcher(sid) {
 //   判据：watcher 启动后第一件事就是抢锁（coalescePath(sid) + '.lock'），锁文件 mtime 会新于启动时刻。
 //   原实现 spawn 后**不校验**，spawn 异步失败时调用方毫不知情 → 弹窗静默消失（本次故障根因）。
 //   返回 true = watcher 已接管（弹窗由它负责）；false = 未起来，**调用方必须降级为同步弹窗**。
+// v3.43.0（KI-13 方案 α）：轮询分支补 pid 复核 —— mtime 变新 + **新锁 pid 仍存活** 才算接管（见函数内注释）。
 // v3.42.1（KI-12 方案 A）：心跳锁"是否仍应被认定为有效持有者"的**纯判定**（无副作用、可单测）。
 //   返回 'alive'  = 心跳新鲜 且 pid 仍存活 → 真持有者，调用方应认定"已接管"。
 //        'dead'   = 心跳新鲜 但 pid 已死（watcher 刚崩、心跳未过期）→ **必须降级**（否则弹窗悬空）。
@@ -349,10 +350,23 @@ function startWatcherVerified(sid) {
     if (verdict === 'dead') { try { fs.unlinkSync(lockF); } catch (e) { /* 死锁清理失败不阻塞 */ } }
   } catch (e) { /* 锁不可读 → 走下方 spawn 判定 */ }
   spawnFlushWatcher(sid);
+  // v3.43.0（KI-13 方案 α）：**锁 mtime 变新只是必要条件**，必须再复核"新锁的持有者 pid 仍存活"。
+  //   病根（2026-10-09 实测，事故 3：弹窗悬空 ~70s）：watcher 建完锁立刻被宿主 Job Object 连带杀
+  //   （Stop = 回合结束信号 → 客户端回收 Job → 连带杀 detached 子进程；detached 在 Windows Job 下挡不住），
+  //   而这里只看 `lockF.mtimeMs > lockBefore` → 锁确实新了 → 误判"已接管" → return true →
+  //   调用方不降级 → 弹窗一直悬空到用户发下一条消息由 hook-fallback 补弹。
+  //   与 KI-12（v3.42.1，读侧 classifyWatchLock）是**同一病根族的另一个触发点**：
+  //     那边是"后续 Stop 读锁时心跳新鲜但不复核 pid"，这边是"本次 Stop 轮询时 mtime 变新但不复核 pid"。
   for (let i = 0; i < 10; i++) {                 // 最多约 1.5s（10 × 150ms）
     if (lastWatcherSpawnError) return false;     // 已收到异步 error → 立即判定失败，不空等
     try {
-      if (fs.existsSync(lockF) && fs.statSync(lockF).mtimeMs > lockBefore) return true; // 锁被新建/更新 → watcher 已接管
+      if (fs.existsSync(lockF) && fs.statSync(lockF).mtimeMs > lockBefore) {
+        // 锁已被新建/更新：只有持有者 pid 仍存活才算"真接管"；pid 已死（宿主连带杀）→ 继续轮询，
+        // 耗尽 1.5s 后返回 false → 调用方按既定逻辑降级为同步弹窗（与 KI-12 同一条降级路径）。
+        const verdict = classifyWatchLock(sid, Date.now());
+        if (verdict === 'alive') return true;
+        // verdict 为 'dead'（锁新但 pid 死）或 'stale'（锁已被删/心跳过期）→ 不认，继续等
+      }
     } catch (e) { /* 读取瞬时失败：下一轮重试 */ }
     try { syncSleepMs(150); } catch (e) { /* sleep 150ms（v3.18：原 ping.exe 模拟，改 Atomics.wait） */ }
   }
@@ -5817,7 +5831,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.42.1'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.43.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -6994,4 +7008,7 @@ module.exports = {
   SKILL_VERSION, UPDATE_CHECK_FILE, UPDATE_INTERVAL_MS, UPDATE_MAX_NOTIFY, UPDATE_NOTIFY_GAP_MS, HOOK_IDLE_MS,
   // v3.34.0（A2）：exports/ 清理导出——与 pruneRoundFiles 同款，selftest 直接单测保留期与目录边界。
   pruneExports, EXPORTS_KEEP_DAYS,
+  // v3.43.0（KI-13 方案 α）：watcher 接管判定导出——selftest 可 monkey-patch child_process.spawn 后
+  //   直接单测「锁 mtime 变新但持有者 pid 已死 → 必须返回 false（降级弹窗）」，不必真 spawn 子进程。
+  startWatcherVerified, spawnFlushWatcher,
 };
