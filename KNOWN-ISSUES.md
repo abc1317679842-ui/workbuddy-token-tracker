@@ -95,6 +95,53 @@
 - **为什么不加去重键**：`roundStart` 本身在压缩场景下不稳定，用 `(sid, roundStart)` 做键等于拿一个会漂移的量做键；用 `(sid, in/out/total)` 做键则会把"两次量恰好相同"的合法轮误并。可靠的键需要先让轮次边界本身稳定（属 P4 重构范围），当前不动。
 - **缓解**：README 措辞已改为如实描述（"每轮落一条；同一轮若因压缩被拆成多次写入会落多条，金额之和仍等于该轮总量"）。
 
+## KI-12 弹窗悬空：watcher 死亡竞态窗口（2026-10-09 发现）—— **v3.42.1 已修（方案 A）**
+
+> 现场：2026-10-09 03:35~03:57，用户报告"3:49 结束、3:57 才弹窗 + ⚠账缺"。
+> 完整根因见当时的分析；此处留档条目本身。
+> **修复状态**：v3.42.1（2026-10-10）按方案 A 修复，守卫 selftest T48（b1 红线已反向验证）。
+
+### 现象
+
+- 轮次A（03:35:32~03:43:36，专家团：2 次 Agent 调用）→ Stop 写 coalesce + 启动 watcher（pid=15692）。
+- 轮次A **已正确入账**（`in=6879687` == trace `totalInputTokens`），无漏账。
+- watcher 在 **03:49:37 死亡**（pid 已不存在），最后心跳停在 03:49:37。
+- **03:49:38 轮次B 的 Stop** 调 `startWatcherVerified` → 读锁发现心跳距今 **~1000ms < 15000ms**
+  → **误判 owner 存活 → `return true`** → 调用方认为"watcher 会弹" → **不降级、不弹窗**。
+- 结果：**弹窗悬空 8 分钟**，直到 03:57 用户发消息触发 `--hook` 的 hook-fallback 才补弹。
+
+### 缺陷定位
+
+`startWatcherVerified()` 的心跳判活分支**只看心跳年龄、不复核 pid**：
+```js
+if (lo && lo.hb === 1 && Number.isFinite(Number(lo.at)) && (Date.now() - Number(lo.at)) < 15000) return true;
+```
+`WATCH_LOCK_HB_MS = 15s` 与"watcher 死亡瞬间"之间存在**竞态窗口**：owner 刚死、心跳还没过 15s 时，
+新 Stop 会误判其存活。本案恰好只差 1 秒。
+
+**与 v3.42.0 无关**（`WATCH_LOCK_HB_MS` 心跳判活是 v3.38.0 引入；A19/A17/A23/B1 均不改此路径）。
+
+### 修复（v3.42.1，方案 A）
+
+抽出**纯判定** `classifyWatchLock(sid, nowMs, pidAlive)`，三态：
+| 返回 | 条件 | 调用方行为 |
+|---|---|---|
+| `'alive'` | 心跳新鲜 **且** pid 存活 | 认定已接管（`return true`，不弹窗） |
+| `'dead'` | 心跳新鲜 **但** pid 已死 | **删死锁 → 走 spawn 判定**（调用方据此降级弹窗） |
+| `'stale'` | 心跳过期 / 无 hb / 锁不存在 / 解析失败 | 走 spawn 判定 |
+
+pid 探活用 `process.kill(pid, 0)`：`EPERM`（存在但无权限）视为存活、`ESRCH`（无此进程）视为已死。
+**PID 复用风险**：仅作二次确认（非唯一判据），且 pid 死即删锁，风险可控。
+
+**未改动**：watcher 主循环、`touchWatchLock` 写心跳、`acquireWatchLock` 抢锁语义全部未动，
+只改"判活"这一个读侧分支。**零账本影响**（不碰 token / 金额 / 水位线）。
+
+守卫：selftest **T48**（7 条：b0 无锁→stale / **b1 红线** 心跳新鲜+pid死→dead /
+b2 心跳新鲜+pid活→alive / b3 心跳过期→stale / b4 无 hb→stale / b5 非法 JSON→stale / b6 真实 pid 探活）。
+**反向验证**：隔离副本上把判定回退为"恒 alive（纯心跳）" → **T48-b1 变红**（`got alive`），确认守卫有效。
+
+---
+
 ## KI-11 第五轮（plan-B）剩余项 —— v3.42.0 登记，**已知、暂不修**
 
 > 登记口径：**审计口径已由用户于 2026-10-09 校正** —— **真实 token 消耗是硬账**（必须绝对准、可复算、

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.42.0 (2026-10-10)
+// token-usage-tracker v3.42.1 (2026-10-10)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -308,6 +308,30 @@ function spawnFlushWatcher(sid) {
 //   判据：watcher 启动后第一件事就是抢锁（coalescePath(sid) + '.lock'），锁文件 mtime 会新于启动时刻。
 //   原实现 spawn 后**不校验**，spawn 异步失败时调用方毫不知情 → 弹窗静默消失（本次故障根因）。
 //   返回 true = watcher 已接管（弹窗由它负责）；false = 未起来，**调用方必须降级为同步弹窗**。
+// v3.42.1（KI-12 方案 A）：心跳锁"是否仍应被认定为有效持有者"的**纯判定**（无副作用、可单测）。
+//   返回 'alive'  = 心跳新鲜 且 pid 仍存活 → 真持有者，调用方应认定"已接管"。
+//        'dead'   = 心跳新鲜 但 pid 已死（watcher 刚崩、心跳未过期）→ **必须降级**（否则弹窗悬空）。
+//        'stale'  = 心跳过期 / 无 hb 标记 / 锁不存在 / 解析失败 → 走 spawn 判定。
+//   缺陷复现（2026-10-09 实测）：纯心跳判活会在 'dead' 场景误判 alive → 弹窗悬空 8 分钟。
+//   pidAlive 注入式（默认走 process.kill(pid,0)），便于测试构造"心跳新鲜 + pid 已死"。
+function classifyWatchLock(sid, nowMs, pidAlive) {
+  const lockF = coalescePath(sid) + '.lock';
+  let lo = null;
+  try {
+    if (!fs.existsSync(lockF)) return 'stale';
+    lo = JSON.parse(fs.readFileSync(lockF, 'utf-8'));
+  } catch (e) { return 'stale'; }
+  if (!lo || lo.hb !== 1 || !Number.isFinite(Number(lo.at))) return 'stale';
+  if ((Number(nowMs) - Number(lo.at)) >= 15000) return 'stale';
+  const pid = Number(lo.pid);
+  const alive = (typeof pidAlive === 'function') ? !!pidAlive(pid)
+    : (function () {
+        if (!Number.isFinite(pid) || pid <= 0) return false;
+        try { process.kill(pid, 0); return true; }
+        catch (e) { return !!(e && e.code === 'EPERM'); }   // EPERM = 存在但无权限 → 存活；ESRCH = 已死
+      })();
+  return alive ? 'alive' : 'dead';
+}
 function startWatcherVerified(sid) {
   let cp = null;
   try { cp = require('child_process'); } catch (e) { return false; }
@@ -317,11 +341,12 @@ function startWatcherVerified(sid) {
   // v3.38.0（C3②）：**已有 watcher 且心跳新鲜 → 直接判定"已接管"**，不必再 spawn 一个。
   //   旧逻辑只看"spawn 后锁 mtime 是否变化"：若已有 watcher 持有心跳锁，新 spawn 的那个拿不到锁、
   //   也不会刷新 mtime → 1.5s 后误判"启动失败"，白跑一次降级分支。心跳锁让"谁在跑"变得可直接读取。
+  // v3.42.1（KI-12 方案 A）：**心跳新鲜只是必要条件**，必须再复核 pid 存活——见 classifyWatchLock。
+  //   实测 watcher 死亡 → 下一轮 Stop 间隔仅 ~1s（<15s 阈值）时，纯心跳判活误判接管 → 弹窗悬空 8 分钟。
   try {
-    if (fs.existsSync(lockF)) {
-      const lo = JSON.parse(fs.readFileSync(lockF, 'utf-8'));
-      if (lo && lo.hb === 1 && Number.isFinite(Number(lo.at)) && (Date.now() - Number(lo.at)) < 15000) return true;
-    }
+    const verdict = classifyWatchLock(sid, Date.now());
+    if (verdict === 'alive') return true;
+    if (verdict === 'dead') { try { fs.unlinkSync(lockF); } catch (e) { /* 死锁清理失败不阻塞 */ } }
   } catch (e) { /* 锁不可读 → 走下方 spawn 判定 */ }
   spawnFlushWatcher(sid);
   for (let i = 0; i < 10; i++) {                 // 最多约 1.5s（10 × 150ms）
@@ -5792,7 +5817,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.42.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.42.1'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -6917,7 +6942,7 @@ function main() {
 if (require.main === module) main();
 module.exports = {
   todayStr, dateStrOfTs, loadDailyUsage, saveDailyUsage, recordUsage, dayTotalOf, hitRate,
-  calcCost, triPrice, triPriceRounded, findModel, isLocalModel, fmtCost, cleanModelName,
+  calcCost, triPrice, triPriceRounded, classifyWatchLock, findModel, isLocalModel, fmtCost, cleanModelName,
   readTranscLines, parseTranscChunk, readTranscLinesFrom, extractUsage, perModelFromRows, aggregatePerModel,
   aggregateMainOnly, aggregateSubsOnly, aggregateTranscript,
   todayDisplay, reportTxt, reportSummaryTxt, normalizeDailyUsage,

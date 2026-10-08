@@ -3917,6 +3917,128 @@ else {
   if (savedEnv47 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv47;
 }
 
+// ===== T48（v3.42.1 / KI-12）：watcher 心跳锁判活必须复核 pid，防「弹窗悬空」 =====
+//   病根：`startWatcherVerified` 原判活逻辑**只看心跳年龄 < 15s**。watcher 崩溃瞬间与最后心跳间隔
+//   很短（2026-10-09 实测仅 ~1s）时，下一轮 Stop 读锁 → 误判"已接管" → 调用方不降级、不弹窗
+//   → **弹窗悬空**（实测悬空 8 分钟，直到用户发下一条消息触发 hook-fallback 才补弹）。
+//   修法（方案 A）：心跳新鲜 **且** pid 仍存活才认定接管；pid 已死则删锁走 spawn 判定。
+//   本组钉住 classifyWatchLock 的三态判定 + 关键红线（b1：心跳新鲜+pid死 → 必须 'dead'，不得 'alive'）。
+{
+  const savedEnv48 = process.env.WB_ROOT;
+  process.env.WB_ROOT = tmp;
+  let tt48 = null;
+  try { tt48 = require(path.join(skillDir, 'token-tracker.js')); } catch (e) { tt48 = null; }
+  if (!tt48 || typeof tt48.classifyWatchLock !== 'function') {
+    ok('T48 模块加载（需要 classifyWatchLock 导出）', false, '缺少导出');
+  } else {
+    const fs3 = require('fs'), os3 = require('os');
+    const C = tt48.classifyWatchLock;
+    // classifyWatchLock 内部自行拼 coalescePath(sid)+'.lock'；coalescePath 已导出，直接构造锁路径。
+    const mkSid = () => 'tt48-' + process.pid + '-' + Date.now() + '-' + Math.floor(Math.random() * 1e6);
+    try {
+      if (typeof tt48.coalescePath !== 'function') {
+        // 兜底：coalescePath 未导出 → 退化为源码级守卫
+        const src = fs3.readFileSync(path.join(skillDir, 'token-tracker.js'), 'utf-8');
+        ok('T48-b1★(源码级) classifyWatchLock 含 pid 存活复核（process.kill(pid, 0)）',
+          /process\.kill\(pid,\s*0\)/.test(src), '未找到 pid 探活');
+        ok('T48-b2★(源码级) 存在 alive/dead 三态返回',
+          /return\s+alive\s*\?\s*'alive'\s*:\s*'dead'/.test(src), '未找到 alive/dead 三态返回');
+      } else {
+      // 找一个确认死亡的 pid（ESRCH）
+      let deadPid = null;
+      for (let probe = 990000; probe < 999999; probe++) {
+        try { process.kill(probe, 0); }
+        catch (e) { if (e.code === 'ESRCH') { deadPid = probe; break; } }
+      }
+      if (!deadPid) deadPid = 987654; // 极端兜底；b1 用注入 pidAlive 明确构造，不依赖真实存活
+
+      // b0：无锁 → 'stale'
+      {
+        const sid0 = mkSid();
+        const v0 = C(sid0, Date.now());
+        ok('T48-b0 无锁文件 → "stale"（走 spawn 判定）', v0 === 'stale', `got ${v0}`);
+      }
+
+      // b1 ★红线：心跳新鲜 + pid 已死 → 必须 'dead'（旧实现纯心跳 → 误判 alive → 弹窗悬空 8 分钟）
+      {
+        const sid1 = mkSid();
+        const lp1 = tt48.coalescePath(sid1) + '.lock';
+        try {
+          fs3.writeFileSync(lp1, JSON.stringify({ at: Date.now(), pid: deadPid, hb: 1 }));
+          const v1 = C(sid1, Date.now(), () => false); // 注入"pid 已死"
+          ok('T48-b1 ★★心跳新鲜+pid已死 → "dead"（不得 "alive"，否则弹窗悬空）',
+            v1 === 'dead', `got ${v1}（旧实现返回 alive → 悬空）`);
+        } catch (e) { ok('T48-b1 ★★心跳新鲜+pid已死 → "dead"', false, e.message); }
+        finally { try { fs3.unlinkSync(lp1); } catch (e) { /* silent-ok:清理 */ } }
+      }
+
+      // b2：心跳新鲜 + pid 存活 → 'alive'（正常接管语义不变）
+      {
+        const sid2 = mkSid();
+        const lp2 = tt48.coalescePath(sid2) + '.lock';
+        try {
+          fs3.writeFileSync(lp2, JSON.stringify({ at: Date.now(), pid: process.pid, hb: 1 }));
+          const v2 = C(sid2, Date.now(), () => true);
+          ok('T48-b2 心跳新鲜+pid存活 → "alive"（正常接管语义不变）', v2 === 'alive', `got ${v2}`);
+        } catch (e) { ok('T48-b2 心跳新鲜+pid存活 → "alive"', false, e.message); }
+        finally { try { fs3.unlinkSync(lp2); } catch (e) { /* silent-ok:清理 */ } }
+      }
+
+      // b3：心跳过期（>15s）→ 'stale'（年龄闸门优先）
+      {
+        const sid3 = mkSid();
+        const lp3 = tt48.coalescePath(sid3) + '.lock';
+        try {
+          fs3.writeFileSync(lp3, JSON.stringify({ at: Date.now() - 20000, pid: process.pid, hb: 1 }));
+          const v3 = C(sid3, Date.now(), () => true);
+          ok('T48-b3 心跳过期(>15s) → "stale"（不因 pid 存活而误认接管）', v3 === 'stale', `got ${v3}`);
+        } catch (e) { ok('T48-b3 心跳过期 → "stale"', false, e.message); }
+        finally { try { fs3.unlinkSync(lp3); } catch (e) { /* silent-ok:清理 */ } }
+      }
+
+      // b4：缺 hb 标记（旧版锁 / 非 watcher 锁）→ 'stale'
+      {
+        const sid4 = mkSid();
+        const lp4 = tt48.coalescePath(sid4) + '.lock';
+        try {
+          fs3.writeFileSync(lp4, JSON.stringify({ at: Date.now(), pid: process.pid }));
+          const v4 = C(sid4, Date.now(), () => true);
+          ok('T48-b4 无 hb 标记 → "stale"（非 watcher 心跳锁不参与判活）', v4 === 'stale', `got ${v4}`);
+        } catch (e) { ok('T48-b4 无 hb 标记 → "stale"', false, e.message); }
+        finally { try { fs3.unlinkSync(lp4); } catch (e) { /* silent-ok:清理 */ } }
+      }
+
+      // b5：锁内容非法 JSON → 'stale'（不抛）
+      {
+        const sid5 = mkSid();
+        const lp5 = tt48.coalescePath(sid5) + '.lock';
+        try {
+          fs3.writeFileSync(lp5, '{not-json');
+          const v5 = C(sid5, Date.now(), () => true);
+          ok('T48-b5 锁内容非法 JSON → "stale"（安全降级、不抛）', v5 === 'stale', `got ${v5}`);
+        } catch (e) { ok('T48-b5 锁内容非法 JSON → "stale"', false, e.message); }
+        finally { try { fs3.unlinkSync(lp5); } catch (e) { /* silent-ok:清理 */ } }
+      }
+
+      // b6：真实 pid 探活路径（不注入）——持锁为自身 pid 且心跳新鲜 → 'alive'
+      {
+        const sid6 = mkSid();
+        const lp6 = tt48.coalescePath(sid6) + '.lock';
+        try {
+          fs3.writeFileSync(lp6, JSON.stringify({ at: Date.now(), pid: process.pid, hb: 1 }));
+          const v6 = C(sid6, Date.now()); // 不注入 → 走真实 process.kill(process.pid,0)
+          ok('T48-b6 真实 pid 探活：自身 pid + 心跳新鲜 → "alive"', v6 === 'alive', `got ${v6}`);
+        } catch (e) { ok('T48-b6 真实 pid 探活', false, e.message); }
+        finally { try { fs3.unlinkSync(lp6); } catch (e) { /* silent-ok:清理 */ } }
+      }
+      }
+    } catch (e) {
+      ok('T48 组异常', false, (e && e.message) || String(e));
+    }
+  }
+  if (savedEnv48 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv48;
+}
+
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。
 //   为什么需要：主脚本在被 require 时会跑 loadPricing → maybeRefreshHolidays（每进程一次、四条件命中即
 //   **detach** spawn 一个 refresh-holidays.js 子进程并往 SNAP_DIR 写 `.holidays-refresh.json`）。该子进程

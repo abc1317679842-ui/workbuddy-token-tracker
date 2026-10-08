@@ -39,10 +39,9 @@ type: skill
 
 ## 当前功能总览（版本以 manifest.yaml 为准）
 
+> **v3.42.1 要点（2026-10-10）：修 KI-12「弹窗悬空」——watcher 判活必须复核 pid（心跳新鲜 ≠ 还活着）。** `startWatcherVerified` 原判活只看心跳年龄 <15s；watcher 崩溃与末次心跳间隔很短时（实测 ~1s）会误判"已接管" → 调用方不降级 → **弹窗悬空**（实测 8 分钟）。修法：纯判定 `classifyWatchLock` 三态（alive/dead/stale），**心跳新鲜且 pid 存活**才认定接管，pid 死则删锁降级。守卫 T48（b1 红线）。零账本影响。
 > **v3.42.0 要点（2026-10-10）：区间端点加日历校验 + 末尾残行不再丢 + 导出清理不误删；技术债收敛（根探测 ×4 / 计价公式 ×3 收成单点）。**
 > ① **A17**：`2026-13-45..` 这类"格式对、日期不存在"的区间端点**显式报错**（原来被静默扩成"全部历史"）；`isRealDateStr` 日历级判定。② **A19**：transcript 末尾**无换行**的完整行不再永久丢弃（`totalLines` 同步 +1，防下一轮重复计费）。③ **A23**：`pruneExports` 只删自家 `report-<label>-YYYYMMDD-HHMMSS.csv`，不再误删用户放进 `exports/` 的文件。④ **B1**：`detectWorkBuddyRoot` ×4 → 新模块 `wb-root.js`；三项计价公式 ×3 → `triPrice`/`triPriceRounded`（**数值逐行比对完全相同**，`calcCost` 分桶路径未动）。A18（stdin 死等）经评估**不修**，理由见 KNOWN-ISSUES KI-11。
-> **v3.41.0 要点（2026-10-10）：三种计价口径统一为「按行逐条判定」——主链路不再整批一个倍率，跨峰谷边界轮不再与 backfill/recalc 给出三个金额。弹窗口径不变。**
-> ① 主链路 `calcCost` 新增行级峰谷分桶（`aggregateTranscLines` 弹窗侧 + `perModelFromRows` 账本侧，按每行自己的 `ts` 判峰谷），三项之和 ≠ 总量则**逐字节回退旧整批口径**；`peakRulesForAgg` 惰性读本机 `deepseek_rules`（mtime 缓存）。② 轮次明细落 `peakSplit`，`recalc-day.js` 新增 `peakSplitOf` 优先精确回算（口径标 `精确(逐行)`），老明细无分桶时行为与 v3.39.0 一致。附带：轮次明细路径抽成唯一实现 `snapshotFileFor`/`roundsFileOf`。
 > **逐版细节、动机、取舍一律查 `CHANGELOG.md`** —— 本文件不再堆版本要点；上面若与旧说法冲突，**以本条为准**。
 > **逐版细节、动机、取舍一律查 `CHANGELOG.md`** —— 本文件不再堆版本要点；上面若与旧说法冲突，**以本条为准**。
 
