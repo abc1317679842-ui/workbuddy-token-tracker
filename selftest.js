@@ -2379,8 +2379,12 @@ else {
       if (KINDS33.indexOf(m[1]) < 0) { nKind++; if (badSamples.length < 3) badSamples.push(`${f}:${i + 1}=${m[1]}`); }
     }
   }
-  ok('T33-a1 ★裸 catch 总数与基线一致（36；新增/删除必须显式改这里，防"顺手吞一个错"）',
-    nAll === 36, `实测 ${nAll} 处`);
+  // v3.38.0：36 → 37 —— watcher 锁改心跳后，接管"心跳已停"的旧锁时新增一处删锁的清理型裸 catch
+  //   （token-tracker.js 心跳接管分支，已按约定带 `// silent-ok:清理` 标记）。
+  //   之所以显式改基线而不是绕开：本守卫的语义就是"新增静默必须留痕"，T33-a2/a3 仍守
+  //   "必须带标记 + 类别落在四类白名单"，所以改数字不会削弱守卫生效面。
+  ok('T33-a1 ★裸 catch 总数与基线一致（37；新增/删除必须显式改这里，防"顺手吞一个错"）',
+    nAll === 37, `实测 ${nAll} 处`);
   ok('T33-a2 ★每一处裸 catch 都带 silent-ok:<类别> — <理由>（无标记即红）',
     nBad === 0, nBad ? `${nBad} 处无标记：${badSamples.join(', ')}` : '');
   ok('T33-a3 ★类别必须落在白名单四类（诊断/清理/探测/降级）内——写个别的不算数',
@@ -2809,6 +2813,111 @@ else {
   ok('T39-a5 ★最大单个超时预算 < 整进程上限（不会撞 token-tracker 的 kill 闸）',
     !!rp39 && cap > 0 && rp39.BIG_SOURCE_TIMEOUT_MS < cap,
     `BIG=${rp39 && rp39.BIG_SOURCE_TIMEOUT_MS} 上限=${cap}`);
+}
+
+// ===== T40（v3.38.0）：子代理弹窗 —— 中间不弹 / 主任务结束时按模型分条 / watcher 锁心跳 =====
+//   用户 2026-10-08 定案：① 中间过程（读回传 / 再派活 / 批与批的间隔）**一律不弹窗，只落盘记账**；
+//   ② 要的"及时" = 主模型任务结束时跟着弹，不是"每批完成就弹一次"；③ 不同模型的子代理各弹一条。
+//   实证基线（本机真实日志，非推断）：26 分钟弹 22 条（按批弹退化）、子代理弹窗迟到 124 秒、
+//   且迟到的一半来自"已跑完的子代理文件因末次写入落在 20s 内被判还在写"的白等。
+//   四道守卫：① Stop 端默认不拆（C2）；② 收口判据用"文件已落定"（C3①，放行率 48.1%→81.5%）；
+//   ③ 锁改心跳（C3②，Windows PID 复用 → 永久孤儿锁的治本）；④ 弹窗按模型分条 + 文案回 v2.98（C3③④）。
+{
+  const src40 = srcUnion(); // v3.35.0（B2）：Stop 端已迁出 → 守 Stop 行为的断言改扫并集
+  ok('T40-a1 ★Stop 端默认不再拆分弹（WB_TEAM_SPLIT 由"默认开"改为"=== "1" 才开"）',
+    /WB_TEAM_SPLIT\s*===\s*'1'/.test(src40) && !/WB_TEAM_SPLIT\s*!==\s*'0'/.test(src40),
+    '仍是 !== "0" → 中间过程会继续按批弹（实测 26 分钟弹 22 条）');
+  ok('T40-a2 ★收口判据改用"子代理文件已全部落定"（不再用 hasSubagentsRecentlyActive 的纯 mtime 活跃窗）',
+    /!subagentsAllSettled\(tsPath/.test(src40) && /subsSettled \? \[\] : pendingSubRaw/.test(src40),
+    '旧判据会把"已跑完但 20s 内写过"的文件当成还在写 → 白空等');
+  ok('T40-a3 ★watcher 锁改心跳：锁带 hb:1 + 15s 阈值 + 每轮轮询 touch',
+    /hb: 1/.test(src40) && /WATCH_LOCK_HB_MS\s*=\s*15 \* 1000/.test(src40) && /touchWatchLock\(\);/.test(src40));
+  // a4：心跳分支**不看 pid** —— 判据是锁里 at 的新鲜度（`mine.hb === 1` + `Date.now() - at < WATCH_LOCK_HB_MS`）。
+  //     注：srcUnion 剥注释，故只能断言代码特征，不能断言注释文案。
+  ok('T40-a4 ★心跳判存活取代 pid 探活（判据 = 锁里 at 的新鲜度，不再问 process.kill）',
+    /mine\.hb === 1/.test(src40)
+    && /Date\.now\(\) - Number\(mine\.at\)\) < WATCH_LOCK_HB_MS/.test(src40)
+    && /心跳/.test(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8')),
+    'pid 探活在 Windows 上必踩 PID 复用 → 锁被判"存活"→ 该 sid 永久失去 watcher');
+  ok('T40-a5 ★按模型分条：三处出口共用 showToastsSplitByModel（watcher / hook 兜底 / v3.12 补弹 ×2）',
+    (src40.match(/showToastsSplitByModel\(/g) || []).length >= 5, // 1 处定义 + 4 处调用
+    `出现次数=${(src40.match(/showToastsSplitByModel\(/g) || []).length}（低于 5 = 有出口漏改）`);
+  ok('T40-a6 ★v3.12 硬编码文案「（子代理）」已全部换成 v2.98 的 subagentTagOf（专家团/子代理分得开）',
+    !/toastLineTagged\([^)]*'（子代理）'/.test(src40));
+
+  const mod40 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  if (!mod40) ok('T40 行为验证（主模块加载失败）', false, 'token-tracker.js require 失败 —— CI 正常环境下这必是代码回归，不允许静默跳过');
+  else {
+    const P40 = path.join(tmp, 'projects', 't40');
+    fs.mkdirSync(path.join(P40, 's1', 'subagents'), { recursive: true });
+    const tp40 = path.join(P40, 's1.jsonl');
+    const T0 = 1727827200000;
+    let q40 = 0;
+    // 真实子代理末行形态（本机 18/18 实测）：{type:'message', role:'assistant', status:'completed'|'incomplete'}
+    const row40 = (ts, model, i, o, status) => JSON.stringify({ type: 'message', role: 'assistant', id: 'r' + (q40++),
+      timestamp: ts, status: status || 'completed',
+      providerData: { model, messageId: 'm' + q40, usage: { input_tokens: i, output_tokens: o } } });
+    fs.writeFileSync(tp40, [row40(T0 + 1000, 'hy4-preview', 1000, 100), row40(T0 + 2000, 'hy4-preview', 500, 50)].join('\n') + '\n');
+    const sa40 = path.join(P40, 's1', 'subagents', 'agent-a.jsonl');
+    const sb40 = path.join(P40, 's1', 'subagents', 'agent-b.jsonl');
+    fs.writeFileSync(sa40, row40(T0 + 3000, 'hy3', 400, 40) + '\n');
+    fs.writeFileSync(sb40, row40(T0 + 4000, 'deepseek-v4.1-flash', 300, 30) + '\n');
+
+    // b1：全终止态 → 立即落定（这是 124 秒里"白等"的那部分被砍掉的依据）
+    ok('T40-b1 ★子代理末行全为终止态 → 判定已落定（不等 mtime 窗口）',
+      mod40.subagentsAllSettled(tp40, 0, 20000) === true);
+    // b2：incomplete 但已停写 ≥20s → 落定（补 v3.09.1 因 14% incomplete 否决"文件终态"判据的洞）
+    //   注意：utimesSync 收的是 **Date 对象**（传毫秒数字会被当秒 → 落到 1970/未来，断言会假绿）。
+    const old40 = new Date(Date.now() - 60000);
+    fs.writeFileSync(sa40, row40(T0 + 3000, 'hy3', 400, 40, 'incomplete') + '\n');
+    fs.utimesSync(sa40, old40, old40);
+    fs.utimesSync(sb40, old40, old40);
+    ok('T40-b2 ★incomplete 但已停写 ≥20s → 视为落定（放行率 48.1% → 81.5% 的关键）',
+      mod40.subagentsAllSettled(tp40, 0, 20000) === true);
+    // b3：incomplete 且刚写（<20s）→ 不放行（红线：宁可多等，绝不漏算子代理 token）
+    const now40 = new Date(Date.now());
+    fs.utimesSync(sa40, now40, now40);
+    ok('T40-b3 ★incomplete 且仍在写（<20s）→ 不放行（防漏 token）',
+      mod40.subagentsAllSettled(tp40, 0, 20000) === false);
+    fs.writeFileSync(sa40, row40(T0 + 3000, 'hy3', 400, 40) + '\n'); // 还原为终止态
+
+    // b4~b7：按模型分条的形状与守恒
+    const agg40 = mod40.aggregateTranscript(tp40, 0);
+    ok('T40-b4 夹具：整轮聚合含 3 个模型桶（主 hy4-preview + 子 hy3 + 子 deepseek）',
+      !!agg40 && !!agg40.models && Object.keys(agg40.models).length === 3);
+    const parts40 = mod40.splitByModelStats(agg40);
+    ok('T40-b5 ★多模型 → 按模型分条且主模型排第一（同模型按桶合并，落实 v2.95）',
+      parts40.length === 3 && parts40[0].model === 'hy4-preview',
+      `条数=${parts40.length} 首条=${parts40[0] && parts40[0].model}`);
+    ok('T40-b6 ★每条只带自己那一桶 → 各自单独计价，不做跨模型混合',
+      parts40.every((p) => Object.keys(p.stat.models).length === 1 && !!p.stat.models[p.model]));
+    ok('T40-b7 ★分条后各桶 token 之和 = 整轮合计（不漏 token，红线）',
+      parts40.reduce((s, p) => s + p.stat.total, 0) === agg40.total,
+      `分条和=${parts40.reduce((s, p) => s + p.stat.total, 0)} 整轮=${agg40.total}`);
+    // b8：主子同模型 → 不拆（保持原单条弹窗，行为逐字节不变）
+    fs.mkdirSync(path.join(P40, 's2', 'subagents'), { recursive: true });
+    const tp40b = path.join(P40, 's2.jsonl');
+    fs.writeFileSync(tp40b, row40(T0 + 1000, 'hy4-preview', 100, 10) + '\n');
+    fs.writeFileSync(path.join(P40, 's2', 'subagents', 'agent-c.jsonl'), row40(T0 + 2000, 'hy4-preview', 200, 20) + '\n');
+    ok('T40-b8 ★主子同模型 → 不拆（仍是 1 条，金额 = 各批之和）',
+      mod40.splitByModelStats(mod40.aggregateTranscript(tp40b, 0)).length === 0);
+    // b9：token=0 的子代理桶不弹（V13：空跑不该弹窗）
+    const aggZero = { in: 100, out: 10, cached: 0, total: 110, model: 'hy4-preview', modelMain: 'hy4-preview',
+      models: { 'hy4-preview': { in: 100, out: 10, cached: 0, total: 110, lastTs: T0 },
+        'hy3': { in: 0, out: 0, cached: 0, total: 0, lastTs: T0 } } };
+    ok('T40-b9 ★token=0 的子代理桶不产出弹窗（空跑无消耗，弹了是噪音）',
+      mod40.splitByModelStats(aggZero).length === 0);
+    // b10：补弹路径（v3.12 mainToastedAt 残留）的聚合必须带分模型明细，否则仍是跨模型混合一条
+    const subAgg40 = mod40.aggregateSubsOnly(tp40, 0);
+    ok('T40-b10 ★aggregateSubsOnly 带分模型明细（v3.12 补弹分支才能同样分条）',
+      !!subAgg40 && !!subAgg40.models && Object.keys(subAgg40.models).length === 2,
+      subAgg40 ? `桶数=${Object.keys(subAgg40.models || {}).length}` : 'null');
+  }
+  // c 组（端到端，需 spawn）：kill watcher 后 15s 内新 watcher 接管 —— 沙箱 SPAWN_OK=false 时跳过，CI 真跑。
+  if (!SPAWN_OK) {
+    envSkip('T40-c1 ★心跳锁端到端：kill watcher 后 15s 内新 watcher 接管（改前：pid 被复用 → 永不接管）', SPAWN_SKIP_REASON);
+    envSkip('T40-c2 ★端到端：异模型轮弹窗条数 = 模型数，且逐条金额与账本同口径', SPAWN_SKIP_REASON);
+  }
 }
 
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。

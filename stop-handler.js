@@ -272,8 +272,16 @@ function handleStopEnd(ctx) {
         //        ③ 再次触发 → 不重复；④ 真实 toast 日志 md5 前后一致（零污染）。
         //   ⚠️ 排查提示：**补弹路径依赖 trace 文件存在**——早前在"沙箱未造 trace"的夹具里测出"补弹不触发"，
         //      是夹具缺失导致的假象，非代码缺陷（排查花了很久，记此备忘）。
-        //   紧急关闭：设环境变量 WB_TEAM_SPLIT=0（回到 v3.11 行为：异常轮仍走 watcher，延迟但最终弹一条完整的）。
-        const TEAM_SPLIT_ENABLED = process.env.WB_TEAM_SPLIT !== '0';
+        // v3.38.0（2026-10-08 用户定案）：**默认改为不再拆分弹**。
+        //   需求原文：① 中间过程（主模型读子代理回传 → 再派任务 → 批与批的间隔）**一律不弹窗，
+        //   只落盘记账**——用户"在任务中间弹不弹其实无所谓"；② 要的"及时"是**主模型任务结束时
+        //   弹窗跟着一起出来**，不是"每批子代理完成就弹一次"。
+        //   实证依据：2026-10-02 18:20~18:41 一轮内因每批补弹都推进 lastStopAt，退化成「按批弹」，
+        //   26 分钟弹了 **22 条**；且该批主子同模型，按 v2.95 本就不该拆。
+        //   现默认走下方「写 coalesce + 启 watcher + 启动失败则同步降级」路径（= v3.11 行为），
+        //   由 watcher 在主任务真结束时**按模型分条**一次弹出（分条逻辑见 token-tracker.js 出口）。
+        //   紧急回退：设 WB_TEAM_SPLIT=1 可回到 v3.12 拆分弹行为（每条主模型先弹、子代理后补）。
+        const TEAM_SPLIT_ENABLED = process.env.WB_TEAM_SPLIT === '1';
         const existingCoal = readCoalesceInfo(effSid);
         const mainAlreadyToasted = !!(existingCoal && existingCoal.mainToastedAt);
         if (TEAM_SPLIT_ENABLED && agg && agg.teamActive === true && !teamDataReady) {

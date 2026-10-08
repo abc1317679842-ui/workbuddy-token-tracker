@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.37.0 (2026-10-08)
+// token-usage-tracker v3.38.0 (2026-10-09)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -314,6 +314,15 @@ function startWatcherVerified(sid) {
   const lockF = coalescePath(sid) + '.lock';
   let lockBefore = 0;
   try { if (fs.existsSync(lockF)) lockBefore = fs.statSync(lockF).mtimeMs; } catch (e) { lockBefore = 0; }
+  // v3.38.0（C3②）：**已有 watcher 且心跳新鲜 → 直接判定"已接管"**，不必再 spawn 一个。
+  //   旧逻辑只看"spawn 后锁 mtime 是否变化"：若已有 watcher 持有心跳锁，新 spawn 的那个拿不到锁、
+  //   也不会刷新 mtime → 1.5s 后误判"启动失败"，白跑一次降级分支。心跳锁让"谁在跑"变得可直接读取。
+  try {
+    if (fs.existsSync(lockF)) {
+      const lo = JSON.parse(fs.readFileSync(lockF, 'utf-8'));
+      if (lo && lo.hb === 1 && Number.isFinite(Number(lo.at)) && (Date.now() - Number(lo.at)) < 15000) return true;
+    }
+  } catch (e) { /* 锁不可读 → 走下方 spawn 判定 */ }
   spawnFlushWatcher(sid);
   for (let i = 0; i < 10; i++) {                 // 最多约 1.5s（10 × 150ms）
     if (lastWatcherSpawnError) return false;     // 已收到异步 error → 立即判定失败，不空等
@@ -1470,8 +1479,96 @@ function aggregateSubsOnly(tsPath, roundStartMs) {
   return {
     in: sub.in, out: sub.out, cached: sub.cached, total: sub.total,
     model: dominant, modelMain: dominant, subModels,
+    // v3.38.0：带上**分模型明细**（优先用 aggregateTranscLines 算好的 sub.models，含 lastTs，
+    //   与整轮聚合 res.models 同口径）——供弹窗「按模型分条」各自单独计价（见 splitByModelStats）。
+    //   旧行为不变：此前本函数返回对象没有 models，调用方（toastLine2）会回退到单模型计价；
+    //   现在多模型轮改为逐模型计价，与账本口径一致（v3.26.0 ⑧ 的设计意图）。
+    models: sub.models || byModel,
     count: sub.count, durMs: sub.durMs, firstTs: sub.firstTs, lastTs: sub.lastTs, reasoning: sub.reasoning,
   };
+}
+
+// v3.38.0（用户 2026-10-08 定案）：把整轮聚合**按模型拆成多条弹窗 stat**。
+//   需求：主模型任务结束时跟着弹——同模型合并 1 条；**每种不同模型的子代理各 1 条**
+//   （例：主 hy4-preview + 子 hy3 / deepseek-v4.1-flash / glm → 1 + 3 = 4 条）。
+//   实现要点：
+//     ① 按模型分桶（models 明细本就是按模型合并的）→ 与主模型同模型天然并入主模型那条（落实 v2.95）；
+//     ② 每条只带自己那一桶 models → toastLine2 分模型计价（v3.26.0 ⑧）**各自单独计价**，不做跨模型混合；
+//     ③ 返回 [] = 无法拆（无明细 / 只有 1 个模型）→ 调用方走原单条路径，行为**逐字节不变**；
+//     ④ token=0 的模型桶不产出（V13：空跑不该弹窗）；本地模型桶照常产出（显示「本地·免费」）。
+//   排序：主模型第一条，其余按 token 降序。
+function splitByModelStats(agg) {
+  try {
+    if (!agg) return [];
+    const modelsObj = (agg.models && typeof agg.models === 'object') ? agg.models : null;
+    if (!modelsObj) return [];
+    const keys = Object.keys(modelsObj).filter((n) => {
+      const b = modelsObj[n];
+      if (!b || typeof b !== 'object') return false;
+      return (Number(b.total) || (Number(b.in) || 0) + (Number(b.out) || 0)) > 0;
+    });
+    if (keys.length <= 1) return []; // 单模型 → 不拆（保持原单条行为）
+    const mainKey = normalizeModelName(agg.modelMain || agg.model || '');
+    keys.sort((a, b) => {
+      if (normalizeModelName(a) === mainKey) return -1;
+      if (normalizeModelName(b) === mainKey) return 1;
+      return (Number(modelsObj[b].total) || 0) - (Number(modelsObj[a].total) || 0);
+    });
+    return keys.map((n) => {
+      const b = modelsObj[n];
+      return {
+        model: n,
+        stat: {
+          in: b.in || 0, out: b.out || 0, cached: b.cached || 0,
+          total: b.total || ((b.in || 0) + (b.out || 0)),
+          model: n, modelMain: n, subModels: undefined,
+          models: { [n]: b }, // 单桶 → 该条只按该模型计价
+          count: b.count || 0,
+          durMs: agg.durMs, firstTs: b.firstTs || agg.firstTs, lastTs: b.lastTs || agg.lastTs,
+        },
+      };
+    });
+  } catch (e) { return []; } // 拆分失败 → 退化为单条，绝不因显示改造丢弹窗
+}
+
+// v3.38.0（C3③）：**按模型分条弹窗**的唯一实现（flush-delayed 收口 / --hook 兜底 / v3.12 补弹三处共用）。
+//   为什么抽成函数（而非在 main() 内展开）：v3.35.0 拆分 main() 的守卫（T37-b1，上限 950 行）不允许
+//   把显示逻辑堆回 main；且三处出口共用同一实现，才不会出现"watcher 分条了、兜底没分条"的漂移。
+//   返回：true = 已分条弹出（≥2 个模型）；false = 单模型或无法拆 → 调用方走原单条路径（行为不变）。
+//   参数 opts：{ pricing, tsPath, roundStart, bal, firstToday, reason, alwaysTag, subs }
+//     firstToday —— 只给第一条用（--hook 兜底路径它可能是带记账的 todayDisplay，绝不能重复调用）；
+//     alwaysTag  —— 补弹子代理条时用：每条都挂形态标注（该 agg 本来就只含子代理）；
+//     subs       —— 调用方已算好的 subagentModelSet，避免重复扫盘。
+function showToastsSplitByModel(agg, opts) {
+  const o = opts || {};
+  const pricing = o.pricing;
+  const parts = splitByModelStats(agg);
+  if (parts.length <= 1) return false;
+  const subs = o.subs || subagentModelSet(o.tsPath, o.roundStart || 0);
+  const mainKey = normalizeModelName(agg.modelMain || '');
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    const mShort = shortModelName(p.stat, pricing);
+    const isMain = normalizeModelName(p.model) === mainKey;
+    const entry = subs.get(normalizeModelName(p.model));
+    // v3.38.0（C3④）：标注统一走 v2.98 文案「（子代理使用）」/「（专家团使用）」；查不到形态时保守按子代理。
+    //   走 toastLineTagged（而非手拼 label）——它带"放不下就放弃标注"的超宽保护，绝不挤掉真实数据。
+    const needTag = o.alwaysTag || (!isMain && entry);
+    const tag = (entry) ? subagentTagOf(entry) : '（子代理使用）';
+    // 余额 / 今日累计只在第一条显示：多条重复同一个累计值易被误读成"要累加"
+    const todayI = i === 0 ? (o.firstToday != null ? o.firstToday : todayUsageTxt()) : todayUsageTxt();
+    const balI = i === 0 ? (o.bal || '') : '';
+    const periodI = periodNote(p.stat, pricing);
+    if (needTag) {
+      showToast(toastLineTagged(p.stat, pricing, tag), toastLine2(p.stat, pricing), o.reason || 'split-by-model', o.tsPath);
+    } else {
+      showToast(
+        toastLine1(p.stat, shortModelName(p.stat, pricing), periodI, balI, todayI, noPriceTag1(p.stat, pricing)),
+        toastLine2(p.stat, pricing), o.reason || 'split-by-model', o.tsPath,
+      );
+    }
+  }
+  return true;
 }
 
 // watcher 用：roundStart 后是否有 timestamp > sinceMs 的新调用（主 transcript）或子代理文件 mtime > sinceMs
@@ -1798,6 +1895,40 @@ function allInRoundSubFilesTerminal(tsPath, roundStartMs) {
       if (!(last && last.type === 'message' && last.role === 'assistant' && last.status !== 'incomplete')) return false;
     }
     return any; // 本轮没有子代理文件 → 不算"已终止"，交给原有 mtime 判据
+  } catch (e) { return false; }
+}
+
+// v3.38.0（2026-10-08）：本轮子代理是否**全部已落定** —— 比 allInRoundSubFilesTerminal 宽松一级。
+//   ① 末行终止态（message/assistant 且非 incomplete）→ 已跑完，落定；
+//   ② 末行 incomplete 但**已停写 ≥ staleMs** → 属被取消/中断，永远不会再写，视为落定；
+//   ③ 其它（末行非 assistant / 仍在写）→ 未落定。
+// 为什么要加 ②：v3.09.1 当年否决"文件终态"判据，理由是真实会话 21 个子代理里 3 个末行永远是
+//   incomplete（≈14%），只判①会让快速路径永不触发。②正是堵这个洞——**incomplete 不等于还在跑**，
+//   只要已经停写够久就是死了。
+// 实测（本机 27 会话 / 210 子代理文件）：只判①会话级放行率 **48.1%**；加②后 **81.5%（22/27）**，
+//   未放行的 5 个（01593e8c / 652f2909 / 9609fc9f / 689004dc / 64565a2f）**全是手动取消/中断会话**，
+//   正该交给兜底。另实测：终止态文件 99% 早停 ≥20s（中位 4789s），incomplete 85% 早停 ≥20s。
+// 与 subagentsAllStagnant 的区别：那个是"全部停写超时"（不看末行），本函数看末行状态 + 停写，更准。
+function subagentsAllSettled(tsPath, roundStartMs, staleMs) {
+  try {
+    const dir = subagentsDirFromTranscript(tsPath);
+    const files = fs.readdirSync(dir).filter((f) => /^agent-.*\.jsonl$/i.test(f));
+    let any = false;
+    const now = Date.now();
+    const stale = Number(staleMs) || SUBAGENT_IDLE_MS;
+    for (const f of files) {
+      const p = path.join(dir, f);
+      let mt = 0;
+      try { mt = fs.statSync(p).mtimeMs; } catch (e) { continue; }
+      if (mt <= roundStartMs) continue; // 非本轮的子代理文件 → 不参与判定
+      any = true;
+      const last = lastTranscLine(p);
+      const isMsg = !!(last && last.type === 'message' && last.role === 'assistant');
+      if (isMsg && last.status !== 'incomplete') continue;           // ① 终止态 → 落定
+      if (isMsg && (now - mt) >= stale) continue;                    // ② incomplete 且已停写 → 落定
+      return false;                                                  // ③ 未落定
+    }
+    return any; // 本轮没有子代理文件 → 不算"已落定"，交给原有 mtime 判据
   } catch (e) { return false; }
 }
 
@@ -5169,7 +5300,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.37.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.38.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -5453,23 +5584,56 @@ function main() {
     // TOCTOU 双启动（R4，前序 S4 starts=2 + repro_r4_logic.js 确定性临界窗）。
     // 修复：open('wx') 原子建锁；EEXIST 时评估锁有效性（pid 探活区分"可确认死亡/无法确认"），
     // 仅可确认死亡或 TTL 过期才安全接管；释放只删自己持有的锁（校验 pid===自己）。
+    const WATCH_LOCK_HB_MS = 15 * 1000; // v3.38.0：心跳判死阈值（3s 一跳，15s 未刷新即判 owner 已死）
     const lockPath = coalescePath(fSid) + '.lock';
     let gotLock = false;
     const myPid = process.pid;
+    // v3.38.0（C3②）：锁内容加 `hb:1` 标记（本版本起的锁是"心跳锁"）。三处建锁统一走这里。
+    const writeLockSync = (fd) => { fs.writeSync(fd, JSON.stringify({ at: Date.now(), pid: myPid, hb: 1 })); };
+    const tryCreateLock = () => {
+      try {
+        const fd = fs.openSync(lockPath, 'wx');
+        writeLockSync(fd);
+        fs.closeSync(fd);
+        return true;
+      } catch (e) { return false; }
+    };
+    // v3.38.0（C3②）：**每轮 poll 刷新 at（心跳）** —— 让"owner 是否还活着"不再依赖 pid 探活。
+    //   只刷自己持有的锁（校验 pid===自己）；刷新失败不致命，下一轮再刷。
+    const touchWatchLock = () => {
+      if (!gotLock) return;
+      try {
+        const o = JSON.parse(fs.readFileSync(lockPath, 'utf-8'));
+        if (!o || o.pid !== myPid) return;
+        fs.writeFileSync(lockPath, JSON.stringify({ at: Date.now(), pid: myPid, hb: 1 }));
+      } catch (e) { /* 心跳刷新失败：不抛，下一轮重试 */ }
+    };
     const acquireWatchLock = () => {
       try { fs.mkdirSync(path.dirname(lockPath), { recursive: true }); } catch (e) {} // silent-ok:清理 — 建锁目录；真失败会在随后的建锁处报错
       // 先尝试原子建锁（R4 核心）：不存在才创建，EEXIST 表示已有人持有
       try {
         const fd = fs.openSync(lockPath, 'wx');
-        fs.writeSync(fd, JSON.stringify({ at: Date.now(), pid: myPid }));
+        writeLockSync(fd);
         fs.closeSync(fd);
         return true; // 原子获取成功
       } catch (e) {
-        if (e.code !== 'EEXIST') return false; // 其他 IO 错误：退化为无锁（继续尝试弹窗）
+        if (e.code !== 'EEXIST') return false; // 其他 IO 错误：退化为无锁（不抢，行为同旧版）
       }
       // 已存在锁 → 评估有效性（R3）
       let mine = null;
       try { mine = JSON.parse(fs.readFileSync(lockPath, 'utf-8')); } catch (e) { mine = null; }
+      // v3.38.0（C3②）：**心跳优先判定**（原 pid 探活在 Windows 上必踩 PID 复用 → 永久孤儿锁）。
+      //   实证：`.coalesce-907e5d21….lock` 至今残留，pid 18620 已被 cmd 进程复用 → `process.kill(pid,0)`
+      //   误判存活、TTL 分支也拒绝接管 → 该 sid **永久失去 watcher**（这正是 124 秒延迟的放大器）。
+      //   规则（只对带 hb:1 的新锁生效；旧格式锁走下方原逻辑，行为不变）：
+      //     心跳新鲜（<15s） → owner 一定在跑 → 不抢（交给它弹）；
+      //     心跳停 ≥15s     → owner 已死/被宿主收割/卡死 → **立即接管**（不看 pid，15 秒内自愈）。
+      //   pid 复用不再影响判定：心跳是 owner 自己写的证据，与 pid 是否被无关进程占用无关。
+      if (mine && mine.hb === 1 && Number.isFinite(Number(mine.at))) {
+        if ((Date.now() - Number(mine.at)) < WATCH_LOCK_HB_MS) return false; // owner 在跑 → 保持互斥
+        try { fs.unlinkSync(lockPath); } catch (e) {} // silent-ok:清理 — 心跳已停，接管
+        return tryCreateLock();
+      }
       const fresh = mine && (Date.now() - (mine.at || 0) < WATCH_LOCK_TTL);
       if (!fresh) {
         // v3.24.0（级联⑩）：TTL 过期分支**补 pid 探活** —— 原先不看 pid 直接抢锁，而 v3.23.2 把
@@ -5485,12 +5649,7 @@ function main() {
         }
         // TTL 过期且 owner 已死（或无 pid）→ 锁失效，安全接管：删旧锁后重新原子建锁
         try { fs.unlinkSync(lockPath); } catch (e) {} // silent-ok:清理 — 释放锁；未持有/已被清都会抛
-        try {
-          const fd = fs.openSync(lockPath, 'wx');
-          fs.writeSync(fd, JSON.stringify({ at: Date.now(), pid: myPid }));
-          fs.closeSync(fd);
-          return true;
-        } catch (e) { return false; }
+        return tryCreateLock(); // v3.38.0：新锁带 hb:1，此后本机 watcher 锁均为心跳锁
       }
       // TTL 未过期 → 需判断 owner 是否存活
       const pid = mine && Number(mine.pid);
@@ -5508,12 +5667,7 @@ function main() {
       if (alive) return false; // owner 仍存活 → 保持互斥，本 watcher 退出
       // owner 已可确认死亡 → 安全接管
       try { fs.unlinkSync(lockPath); } catch (e) {} // silent-ok:清理 — 释放锁；同上
-      try {
-        const fd = fs.openSync(lockPath, 'wx');
-        fs.writeSync(fd, JSON.stringify({ at: Date.now(), pid: myPid }));
-        fs.closeSync(fd);
-        return true;
-      } catch (e) { return false; }
+      return tryCreateLock(); // v3.38.0：同上（仅旧格式锁残留时才会走到这里）
     };
     // v3.05（2026-09-11 修复·TDZ 崩溃）：**把 watcher 调试日志函数提前到抢锁之前定义**。
     //   原实现里 `appendWatchDebug` 定义在下方（抢锁成功之后），而"未拿到锁"分支会先调用它 ——
@@ -5608,6 +5762,10 @@ function main() {
     let toastReason = null;     // v2.61/debug：触发弹窗的原因（break 时赋值，用于去重日志）
     let lastPollSnapshot = null; // v2.61/debug：最近一次 poll 的状态快照，供 idle-timeout 兜底日志使用
     while (Date.now() - lastActiveAt < WATCH_MAX_MS) {   // 空闲超时：主模型持续活跃则永不退出、绝不弹
+      // v3.38.0（C3②）：每轮轮询刷新锁心跳（3s/跳，远快于 15s 判死阈值）。
+      //   作用：外部（下一个 Stop / startWatcherVerified）只看锁里 at 的新鲜度即可确认本 watcher 还活着，
+      //   不再依赖 process.kill(pid,0) —— 那是 PID 复用误判存活、产生永久孤儿锁的根因。
+      touchWatchLock();
       // v3.19.3：原 compactionMode（v2.62）+ compressionPending（v2.70）状态机已整体删除。
       // 全量日志复核：该判定在生产环境从未生效过一次（compactionMode=true 0 次、
       // compression-omen/resumed/timeout 各 0 次、185 次 flush-watch 启动快照命中标记 0 次），
@@ -5630,7 +5788,14 @@ function main() {
       firstPollDone = true;
       const newTail = hasNewTail();
       // v2.43：子代理"未完成"语义判据——还有 spawn 但未发结束信号（system completed/failed 通知或子代理回传）→ 未结束。
-      const pendingSub = subagentPending(tsPath);
+      const pendingSubRaw = subagentPending(tsPath);
+      // v3.38.0：子代理文件若**已全部落定**（末行终止 / incomplete 但已停写 ≥20s），
+      //   就否决 pending 的**假非空**——pending 靠"spawn 名 vs 结束通知"匹配，而 22 次 Agent 调用
+      //   无 name 字段时会抓出噪声名（实测 ["subagent","schema"]），且非团队子代理不发
+      //   teammate-message 通知 → ended 恒空 → pending 恒非空 → 永远走不到收口。
+      //   文件落盘状态是更权威的证据。仍保留 pendingSubRaw 供 deadTeam 判定使用（那里要的是"真未完成"）。
+      const subsSettled = subagentsAllSettled(tsPath, info0.roundStart || 0, SUBAGENT_IDLE_MS);
+      const pendingSub = subsSettled ? [] : pendingSubRaw;
       // v2.45：用户手动停止即时信号——末行 "Interrupted by user" → 立即结算（子代理同步停，实测行ts差0s）。
       const interrupted = interruptedByUser(tsPath);
       // v2.44：死寂检测——主模型静止(final) + 有未完成子代理 + 子代理文件全停更超 60 秒 → 手动停止/回传失效，
@@ -5733,13 +5898,18 @@ function main() {
           // v2.97：窗口由硬编码 60s 改为 SUBAGENT_IDLE_MS（默认 20s）——实测事件间最大间隔仅 8.8s，
           //   60s 造成用户体感"子代理结束后 1 分钟才弹窗"。此处只收紧正常路径；
           //   异常死寂兜底（subagentsAllStagnant）仍保持 60s 保守值。
-          if (hasSubagentsRecentlyActive(tsPath, SUBAGENT_IDLE_MS)) {
-            // 子代理文件还在写 → 假空，继续等（不收口）
+          // v3.38.0：改用「文件是否已全部落定」替代单纯 mtime 活跃窗。
+          //   旧判据 hasSubagentsRecentlyActive(20s) 只看"最近有没有写过"——一个**已经跑完**的子代理
+          //   文件，只要末次写入落在 20s 内就被判"还在写"，白白空等 20s；本次 124 秒的延迟有一半来自这类空等。
+          //   subagentsAllSettled 看末行状态：终止态直接算落定（不用等）；incomplete 才要求停写 ≥20s。
+          //   收口前**重新计算一次**（3 秒轮询内可能有新的收尾写入），避免用轮询开头的旧结论。
+          if (!subagentsAllSettled(tsPath, info0.roundStart || 0, SUBAGENT_IDLE_MS)) {
+            // 仍有子代理未落定 → 继续等（不收口）
             lastActiveAt = Date.now();
             busySince = 0;
           } else {
-            // 子代理确实停更 + 末行已稳定 >=3 帧 → 立即收口（v2.60：无确认窗口）
-            toastReason = 'stableCount>=3';
+            // 子代理确实已落定 + 末行已稳定 >=3 帧 → 立即收口（v2.60：无确认窗口）
+            toastReason = 'subagents-settled';
             break;
           }
         } else {
@@ -5772,24 +5942,40 @@ function main() {
       });
       const bal = balanceText();
       if (info.mainToastedAt) {
-        // v3.12：异常轮——主模型已在 Stop 先弹，此处只补弹【子代理】部分（不含主模型用量，否则重复）
+        // v3.12：异常轮——主模型已在 Stop 先弹，此处只补弹【子代理】部分（不含主模型用量，否则重复）。
+        // v3.38.0：Stop 端已不再拆分弹（C2），本分支只服务**旧 coalesce 残留**（升级前写下的 mainToastedAt）；
+        //   同时按 §3.3b 修缺陷——原实现无论几种模型都只弹 1 条，异模型时违反"分开弹"且金额跨模型混合。
         const subAgg = aggregateSubsOnly(info.tsPath, info.roundStart || 0);
         if (subAgg && subAgg.total > 0) {
-          const subToastAgg = Object.assign({}, subAgg, { subModels: undefined });
-          showToast(toastLineTagged(subToastAgg, pricing, '（子代理）'), toastLine2(subToastAgg, pricing), 'team-sub-only', info.tsPath);
+          const subsMap = subagentModelSet(info.tsPath, info.roundStart || 0);
+          if (!showToastsSplitByModel(subAgg, { pricing, tsPath: info.tsPath, roundStart: info.roundStart || 0, subs: subsMap, alwaysTag: true, reason: 'team-sub-only' })) {
+            const subToastAgg = Object.assign({}, subAgg, { subModels: undefined });
+            const e0 = subsMap.get(normalizeModelName(subAgg.model || ''));
+            showToast(toastLineTagged(subToastAgg, pricing, e0 ? subagentTagOf(e0) : '（子代理使用）'), toastLine2(subToastAgg, pricing), 'team-sub-only', info.tsPath);
+          }
         }
         appendCompactionLog('flush-team-sub-only', { sid: fSid, subTotal: subAgg ? subAgg.total : 0 });
         clearCoalesce(fSid);
         const ws = loadSnapshot(fSid) || {};
         saveSnapshot({ file: ws.file || '', stat: ws.stat || null, lastUserMsgAt: ws.lastUserMsgAt || 0, lastStopAt: Date.now() }, fSid);
       } else {
-        // v2.98：子代理/专家团弹窗标注——区分两种形态（专家团=带 agentColor 的成员；普通子代理=内置类型）。
-        // 与主模型同名的子代理会被并入同一模型桶（按模型分桶已天然实现），此处仅做标注，不改计费与数据结构。
-        const subModels = subagentModelSet(info.tsPath, info.roundStart || 0);
-        const modelShort = shortModelName(agg, pricing);
-        const subEntry = subModels.get(normalizeModelName(agg.model || ''));
-        const modelLabel = subEntry ? modelShort + subagentTagOf(subEntry) : modelShort;
-        showToast(toastLine1(agg, modelLabel, periodNote(agg, pricing), bal, todayUsageTxt(), noPriceTag1(agg, pricing)), toastLine2(agg, pricing), toastReason, info.tsPath);
+        // v3.38.0（C3③）：**按模型分条弹**（用户 2026-10-08 定案：「不同模型的子代理也要单独弹窗」）。
+        //   单模型（含"子代理与主模型同模型"已按桶合并）→ 下方原单条路径，**逐字节不变**；
+        //   ≥2 个模型 → 主模型 1 条 + 每种不同子代理模型各 1 条，各自单独计价，不做跨模型混合。
+        if (showToastsSplitByModel(agg, {
+          pricing, tsPath: info.tsPath, roundStart: info.roundStart || 0,
+          bal, firstToday: todayUsageTxt(), reason: toastReason,
+        })) {
+          appendCompactionLog('flush-split-by-model', { sid: fSid, parts: Object.keys(agg.models || {}) });
+        } else {
+          // v2.98：子代理/专家团弹窗标注——区分两种形态（专家团=带 agentColor 的成员；普通子代理=内置类型）。
+          // 与主模型同名的子代理会被并入同一模型桶（按模型分桶已天然实现），此处仅做标注，不改计费与数据结构。
+          const subModels = subagentModelSet(info.tsPath, info.roundStart || 0);
+          const modelShort = shortModelName(agg, pricing);
+          const subEntry = subModels.get(normalizeModelName(agg.model || ''));
+          const modelLabel = subEntry ? modelShort + subagentTagOf(subEntry) : modelShort;
+          showToast(toastLine1(agg, modelLabel, periodNote(agg, pricing), bal, todayUsageTxt(), noPriceTag1(agg, pricing)), toastLine2(agg, pricing), toastReason, info.tsPath);
+        }
         clearCoalesce(fSid);
         // v2.27：watcher 弹窗完成 = 专家团本轮真正结束 → 推进 lastStopAt（供 hook 端起点刷新守卫）
         const ws = loadSnapshot(fSid) || {};
@@ -6042,10 +6228,15 @@ function main() {
       const bal = balanceText();
       if (pendInfo && pendInfo.mainToastedAt) {
         // v3.12：异常轮——主模型已在 Stop 先弹，hook 兜底只补弹【子代理】部分（不含主模型用量，否则重复）
+        // v3.38.0（C3④ + §3.3b）：同 flush-delayed 端处理——标注改 v2.98 文案；异模型按模型分条。
         const subAgg = aggregateSubsOnly(pendInfo.tsPath, (pendInfo && pendInfo.roundStart) || 0);
         if (subAgg && subAgg.total > 0) {
-          const subToastAgg = Object.assign({}, subAgg, { subModels: undefined });
-          showToast(toastLineTagged(subToastAgg, pricing, '（子代理）'), toastLine2(subToastAgg, pricing), 'team-sub-only', pendInfo.tsPath);
+          const subsMap = subagentModelSet(pendInfo && pendInfo.tsPath, (pendInfo && pendInfo.roundStart) || 0);
+          if (!showToastsSplitByModel(subAgg, { pricing, tsPath: pendInfo && pendInfo.tsPath, roundStart: (pendInfo && pendInfo.roundStart) || 0, subs: subsMap, alwaysTag: true, reason: 'team-sub-only' })) {
+            const subToastAgg = Object.assign({}, subAgg, { subModels: undefined });
+            const e0 = subsMap.get(normalizeModelName(subAgg.model || ''));
+            showToast(toastLineTagged(subToastAgg, pricing, e0 ? subagentTagOf(e0) : '（子代理使用）'), toastLine2(subToastAgg, pricing), 'team-sub-only', pendInfo.tsPath);
+          }
         }
         appendCompactionLog('hook-team-sub-only', { sid, subTotal: subAgg ? subAgg.total : 0 });
         clearCoalesce(sid);
@@ -6067,7 +6258,16 @@ function main() {
         //   —— 删掉会让这些轮**永不入账**（v3.33.0 S1 刚修好的"双封死"会原样复发）。
         //   故按 coalesce 元信息分岔：alreadyRecorded → 只显示；否则照旧记账。
         const pendToday = (pendInfo && pendInfo.alreadyRecorded === true) ? todayUsageTxt() : todayDisplay(pendAgg, pricing);
-        showToast(toastLine1(pendAgg, pendModel, periodNote(pendAgg, pricing), bal, pendToday, noPriceTag1(pendAgg, pricing)), toastLine2(pendAgg, pricing), 'hook-fallback');
+        // v3.38.0（C3③ + §3.3b）：hook 兜底**同样按模型分条**（与 watcher 出口共用同一实现）。
+        //   原缺陷：Stop 端不再先弹后，coalesce 里没有 mainToastedAt → 一律走本分支弹**完整一条**，
+        //   异模型时违反"不同模型分开弹"，且金额跨模型混合。现同模型 → 单条（原行为）；异模型 → 每条各弹。
+        //   ⚠️ pendToday 已在上方算好（含记账语义），传给分条函数只用于第一条，绝不重复入账。
+        if (!showToastsSplitByModel(pendAgg, {
+          pricing, tsPath: pendInfo && pendInfo.tsPath, roundStart: (pendInfo && pendInfo.roundStart) || 0,
+          bal, firstToday: pendToday, reason: 'hook-fallback',
+        })) {
+          showToast(toastLine1(pendAgg, pendModel, periodNote(pendAgg, pricing), bal, pendToday, noPriceTag1(pendAgg, pricing)), toastLine2(pendAgg, pricing), 'hook-fallback');
+        }
         clearCoalesce(sid);
         // v2.27：兜底补弹完成 → 该轮已结束，标记 lastStopAt（供下轮起点刷新判断）
         const psnap = loadSnapshot(sid) || {};
@@ -6243,6 +6443,8 @@ module.exports = {
   doctorTxt,
   ROUNDS_DIR, EXPORTS_DIR,
   mainModelState, lastTranscLine, coalescePath, hasActiveSubagentsSince, subagentsDirFromTranscript, subagentPending, subagentsAllStagnant, interruptedByUser, hasSubagentsRecentlyActive,
+  subagentsAllSettled, // v3.38.0：子代理「是否已全部落定」判据（终止态 / incomplete 且停写≥20s），selftest 可直接单测
+  splitByModelStats, showToastsSplitByModel, // v3.38.0：按模型分条（拆分 / 弹窗），selftest 可直接单测
   interruptedRowsAfter,
   incrementalRecord, loadLedgerWatermark, saveLedgerWatermark,
   estimateInterrupted, estimateInterruptedInc,
