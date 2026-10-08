@@ -140,6 +140,19 @@ pid 探活用 `process.kill(pid, 0)`：`EPERM`（存在但无权限）视为存�
 b2 心跳新鲜+pid活→alive / b3 心跳过期→stale / b4 无 hb→stale / b5 非法 JSON→stale / b6 真实 pid 探活）。
 **反向验证**：隔离副本上把判定回退为"恒 alive（纯心跳）" → **T48-b1 变红**（`got alive`），确认守卫有效。
 
+### 遗留观察（不修，已知无害）
+
+`acquireWatchLock`（watcher 抢锁侧，约 L6145）对**带 `hb:1` 的锁**仍用**纯心跳**判活（心跳新鲜 → 不抢），
+与 `classifyWatchLock`（读侧）的"心跳新鲜 **且** pid 活"判据**不一致**。当前**无实害**，因为：
+
+- 两侧差异只落在「心跳新鲜 + pid 已死」窗口；该窗口下读侧已 `unlinkSync` 删掉死锁 →
+  新 watcher 起来时锁已不存在 → 直接走原子建锁（`openSync 'wx'`）成功，**根本走不到**心跳分支。
+- `acquireWatchLock` 的纯心跳判活是 **v3.38.0 的有意设计**（注释 L6138-6144）："心跳是 owner 自己写的证据，
+  与 pid 是否被无关进程占用无关" —— 刻意规避 Windows PID 复用导致的永久孤儿锁。**不应轻改**。
+
+若将来要统一，正确做法是让 `acquireWatchLock` 也复用 `classifyWatchLock`，且必须重新论证 PID 复用风险
+（心跳新鲜是强证据，叠加 pid 复核反而引入它本想避开的敞口）。**2026-10-10 评估：不修。**
+
 ---
 
 ## KI-11 第五轮（plan-B）剩余项 —— v3.42.0 登记，**已知、暂不修**
