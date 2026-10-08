@@ -1450,7 +1450,8 @@ else {
       /delete stat\.no_price/.test(recalc18) && /cost > 0/.test(recalc18));
     // T18-c5（v3.28.0）：toastLine2 曾把「⚠未计价」追加块**逐字复制两遍**（条件相同、都 `line += '｜⚠未计价'`）
     //   → 弹窗实测出现 `｜⚠未计价｜⚠未计价`。这里锁住"标签追加块"的数量不变量，专防复制粘贴：
-    //   ① `line += '｜…'`（追加一个标签段）在全函数体内**恰好 5 处**（价⚠️/官价⚠️/⚠价核验/⚠未计价/⚠账缺）；
+    //   ① `line += '｜…'`（追加一个标签段）在全函数体内**恰好 2 处**（⚠未计价 / ⚠账缺；
+    //      v3.44.0 前是 5 处，价⚠️/官价⚠️/⚠价核验 已迁到行1 见 noPriceTag1）；
     //   ② `line += '｜⚠未计价'` **恰好 1 次**（这处正是被复制过的那个块）。
     //   若有人再粘贴一遍任何标签块，①或②必然超标 → 立刻红。（后续新增正当标签时需同步更新此计数，
     //   这正是"新标签必须被显式意识到"的预期摩擦，不是误报。）
@@ -1459,8 +1460,8 @@ else {
     const tl2Body = stripComments(main18.slice(tl2Start, tl2End));
     const tagAppendCount = (tl2Body.match(/line \+= '｜/g) || []).length;
     const unpaidAppendCount = (tl2Body.match(/line \+= '｜⚠未计价'/g) || []).length;
-    ok('T18-c5 ★toastLine2 标签追加块无重复（line += \'｜…\' 恰好 5 处、⚠未计价 恰好追加 1 次）',
-      tl2Start > 0 && tl2End > tl2Start && tagAppendCount === 5 && unpaidAppendCount === 1,
+    ok('T18-c5 ★toastLine2 标签追加块无重复（line += \'｜…\' 恰好 2 处、⚠未计价 恰好追加 1 次）',
+      tl2Start > 0 && tl2End > tl2Start && tagAppendCount === 2 && unpaidAppendCount === 1,
       `tagAppend=${tagAppendCount} unpaidAppend=${unpaidAppendCount}`);
   }
 }
@@ -1489,22 +1490,34 @@ else {
     const l2of = (s, p) => mod19.toastLine2(s, p);
 
     // ── a. 价核验触发源收窄（用户疑问①：停用历史流水账 + 必须点名本轮模型）──
+    // v3.44.0：⚠价核验 与 价⚠️/官价⚠️ 已从行2 迁到行1（用户 2026-10-10 要求：行2 加它们会挤掉缓存百分比）。
+    //   故本组断言改查**行1 的标签源 noPriceTag1** —— 触发源收窄 / 只报本轮模型 的语义逐条不变。
+    const tag1of = (s, p) => mod19.noPriceTag1(s, p);
     const pNote19 = P19({ last_refresh_note: '2026-10-01T17:53:35.143Z 多源刷新：⚠️模糊匹配歧义: kimi-k3: ...' });
     ok('T19-a1 ★历史 last_refresh_note 含 ⚠ 不再挂「⚠价核验」（A-8 的永久误报根因）',
-      l2of(short19, pNote19).indexOf('价核验') < 0, l2of(short19, pNote19));
+      tag1of(short19, pNote19).indexOf('价核验') < 0, tag1of(short19, pNote19));
     const pOther19 = P19({ _ambig_warnings: ['kimi-k3: USD源 模糊命中 2 个不同价候选，已放弃', 'glm-5.3-flash: USD源 模糊命中 3 个'] });
     ok('T19-a2 ★与本轮模型**无关**的歧义不挂标签（别的模型的问题不得污染每一条弹窗）',
-      l2of(short19, pOther19).indexOf('价核验') < 0, l2of(short19, pOther19));
+      tag1of(short19, pOther19).indexOf('价核验') < 0, tag1of(short19, pOther19));
     const pMine19 = P19({ _ambig_warnings: ['kimi-k3: xx', M19 + ': USD源 模糊命中 2 个不同价候选，已放弃'] });
-    ok('T19-a3 ★点名本轮模型的歧义 → 照常挂标签（收窄不等于失效）',
-      l2of(short19, pMine19).indexOf('⚠价核验') >= 0, l2of(short19, pMine19));
+    ok('T19-a3 ★点名本轮模型的歧义 → 照常挂标签（收窄不等于失效，且已挂到行1）',
+      tag1of(short19, pMine19).indexOf('⚠价核验') >= 0, tag1of(short19, pMine19));
     const pAudit19 = P19({ _price_audit: { at: 'x', warnings: [M19 + ': 人民币价 1 vs usd×7.2=0.5 偏差 50%'] } });
-    ok('T19-a4 ★_price_audit 点名本轮模型 → 挂标签', l2of(short19, pAudit19).indexOf('⚠价核验') >= 0, l2of(short19, pAudit19));
+    ok('T19-a4 ★_price_audit 点名本轮模型 → 挂标签', tag1of(short19, pAudit19).indexOf('⚠价核验') >= 0, tag1of(short19, pAudit19));
     const pAuditOther19 = P19({ _price_audit: { at: 'x', warnings: ['other-m: 偏差 50%'] } });
-    ok('T19-a5 ★_price_audit 与本轮无关 → 不挂', l2of(short19, pAuditOther19).indexOf('价核验') < 0, l2of(short19, pAuditOther19));
+    ok('T19-a5 ★_price_audit 与本轮无关 → 不挂', tag1of(short19, pAuditOther19).indexOf('价核验') < 0, tag1of(short19, pAuditOther19));
     const pHy19 = { models: { hy3: PAID19 }, _ambig_warnings: ['hy3-preview: USD源歧义'] };
     ok('T19-a6 ★显示名与价库键不一致也能命中（hy3 ↔ hy3-preview 宽松匹配）',
-      l2of({ model: 'hy3', in: 1000000, out: 10000, cached: 0 }, pHy19).indexOf('⚠价核验') >= 0);
+      tag1of({ model: 'hy3', in: 1000000, out: 10000, cached: 0 }, pHy19).indexOf('⚠价核验') >= 0);
+
+    // v3.44.0 新增：价格类标签**整体迁到行1**（用户 2026-10-10 要求）——钉住「行1 有、行2 无」，防回退。
+    ok('T19-a7 ★价格类标签不得再出现在行2（已整体迁行1；行2 位置留给缓存百分比）',
+      l2of(short19, pMine19).indexOf('价核验') < 0 && l2of(short19, pMine19).indexOf('价⚠️') < 0,
+      l2of(short19, pMine19));
+    const pRef19 = P19({ last_refresh_error: 'all sources failed' });
+    ok('T19-a8 ★价⚠️（多源拉取失败）迁到行1、行2 不再出现',
+      tag1of(short19, pRef19).indexOf('价⚠️') >= 0 && l2of(short19, pRef19).indexOf('价⚠️') < 0,
+      tag1of(short19, pRef19) + ' || ' + l2of(short19, pRef19));
 
     // ── b. 行2 宽度守卫优先级（用户疑问②：缓存百分比优先于降级标签）──
     const long19 = { model: M19, in: 2163000, out: 20000, cached: Math.round(2163000 * 0.9557) };
@@ -4133,6 +4146,136 @@ else {
     }
   }
   if (savedEnv49 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv49;
+}
+
+// ===== T50（v3.44.0 / C 类根治）：团队轮必须走同步弹，且弹完硬性结案（防「延迟弹窗」与「二次弹」） =====
+//   病根：团队轮原先走 coalesce + watcher 等子代理落定 —— ① Stop 侧落定判据过严（allInRoundSubFilesTerminal
+//   只认末行终止态，实测会话级放行率 48.1%；而 watcher 侧同口径 subagentsAllSettled 是 81.5%）→ 一半多轮次
+//   明明子代理早已写完全、数据已齐，仍被迫走 watcher；② watcher 是 detached 子进程，会被宿主 Job Object
+//   连带杀 → 弹窗悬空（KI-12/KI-13）。
+//   修法：团队轮与普通轮走**同一条同步弹路径**（落定判据换 subagentsAllSettled + 有界微重判），
+//   弹完 clearCoalesce + 推进 lastStopAt = **硬性结案**（三条补弹路径 watcher/round-watch/hook 全部
+//   以"coalesce 存在 / lastStopAt 未推进"为前提 → 自动失活，**绝不二次弹**）。
+//   本组钉住：条件含 teamSyncToast / 落定判据换 subagentsAllSettled / 弹完必清 coalesce / 不 spawn watcher。
+{
+  const src50 = fs.readFileSync(path.join(SRC, 'stop-handler.js'), 'utf-8');
+  // 剥注释后再做断言（本项目习惯在注释里保留历史说明；b4 的否定断言尤其必须剥注释，否则会被注释命中）
+  const code50 = src50.replace(/\/\*[\s\S]*?\*\//g, '')
+    .split(/\r?\n/).filter((l) => !/^\s*\/\//.test(l)).join('\n');
+
+  ok('T50-b1 ★团队轮同步弹开关存在（teamSyncToast + 逃生阀 WB_SYNC_TEAM）',
+    /const teamSyncToast = [^;]*WB_SYNC_TEAM[^;]*;/.test(code50),
+    '未找到 teamSyncToast / WB_SYNC_TEAM');
+
+  ok('T50-b2 ★★同步弹分支条件含 teamSyncToast（团队轮也走同步弹，不再走 watcher）',
+    /if \(isPlainRound \|\| teamDataReady \|\| teamSyncToast\)/.test(code50),
+    '条件未含 teamSyncToast → 团队轮仍走 coalesce+watcher');
+
+  ok('T50-b3 ★★团队轮落定判据换成 subagentsAllSettled（取代过严的 allInRoundSubFilesTerminal）',
+    /const settled0 = subagentsAllSettled\(/.test(code50) && /teamDataReady = settled0;/.test(code50),
+    '落定判据未换成 subagentsAllSettled');
+
+  ok('T50-b4 ★★落定判定不得再用 allInRoundSubFilesTerminal（防回退到过严判据）',
+    !/teamDataReady\s*=[^;]*allInRoundSubFilesTerminal/.test(code50),
+    'teamDataReady 仍用 allInRoundSubFilesTerminal');
+
+  // 提取同步弹分支块（从条件行到该分支末尾的 out(...)）
+  const syncStart = code50.indexOf('if (isPlainRound || teamDataReady || teamSyncToast) {');
+  let block50 = '';
+  if (syncStart >= 0) {
+    const outIdx = code50.indexOf('out({ hookSpecificOutput: {} });', syncStart);
+    block50 = outIdx > syncStart ? code50.slice(syncStart, outIdx) : code50.slice(syncStart, syncStart + 7000);
+  }
+  const wPos = block50.indexOf('writeCoalesce(');
+  const cPos = block50.indexOf('clearCoalesce(');
+
+  ok('T50-b5 ★★同步弹分支内先 writeCoalesce 后 clearCoalesce（弹失败留兜底 / 弹成功清标记 → 不二次弹）',
+    wPos >= 0 && cPos > wPos, `writeCoalesce@${wPos} clearCoalesce@${cPos}`);
+
+  ok('T50-b6 ★★同步弹分支内不得启动 watcher（团队轮不再 spawn detached 子进程）',
+    block50.length > 0 && !/startWatcherVerified|spawnFlushWatcher/.test(block50),
+    block50.length ? '分支内仍调用 watcher 启动' : '未提取到分支块');
+
+  ok('T50-b7 团队轮弹窗 reason 标签区分（+team-sync，便于诊断）',
+    /'\+team-sync'/.test(src50), '未找到 +team-sync 标签');
+}
+
+// ===== T51（v3.44.0）：主模型与子代理「同模型」合并成单条弹窗时，第一行必须标明含子代理 =====
+//   背景（用户 2026-10-10 实测）：主+子代理同模型 → 按模型分条逻辑返回 false（只有 1 个模型桶）→ 走单条弹窗；
+//   而 toastLine1 既有的「（子代理 X）」只标注**与主模型不同**的子代理模型（subs 过滤），同模型时恒为空
+//   → 第一行**看不出本轮含子代理**。补「（含子代理）」标识；放不下整段丢弃（绝不挤掉数据）。
+{
+  const savedEnv51 = process.env.WB_ROOT;
+  process.env.WB_ROOT = tmp;
+  let tt51 = null;
+  try { tt51 = require(path.join(skillDir, 'token-tracker.js')); } catch (e) { tt51 = null; }
+  if (!tt51 || typeof tt51.toastLine1 !== 'function' || typeof tt51.dispWidthTitle !== 'function') {
+    ok('T51 模块加载（需要 toastLine1 / dispWidthTitle 导出）', false, '缺少导出');
+  } else {
+    const base51 = { in: 1249399, out: 13381, cached: 1180288, total: 1262780, model: 'deepseek-flash', modelMain: 'deepseek-flash', durMs: 73000 };
+    const first51 = (stat, ms) => String(tt51.toastLine1(stat, ms || stat.model, '', '', '', '')).split('\n')[0];
+    const TAG51 = '（含子代理）';
+    try {
+      const f1 = first51(Object.assign({}, base51, { subModels: ['deepseek-flash'], subCount: 2, teamActive: true }));
+      ok('T51-b1 ★★主+子代理同模型 → 首行含「（含子代理）」',
+        f1.includes(TAG51), `got ${JSON.stringify(f1)}`);
+
+      const f2 = first51(Object.assign({}, base51, { subModels: [], subCount: 0, teamActive: false }));
+      ok('T51-b2 纯普通轮 → 首行不含标识', !f2.includes(TAG51), `got ${JSON.stringify(f2)}`);
+
+      const f3 = first51(Object.assign({}, base51, { subModels: ['hy3'], subCount: 1, teamActive: true }));
+      ok('T51-b3 ★★异模型子代理 → 主条不加任何子代理标注（已在分条弹窗单独成条）',
+        !f3.includes(TAG51) && !f3.includes('子代理'), `got ${JSON.stringify(f3)}`);
+
+      const LONG51 = 'deepseek-v4.1-flash-super-long-name';
+      const f4 = first51(Object.assign({}, base51, { model: LONG51, modelMain: LONG51, subModels: [LONG51], subCount: 1, teamActive: true }), LONG51);
+      ok('T51-b4 ★★放不下时整段丢弃且首行不超宽（绝不挤掉数据）',
+        !f4.includes(TAG51) && tt51.dispWidthTitle(f4) <= 45, `got ${JSON.stringify(f4)} 宽=${tt51.dispWidthTitle(f4)}`);
+
+      const f5 = first51(Object.assign({}, base51, { subModels: [], subCount: 0, teamActive: true }));
+      ok('T51-b5 teamActive 但 subCount=0 也加（子代理刚派发、文件未落盘）', f5.includes(TAG51), `got ${JSON.stringify(f5)}`);
+    } catch (e) { ok('T51 组异常', false, (e && e.message) || String(e)); }
+  }
+  if (savedEnv51 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv51;
+}
+
+// ===== T52（v3.44.0）：行1 超宽时**先缩短时段标注格式**（高峰双倍→高峰 / 夜间N折→夜间） =====
+//   场景：长模型名 + 「（含子代理）」 + 时段 + 价格标注 叠加 → 超过 TOAST_ROW1_MAX_W(45)。
+//   策略：先挤掉时段里的冗余修饰词，保住模型名完整 + 各标注都在；缩了仍超才走既有"缩名保标注"。
+//   触发概率低（用户 2026-10-10：机制要有，但日常不会挤满；极端叠加才出现）。
+{
+  const savedEnv52 = process.env.WB_ROOT;
+  process.env.WB_ROOT = tmp;
+  let tt52 = null;
+  try { tt52 = require(path.join(skillDir, 'token-tracker.js')); } catch (e) { tt52 = null; }
+  if (!tt52 || typeof tt52.toastLine1 !== 'function') {
+    ok('T52 模块加载（需要 toastLine1 导出）', false, '缺少导出');
+  } else {
+    const first52 = (stat, ms, period, extra) => String(tt52.toastLine1(stat, ms, period, '', '', extra || '')).split('\n')[0];
+    const B52 = { in: 1000, out: 100, cached: 100, total: 1100, model: 'm', modelMain: 'm', durMs: 1000 };
+    const LONGM52 = 'a-very-long-model-name-here';
+    const TAG52 = '｜⚠价核验';
+    try {
+      const f1 = first52(B52, LONGM52, '高峰双倍', TAG52);
+      ok('T52-b1 ★★行1 超宽时把「高峰双倍」缩短为「高峰」',
+        f1.indexOf('高峰') >= 0 && f1.indexOf('双倍') < 0 && tt52.dispWidthTitle(f1) <= 45,
+        `got ${JSON.stringify(f1)} w=${tt52.dispWidthTitle(f1)}`);
+
+      const f2 = first52(B52, 'deepseek-flash', '高峰双倍', '');
+      ok('T52-b2 不超宽时保持「高峰双倍」（不无谓缩短）',
+        f2.indexOf('高峰双倍') >= 0, `got ${JSON.stringify(f2)}`);
+
+      const f3 = first52(B52, LONGM52, '夜间2折', TAG52);
+      ok('T52-b3 ★行1 超宽时把「夜间2折」缩短为「夜间」',
+        f3.indexOf('夜间') >= 0 && f3.indexOf('折') < 0 && tt52.dispWidthTitle(f3) <= 45,
+        `got ${JSON.stringify(f3)} w=${tt52.dispWidthTitle(f3)}`);
+
+      const f4 = first52(B52, 'a-super-ultra-mega-long-model-name-that-will-never-fit', '高峰双倍', TAG52);
+      ok('T52-b4 缩短后仍超宽 → 走既有守卫，结果不崩且 ≤45',
+        tt52.dispWidthTitle(f4) <= 45, `got ${JSON.stringify(f4)} w=${tt52.dispWidthTitle(f4)}`);
+    } catch (e) { ok('T52 组异常', false, (e && e.message) || String(e)); }
+  }
+  if (savedEnv52 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv52;
 }
 
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。

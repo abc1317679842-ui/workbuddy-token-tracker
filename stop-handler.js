@@ -65,6 +65,7 @@ function handleStopEnd(ctx) {
     sleepSync,
     startWatcherVerified,
     subagentPending,
+    subagentsAllSettled,
     summarizePayload,
     terminalError,
     toastLine1,
@@ -196,6 +197,21 @@ function handleStopEnd(ctx) {
         //   本改动同时**回归代码原设计意图**（见上方 v2.27/v2.28 注释：普通轮立即弹，仅专家团走合并延迟）。
         //   判断依据 agg.subCount / agg.teamActive —— 二者均为 0/false 即普通轮。
         const isPlainRound = !(agg && (Number(agg.subCount) > 0 || agg.teamActive === true));
+        // v3.44.0（C 类根治）：**团队轮改走同步弹**，不再 spawn watcher 等子代理落定。
+        //   背景（2026-10-09 实测，用户报"有子代理才延迟弹窗"）：子代理参与的轮次弹窗延迟/悬空，根因有二——
+        //   ① Stop 侧落定判据 `allInRoundSubFilesTerminal` 只认"末行终止态"，**一个 incomplete 残留就整轮判
+        //      未收尾** → 被迫 spawn watcher。实测会话级放行率仅 **48.1%**；而 watcher 侧同口径判据
+        //      （`subagentsAllSettled`）是 **81.5%**——两侧判据不一致，一半多轮次明明子代理早已写完全、
+        //      数据已齐，仍被判"未收尾"（不是子代理"延迟结束"，是判据"认不出它已经结束了"）。
+        //   ② watcher 是 detached 子进程，会被宿主 Job Object 连带杀 → 弹窗悬空（KI-12 v3.42.1 / KI-13 v3.43.0）。
+        //   现改为：团队轮与普通轮**同一条同步弹路径**（落定判据换 `subagentsAllSettled` + 有界微重判），
+        //   弹完 `clearCoalesce` + 推进 `lastStopAt` = **硬性结案**，三条补弹路径（watcher / round-watch /
+        //   hook）全部以"coalesce 存在 / lastStopAt 未推进"为前提 → 自动失活，**绝不二次弹**。
+        //   实测依据（本机 28 个含子代理会话）：78.6% 的子代理早于主任务结束 >20s 停写 → 判据立即认出、0 等待；
+        //   仅 ~14%（手动取消场景，子代理被丢弃后仍跑）需走微重判窗口；其中跑几十秒的收不进来 → 弹窗少算该部分，
+        //   但**账本照记**（各子代理文件有独立行数水位线、幂等）——用户 2026-10-10 定案："剩下的只记录就好了"。
+        //   逃生阀：`WB_SYNC_TEAM=0` 退回旧行为（团队轮走 coalesce + watcher）；`WB_TEAM_SPLIT=1` 优先级更高。
+        const teamSyncToast = !isPlainRound && process.env.WB_SYNC_TEAM !== '0' && process.env.WB_TEAM_SPLIT !== '1';
         // v3.09 修复D（2026-09-22 实证·弹窗时效）：团队轮若在 Stop 时刻**子代理已全部收尾**，说明数据已齐
         //   → 直接走同步立即弹窗，不再 spawn watcher。
         //   证据：当晚三次团队轮弹窗全靠下一轮 --hook 兜底（reason=hook-fallback），延迟 1~10 分钟；
@@ -216,29 +232,44 @@ function handleStopEnd(ctx) {
         //   会导致本快速路径永不触发（真实会话实测 21 个子代理中 3 个 incomplete）。
         let teamDataReady = false;
         try {
-          // v3.13（2026-09-23）：原判据只看 mtime 活跃窗（20s）→ 子代理"刚写完但差 <20s"会被误判"仍在跑"，
-          //   白拆两条（实测 01:45：文件 01:45:05.904 写完，Stop 在 01:45:05.2，只差 0.7 秒）。
-          //   新增**有界微重判**：pending=0 且文件"刚活跃"时，最多重判 3 次（每次等 700ms，共 ~2.1s），
-          //   其间只要 `subagentPending()` 仍为 0 且**本轮子代理文件全部为终止态**（allInRoundSubFilesTerminal）
-          //   就放行**单条完整弹窗**（含子代理 token）。
-          //   ⚠️ 准确性优先：只有**全部**文件确认终止才放行；超预算仍未终止 → 走拆分兜底（绝不漏 token）。
-          //   关闭开关：环境变量 WB_NO_SUB_WAIT=1（用于测试或异常时快速回退）。
-          const pend0 = subagentPending(tsPath).length === 0;
-          const active0 = hasSubagentsRecentlyActive(tsPath, SUBAGENT_IDLE_MS);
-          teamDataReady = pend0 && !active0;
-          if (pend0 && active0 && process.env.WB_NO_SUB_WAIT !== '1') {
-            for (let i = 0; i < 3 && !teamDataReady; i++) {
+          // v3.13（2026-09-23）：曾只看 mtime 活跃窗（20s）→ 子代理"刚写完但差 <20s"被误判"仍在跑"，
+          //   白拆两条（实测 01:45：文件 01:45:05.904 写完，Stop 在 01:45:05.2，只差 0.7 秒）→ 加入有界微重判。
+          // v3.44.0：判据由 `allInRoundSubFilesTerminal`（只认末行终止态）换成 **`subagentsAllSettled`**
+          //   （末行终止 **或** incomplete 但已停写 ≥20s）= 与 watcher 侧收口口径统一。此前两侧不一致、
+          //   Stop 侧严一倍（实测放行率 48.1% vs 81.5%）→ 一半多轮次被迫走 watcher。
+          //   **不再看 `subagentPending`**：它靠"spawn 名 vs 结束通知"匹配，无 name 字段的 Agent 调用会抓出
+          //   噪声名 → 假非空（v3.38.0 已定性）；**文件落盘状态是更权威的证据**（同 watcher 侧 L6324 口径）。
+          //   微重判窗口 3×700ms → **4×700ms（≈2.8s）**：未落定时最多再确认 4 次，超窗即弹（不无限等）。
+          //   关闭开关：WB_NO_SUB_WAIT=1（测试 / 异常时快速回退，直接判未落定、不进微重判）。
+          const settled0 = subagentsAllSettled(tsPath, aggStart0, SUBAGENT_IDLE_MS);
+          teamDataReady = settled0;
+          if (!settled0 && process.env.WB_NO_SUB_WAIT !== '1') {
+            for (let i = 0; i < 4 && !teamDataReady; i++) {
               sleepSync(700);
               try {
-                teamDataReady = subagentPending(tsPath).length === 0 && allInRoundSubFilesTerminal(tsPath, aggStart0);
+                teamDataReady = subagentsAllSettled(tsPath, aggStart0, SUBAGENT_IDLE_MS);
               } catch (e) { teamDataReady = false; }
               if (teamDataReady) appendCompactionLog('stop-sub-wait-resolved', { sid: effSid, tries: i + 1 });
             }
           }
         } catch (e) { teamDataReady = false; }
-        if (isPlainRound || teamDataReady) {
-          // 普通轮：同步立即弹（不 spawn、不等确认窗），并清掉 coalesce 以免被兜底二次补弹
+        if (isPlainRound || teamDataReady || teamSyncToast) {
+          // 同步立即弹（不 spawn watcher、不等确认窗），并清掉 coalesce 以免被兜底二次补弹。
+          // v3.44.0：团队轮（teamSyncToast）也走这里 —— 见上方判断块注释。
           try {
+            // v3.44.0：团队轮同步弹前先写 coalesce，作为"弹窗失败"的兜底信号（alreadyRecorded 供
+            //   hook 兜底只显示、不重复记账）。弹成功 → 下方 clearCoalesce 清掉，三条补弹路径全部失活；
+            //   弹失败（异常跳到 catch）→ coalesce 保留，下次 --hook 触发时兜底补弹。
+            //   普通轮不写：保持原行为（最小化变更面），它不依赖兜底。
+            if (!isPlainRound) {
+              try {
+                writeCoalesce(effSid, agg, {
+                  tsPath, roundStart: aggStart0, byModel,
+                  terminalError: teAtStop || undefined, traceFile,
+                  alreadyRecorded: true,
+                });
+              } catch (e) { /* silent-ok:降级 — coalesce 写失败只丢兜底，不阻塞同步弹窗 */ }
+            }
             // v3.38.1（真机复现 2026-10-09 00:52，用户截图质问「为什么还是合并了」）：
             //   本快速路径（v3.09 加）在 v3.38.0 改造时**漏改**——它先于 TEAM_SPLIT 与 watcher 执行，
             //   teamDataReady 时直接单条弹（旧标注「（子代理 hy3）」+ 跨模型混合计价），把 C3③ 的
@@ -247,17 +278,21 @@ function handleStopEnd(ctx) {
             //   修法：团队轮（!isPlainRound）先试 showToastsSplitByModel——≥2 模型 → 分条弹
             //   （与 watcher 收口同一实现）；单模型返回 false → 回落原单条，逐字节不变。
             //   真普通轮（isPlainRound）不试分条：无子代理，models 必然单桶，白扫盘。
+            // v3.44.0：reason 标签区分轮型（诊断用）——普通轮 `+plain-immediate`，团队轮 `+team-sync`。
+            const syncReason = (typeof toastReason === 'string' && toastReason)
+              ? toastReason + (isPlainRound ? '+plain-immediate' : '+team-sync')
+              : (isPlainRound ? 'plain-immediate' : 'team-sync');
             if (!isPlainRound && showToastsSplitByModel(agg, {
               pricing, tsPath, roundStart: aggStart0,
               bal: balanceText(), firstToday: todayUsageTxt(),
-              reason: (typeof toastReason === 'string' && toastReason) ? toastReason + '+plain-immediate' : 'plain-immediate',
+              reason: syncReason,
             })) {
-              appendCompactionLog('stop-plain-immediate-split', { sid: effSid, parts: Object.keys((agg && agg.models) || {}) });
+              appendCompactionLog(isPlainRound ? 'stop-plain-immediate-split' : 'stop-team-sync-split', { sid: effSid, parts: Object.keys((agg && agg.models) || {}) });
             } else {
               showToast(
                 toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), balanceText(), todayUsageTxt(), noPriceTag1(agg, pricing)),
                 toastLine2(agg, pricing),
-                (typeof toastReason === 'string' && toastReason) ? toastReason + '+plain-immediate' : 'plain-immediate',
+                syncReason,
                 tsPath
               );
             }
@@ -278,8 +313,8 @@ function handleStopEnd(ctx) {
                 lastStopAt: Date.now(),
               }, sid);
             } catch (e) { /* 快照写失败不影响弹窗 */ }
-            appendCompactionLog('stop-plain-immediate', { sid: effSid, subCount: agg && agg.subCount, teamActive: !!(agg && agg.teamActive), teamDataReady });
-          } catch (e) { process.stderr.write(`[token-tracker] 普通轮同步弹窗失败: ${e.message}\n`); }
+            appendCompactionLog(isPlainRound ? 'stop-plain-immediate' : 'stop-team-sync', { sid: effSid, subCount: agg && agg.subCount, teamActive: !!(agg && agg.teamActive), teamDataReady });
+          } catch (e) { process.stderr.write(`[token-tracker] 同步弹窗失败(${isPlainRound ? '普通轮' : '团队轮'}): ${e.message}\n`); }
           out({ hookSpecificOutput: {} });
           return true;
         }
@@ -425,4 +460,4 @@ function handleStopEnd(ctx) {
   return false;
 }
 
-module.exports = { handleStopEnd, STOP_TX_NAMES: ["SUBAGENT_IDLE_MS","TOAST_LINE_MAX_W","aggregateMainOnly","aggregatePerModel","aggregateTranscript","allInRoundSubFilesTerminal","appendCompactionLog","balanceText","captureTranscShape","clearCoalesce","coalescePath","dispWidth","ensureNewModelPricing","estimateInterrupted","freshCompactionMarker","hasSubagentsRecentlyActive","incrementalRecord","inferRoundStartFromText","lastWatcherSpawnError","latestTraceFile","ledgerKey","lineFor","loadSnapshot","mergeEstIntoModels","noPriceTag1","periodNote","readCoalesceInfo","readTranscLines","roundLabel","saveSnapshot","shortModelName","showToast","showToastsSplitByModel","sleep","sleepSync","startWatcherVerified","subagentPending","summarizePayload","terminalError","toastLine1","toastLine2","toastLineTagged","todayUsageTxt","traceWallDurMs","transcriptPathFromPayload","writeCoalesce","writeProbe"] };
+module.exports = { handleStopEnd, STOP_TX_NAMES: ["SUBAGENT_IDLE_MS","TOAST_LINE_MAX_W","aggregateMainOnly","aggregatePerModel","aggregateTranscript","allInRoundSubFilesTerminal","appendCompactionLog","balanceText","captureTranscShape","clearCoalesce","coalescePath","dispWidth","ensureNewModelPricing","estimateInterrupted","freshCompactionMarker","hasSubagentsRecentlyActive","incrementalRecord","inferRoundStartFromText","lastWatcherSpawnError","latestTraceFile","ledgerKey","lineFor","loadSnapshot","mergeEstIntoModels","noPriceTag1","periodNote","readCoalesceInfo","readTranscLines","roundLabel","saveSnapshot","shortModelName","showToast","showToastsSplitByModel","sleep","sleepSync","startWatcherVerified","subagentPending","subagentsAllSettled","summarizePayload","terminalError","toastLine1","toastLine2","toastLineTagged","todayUsageTxt","traceWallDurMs","transcriptPathFromPayload","writeCoalesce","writeProbe"] };

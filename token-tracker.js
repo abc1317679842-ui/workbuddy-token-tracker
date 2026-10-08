@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.43.0 (2026-10-10)
+// token-usage-tracker v3.44.0 (2026-10-10)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -4912,30 +4912,43 @@ function shrinkTitle(s, maxW) {
 
 function toastLine1(stat, modelShort, period, balTxt, todayTxt, extraTag) {
   let head = modelShort || '';
-  // v3.11：团队轮在第一行补「（子代理 X）」——只补与主模型**不同**的子代理模型；最多列 1 个 + 「等」。
-  //   需求（用户 2026-09-23 明确）：① 第一个必须是主模型；② 第一行最多两个模型名；③ 超宽就截断，先截子代理段。
-  //   实现：主模型完整保留；给子代理段按剩余预算截断（shrinkTitle），预算不足则整段丢弃。
+  // v3.44.0（用户 2026-10-10 定案）：**主条不再标注「（子代理 X）」**。
+  //   原因（用户原话）："子代理已经单独弹窗了，不需要在那里加它了" —— 异模型子代理由分条弹窗
+  //   **单独成条**（那条自带「（子代理使用）」标注，见 showToastsSplitByModel），主条再标一次既冗余、
+  //   又会让人误以为"主条里含了子代理的消耗"。
+  //   （原 v3.11「（子代理 X）」逻辑删除——v3.38.0 分条之后它已是死代码：单条路径下 subModels 只会是
+  //   与主模型同模型，filter 后恒空；保留它反而在异常输入下吐出误导标注。）
+  //   只保留真正看不出、需要标识的场景：**主模型与子代理同模型 → 合并成一条**（分条逻辑返回 false）。
   try {
-    const subs = Array.isArray(stat && stat.subModels)
+    const hasSubs = !!(stat && (Number(stat.subCount) > 0 || stat.teamActive === true));
+    const subsDiff = Array.isArray(stat && stat.subModels)
       ? stat.subModels.filter((m) => m && m !== (modelShort || ''))
       : [];
-    if (subs.length) {
+    // · 只在"本轮确有子代理"且"无**异模型**子代理"（= 同模型合并单条）时加；
+    // · 分条弹窗的每条 stat 不含 subCount/teamActive（见 splitByModelStats）→ 恒不进这里，无重复标注；
+    // · 标识放不下就整段丢弃（与 extraTag / updateTag 同规矩）——标注绝不挤掉真实数据。
+    if (hasSubs && subsDiff.length === 0) {
+      const tag = '（含子代理）';
       const periodW = period ? dispWidthTitle(` ${period}`) : 0;
-      // 6 = 「（子代理 」+「）」的近似显示宽度
-      const budget = TOAST_ROW1_MAX_W - dispWidthTitle(head) - periodW - 6;
-      if (budget >= 6) {
-        const one = String(subs[0]);
-        const shown = dispWidthTitle(one) <= budget ? one : shrinkTitle(one, budget);
-        head = `${head}（子代理 ${shown}${subs.length > 1 ? '等' : ''}）`;
-      }
+      const tagW = extraTag ? dispWidthTitle(String(extraTag)) : 0;
+      if (dispWidthTitle(head + tag) + periodW + tagW <= TOAST_ROW1_MAX_W) head = head + tag;
     }
   } catch (e) { /* 标注失败不影响主流程 */ }
   // 行1：模型名 + 时段标注（空格分隔，不占用时间位置）
   // v3.27.0：extraTag（如「｜⚠无公开价」）并入行1 —— 用户 2026-10-02 明确要求放行1：
   //   行2 已有「输入/输出/缓存/缓存命中/金额」五段，标注塞那里会把缓存百分比挤掉；
   //   行1 模型名右侧本来就有空位。标注同样受下面的超宽守卫保护（放不下就丢标注，绝不挤掉数据）。
-  const periodTxt = period ? ` ${period}` : '';
   const tagTxt = extraTag ? String(extraTag) : '';
+  // v3.44.0（用户 2026-10-10）：行1 拥挤时**先缩短时段标注格式**——"高峰双倍"→"高峰"、"高峰×N"→"高峰"、
+  //   "夜间N折"→"夜间"。先挤掉冗余修饰词，保住**模型名完整 + 各标注都在**；缩了仍超宽才走下方既有守卫
+  //   （缩名保标注）。
+  //   触发概率很低——日常"模型名 + 标注"不会挤满 45u，只有在**长模型名 + （含子代理） + 时段 + 价格标注**
+  //   叠加这类极端情况下才出现（用户 2026-10-10 明确：机制要有，但很少触发）。
+  let periodTxt = period ? ` ${period}` : '';
+  if (period && dispWidthTitle(`${head}${periodTxt}${tagTxt}`) > TOAST_ROW1_MAX_W) {
+    const short = String(period).replace(/双倍|×\d+|\d+折/g, '').replace(/\s{2,}/g, ' ').trim();
+    if (short && short !== String(period)) periodTxt = ` ${short}`;
+  }
   const line1 = `${head}${periodTxt}${tagTxt}`;
   // v3.22.0：版本更新标记（`⬆vX.Y.Z`）——**只有「本机没配 UserPromptSubmit hook」的用户会出现**
   //   （updateTagForToast 内以 lastHookAt 判定；已配 hook 的永远走回答注入，这里恒为空串）。
@@ -5020,6 +5033,15 @@ function noPriceTag1(stat, pricing) {
   if (anyNoPublicPrice(stat, pricing)) return ((stat && stat.in) || (stat && stat.out)) ? '｜⚠无公开价' : '';
   // 只有**真有缓存命中**时才会因缺缓存价而低估 —— 无缓存命中的轮标了纯属噪音
   if (anyCachePriceUnknown(stat, pricing)) return Number(stat && stat.cached) > 0 ? '｜⚠缓存价未知' : '';
+  // v3.44.0（用户 2026-10-10 要求）：**价格类标签从行2 整体移到行1** —— 行2 已满（加标签就会挤掉
+  //   缓存命中百分比；用户 2026-10-02 已抱怨过「又报价核验，又把缓存命中百分比顶掉」）。行1 模型名右侧有余量。
+  //   优先级（只显示**最严重的一条**，控宽）：⚠价核验（价库待核验项涉及本轮模型）
+  //   > 价⚠️（多源拉取全失败 → 费用按上次价格估算）> 官价⚠️（DeepSeek 官价回落到聚合源）。
+  const hasTok = !!((stat && stat.in) || (stat && stat.out));
+  if (!hasTok) return '';
+  if (priceAuditTag(stat, pricing)) return '｜⚠价核验';
+  if (pricing && pricing.last_refresh_error) return '｜价⚠️';
+  if (pricing && pricing.deepseek_refresh_error) return '｜官价⚠️';
   return '';
 }
 function toastLine2(stat, pricing) {
@@ -5094,23 +5116,10 @@ function toastLine2(stat, pricing) {
   if (cost) segs.push(cost);
   if (segs.length) parts2.push(segs.join('｜'));
   let line = parts2.join('｜');
-  // v2.31：价格多源拉取全失败 → 提示「价⚠️」，表示费用按上次价格估算（refresh-prices.js 全源失败时写入 last_refresh_error）
-  if (pricing && pricing.last_refresh_error) {
-    line += '｜价⚠️';
-  }
-  // v2.59：DeepSeek 官方定价抓取失败（回落聚合源）→ 提示「官价⚠️」，表示 DeepSeek 系按本地/聚合源价估算
-  if (pricing && pricing.deepseek_refresh_error) {
-    line += '｜官价⚠️';
-  }
-  // v3.29.0（A-8）：价格诊断告警链修复——把 refresh-prices.js 已落盘的 _price_audit / _ambig_warnings
-  //   变成用户可见提示。toast 只挂极短标签「⚠价核验」（详情见 priceAuditTag 的 stderr 输出），
-  //   与上方 价⚠️ / 官价⚠️ 同位置、同模式，避免撑破行2。
-  // v3.30.0（F-1）：触发源去掉 last_refresh_note（历史流水账 → 永久误报），且改为"只报本轮模型被点名的"。
-  if (pricing) {
-    // v3.30.0（F-1）：必须传 stat —— 标签只在本轮模型被点名的告警上挂（详见 priceAuditTag 注释）
-    const auditTag = priceAuditTag(stat, pricing);
-    if (auditTag) line += '｜' + auditTag;
-  }
+  // v3.44.0（用户 2026-10-10 要求）：**价⚠️ / 官价⚠️ / ⚠价核验 三个价格类标签已整体移到行1**
+  //   （见 noPriceTag1）——行2 挂它们会挤掉缓存命中百分比（用户 2026-10-02 已抱怨「又报价核验，
+  //   又把缓存命中百分比顶掉」）。行2 只保留「数据不可信」类：⚠未计价（金额缺失）/ ⚠账缺（token 少计），
+  //   这两个任何情况都不丢（下方宽度守卫也不碰）。
   // v3.24.0（级联②）：该模型在价库里找不到 → 金额显示「未收录」，但那不够醒目（报告实测：
   // 纯净环境无本地价库时 hy3 等子代理模型金额静默=0，用户毫无感知）。补「⚠未计价」标注，
   // 对齐 价⚠️/官价⚠️ 模式。只在确实有 token 消耗时标注（空轮不标）。
@@ -5142,11 +5151,8 @@ function toastLine2(stat, pricing) {
   //   ⚠未计价（金额缺失）/ ⚠账缺（token 少计）是「数据不可信」信号，**两级都不丢**。
   // 安全说明：'｜价⚠️' 与 '｜官价⚠️' **不会互相误伤**——`'｜官价⚠️'.indexOf('｜价⚠️') === -1`
   //   （「｜」后紧邻的是「官」而非「价」），故 replace 各丢各的，顺序无副作用。
-  const TAG_DROP_ORDER = ['｜⚠价核验', '｜价⚠️', '｜官价⚠️'];
-  for (const t of TAG_DROP_ORDER) {
-    if (dispWidth(line) <= TOAST_LINE_MAX_W) break;
-    line = line.replace(t, '');
-  }
+  // v3.44.0：原「第一级：丢价格类标签（⚠价核验 / 价⚠️ / 官价⚠️）」已随标签迁移到行1 而取消——
+  //   行2 现在只剩「数据不可信」类（⚠未计价 / ⚠账缺），它们**本就不该丢**，故直接进第二级（丢缓存占比）。
   if (dispWidth(line) > TOAST_LINE_MAX_W) {
     // v3.27.0：ratioTxt 现在不带尾随「｜」（金额段可能整体缺席），
     //   所以要多清一次「<ratio>｜」形式，以及清完后的行尾孤立「｜」。
@@ -5831,7 +5837,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.43.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.44.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -6600,6 +6606,7 @@ function main() {
     sleepSync,
     startWatcherVerified,
     subagentPending,
+    subagentsAllSettled,
     summarizePayload,
     terminalError,
     toastLine1,

@@ -39,8 +39,8 @@ type: skill
 
 ## 当前功能总览（版本以 manifest.yaml 为准）
 
+> **v3.44.0 要点（2026-10-10）：团队轮改走同步弹 —— 子代理参与的轮次弹窗延迟/悬空根治。** 原团队轮走 coalesce + watcher 等子代理落定，但 ① Stop 侧落定判据过严（`allInRoundSubFilesTerminal` 只认末行终止态，实测会话级放行率 **48.1%**，而 watcher 侧同口径 `subagentsAllSettled` 是 **81.5%**）→ 一半多轮次子代理早已写完全、数据已齐却被判"未收尾"、被迫走 watcher；② watcher 是 detached 子进程，会被宿主 Job Object 连带杀 → 悬空（KI-12/KI-13）。改为：团队轮与普通轮**同一条同步弹路径**（落定判据换 `subagentsAllSettled` + 有界微重判 4×700ms），弹完 `clearCoalesce` + 推进 `lastStopAt` = **硬性结案**（三条补弹路径全部失活，**绝不二次弹**）；Stop 之后仍在写的子代理**只记账不弹**（各文件独立水位线、幂等）。逃生阀 `WB_SYNC_TEAM=0` 可退回旧行为。守卫 T50。
 > **v3.43.0 要点（2026-10-10）：修 KI-13「弹窗悬空」第二触发点——spawn 后轮询接管判定必须复核 pid（锁 mtime 变新 ≠ watcher 还活着）。** `startWatcherVerified` 的 1.5s 轮询**只看 `lockF.mtimeMs > lockBefore`**；watcher 建完锁立刻被宿主 Job Object 连带杀（Stop = 回合结束信号 → 客户端回收 Job；`detached` 在 Windows Job 下挡不住）→ mtime 确实新了 → 误判"已接管" → 调用方不降级 → **弹窗悬空 ~70s**（直到用户发下一条消息由 hook-fallback 补弹）。修法（方案 α）：轮询里锁 mtime 变新后**必须再过 `classifyWatchLock`**，只认 `'alive'` 才返回 true，否则耗尽 1.5s 后返回 false 走降级弹窗。守卫 T49（b1 红线 + b5 源码级）。零账本影响。
-> **v3.42.1 要点（2026-10-10）：修 KI-12「弹窗悬空」——watcher 判活必须复核 pid（心跳新鲜 ≠ 还活着）。** `startWatcherVerified` 原判活只看心跳年龄 <15s；watcher 崩溃与末次心跳间隔很短时（实测 ~1s）会误判"已接管" → 调用方不降级 → **弹窗悬空**（实测 8 分钟）。修法：纯判定 `classifyWatchLock` 三态（alive/dead/stale），**心跳新鲜且 pid 存活**才认定接管，pid 死则删锁降级。守卫 T48（b1 红线）。零账本影响。
 > **逐版细节、动机、取舍一律查 `CHANGELOG.md`** —— 本文件不再堆版本要点；上面若与旧说法冲突，**以本条为准**。
 
 > **⚠️ 强制（查询触发总纲）：所有统计查询必须调用 `--report` 命令并原样贴出脚本输出，禁止自行解析 JSON。** 无论用户问「今日消耗」「今天用了多少」「账本」「报告」「统计」「花费」还是历史某天，一律先跑 `node token-tracker.js --report`（或 `--report <日期>`），再把脚本打印的 Markdown 表格原文贴给用户；不得自行读取 `daily-usage.json`、不得自行汇总、不得转成列表/纯文本/代码块。详细规则见下方「查询触发规则（强制）」与「展示格式约束（强制）」。
@@ -55,10 +55,10 @@ type: skill
 - **版本更新提示（v3.21.0，v3.22.0 补覆盖）**：每 **7 天**匿名查一次仓库版本（**同时查 `releases/latest` 与全部 tag，取较大者**），发现新版本时**由模型在回答末尾提一句**，不占 toast 空间；`out()` 内部追加 → 任何 hook 输出路径都带得上；**只配 Stop 的用户**改走弹窗兜底（`｜⬆vX.Y.Z`，放不下就不显示）。同一新版本**最多提示 2 次、间隔 ≥24h**（脚本自动节流，你不用去重）。开关 `ENABLE_UPDATE_CHECK`。**升级操作步骤见「版本更新提示与如何升级」章节**——注入的提示里不含升级步骤。⚠️ **帮不了已装旧版（<v3.21.0）的用户**。
 - **统计范围边界（务必对用户如实说）**：本技能统计的是「**WorkBuddy 落盘了的消耗**」，**不等于账上被扣的全部消耗**（四条缺口 + 对账口径见「数据源与准确性」一节）。
 - **今日累计**：toast 行1 显示 `今日¥X.XX`（读当日账本 total.cost，含本条）。
-- **时段标注**：DeepSeek 原厂系支持峰谷定价，自动标注 `高峰双倍`；声明 `night_discount` 的模型夜间标注 `夜间X折`。**DeepSeek 时段自动跟随官方**（`deepseek_rules.peak_schedule` 由 `deepseek-official.js` 每日抓官方定价页；无规则回落内置默认 9-12/14-18 + 周末低峰），**无需手动维护**；其他厂商的峰谷/夜间字段仍需人工写入 `pricing.json`。
+- **时段标注**：DeepSeek 原厂系支持峰谷定价，自动标注 `高峰双倍`；声明 `night_discount` 的模型夜间标注 `夜间X折`（**当前定价库无模型声明该字段 → 夜间标注实际不会出现**）。**行1 拥挤时自动缩短**（`高峰双倍`→`高峰`、`夜间X折`→`夜间`），日常不触发。**DeepSeek 时段自动跟随官方**（`deepseek_rules.peak_schedule` 由 `deepseek-official.js` 每日抓官方定价页；无规则回落内置默认 9-12/14-18 + 周末低峰），**无需手动维护**；其他厂商的峰谷/夜间字段仍需人工写入 `pricing.json`。
 - **余额显示**：仅 DeepSeek 自定义 API 且开启开关时启用，默认隐藏 + 变化检测（余额变才显示），15 秒 TTL 缓存。
-- **专家团/多子回合聚合**：识别 `Agent`/`TeamCreate` 等团队活动，专家团跑完延迟约 6 秒**只弹一次整轮汇总**，不重复弹 N 次。
-- **团队轮补弹链路死亡检测（v3.26.0）**：团队轮拆分弹后刻意不推进轮次终点；watcher 一旦被宿主收割（KI-3）就永久停在旧轮 → 起点重叠、双弹屏。hook 端检测「coalesce 残留超时（默认 10 分钟，环境变量 `WB_TEAM_SPLIT_STALE_MS` 可调）+ 子代理已静止」→ 宣告本轮结算并双推进起点/终点。详见 `KNOWN-ISSUES.md` KI-6 ⑨。
+- **专家团/多子回合聚合**：识别 `Agent`/`TeamCreate` 等团队活动。**v3.44.0 起与普通轮走同一条「同步弹」路径** —— 主任务结束时**立即弹一次整轮汇总**（按模型分条），不再延迟等待 watcher；Stop 之后仍在写的子代理**只记账、不补弹**。旧行为（coalesce + watcher 等待）可用 `WB_SYNC_TEAM=0` 回退。
+- **团队轮补弹链路死亡检测（v3.26.0）**：**⚠ 仅 `WB_SYNC_TEAM=0`（旧行为）下才有意义** —— v3.44.0 起团队轮走同步弹、弹完即 `clearCoalesce` + 推进 `lastStopAt` 结案，不再产生"coalesce 残留 / watcher 被收割"。旧机制：团队轮拆分弹后刻意不推进轮次终点；watcher 一旦被宿主收割（KI-3）就永久停在旧轮 → 起点重叠、双弹屏。hook 端检测「coalesce 残留超时（默认 10 分钟，环境变量 `WB_TEAM_SPLIT_STALE_MS` 可调）+ 子代理已静止」→ 宣告本轮结算并双推进起点/终点。详见 `KNOWN-ISSUES.md` KI-6 ⑨。
 - **多会话隔离**：按 hook payload 的 `session_id` 拆分快照，多会话并发互不串扰。
 - **价格体系（零密钥联网）**：`pricing.json` 官方人民币价 + 每日自动多源刷新 + 未收录新模型自动联网补录（国内源优先）。默认零密钥：仅余额查询携带 API key（默认关闭）。细节见「费用估算」与 `docs/pricing-refresh.md`。
 - **快照自动清理**：`.snapshot-<sid>.json` 保留最近 30 天 + 最多 50 个，当前会话永不清。
