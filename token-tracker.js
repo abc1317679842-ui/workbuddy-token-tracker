@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.39.0 (2026-10-09)
+// token-usage-tracker v3.40.0 (2026-10-10)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -453,6 +453,10 @@ const EXPORTS_KEEP_DAYS = 30;
 // ===== v2.66 通用工具：模型名归一化 + 文件锁 + 原子写 =====
 // 账本文件曾损坏 → 本轮禁止写回空对象以免覆盖历史（损坏文件已备份为 .corrupt）
 let gDailyCorrupt = false;
+// v3.40.0（plan-B A21）：本进程是否**真的隔离过**损坏账本（rename 成 .corrupt-<ts>）。
+//   与 gDailyCorrupt 分工：后者是"本轮别写回"的闸门，本标志是"文件是我自己搬走的"的记忆。
+//   两者一起才能回答 loadDailyUsage 的 ENOENT 分支该不该复位（见该处注释）。
+let gLedgerQuarantined = false;
 
 // 模型名归一化：去首尾空格、连续空格合并为单空格、统一小写（兼容 "GPT-4 " / "gpt-4" 等变体）
 function normalizeModelName(n) {
@@ -3060,6 +3064,18 @@ function loadDailyUsage() {
       //   因文件已被本轮重命名为 .corrupt-<ts> 而走 ENOENT 分支 → 标志被清 → recordUsage 不再跳过
       //   → 用空账本写回，历史累计丢失（而日志仍声称"本轮不写回覆盖"，与实际行为矛盾）。
       //   现在标志只由"成功解析"来清除，损坏状态在本进程内保持，确保跳过写入生效。
+      //
+      // v3.40.0（plan-B A21 修复）：**但上面这条"永不清除"在长驻进程里会变成永久失记**。
+      //   病根：损坏文件被 rename 成本 .corrupt-<ts> 后，本进程内此后每次 loadDailyUsage 都走
+      //   ENOENT 分支 → 标志永不清 → `recordUsage` 恒返回 false → **该进程之后所有用量再也不记**。
+      //   触发面：watcher（`--flush-delayed`）与 Stop 兜底都是**同一进程多轮调用**的形态。
+      //   处置与 v2.99 的关切相反但同为 fail-safe：**区分"本进程刚隔离过"与"文件本就不存在"**。
+      //   · 本进程内隔离过（gLedgerQuarantined 为真）→ 现状：不清标志（防用空账本覆盖历史）；
+      //   · 文件从未存在过、且本进程未隔离过 → 人工已把损坏文件修好/删掉、或首次运行 →
+      //     清标志让记账恢复。**这是恢复路径，不是覆盖路径**：文件真的不存在时，
+      //     recordUsage 用空账本起步只会丢掉"本来就已不在磁盘上的历史"（那部分在 .corrupt 备份里），
+      //     不会覆盖任何现存数据 —— 而"永久失记"会持续丢掉**将来**的所有用量，危害更大。
+      if (!gLedgerQuarantined) gDailyCorrupt = false;
       return {};
     }
     // v3.24.0（级联③）：**区分「文件真损坏」与「瞬时读失败」** —— 原先所有非 ENOENT 错误一律
@@ -3088,6 +3104,7 @@ function loadDailyUsage() {
         if (!hasBackup) {
           const corruptPath = DAILY_USAGE_FILE + '.corrupt-' + Date.now();
           fs.renameSync(DAILY_USAGE_FILE, corruptPath);
+          gLedgerQuarantined = true; // v3.40.0（A21）：记住"文件是我搬走的" → ENOENT 分支才敢不复位
           process.stderr.write(`[token-tracker] 账本损坏，已备份为 ${path.basename(corruptPath)}（本轮不写回覆盖）\n`);
         } else {
           process.stderr.write(`[token-tracker] 账本损坏（此前已备份过，不重复备份；本轮不写回覆盖）\n`);
@@ -4880,17 +4897,31 @@ function balanceText() {
   const cache = readBalanceCache();
 // 取当前余额：15 秒缓存命中直接复用，否则网络查询；查询失败降级用旧缓存
   let total = null;
+  let isFreshQuery = false; // v3.40.0（A12）：本次是否**真的从网络拿到了**新余额
   if (typeof cache.total === 'number' && (now - (cache.time || 0)) < BALANCE_TTL_MS) {
-    total = cache.total;
+    total = cache.total;                    // TTL 命中：沿用缓存，time 不刷新（本来就新鲜）
   } else {
     const r = queryBalance(key);
-    if (r && typeof r.total === 'number') total = r.total;
-    else if (typeof cache.total === 'number') total = cache.total; // 失败降级，不因网络抖动闪没
+    if (r && typeof r.total === 'number' && Number.isFinite(r.total)) { total = r.total; isFreshQuery = true; }
+    else if (typeof cache.total === 'number' && Number.isFinite(cache.total)) total = cache.total; // 失败降级，不因网络抖动闪没
   }
   if (total === null) return '';
   const last = cache.history.length ? cache.history[cache.history.length - 1].total : null;
   pushBalanceHistory(cache, now, total);
-  try { fs.writeFileSync(BALANCE_CACHE, JSON.stringify({ time: now, total, currency: cache.currency || 'CNY', history: cache.history })); } catch (e) { /* 缓存写失败不致命 */ }
+  // A12 附带修复：`typeof NaN === 'number'` 为真 → 接口返回非数字时 total=NaN 能通过全部校验 →
+  //   弹窗显示「余额¥NaN」。这里显式挡住非有限值（NaN/Infinity 一律视为无效观测，不写缓存）。
+  try {
+    if (Number.isFinite(total)) {
+      fs.writeFileSync(BALANCE_CACHE, JSON.stringify({
+        // v3.40.0（plan-B A12）：**只有真查到**才把 time 刷新为 now。
+        //   病根：失败降级用旧值时也写 `time: now` —— API 持续不可达 → 旧余额被反复"续命"，
+        //   缓存永远读不到过期信号 → 弹窗显示的余额可能已陈旧数天而用户毫无察觉。
+        //   isFreshQuery 为假（TTL 命中 / 网络失败降级）→ 保留旧 time，让 TTL 正常老化。
+        time: isFreshQuery ? now : (cache.time || now),
+        total, currency: cache.currency || 'CNY', history: cache.history,
+      }));
+    }
+  } catch (e) { /* 缓存写失败不致命 */ }
   // 首次观测：只记录 baseline，不显示（给变化检测建立对比基准）
   if (last === null) return '';
   // 余额与上次不同（toFixed(2) 字符串比较，避免浮点相等判断）→ 账户在消耗 → 显示
@@ -5015,6 +5046,25 @@ function savePricingAtomic(pricing, mergeKeys) {
       }
     }
     fs.writeFileSync(tmp, JSON.stringify(out, null, 2) + '\n');
+    // v3.40.0（plan-B A6）：**覆盖前留一份上一版**。
+    //   病根：原实现直接 rename 覆盖，写盘前无备份 → 自动补录一旦采到错价（模糊匹配单命中即采用，
+    //   见 lookupCnPrice / refresh-prices 的 ambigAdd），**发现后只能人肉改文件**，没有回滚手段。
+    //   与 backfill 的 `.bak-backfill-*` 有界保留同一做法：带时间戳归档、只留最近 3 份，避免线性堆积。
+    //   任何失败一律静默 —— 备份是尽力而为的**附加保护**，绝不能因为它让写盘失败（写盘才是主目的）。
+    try {
+      if (fs.existsSync(PRICING)) {
+        const dir = path.dirname(PRICING);
+        const base = path.basename(PRICING);
+        const stamp = path.join(dir, base + '.bak-autofill.' + Date.now());
+        fs.copyFileSync(PRICING, stamp);
+        const olds = fs.readdirSync(dir)
+          .filter((f) => f.startsWith(base + '.bak-autofill.'))
+          .sort(); // 文件名内嵌 13 位时间戳 → 字典序 == 时间序
+        for (const f of olds.slice(0, Math.max(0, olds.length - 3))) {
+          try { fs.unlinkSync(path.join(dir, f)); } catch (e) { /* silent-ok:清理 — 占用/权限：静默，下次再清 */ }
+        }
+      }
+    } catch (e) { /* silent-ok:降级 — 备份失败不阻断计价写入（备份是尽力而为的附加保护） */ }
     fs.renameSync(tmp, PRICING);
     return true;
   } catch (e) {
@@ -5098,7 +5148,19 @@ function ensureNewModelPricing(pricing, stat) {
   }
   if (isLocalModel(stat.model)) return { status: 'none', note: '' }; // 本地模型不计费，禁止自动补录云端价
   const hit = findModel(pricing, stat.model, 'price'); // v2.71：计费模式——宽松命中（如 hy3-x→hy3）即视为已收录，避免无谓联网补录
-  if (hit && typeof hit.m.input_price === 'number') return { status: 'none', note: '' };
+  // v3.39.0（plan-B A8）：**"无公开价"条目要能自愈**。原判据只要求 input_price 是 number ——
+  //   unpublished 条目的 input_price 恒为 0（也是 number）→ 直接 return → **永不重新联网**，
+  //   官方日后公布单价也不会自动回填。现在：unpublished 条目过了重查窗口（30 天）→ 放行去查。
+  //   注意只放行"重查"，不改变"本轮记 0 元"的行为（计价链路不看这里）。
+  const NO_PUBLIC_RECHECK_MS = 30 * 24 * 3600 * 1000;
+  if (hit && typeof hit.m.input_price === 'number') {
+    const isUnpub = hit.m.pricing_status === 'unpublished';
+    const dueAt = Number(hit.m.unpublished_at || 0) + NO_PUBLIC_RECHECK_MS;
+    if (!isUnpub || (dueAt > 0 && Date.now() >= dueAt)) return { status: 'none', note: '' };
+    // unpublished 且未到窗口 → 走下面的重查流程；顺手记一次"本轮查过了"供排查
+    hit.m.unpublished_checked_at = Date.now();
+    process.stderr.write(`[token-tracker] ${stat.model} 为「无公开价」条目且已过重查窗口 → 本轮重新联网确认官方是否已公布单价\n`);
+  }
   const name = lookupKeyOf(stat.model); // v3.18：路径型模型名（本地 .gguf 等）取末段做键，避免把本机绝对路径写进价格库
   const looked = loadLookedup().indexOf(name) >= 0;
   if (looked) {
@@ -5113,12 +5175,24 @@ function ensureNewModelPricing(pricing, stat) {
       // 国内模型：直接人民币价补录
       const ok = addModelPrice(pricing, stat.model, cnRef, 'CN');
       return { status: ok ? 'added' : 'error', note: ok ? `ℹ️ 新模型 ${stat.model} 已从国内源(llmabacus·人民币)自动补录` : `⚠️ 新模型 ${stat.model} 价格写入失败` };
-    } else {
-      // 国外模型（llmabacus 返回 USD 价）→ 按国外定价 USD×汇率
+    } else if (cnRef.priceCurrency === 'USD') {
+      // 国外模型（llmabacus 明确标注 USD 价）→ 按国外定价 USD×汇率
       const usdRef = { id: cnRef.id, usdIn: cnRef.in, usdOut: cnRef.out };
       const ok = addModelPrice(pricing, stat.model, usdRef, 'US');
       return { status: ok ? 'added' : 'error', note: ok ? `ℹ️ 新模型 ${stat.model} 已从 llmabacus(USD·国外定价)自动补录` : `⚠️ 新模型 ${stat.model} 价格写入失败` };
     }
+    // v3.40.0（plan-B A7）：**priceCurrency 缺失/为别的值时不得默认按 USD 处理**。
+    //   病根：原实现是 `if (CNY) {...} else {...按 USD×7.2...}` —— 把「明确标了 USD」与
+    //   「字段缺失 / null / 未知值」一视同仁。某国产模型在源上没标币种时，人民币价被 ×7.2
+    //   写成人民币（**虚高约 7 倍**），且数值落在合理区间内 → 不触发任何告警。
+    //   方向性判断：错补 7 倍是"多收钱"且无痕；漏补只是"本轮没自动补上"，下次刷新还能补（少记可恢复）。
+    //   → 拒绝自动补录，改为把候选值挂出来供人工确认（人工补价路径见 SKILL.md「无公开价」章节）。
+    process.stderr.write(`[token-tracker] ⚠ 新模型 ${stat.model}：国内源命中但 priceCurrency=`
+      + `${JSON.stringify(cnRef.priceCurrency)}（既非 CNY 也非 USD）→ **拒绝自动折算**`
+      + `（按 USD 处理会把人民币价乘汇率写成人民币，虚高数倍且无告警）；`
+      + `候选值 ${cnRef.in}/${cnRef.out}，请人工核对币种后补录\n`);
+    rememberLookedup(name);
+    return { status: 'skipped', note: `⚠️ 新模型 ${stat.model} 币种未知，已跳过自动补录（避免错价 7 倍），请人工核对` };
   }
   if (cnRef === undefined) {
     process.stderr.write(`[token-tracker] 国内源 llmabacus 不可达，回退 OpenRouter 补录\n`);
@@ -5165,6 +5239,15 @@ function rememberNoPublicPrice(pricing, modelName) {
   });
   m.pricing_status = 'unpublished'; // 已存在条目时确保标记（可能是旧版误写的 0 元条目）
   m.input_price = 0; m.output_price = 0;
+  // v3.39.0（plan-B A8）：**"无公开价"不再永久锁死**。
+  //   病根：`input_price: 0` 是 number → 下轮 `findModel` 精确命中直接返回 → **永不重新联网**，
+  //   官方日后公布单价也不会自动回填。KI-7 写了"人工补价 + recalc-day 回算"的补救路径，
+  //   但没写"自动链路永远不会自愈"这个事实。
+  //   修法：记 `unpublished_at`（首次判定的时间戳）+ `unpublished_checked_at`（每次重查的时间）。
+  //   `ensureNewModelPricing` 侧据此判"过了重查窗口就再查一次"（见该处 noPublicRecheckDue）。
+  //   窗口取 30 天：官方公布价属低频事件，30 天粒度足够且不显著增加联网量。
+  //   只补时间戳，**不动 input_price / pricing_status**（保持原有"0 = 未公布"语义不变）。
+  if (!m.unpublished_at) m.unpublished_at = Date.now();
   // v3.31.0（P1-11）：本分支只改了这一个条目 → 锁内重读合并时**只合并它**，避免整份覆写
   //   吃掉 refresh-prices.js 并发落盘的其它价格（与 NOT_FOUND 分支同源，见 savePricingAtomic 注释）。
   const persist = stripLocalDbEntries(pricing);
@@ -5390,7 +5473,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.39.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.40.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

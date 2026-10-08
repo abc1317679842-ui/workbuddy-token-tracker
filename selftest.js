@@ -2386,6 +2386,9 @@ else {
   // v3.39.0：37 → 41 —— 水位线反向闸门（plan-B A1/A2）新增 4 处清理/降级型裸 catch：
   //   backfill.js ×3（水位线落盘失败后的账本/水位线回滚，失败统一降级为人工告警）、
   //   selftest.js ×1（T41 夹具清场）。均按约定带 `// silent-ok:<类别>` 标记。
+  // v3.40.0：T42 的 A21 夹具虽然也写了 4 处 `catch (e) { /* silent-ok:清理 … */ }`，但本守卫的
+  //   判据是 `catch (x) {}`（**空块紧邻**，`BARE33`），带注释的形态**不匹配** → 计数不变（实测确认）。
+  //   这里保留显式说明，避免后人看到"多了 4 处静默"却不知道为什么基线没动。
   ok('T33-a1 ★裸 catch 总数与基线一致（41；新增/删除必须显式改这里，防"顺手吞一个错"）',
     nAll === 41, `实测 ${nAll} 处`);
   ok('T33-a2 ★每一处裸 catch 都带 silent-ok:<类别> — <理由>（无标记即红）',
@@ -3151,6 +3154,234 @@ else {
       dErr.err.indexOf('已回滚本轮账本') < 0, dErr.err.slice(0, 160));
   }
   if (savedEnv41 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv41;
+}
+
+// ===== T42（v3.40.0 / plan-B A6~A12、A21）：价格写入侧闸门 + 状态自愈 —— 8 条零散修复的守卫 =====
+//   为什么打包成一组：这 8 条都是"**静默错**"——不抛异常、不报警、只在账本/价格库上悄悄落一个错值。
+//   它们各自的触发面都窄（币种字段缺失 / 缓存陈旧 / 损坏后人工修好 / 资产冻结被覆盖），人肉回归
+//   几乎必然漏。共同点：**修的是一个"方向性判断"**（多收钱 vs 少记），所以断言的落点都是"方向"。
+//   逐条病根见各分支内联注释；此处只记 T42 的判据口径：源码守卫钉在**函数体内**（grabFn），
+//   行为夹具能真跑的（A21 的隔离标志位可经 require 后调 loadDailyUsage 观察）就真跑 + 观察日志。
+{
+  const rawTT42 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const rawRP42 = fs.readFileSync(path.join(SRC, 'refresh-prices.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const grab42 = (src, name) => {
+    const i = src.indexOf('function ' + name + '(');
+    if (i < 0) return '';
+    const j = src.indexOf('\nfunction ', i + 1);
+    return j < 0 ? src.slice(i) : src.slice(i, j);
+  };
+
+  // ── A6：savePricingAtomic 覆盖前备份（有界保留 3 份） ──
+  //   病根：原实现直接 `renameSync(tmp, PRICING)` —— 自动补录一旦采到错价（模糊匹配单命中即采用），
+  //   发现后**只能人肉改文件**，没有任何回滚手段。备份是"错价可恢复"的唯一落点。
+  const saveAtomicSrc = stripComments(grab42(rawTT42, 'savePricingAtomic'));
+  ok('T42-a1 ★savePricingAtomic 覆盖前 copyFileSync 备份上一版（错价可回滚的唯一落点）',
+    /copyFileSync\(PRICING, stamp\)/.test(saveAtomicSrc)
+    && saveAtomicSrc.indexOf('copyFileSync(PRICING, stamp)') < saveAtomicSrc.indexOf('renameSync(tmp, PRICING)'),
+    '备份必须在 rename 之前，否则备份的是新价');
+  ok('T42-a2 ★备份带时间戳且只留最近 3 份（文件名内嵌 13 位 ts → 字典序 == 时间序）',
+    /\.bak-autofill\.' \+ Date\.now\(\)/.test(saveAtomicSrc)
+    && /olds\.length - 3/.test(saveAtomicSrc),
+    '无上限归档会线性堆积；固定名会互相覆盖（等于没备份）');
+  // 备份是**尽力而为的附加保护**：任何失败都必须静默，绝不能让它把主目的（写盘）带崩
+  //   注意：这里必须扫**未剥注释**的原文 —— stripComments 会把 `// silent-ok:降级` 这段注释本身剥掉，
+  //   用它做判据会永远红（本断言首版就踩了这个坑，实测确认）。
+  const saveAtomicRaw = grab42(rawTT42, 'savePricingAtomic');
+  ok('T42-a3 ★备份失败静默降级（silent-ok），不阻断计价写入',
+    /catch \(e\) \{ \/\* silent-ok:降级/.test(saveAtomicRaw),
+    '备份失败抛出去 = 为了附加保护砸了主流程');
+  // A6 特有契约：备份文件名必须落在 .gitignore 的 `*.bak-*` 规则内。
+  //   技能目录**本身就是 git 工作区** → 不加忽略的话，自动补录每次落一个备份 = 仓库被运行时
+  //   产物污染（v3.32.0 审计 P1-10 踩过同类：锁文件 / .corrupt 备份被 `git add -A` 提交上去）。
+  //   判据用 glob 本身而非"写死了某条规则"：只要 `pricing.json.bak-autofill.<ts>` 被任一规则覆盖即过。
+  {
+    const gi = (() => { try { return fs.readFileSync(path.join(SRC, '.gitignore'), 'utf-8'); } catch (e) { return ''; } })();
+    const covered = /\*\.bak-\*/.test(gi) || /pricing\.json\.bak-/.test(gi);
+    ok('T42-a23 ★A6 备份文件名被 .gitignore 覆盖（否则每次自动补录都往仓库塞一个运行时产物）',
+      covered, '需保留 `*.bak-*` 或显式加 `pricing.json.bak-*`');
+  }
+
+  // ── T42-a24：SKILL.md「最新版要点块」不得用 `①` 续行绕过 T36-b1 的行数上限 ──
+  //   本版实测踩过：T36-b1 的判据只数 `> **vX.Y.Z 要点` 开头的行（≤2 行即过），
+  //   于是给 v3.40.0 写了 1 行要点 + 4 行 `> **①…` 续行，**总数 5 行却照样绿** ——
+  //   守卫被"换个前缀"绕过，正是它想防的"回堆本文件"。这里补：最新版要点块（从
+  //   `> **vX 要点` 起、到下一个 `> **vY 要点` 或引用块结束为止）**总行数 ≤ 2**。
+  {
+    const lines = fs.readFileSync(path.join(SRC, 'SKILL.md'), 'utf-8').replace(/\r\n/g, '\n').split('\n');
+    const isHead = (l) => /^>\s*\*\*v\d+\.\d+(\.\d+)?\s*要点/.test(l);
+    const headIdx = lines.findIndex(isHead);
+    let block = 0;
+    if (headIdx >= 0) {
+      for (let i = headIdx; i < lines.length; i++) {
+        const l = lines[i];
+        if (!/^>/.test(l)) break;            // 引用块结束
+        if (i > headIdx && isHead(l)) break; // 下一版要点开始
+        block++;
+      }
+    }
+    ok('T42-a24 ★SKILL.md 最新版要点块总行数 ≤2（防用 `①` 续行绕过 T36-b1 的行数上限）',
+      headIdx >= 0 && block <= 2,
+      headIdx < 0 ? '找不到「vX 要点」行' : `实测 ${block} 行（v3.40.0 曾写成 5 行却让 T36-b1 照样绿）`);
+  }
+
+  // ── A7：priceCurrency 缺失不得默认按 USD 折算 ──
+  //   病根：原 `if (CNY) {...} else {...USD×7.2...}` 把「明确标了 USD」与「字段缺失/null/未知值」
+  //   一视同仁 → 人民币价被 ×7.2（虚高约 7 倍）且落在合理区间内 → **无任何告警**。
+  //   方向性：错补 7 倍是多收钱且无痕；漏补只是少记（可恢复）。
+  const ensureSrc = stripComments(grab42(rawTT42, 'ensureNewModelPricing'));
+  ok('T42-a4 ★priceCurrency 三分支：CNY / USD / 其余（改前是 CNY / else=USD 两分支）',
+    /cnRef\.priceCurrency === 'CNY'/.test(ensureSrc)
+    && /cnRef\.priceCurrency === 'USD'/.test(ensureSrc)
+    && !/\} else \{\s*\n\s*\/\/ 国外模型/.test(ensureSrc),
+    '`else` 兜底按 USD 处理 = 币种未知时把人民币价乘汇率');
+  ok('T42-a5 ★币种未知 → 拒绝折算 + 留告警 + 挂出候选值供人工核对',
+    /拒绝自动折算/.test(ensureSrc) && /候选值 \$\{cnRef\.in\}\/\$\{cnRef\.out\}/.test(ensureSrc),
+    '静默跳过会让人以为"源上没这个模型"，而不是"币种没标"');
+
+  // ── A8：unpublished 条目过重查窗口后要重新联网（不再永久锁死） ──
+  //   病根：input_price: 0 是 number → 下轮 findModel 精确命中直接 return → 永不重查，
+  //   官方日后公布单价也不会自动回填。KI-7 只写了人工补救路径，没写"自动链路永不自愈"。
+  ok('T42-a6 ★ensureNewModelPricing 对 unpublished 条目做重查窗口判定（30 天）',
+    /NO_PUBLIC_RECHECK_MS/.test(ensureSrc)
+    && /pricing_status === 'unpublished'/.test(ensureSrc)
+    && /unpublished_at/.test(ensureSrc),
+    '只判 typeof input_price === number 会把 0 元条目永久挡在门外');
+  const rememberSrc = stripComments(grab42(rawTT42, 'rememberNoPublicPrice'));
+  ok('T42-a7 ★rememberNoPublicPrice 首次记 unpublished_at（重查窗口的基准时间戳）',
+    /if \(!m\.unpublished_at\) m\.unpublished_at = Date\.now\(\)/.test(rememberSrc),
+    '缺基准时间戳 → dueAt 恒为窗口值 → 重查永不触发');
+  ok('T42-a8 ★重查只补时间戳，不改 input_price / pricing_status（"0 = 未公布"语义不变）',
+    !/m\.input_price = 1|m\.pricing_status = 'ok'/.test(rememberSrc)
+    && /m\.input_price = 0; m\.output_price = 0;/.test(rememberSrc),
+    '重查不该顺手改价，那是另一个决策');
+
+  // ── A9：refresh-prices 的 priceGate 不得把 0 判非法 ──
+  //   病根：`nv <= 0` 把 0 判非法并推 warning，而 KI-7 明确「0 = 厂商未公布价，是合法常态」——
+  //   两个模块对同一个 0 的语义定义**相反**，且共用 `_price_audit.warnings` → 真告警被噪音淹没。
+  const gateSrc = stripComments(rawRP42.slice(rawRP42.indexOf('function priceGate('), rawRP42.indexOf('function ', rawRP42.indexOf('function priceGate(') + 10)));
+  ok('T42-a9 ★priceGate 判据为 nv < 0（0 放行），且 0 单独短路越过区间/骤变校验',
+    /nv < 0/.test(gateSrc) && !/nv <= 0/.test(gateSrc)
+    && /if \(nv === 0\) \{[\s\S]{0,300}?return false;/.test(gateSrc),
+    '`<= 0` 会让每个未公布价模型每次刷新都刷一条假告警');
+  ok('T42-a10 ★0 的放行不越过"负数/NaN/Infinity 仍非法"（真异常照拦）',
+    /typeof nv !== 'number' \|\| !isFinite\(nv\) \|\| nv < 0/.test(gateSrc),
+    '把 0 放行写成"什么值都放行"会把真异常一起放过去');
+
+  // ── A10：region 推断结果可重判（不再永久固化） ──
+  //   病根：`if (!m.region)` 一旦写入不再重判 → 某轮 llmabacus 拉取失败 → 真实 US 模型被写死 CN
+  //   → 此后**永远**走错计价分支（CN 主价 vs USD×7.2），且 region 字段本身无"这是猜的"痕迹。
+  ok('T42-a11 ★refresh-prices 记 region_inferred 标记 + 对推断值允许重判',
+    /const regionWasInferred = m\.region_inferred === true;/.test(rawRP42)
+    && /if \(!m\.region \|\| regionWasInferred\)/.test(rawRP42),
+    '只判 !m.region = 推断值一经写入即永久固化');
+  ok('T42-a12 ★llmaHit 到位时删除 region_inferred（有依据=已确认，不再算推断）',
+    /if \(llmaHit\) \{ delete m\.region_inferred; \} else \{ m\.region_inferred = true; \}/.test(rawRP42),
+    '不删标记会让"已确认"的 region 一直被重判，反向覆盖人工核实结果');
+  ok('T42-a13 ★region 纠正留痕 _region_corrected（便于排查"归属何时被谁改的"）',
+    /m\._region_corrected = \{ from: m\.region/.test(rawRP42));
+
+  // ── A11：官方价分支必须尊重 lock（人工冻结语义不被静默破坏） ──
+  //   病根：原 `if (officialBlk) {...} else if (m.lock === true) {...}` —— 官方分支在 lock **之前**
+  //   且自身无 lock 守卫 → `deepseek-v4-pro`(lock:true) 每轮仍被官方价覆写。上游注释却写"三个写价
+  //   分支全部跳过"——契约对官方价不成立。这是"用户冻了价、刷新后价却变了"。
+  ok('T42-a14 ★lockBlocksMainPrice 判据 = lock 为真且 region 非 US（与 isLocked 口径一致）',
+    /const lockBlocksMainPrice = m\.lock === true && m\.region !== 'US';/.test(rawRP42),
+    '不收窄会连带拦掉 US 条目的 usd_* 参考字段更新');
+  ok('T42-a15 ★官方价被 lock 拦下时：不改主价，但记 _official_ref 留官方价备查 + lockKeptMain++',
+    /if \(officialBlk && lockBlocksMainPrice\) \{[\s\S]{0,500}?m\._official_ref = \{[\s\S]{0,400}?lockKeptMain\+\+;/.test(rawRP42),
+    '拦下要留痕，否则用户看不到"官方价其实已变、是你的 lock 挡住了"');
+  ok('T42-a16 ★拦下计数并入汇总输出（lockKept + lockKeptMain，附"含被官方价拦下 N 个"）',
+    /lockKept \+ lockKeptMain/.test(rawRP42) && /含被官方价拦下/.test(rawRP42),
+    '只算 lockKept 会让"被官方价拦下"在汇总里不可见');
+
+  // ── A12：余额缓存 time 只在真查到新值时刷新（陈旧值会长大/被续命） ──
+  //   病根：失败降级用旧值时也写 time: now → API 持续不可达 → 旧余额被反复续命 →
+  //   缓存永远读不到过期信号 → 弹窗显示的余额可能已陈旧数天而用户毫无察觉。
+  const balSrc = stripComments(grab42(rawTT42, 'balanceText'));
+  ok('T42-a17 ★只有真拿到新余额（isFreshQuery）才把 time 刷成 now',
+    /isFreshQuery = true;/.test(balSrc)
+    && /time: isFreshQuery \? now : \(cache\.time \|\| now\)/.test(balSrc),
+    '降级沿用旧值时刷新 time = 陈旧余额永不老化');
+  ok('T42-a18 ★isFreshQuery 只在"网络返回有限数字"时置真（TTL 命中不算新鲜查询）',
+    /const r = queryBalance\(key\);[\s\S]{0,200}Number\.isFinite\(r\.total\)[\s\S]{0,80}isFreshQuery = true;/.test(balSrc),
+    '把 TTL 命中也当新鲜查询 → time 每轮被刷新，老化失效');
+  ok('T42-a19 ★写缓存前显式挡非有限值（typeof NaN === number 会让 ¥NaN 一路通过）',
+    /if \(Number\.isFinite\(total\)\) \{[\s\S]{0,400}?fs\.writeFileSync\(BALANCE_CACHE/.test(balSrc),
+    'NaN/Infinity 不挡 → 弹窗显示「余额¥NaN」');
+
+  // ── A21：gDailyCorrupt 不再"永不复位"（长驻进程损坏后人工修好要能恢复记账） ──
+  //   病根：损坏文件被 rename 成 .corrupt-<ts> 后，本进程此后每次 loadDailyUsage 都走 ENOENT
+  //   分支 → 标志永不清 → recordUsage 恒返回 false → **该进程之后所有用量再也不记**。
+  //   触发面：watcher（--flush-delayed）与 Stop 兜底都是"同一进程多轮调用"。
+  //   修法：区分"本进程刚隔离过"（gLedgerQuarantined，不复位）与"文件本就缺失"（复位=恢复路径）。
+  const loadRaw42 = grab42(rawTT42, 'loadDailyUsage');
+  const loadSrc = stripComments(loadRaw42);
+  ok('T42-a20 ★ENOENT 分支复位 gDailyCorrupt **以 gLedgerQuarantined 为条件**（恢复路径）',
+    /if \(!gLedgerQuarantined\) gDailyCorrupt = false;/.test(loadSrc),
+    '无条件复位 = v2.99 的历史丢失回归；永不复位 = 长驻进程永久失记');
+  ok('T42-a21 ★rename 隔离成功处置 gLedgerQuarantined = true（"文件是我搬走的"记忆）',
+    /gLedgerQuarantined = true;/.test(loadSrc)
+    && loadSrc.indexOf('gLedgerQuarantined = true;') > loadSrc.indexOf('renameSync(DAILY_USAGE_FILE, corruptPath)'),
+    '标记必须在 rename 成功之后，否则文件没搬走也把恢复路径堵了');
+  ok('T42-a22 ★成功解析路径仍清 gDailyCorrupt（v2.99 原行为未被 A21 破坏）',
+    /gDailyCorrupt = false; \/\/ v2\.99：只在\*\*成功解析\*\*后清除标志/.test(loadRaw42),
+    'A21 只改 ENOENT 分支，不得顺手把成功路径的清除删了');
+
+  // ── A21 行为夹具：真跑 loadDailyUsage，观察日志与标志（可确定性单测） ──
+  const savedEnv42 = process.env.WB_ROOT;
+  process.env.WB_ROOT = tmp;
+  const mod42 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  if (!mod42 || typeof mod42.loadDailyUsage !== 'function') {
+    ok('T42 模块加载', false, mod42 ? '缺少 loadDailyUsage 导出' : 'require 失败');
+  } else {
+    const quiet42 = (fn) => {
+      const old = process.stderr.write.bind(process.stderr);
+      const buf = [];
+      process.stderr.write = (s) => { buf.push(String(s)); return true; };
+      let v = null;
+      try { v = fn(); } finally { process.stderr.write = old; }
+      return { v, err: buf.join('') };
+    };
+    const D42 = path.join(tmp, 't42');
+    fs.mkdirSync(D42, { recursive: true });
+    // DAILY_USAGE_FILE 由 WB_ROOT 决定（<WB>/skills/token-usage-tracker/daily-usage.json），
+    //   这里直接对隔离目录下那个路径做手脚；mod42 已按 tmp 计算好路径。
+    const daily42 = path.join(skillDir, 'daily-usage.json');
+    const corruptBackups42 = () => fs.readdirSync(skillDir).filter((f) => f.startsWith('daily-usage.json.corrupt-'));
+
+    // e1：损坏账本 → 隔离（rename）+ 置标志；此时文件已不在原位
+    try { fs.rmSync(daily42, { force: true }); } catch (e) { /* silent-ok:清理 — 夹具重置 */ }
+    for (const f of corruptBackups42()) { try { fs.rmSync(path.join(skillDir, f), { force: true }); } catch (e) { /* silent-ok:清理 — 夹具重置 */ } }
+    fs.writeFileSync(daily42, '{"2026-10-09": {"total": '); // 截断 JSON = SyntaxError
+    const e1 = quiet42(() => mod42.loadDailyUsage());
+    ok('T42-e1 ★损坏账本 → 返回 {}、改名为 .corrupt-<ts>、stderr 有隔离告警',
+      JSON.stringify(e1.v) === '{}' && corruptBackups42().length === 1 && /已备份为 daily-usage\.json\.corrupt-/.test(e1.err),
+      `备份数=${corruptBackups42().length} err=${e1.err.slice(0, 100)}`);
+    // e2：隔离之后**同一进程**再读（文件已不在）→ gLedgerQuarantined 为真 → **不复位**后
+    //   recordUsage 仍拒绝写回（保住 v2.99 的"防覆盖历史"语义）
+    const e2 = quiet42(() => mod42.loadDailyUsage());
+    const e2rec = quiet42(() => mod42.recordUsage(null, null, { hy3: { in: 5, out: 1 } }));
+    ok('T42-e2 ★隔离后同进程再读（ENOENT）→ gDailyCorrupt 保持（recordUsage 被守卫挡下返回 false）',
+      JSON.stringify(e2.v) === '{}' && e2rec.v === false,
+      `loadT=${JSON.stringify(e2.v)} record=${e2rec.v}（ENOENT 无条件复位 = 用空账本覆盖历史，v2.99 回归）`);
+    // e3（A21 的核心）：**新进程**（这里用清掉隔离记忆的方式模拟"人工已把损坏文件删掉/修好"）
+    //   文件不存在 + 本进程未隔离过 → 复位 → 记账恢复。
+    //   本夹具无法真正重启进程，故用一条**独立**的 require 缓存清理后重载模块来获得全新标志位；
+    //   在此之前先把文件恢复成"不存在"，并把已有 .corrupt 备份挪走（模拟人工已处理完）。
+    for (const f of corruptBackups42()) { try { fs.rmSync(path.join(skillDir, f), { force: true }); } catch (e) { /* silent-ok:清理 — 夹具重置 */ } }
+    try { fs.rmSync(daily42, { force: true }); } catch (e) { /* silent-ok:清理 — 夹具重置 */ }
+    const ttPath42 = path.join(skillDir, 'token-tracker.js');
+    delete require.cache[require.resolve(ttPath42)];
+    delete require.cache[ttPath42];
+    const mod42b = (() => { try { return require(ttPath42); } catch (e) { return null; } })();
+    const e3 = quiet42(() => (mod42b ? mod42b.loadDailyUsage() : null));
+    const e3rec = quiet42(() => (mod42b ? mod42b.recordUsage(null, null, { hy3: { in: 5, out: 1 } }) : null));
+    ok('T42-e3 ★文件缺失且本进程未隔离过 → 复位标志，记账恢复（人工修好后不再永久失记）',
+      !!mod42b && JSON.stringify(e3.v) === '{}' && e3rec.v === true,
+      `${e3.err.slice(0, 80)} record=${e3rec.v}`);
+  }
+  if (savedEnv42 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv42;
 }
 
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。

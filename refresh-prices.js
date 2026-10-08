@@ -583,9 +583,21 @@ function priceGate(key, now, pre, warnSink) {
     if (nv == null) return false;                        // 本次没写这个字段 → 不校验
     if (nv === pre[field]) return false;                 // 值没变 → 不校验（存量越界值不该天天报警）
     const label = PRICE_FIELD_LABEL[field];
-    if (typeof nv !== 'number' || !isFinite(nv) || nv <= 0) {
+    // v3.40.0（plan-B A9）：**0 是合法值，不是"抓取值非法"**。
+    //   病根：原判据 `nv <= 0`（现改为 `< 0`）把 0 判非法并推 warning，而 KI-7 明确写
+    //   「0 = 厂商未公布价，是合法常态」（pricing_status:'unpublished'，见 token-tracker.js
+    //   rememberNoPublicPrice）。两个模块对同一个 0 的语义定义**相反**，且共用 `_price_audit.warnings`
+    //   这一个字段 → `space-bunny` 这类未公布价模型**每次刷新都被判非法**（既然 0→0 但 nv===pre[field]
+    //   会提前 return，实际触发点是"从有价变无价"或"首次写入 0"）→ 真告警被这个噪音淹没。
+    //   现在：负数 / NaN / Infinity 仍是非法（真异常）；0 放行（合法常态）。
+    if (typeof nv !== 'number' || !isFinite(nv) || nv < 0) {
       warnSink.push(`${key}: ${label}抓取值非法(${nv})，已保留旧值`);
       return true;
+    }
+    if (nv === 0) {
+      // 0 = 厂商未公布价（合法）→ 不告警，但要越过下面的"合理区间"与"骤变"校验
+      //   （0 必然低于 min=0.001，不特判会每条未公布价模型都刷一条"超出合理区间"）。
+      return false;
     }
     if (nv < PRICE_SANITY.min || nv > PRICE_SANITY.max) {
       warnSink.push(`${key}: ${label}${nv} 元/百万token 超出合理区间[${PRICE_SANITY.min}, ${PRICE_SANITY.max}]（上游单位可能已变更，如改成「元/千 token」），已保留旧值`);
@@ -788,7 +800,7 @@ async function main() {
   }
 
   // v3.32.0（P1-1）：unpublishedCleared = 本次补到真价后被清掉的「无公开价」标记数（会在小结里报出来）
-  let updatedMain = 0, autoConverted = 0, usdUpdated = 0, regionSet = 0, bigDiff = [], lockKept = 0, unpublishedCleared = 0;
+  let updatedMain = 0, autoConverted = 0, usdUpdated = 0, regionSet = 0, bigDiff = [], lockKept = 0, unpublishedCleared = 0, lockKeptMain = 0;
   const regionInferred = []; // v3.24（F2·缺陷5）：靠推断（而非天生带 region）得到国内外归属的模型 key
   const sanityWarnings = []; // v3.31.0（P0-5 / P1-7）：价格体检告警（`<key>: 说明` 形状，并入 _price_audit）
 
@@ -834,11 +846,28 @@ async function main() {
     // v3.24（F2·缺陷5）：**判定行为保持不变**（改了会影响计价口径），仅增加可观测性——
     // 把「靠推断得到归属」的模型 key 收集起来，写盘为 pricing._region_inferred，
     // 并在汇总行打印，让用户清楚这些模型的国内/国外归属是猜的、需要人工核验。
-    if (!m.region) {
-      if (llmaHit && llmaHit.country === 'US') m.region = 'US';
-      else m.region = 'CN'; // 默认国内（现有模型均为国产）
+    // v3.40.0（plan-B A10）：**推断结果不再永久固化**。
+    //   病根：`if (!m.region)` 一旦写入就不再重判 —— 某轮 llmabacus 拉取失败（llmaHit=null）→
+    //   真实 US 模型被按默认写死成 CN → 此后**永远**走错计价分支（CN 主价 vs USD×7.2 折算），
+    //   且 `region` 字段本身无任何痕迹表明"这是猜的"。
+    //   修法：推断出来的 region 同时打 `region_inferred: true`；下轮若仍是推断值，允许**重判**
+    //   （llmaHit 到位就纠正）。人工写死 / 官方来源的 region 没有该标记 → 依旧被尊重、绝不重判。
+    //   `_region_inferred` 汇总数组的语义不变（仍是"当前靠推断定归属的 key"）。
+    const regionWasInferred = m.region_inferred === true;
+    if (!m.region || regionWasInferred) {
+      const inferred = (llmaHit && llmaHit.country === 'US') ? 'US' : 'CN';
+      if (m.region !== inferred) {
+        if (regionWasInferred && llmaHit) {
+          // 有依据可重判，且结论变了 → 纠正并留痕（旧值写进 _region_corrected 供排查）
+          process.stderr.write(`[token-tracker] region 纠正：${key} ${m.region} → ${inferred}（此前为推断值，本轮 llmabacus 有数据）\n`);
+          m._region_corrected = { from: m.region, at: new Date().toISOString().slice(0, 10) };
+        }
+        m.region = inferred;
+      }
+      // 只有在"没有可靠来源"时才是真正的推断；llmaHit 到位时视为已确认（不再打推断标记）
+      if (llmaHit) { delete m.region_inferred; } else { m.region_inferred = true; }
       regionSet++;
-      regionInferred.push(key);
+      if (!llmaHit) regionInferred.push(key);
     }
 
     // USD 参考价：三 USD 源中位数
@@ -873,7 +902,23 @@ async function main() {
       // 也必须走官方价——否则会落进下面的聚合源分支，用 llmabacus 价覆盖掉 deepseek-official.js 刚写入的官方价。
       // v3.36.0：复用循环开头提前算好的 officialHitPre（判据完全相同）——避免两处判据各改各的而漂移。
       const officialBlk = officialHitPre ? (official.official[key] || (m.alias_of ? official.official[m.alias_of] : null)) : null;
-      if (officialBlk) {
+      // v3.40.0（plan-B A11）：**官方价分支也必须尊重 m.lock**。
+      //   病根：原实现 `if (officialBlk) {...} else if (m.lock === true) {...}` —— 官方分支在 lock 之前
+      //   且自身无 lock 守卫 → `deepseek-v4-pro`(lock:true) 每轮仍被官方价覆写。
+      //   而上游注释（:812）明写"lock 条目下面三个写价分支**全部跳过**"——**契约对官方价不成立**，
+      //   文档却按成立来写。这是"人工冻结"语义被静默破坏：用户冻结了价，刷新后价却变了。
+      //   判据：region 为 US 的条目走 usd_* 参考字段、主价本就由 US 分支管，这里只拦 CN 主价分支
+      //   （与 :819 isLocked 的口径保持一致）。
+      const lockBlocksMainPrice = m.lock === true && m.region !== 'US';
+      if (officialBlk && lockBlocksMainPrice) {
+        // 冻结条目：官方价不覆盖主价，但**仍记录官方价以备人工对比**（不改主价，只留痕）。
+        m._official_ref = {
+          input_price: officialBlk.input_price, cached_price: officialBlk.cached_price,
+          output_price: officialBlk.output_price, peak_multiplier: officialBlk.peak_multiplier || 2,
+          at: new Date().toISOString().slice(0, 10),
+        };
+        lockKeptMain++;
+      } else if (officialBlk) {
         m.input_price = officialBlk.input_price;
         m.cached_price = officialBlk.cached_price;
         m.output_price = officialBlk.output_price;
@@ -1067,7 +1112,7 @@ async function main() {
     pricing.deepseek_refresh_error = `DeepSeek 官方定价抓取失败（${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}），DeepSeek 系价格沿用本地/聚合源价`;
     // 失败不阻塞整体刷新：其余模型照常更新
   }
-  pricing.last_refresh_note = `${new Date().toISOString()} 多源刷新：${noteParts.join(' | ')}；人民币主价更新 ${updatedMain} 个${autoConverted ? `，USD换算 ${autoConverted} 个` : ''}，USD参考 ${usdUpdated} 个，region 设定 ${regionSet} 个${lockKept ? `，lock 价保留 ${lockKept} 个` : ''}（汇率 ${rate}）${bigDiff.length ? `；⚠️峰谷模型价差>60%需核验：${bigDiff.join('、')}` : ''}${officialOk ? '；DeepSeek官方价✓' : '；DeepSeek官方价✗(回落聚合源)'}${AMBIG_WARNINGS.size ? `；⚠️模糊匹配歧义: ${[...AMBIG_WARNINGS].join('；')}` : ''}${AMBIG_WARNINGS_LOCKED.size ? `；已 lock 条目的歧义 ${AMBIG_WARNINGS_LOCKED.size} 条（不挂弹窗，见 _ambig_warnings_locked）` : ''}${AMBIG_WARNINGS_OFFICIAL.size ? `；官方价已命中模型的备用源歧义 ${AMBIG_WARNINGS_OFFICIAL.size} 条（备用源结果不被采用 → 不挂弹窗，见 _ambig_warnings_official）` : ''}${auditWarnings.length ? `；⚠️价格一致性自检: ${auditWarnings.join('；')}` : ''}`;
+  pricing.last_refresh_note = `${new Date().toISOString()} 多源刷新：${noteParts.join(' | ')}；人民币主价更新 ${updatedMain} 个${autoConverted ? `，USD换算 ${autoConverted} 个` : ''}，USD参考 ${usdUpdated} 个，region 设定 ${regionSet} 个${(lockKept + lockKeptMain) ? `，lock 价保留 ${lockKept + lockKeptMain} 个${lockKeptMain ? `（含被官方价拦下 ${lockKeptMain} 个）` : ''}` : ''}（汇率 ${rate}）${bigDiff.length ? `；⚠️峰谷模型价差>60%需核验：${bigDiff.join('、')}` : ''}${officialOk ? '；DeepSeek官方价✓' : '；DeepSeek官方价✗(回落聚合源)'}${AMBIG_WARNINGS.size ? `；⚠️模糊匹配歧义: ${[...AMBIG_WARNINGS].join('；')}` : ''}${AMBIG_WARNINGS_LOCKED.size ? `；已 lock 条目的歧义 ${AMBIG_WARNINGS_LOCKED.size} 条（不挂弹窗，见 _ambig_warnings_locked）` : ''}${AMBIG_WARNINGS_OFFICIAL.size ? `；官方价已命中模型的备用源歧义 ${AMBIG_WARNINGS_OFFICIAL.size} 条（备用源结果不被采用 → 不挂弹窗，见 _ambig_warnings_official）` : ''}${auditWarnings.length ? `；⚠️价格一致性自检: ${auditWarnings.join('；')}` : ''}`;
 
   // v3.24（F2·缺陷3）：接收 save() 返回值。false = 抢锁超时、本次未落盘（date/价格都没更新）。
   // 用 process.exitCode=1 而非 process.exit(1)：不中断后续汇总输出与 atexit 清理，
@@ -1080,7 +1125,7 @@ async function main() {
     process.exitCode = 1;
   }
 
-  console.log(`[refresh-prices] 多源刷新完成：date=${today}，源成功 ${okCount}/${Object.keys(SOURCES).length}(国内${cnOk ? '✓' : '✗'} 国外${usdOk ? '✓' : '✗'})，人民币主价 ${updatedMain} 个，USD换算 ${autoConverted} 个，USD参考 ${usdUpdated} 个，region ${regionSet} 个${regionInferred.length ? `（⚠️${regionInferred.length} 个靠推断: ${regionInferred.join('、')}）` : ''}${lockKept ? `，lock 价保留 ${lockKept} 个` : ''}${unpublishedCleared ? `，补价后清「无公开价」标记 ${unpublishedCleared} 个` : ''}${bigDiff.length ? `，⚠️价差大：${bigDiff.join('、')}` : ''}`);
+  console.log(`[refresh-prices] 多源刷新完成：date=${today}，源成功 ${okCount}/${Object.keys(SOURCES).length}(国内${cnOk ? '✓' : '✗'} 国外${usdOk ? '✓' : '✗'})，人民币主价 ${updatedMain} 个，USD换算 ${autoConverted} 个，USD参考 ${usdUpdated} 个，region ${regionSet} 个${regionInferred.length ? `（⚠️${regionInferred.length} 个靠推断: ${regionInferred.join('、')}）` : ''}${(lockKept + lockKeptMain) ? `，lock 价保留 ${lockKept + lockKeptMain} 个${lockKeptMain ? `（含被官方价拦下 ${lockKeptMain} 个）` : ''}` : ''}${unpublishedCleared ? `，补价后清「无公开价」标记 ${unpublishedCleared} 个` : ''}${bigDiff.length ? `，⚠️价差大：${bigDiff.join('、')}` : ''}`);
 }
 
 // 仅当以 `node refresh-prices.js` 直接运行时才执行主流程；被 require 时不自动跑（避免测试/复用触发联网刷新）
