@@ -491,14 +491,17 @@ else {
     ttMod.incrementalRecord(tsPath8, 'sess-b8');
     const ledPath = path.join(skillDir, 'daily-usage.json');
     const led = (() => { try { return JSON.parse(fs.readFileSync(ledPath, 'utf-8').replace(/^\uFEFF/, '')); } catch (e) { return null; } })();
-    const tok8 = ttMod.todayStr();
+    // v3.40.0（plan-B A4）：账本分桶改跟 **token 发生时刻**（不再用写盘时刻 todayStr()）→
+    //   夹具的 ts 是 2026-03-04 高峰，所以必须用 ttMod.dateStrOfTs(peakTs) 去读那一桶。
+    const tok8 = ttMod.dateStrOfTs(peakTs);
     const rec8 = led && led[tok8] && led[tok8].models && led[tok8].models['deepseek-v4.1-flash'];
     const pk8 = ttMod.mergeLocalPriceDb(JSON.parse(JSON.stringify(pricing8b)));
     const cPeak8 = ttMod.calcCost({ model: 'deepseek-v4.1-flash', in: 1000000, cached: 0, out: 0 }, pk8, peakTs);
     const cOff8 = ttMod.calcCost({ model: 'deepseek-v4.1-flash', in: 1000000, cached: 0, out: 0 }, pk8, offTs);
-    ok('T9-B8c incrementalRecord 端到端：账本金额按行时间戳（高峰）计价',
-      Boolean(rec8) && cPeak8 > 0 && Math.abs(cPeak8 - 2 * cOff8) < 1e-9 && Math.abs(rec8.cost - cPeak8) < 1e-6,
-      `ledger=${rec8 && rec8.cost} expect=${cPeak8} off=${cOff8}`);
+    ok('T9-B8c incrementalRecord 端到端：账本金额按行时间戳（高峰）计价，且**分桶日期也是该时刻**',
+      Boolean(rec8) && cPeak8 > 0 && Math.abs(cPeak8 - 2 * cOff8) < 1e-9 && Math.abs(rec8.cost - cPeak8) < 1e-6
+      && !led[ttMod.todayStr()],
+      `ledger=${rec8 && rec8.cost} expect=${cPeak8} off=${cOff8} 桶=${tok8} today桶=${!!led[ttMod.todayStr()]}`);
     fs.rmSync(projDir8, { recursive: true, force: true });
     try { fs.rmSync(path.join(skillDir, '.ledger-watermark.json'), { force: true }); } catch (e) { /* 清理 */ }
   }
@@ -700,7 +703,10 @@ else {
 
   // h：轮次明细 —— 唯一落点、幂等、无 meta 零影响
   const roundsDir = ttMod.ROUNDS_DIR;
-  const roundsFile = path.join(roundsDir, 'rounds-' + ttMod.todayStr().slice(0, 7) + '.jsonl');
+  // v3.40.0（plan-B A4）：明细落哪个文件改跟 **token 发生时刻**（不再用写盘时刻 todayStr()）→
+  //   夹具 ts=1700000001000（2023-11-14）→ 必须按该时刻的月份去读，否则恒读到空。
+  const TS11 = 1700000000000;
+  const roundsFile = path.join(roundsDir, 'rounds-' + ttMod.dateStrOfTs(TS11).slice(0, 7) + '.jsonl');
   const readRounds = () => {
     try {
       return fs.readFileSync(roundsFile, 'utf-8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
@@ -739,7 +745,9 @@ else {
   const rr3 = readRounds();
   ok('T11-h4 不传 meta 的调用点零影响：账本照记、明细不落', rr3.length === 1, `n=${rr3.length}`);
   const ledNow = (() => { try { return JSON.parse(fs.readFileSync(path.join(skillDir, 'daily-usage.json'), 'utf-8').replace(/^\uFEFF/, '')); } catch (e) { return {}; } })();
-  const rec11 = ledNow[ttMod.todayStr()] && ledNow[ttMod.todayStr()].models['m-x'];
+  // v3.40.0（A4）：账本桶同样跟发生时刻 → 用 dateStrOfTs(TS11) 而不是 todayStr()
+  const bucket11 = ttMod.dateStrOfTs(TS11);
+  const rec11 = ledNow[bucket11] && ledNow[bucket11].models['m-x'];
   ok('T11-h5 不传 meta 时账本仍正确累加（200 万 in）', Boolean(rec11) && rec11.in === 2000000, rec11 && rec11.in);
 
   // i：roundLabel —— 取出本轮首条非注入 user 消息
@@ -757,12 +765,17 @@ else {
   ok('T11-i4 文件不存在不抛错', ttMod.roundLabel(path.join(tmp, 'no-such-file.jsonl'), 1) === '');
 
   // j：过期 rounds 清理
+  //   v3.40.0（A4）：本用例要验的是「保留**当下**当月」——它必须用一个**真当月**的文件名，
+  //   不能复用上面跟夹具 ts 走的 roundsFile（那是 2023-11，对 prune 而言同样是过期月）。
+  //   同时**先清空目录**：h 组留下的 rounds-2023-11.jsonl 也是过期月，会一起被删掉 → removed 不是 1。
+  fs.rmSync(roundsDir, { recursive: true, force: true });
   fs.mkdirSync(roundsDir, { recursive: true });
+  const curMonthFile = path.join(roundsDir, 'rounds-' + ttMod.todayStr().slice(0, 7) + '.jsonl');
   fs.writeFileSync(path.join(roundsDir, 'rounds-2020-01.jsonl'), '{}\n');
-  fs.writeFileSync(roundsFile, '{}\n');
+  fs.writeFileSync(curMonthFile, '{}\n');
   const removed11 = ttMod.pruneRoundFiles();
   ok('T11-j 清理过期月份、保留当月',
-    removed11 === 1 && !fs.existsSync(path.join(roundsDir, 'rounds-2020-01.jsonl')) && fs.existsSync(roundsFile),
+    removed11 === 1 && !fs.existsSync(path.join(roundsDir, 'rounds-2020-01.jsonl')) && fs.existsSync(curMonthFile),
     `removed=${removed11}`);
   fs.rmSync(roundsDir, { recursive: true, force: true });
 
@@ -3382,6 +3395,264 @@ else {
       `${e3.err.slice(0, 80)} record=${e3rec.v}`);
   }
   if (savedEnv42 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv42;
+}
+
+// ===== T43（v3.40.0 / plan-B A4 + A13）：分桶与峰谷同源 + 倍率语义写清 =====
+//   A4 病根：账本分桶一律 `todayStr()`（**写盘时刻**），金额却按 `peakTs`（**token 实际发生时刻**）
+//     判峰谷 → 23:59:59 发生、00:00:05 才跑 Stop 的轮次：token 记进**次日**桶、金额按**前一日**
+//     的时段档算，同一批数据两处口径自相矛盾。
+//   A13 病根（审计口径）：`mult` 由「input 价之比」算出却同乘 input/cached/output 三项。
+//     **实证结论：这不是 bug** —— 查官方定价页（2026-10 复核）三项（含缓存命中）在高峰均正好 ×2：
+//       deepseek-flash 缓存命中 空闲 0.02 / 高峰 0.04；未命中 1 / 2；输出 4 / 8
+//       deepseek-v4-pro 缓存命中 0.15 / 0.30；未命中 4.5 / 9.0；输出 13.5 / 27.0
+//     所以"三项同乘"结果**恰好正确**。但结构上没写清 → 后人改价时容易只改一项。
+//     本组把「三项各自随峰谷、当前官方同倍率」这层语义钉在注释与守卫上（不改行为）。
+{
+  const rawTT43 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const grab43 = (src, name) => {
+    const i = src.indexOf('function ' + name + '(');
+    if (i < 0) return '';
+    const j = src.indexOf('\nfunction ', i + 1);
+    return j < 0 ? src.slice(i) : src.slice(i, j);
+  };
+  const calcSrc43 = stripComments(grab43(rawTT43, 'calcCost'));
+  const recSrc43 = stripComments(grab43(rawTT43, 'recordUsage'));
+
+  // a：分桶必须来自 dateStrOfTs（而不是 todayStr）
+  ok('T43-a1 ★recordUsage 分桶用 dateStrOfTs(tsMs) —— 与峰谷判定同一时刻（改前是写盘时刻 todayStr()）',
+    /const date = dateStrOfTs\(tsMs\)/.test(recSrc43) && !/const date = todayStr\(\)/.test(recSrc43),
+    '分桶与计价用两个时刻 = 跨午夜轮 self-contradict');
+  // b：dateStrOfTs 的边界安全（非法 ts 回退 todayStr，绝不把账记到 1970）
+  const dsSrc43 = stripComments(grab43(rawTT43, 'dateStrOfTs'));
+  ok('T43-a2 ★dateStrOfTs 对非法 ts（0/NaN/负）回退 todayStr（异常输入不得把账记到 1970）',
+    /!Number\.isFinite\(t\) \|\| t <= 0\) return todayStr\(\)/.test(dsSrc43));
+  ok('T43-a3 ★dateStrOfTs 已导出（否则 T43-c 的行为断言无处可挂）',
+    /module\.exports = \{[\s\S]*?dateStrOfTs,/.test(rawTT43));
+  // c：明细落点也必须用同一判据（否则水位线回滚会截断另一个文件）
+  // v3.40.0（plan-B A3）：判据从"两处各写一遍同样的表达式"收敛为"两处都调 snapshotFileFor 单点"。
+  //   为什么改判据而不是保留原断言：原设计要求两个调用点**手抄同一表达式**（靠注释约定同步）——
+  //   这正是 A3 要治的"同一口径抄多份"病根本身。现在改为**结构性**保证：两处都调同一个函数，
+  //   只要能证明"两处都调了它"+"它的判据用 dateStrOfTs"，就不可能再失配（比逐字比对表达式更强）。
+  const detSrc43 = stripComments(grab43(rawTT43, 'appendRoundDetail'));
+  ok('T43-a4 ★appendRoundDetail 落文件走 snapshotFileFor（判据单点，不再靠两处手抄表达式同步）',
+    /fs\.appendFileSync\(snapshotFileFor\(null, 0, tsMs\)/.test(detSrc43)
+    && !/rounds-' \+ dateStrOfTs\(/.test(detSrc43),
+    '两处判据不一致 = 回滚去截断别的月份文件（既没回滚当真，又误伤他人）');
+  const incRaw43 = grab43(rawTT43, 'incrementalRecord');
+  ok('T43-a5 ★incrementalRecord 里 snap.roundsPath 同样走 snapshotFileFor（与 append 同源同判据）',
+    /roundsPath = snapshotFileFor\(null, 0, peakTs\)/.test(incRaw43)
+    && !/rounds-' \+ dateStrOfTs\(/.test(incRaw43));
+  // v3.40.0（A3 续）：snapshotFileFor 自身必须用 dateStrOfTs —— 否则上面的"两处同源"只是同源到一个错判据。
+  const snSrc43 = stripComments(grab43(rawTT43, 'snapshotFileFor'));
+  ok('T43-a8 ★snapshotFileFor 内部判据用 dateStrOfTs（单点函数本身得是对的）',
+    /dateStrOfTs\(t\)\.slice\(0, 7\)/.test(snSrc43) && /ROUNDS_DIR/.test(snSrc43));
+
+  // d：A13 语义守卫 —— 三项各自带倍率（结构不许退化成"只乘一项"）
+  ok('T43-a6 ★calcCost 三项（未命中/缓存/输出）各自带 mult（结构上三项都随峰谷）',
+    /\(uncached \/ 1e6\) \* \(m\.input_price \|\| 0\) \* mult/.test(calcSrc43)
+    && /\(cached \/ 1e6\) \* \(m\.cached_price \|\| 0\) \* mult/.test(calcSrc43)
+    && /\(outTok \/ 1e6\) \* \(m\.output_price \|\| 0\) \* mult/.test(calcSrc43),
+    '三项同乘是**当前官方事实**（缓存命中价高峰同样是空闲的 2 倍），不是 bug；但结构不能漏项');
+  ok('T43-a7 ★「三项同乘」的官方依据写在注释里（防后人当 bug 改成"只乘 input"而漏收缓存费）',
+    /三项同乘是当前官方事实/.test(rawTT43) && /不要\*\*?把它"修"成只乘 input|不要.{0,6}把它.{0,4}修.{0,4}成只乘 input/.test(rawTT43),
+    '缺这段依据，后人很可能把"三项同乘"当 bug 摘掉缓存项的倍率');
+
+  // ── c 组：dateStrOfTs 行为（真调，跨午夜是关键用例） ──
+  const savedEnv43 = process.env.WB_ROOT;
+  process.env.WB_ROOT = tmp;
+  const tt43 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  if (!tt43 || typeof tt43.dateStrOfTs !== 'function') {
+    ok('T43 模块加载', false, '缺少 dateStrOfTs 导出');
+  } else {
+    const d43 = tt43.dateStrOfTs;
+    // 北京 2026-03-04 10:00（= UTC 02:00）→ 2026-03-04
+    ok('T43-c1 北京时间当天正午 → 本地日期当天',
+      d43(Date.UTC(2026, 2, 4, 2, 0, 0)) === '2026-03-04', d43(Date.UTC(2026, 2, 4, 2, 0, 0)));
+    // 北京 2026-03-04 23:59:59（= UTC 15:59:59）→ 仍是 2026-03-04（A4 的核心边界）
+    ok('T43-c2 ★北京 23:59:59 的发生时刻 → 归**当天**（跨午夜轮不得被记到次日）',
+      d43(Date.UTC(2026, 2, 4, 15, 59, 59)) === '2026-03-04', d43(Date.UTC(2026, 2, 4, 15, 59, 59)));
+    // 非法输入 → 回退今天（不抛、不越界）
+    const today43 = tt43.todayStr();
+    ok('T43-c3 ★ts=0 / undefined / NaN → 回退 todayStr（不抛、也不记到 1970）',
+      d43(0) === today43 && d43(undefined) === today43 && d43(NaN) === today43,
+      `0→${d43(0)} undef→${d43(undefined)} NaN→${d43(NaN)} today=${today43}`);
+  }
+  if (savedEnv43 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv43;
+}
+
+// ===== T44（v3.40.0 / plan-B A3）：三种聚合口径统一为「按行逐条判定」=====
+// 病根（审计 A3）：同一批 token 有三条计价路径，各自口径不同 ——
+//   ① 主链路 calcCost：整批一个倍率（按批级 peakTs 判整批高峰/空闲）；
+//   ② backfill.js rowCost：逐行判定（正确）；
+//   ③ recalc-day.js costOf：按轮次**时长/次数占比**折算 `1 + (peakMult-1)*ratio`（近似）。
+//   跨 12:00 / 18:00 边界的那一轮，三条路径给出三个不同金额；而 recalc 的定位是"改价后回算历史"
+//   → **回算工具算出来的数和实时链路不一致 = 回算不可信**（这是 A3 的验收标准）。
+// 修法：主链路也逐行分桶（perModelFromRows / aggregateTranscLines 里按每行 ts 判峰谷），
+//   并把切分落进轮次明细（peakSplit）供 recalc 精确回算。
+{
+  const D44 = path.join(tmp, 't44');
+  try { fs.mkdirSync(D44, { recursive: true }); } catch (e) { /* 已存在 */ }
+  const savedEnv44 = process.env.WB_ROOT;
+  process.env.WB_ROOT = D44;
+  // 注意：必须 require **副本**（skillDir）并复用已加载实例——selftest 早已在多处 require 过它，
+  //   Node 按"解析后的绝对路径"缓存，再 require 同路径拿到的就是同一个实例（WB_ROOT 已在首次加载时定死）。
+  //   第一版写成 path.join(SKILL_DIR, ...)（selftest 里没这个常量）→ ReferenceError 被 catch 吞成
+  //   "缺少 calcCost 导出"，红得莫名其妙。用 skillDir + 复用缓存才是对的。
+  let tt44 = null;
+  try { tt44 = require(path.join(skillDir, 'token-tracker.js')); } catch (e) { tt44 = null; }
+  if (!tt44 || typeof tt44.calcCost !== 'function') {
+    ok('T44 模块加载', false, '缺少 calcCost 导出');
+  } else {
+    // 价目表**内联构造**，不从盘上读：隔离副本里没有 pricing.json（selftest 只拷 .js），
+    //   顶层 loadPricing() 会返回空 models → findModel 落空 → calcCost 恒 null（第一版就栽这儿，
+    //   4 条红成"实测 null"，而 c4/c5 反而"绿"——因为 null === null。教训：断言必须能区分"算对"与"没算"）。
+    //   数值取自本机 pricing.json 的 deepseek-v4.1-flash（in 1 / cached 0.02 / out 4 / peak_multiplier 2）。
+    const pricing44 = {
+      models: {
+        'deepseek-v4.1-flash': { input_price: 1, cached_price: 0.02, output_price: 4, peak_multiplier: 2 },
+      },
+      deepseek_rules: { peak_schedule: '9:00 - 12:00、14:00 - 18:00', weekend_off_peak: true },
+    };
+    const M = 'deepseek-v4.1-flash'; // 本机价：in 1 / cached 0.02 / out 4，peak_multiplier 2
+    // c1：**有分桶**时高峰段必须乘 peakMult —— 与调用时刻无关（这是 A3 的核心行为）
+    //   半峰半闲：100万高峰 + 100万空闲 → 1×2 + 1×1 = ¥3
+    const half = tt44.calcCost({ model: M, in: 2000000, out: 0, cached: 0,
+      pIn: 1000000, pCached: 0, pOut: 0, oIn: 1000000, oCached: 0, oOut: 0 }, pricing44);
+    ok('T44-c1 ★有行级分桶时高峰段乘 peakMult（半峰半闲 200万 in → ¥3，不是整批的 ¥2 或 ¥4）',
+      Math.abs(half - 3) < 1e-9, `实测 ${half}`);
+    const allPeak = tt44.calcCost({ model: M, in: 1000000, out: 0, cached: 0,
+      pIn: 1000000, pCached: 0, pOut: 0, oIn: 0, oCached: 0, oOut: 0 }, pricing44);
+    const allOff = tt44.calcCost({ model: M, in: 1000000, out: 0, cached: 0,
+      pIn: 0, pCached: 0, pOut: 0, oIn: 1000000, oCached: 0, oOut: 0 }, pricing44);
+    ok('T44-c2 ★全高峰 → ×2（¥2）；全空闲 → ×1（¥1）—— 分桶自身的倍率是对的',
+      Math.abs(allPeak - 2) < 1e-9 && Math.abs(allOff - 1) < 1e-9,
+      `全高峰 ${allPeak} / 全空闲 ${allOff}`);
+    // c3：**回退路径**——无分桶时行为必须与 v3.39.0 逐字节一致（靠 tsMs 判整批）
+    const noBuck = tt44.calcCost({ model: M, in: 2000000, out: 0, cached: 0 }, pricing44);
+    ok('T44-c3 ★无分桶 → 回退整批口径（不因 A3 改动而变），且结果为有限数',
+      Number.isFinite(noBuck) && noBuck > 0, `实测 ${noBuck}`);
+    // c4：**分桶不完整时必须回退**（真实行有分桶 + 估算段无分桶 → 三项和 ≠ 总量）
+    //   → 不得用残缺分桶算钱（否则静默少算/多算）。这里模拟"in 分桶只覆盖一半"。
+    const partial = tt44.calcCost({ model: M, in: 2000000, out: 0, cached: 0,
+      pIn: 500000, pCached: 0, pOut: 0, oIn: 500000, oCached: 0, oOut: 0 }, pricing44);
+    ok('T44-c4 ★分桶三项和 ≠ 总量 → 拒绝使用分桶、回退整批（残缺分桶绝不静默参与计价）',
+      Math.abs(partial - noBuck) < 1e-9, `残缺分桶 ${partial} vs 整批 ${noBuck}`);
+    // c5：分桶三项**全为 0** → 视为无分桶（不得把全部 token 当免费）
+    const zeroBuck = tt44.calcCost({ model: M, in: 1000000, out: 0, cached: 0,
+      pIn: 0, pCached: 0, pOut: 0, oIn: 0, oCached: 0, oOut: 0 }, pricing44);
+    ok('T44-c5 ★分桶全 0（= 一行都没落进可见时段）→ 视为无分桶、回退整批（不得算成免费）',
+      Math.abs(zeroBuck - tt44.calcCost({ model: M, in: 1000000, out: 0, cached: 0 }, pricing44)) < 1e-9,
+      `实测 ${zeroBuck}`);
+    // c6：cached 也随峰谷（A13 结论）——高峰段的 cached 乘 peakMult
+    //   100万 peak in（其中 100万 cached）→ 1×0.02×2 = ¥0.04
+    const peakCached = tt44.calcCost({ model: M, in: 1000000, out: 0, cached: 1000000,
+      pIn: 1000000, pCached: 1000000, pOut: 0, oIn: 0, oCached: 0, oOut: 0 }, pricing44);
+    ok('T44-c6 ★分桶路径里高峰段 cached 同样 ×peakMult（A13 三项同乘在分桶路径同样成立）',
+      Math.abs(peakCached - 0.04) < 1e-9, `实测 ${peakCached}（应 0.04）`);
+  }
+  if (savedEnv44 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv44;
+
+  // a：结构性守卫 —— 分桶必须在**逐行循环**里按每行 ts 判（而不是批级）
+  const rawTT44 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8');
+  const pmSrc44 = stripComments((() => {
+    const i = rawTT44.indexOf('function perModelFromRows');
+    const j = rawTT44.indexOf('\nfunction ', i + 10);
+    return rawTT44.slice(i, j < 0 ? undefined : j);
+  })());
+  ok('T44-a1 ★perModelFromRows（账本侧 byModel 的来源）在逐行循环内做峰谷分桶',
+    /isPeakHour\(peakRulesAgg, new Date\(ts\)\)/.test(pmSrc44),
+    '账本侧不分桶 → 账本金额仍是整批口径，A3 白改（第一版实测栽在这儿：账本 ¥2 应 ¥3）');
+  const atlSrc44 = stripComments((() => {
+    const i = rawTT44.indexOf('function aggregateTranscLines');
+    const j = rawTT44.indexOf('\nfunction ', i + 10);
+    return rawTT44.slice(i, j < 0 ? undefined : j);
+  })());
+  ok('T44-a2 ★aggregateTranscLines（弹窗侧）同样在逐行循环内分桶 —— 两侧同口径',
+    /isPeakHour\(peakRulesAgg, new Date\(ts\)\)/.test(atlSrc44));
+  // a3：合并点必须带上分桶（否则主+子代理合并时被丢掉）
+  ok('T44-a3 ★aggregateTranscript / aggregatePerModel 合并主+子代理桶时带上行级分桶',
+    /for \(const k of \['pIn', 'pCached', 'pOut', 'oIn', 'oCached', 'oOut'\]\)/.test(rawTT44)
+    && (rawTT44.match(/for \(const k of \['pIn', 'pCached', 'pOut', 'oIn', 'oCached', 'oOut'\]\)/g) || []).length >= 4,
+    '合并处丢分桶 = 主+子代理混合轮金额又漂（需覆盖：aggregateTranscript / aggregatePerModel / merge / toastLine2）');
+  // a4：峰谷规则必须惰性缓存（否则逐行调用 = 每行读一次盘）
+  const pkSrc44 = stripComments((() => {
+    const i = rawTT44.indexOf('function peakRulesForAgg');
+    const j = rawTT44.indexOf('\nfunction ', i + 10);
+    return rawTT44.slice(i, j < 0 ? undefined : j);
+  })());
+  ok('T44-a4 ★peakRulesForAgg 带 mtime 缓存（逐行调用 ≠ 逐行读盘）',
+    /_aggPeakRulesCache/.test(pkSrc44) && /mtimeMs/.test(pkSrc44));
+  // a5：明细必须落 peakSplit（recalc 精确回算的唯一依据）
+  ok('T44-a5 ★轮次明细落 peakSplit（recalc 读不到它就只能退回"轮次数占比"近似折算）',
+    /const peakSplit = \{\};/.test(rawTT44) && /hasAnySplit \? \{ peakSplit \} : \{\}/.test(rawTT44));
+  // a6：recalc 必须**优先**用精确切分。⚠️ 这条是**文本序**守卫，只能防"有人把两个分支写反"，
+  //   防不住"运行时短路精确分支"（反向验证实测：把 `if (split && …)` 改成 `if (false && split && …)`
+  //   后 a6 依然全绿）——真正的行为兜底是下面的 T44-b（peakSplitOf 逐字段断言 + 反向验证会红）。
+  //   两条一起才完整：a6 管"顺序别写反"（读代码即知），b 管"精确数据真被用上"（跑起来才算数）。
+  const rj44 = fs.readFileSync(path.join(SRC, 'recalc-day.js'), 'utf-8');
+  ok('T44-a6 ★recalc 源码里「精确分支」写在「占比折算分支」之前（防把两路写反）',
+    /const split = peakSplitOf\(date, model\);/.test(rj44)
+    && rj44.indexOf('const split = peakSplitOf(date, model);') < rj44.indexOf('} else if (peakRatio === null) {'),
+    '顺序反过来 = 近似折算会盖掉精确结果（A3 的验收标准就是两条路径同金额）');
+  ok('T44-a7 ★recalc 报告里标出口径来源（精确(逐行) / 百分比），用户能看出走的是哪条',
+    /splitUsed \? '精确\(逐行\)'/.test(rj44));
+
+  // b：**行为**验证 peakSplitOf（不是只看源码文本）——a6 只判"两行的先后顺序"，
+  //   实测把精确分支运行时短路掉（`if (false && split …)`）a6 依然全绿 → 文本守卫不足以兜底。
+  //   这里真造一个 rounds-YYYY-MM.jsonl 夹具，指向它读，断言聚合结果**逐字段正确**。
+  //   为什么要求 recalc-day.js 可被 require（require.main 守卫）：不然 require 它就会直接跑 CLI
+  //   → 读写真实账本，测试变成"会改盘的副作用"，不可接受（本轮顺手修掉）。
+  const D44B = path.join(tmp, 't44b');
+  try {
+    fs.mkdirSync(path.join(D44B, 'skills', 'token-usage-tracker'), { recursive: true });
+    // recalc-day.js 用 detectWorkBuddyRoot()（WB_ROOT > ~/.workbuddy-ai > ~/.workbuddy）定位 SKILL_DIR，
+    //   所以必须把 skill 子目录建在 WB_ROOT 下，并把**全部运行时 .js** 拷进去——
+    //   token-tracker.js 会 require ./refresh-holidays.js / ./stop-handler.js 等同级模块，
+    //   少拷一个就是 "Cannot find module"（第一版只拷了 3 个 → require 直接抛，b1 红）。
+    const fxSkill = path.join(D44B, 'skills', 'token-usage-tracker');
+    for (const f of fs.readdirSync(SRC)) {
+      if (!/\.(js|json)$/.test(f)) continue;
+      if (/^selftest\.js$/.test(f)) continue; // selftest 自身不必进夹具
+      try { fs.copyFileSync(path.join(SRC, f), path.join(fxSkill, f)); } catch (e) { /* 单个失败不影响（缺的会显式报出） */ }
+    }
+    const rdir = path.join(fxSkill, 'rounds');
+    fs.mkdirSync(rdir, { recursive: true });
+    // 两轮同日、同模型：一轮高峰 100万 in，一轮空闲 100万 in → 精确合计 pIn=1e6 / oIn=1e6
+    const rows = [
+      { ts: Date.now(), date: '2026-05-06', models: { 'deepseek-v4.1-flash': { in: 1000000, out: 0, cached: 0, total: 1000000 } },
+        peakSplit: { 'deepseek-v4.1-flash': { pIn: 1000000, pCached: 0, pOut: 0, oIn: 0, oCached: 0, oOut: 0 } } },
+      { ts: Date.now(), date: '2026-05-06', models: { 'deepseek-v4.1-flash': { in: 1000000, out: 0, cached: 0, total: 1000000 } },
+        peakSplit: { 'deepseek-v4.1-flash': { pIn: 0, pCached: 0, pOut: 0, oIn: 1000000, oCached: 0, oOut: 0 } } },
+      // 干扰行：别的日期 / 别的模型（都不得被算进来）
+      { ts: Date.now(), date: '2026-05-07', peakSplit: { 'deepseek-v4.1-flash': { pIn: 9e6, pCached: 0, pOut: 0, oIn: 0, oCached: 0, oOut: 0 } } },
+      { ts: Date.now(), date: '2026-05-06', peakSplit: { 'hy3': { pIn: 9e6, pCached: 0, pOut: 0, oIn: 0, oCached: 0, oOut: 0 } } },
+      // 无 peakSplit 的行（旧版明细）→ 不参与精确切分
+      { ts: Date.now(), date: '2026-05-06', models: { 'deepseek-v4.1-flash': { in: 5e6, out: 0, cached: 0, total: 5e6 } } },
+    ];
+    fs.writeFileSync(path.join(rdir, 'rounds-2026-05.jsonl'), rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+    const saved44b = process.env.WB_ROOT;
+    process.env.WB_ROOT = D44B;
+    delete require.cache[require.resolve(path.join(fxSkill, 'recalc-day.js'))];
+    let rjMod = null;
+    try { rjMod = require(path.join(fxSkill, 'recalc-day.js')); } catch (e) { rjMod = null; }
+    if (!rjMod || typeof rjMod.peakSplitOf !== 'function') {
+      ok('T44-b1 peakSplitOf 可单测（需 require 时不得自动跑 main）', false,
+        'recalc-day.js 必须用 require.main === module 守卫，否则 require 即执行 CLI（会读写真实账本）');
+    } else {
+      const sp = rjMod.peakSplitOf('2026-05-06', 'deepseek-v4.1-flash');
+      ok('T44-b1 ★peakSplitOf 按「日期 + 模型」双重过滤聚合行级切分（日期/模型不匹配的干扰行都不进）',
+        !!sp && sp.pIn === 1000000 && sp.oIn === 1000000 && sp.pCached === 0 && sp.oOut === 0,
+        sp ? JSON.stringify(sp) : 'null');
+      const spNone = rjMod.peakSplitOf('2026-05-06', 'glm-5.3-flash');
+      ok('T44-b2 ★该日期/模型没有切分数据 → 返回 null（调用方据此回退占比折算，不硬造）',
+        spNone === null, String(spNone));
+      const spOld = rjMod.peakSplitOf('2026-04-30', 'deepseek-v4.1-flash');
+      ok('T44-b3 ★整个月份文件都不存在 → 返回 null（不抛错）', spOld === null, String(spOld));
+    }
+    if (saved44b === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = saved44b;
+  } catch (e) {
+    ok('T44-b 夹具构建', false, (e && e.message) || String(e));
+  }
 }
 
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。

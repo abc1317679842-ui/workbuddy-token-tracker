@@ -3,6 +3,59 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.41.0（2026-10-10）—— 修复（A3）：三种计价口径统一为「按行逐条判定」
+
+> 源：plan-B 审计报告 A3（口径三份不一）。
+> 病根：同一批 token 有三条计价路径，**峰谷判定粒度各不相同**——
+> ① 主链路 `calcCost`：**整批一个倍率**（取批级 `peakTs` 判整批）；
+> ② `backfill.js rowCost`：**逐行判定**（正确）；
+> ③ `recalc-day.js costOf`：**按轮次数值/时长占比折算** `1 + (peakMult-1)*ratio`（近似）。
+> 跨 12:00 / 18:00 边界的那一轮 → 三条路径给出**三个不同金额**。
+> 验收标准：recalc 的定位是"改价后回算历史"，**回算出实时链路算不出的数 = 回算不可信**。
+
+### A3：主链路整批一个倍率 → 跨峰谷边界轮与 backfill/recalc 三口径不一致
+
+**触发面**：一轮对话跨越 12:00（上午高峰→午休空闲）或 18:00（下午高峰→傍晚空闲）边界，且该轮有 deepseek 用量。
+**后果**：主链路按"本批 `peakTs` 落在哪个时刻"给整批一个倍率 —— 若 `peakTs` 落在高峰段，则**整批（含空闲段那部分）都按 ×2 计**（多收钱）；反之整批按 ×1（少记）。两个方向都是错的，且**与 backfill 逐行结果、recalc 占比结果都不相等**。
+
+**修法：主链路也逐行分桶**（与 `backfill` 同口径）：
+
+- 在 `aggregateTranscLines`（弹窗侧）与 `perModelFromRows`（账本侧）的**逐行循环**里，按**该行自己的 `ts`** 判峰谷，累出分桶量：高峰段 `pIn/pCached/pOut`、空闲段 `oIn/oCached/oOut`。（第一版只改了弹窗侧、漏了账本侧，导致账本仍算整批值——已补齐，账本侧才是"钱包"。）
+- 峰谷规则来源新增 `peakRulesForAgg()`：惰性读本机 `pricing.json` 的 `deepseek_rules` 并按 `mtimeMs` 缓存（价目表改动自动失效）；读不到返回 `null`（不抛），调用方回退整批口径。
+- `calcCost` 新增分桶路径：`hasBuckets` = **三项之和必须逐项 === 总量**（`pIn+oIn === in` 且 `pCached+oCached === cached` 且 `pOut+oOut === out` 且高峰三项 > 0）；满足则高峰段乘 `peakMult`、空闲段乘 1，**不再看 `mult`**（`mult` 是"整批一个时刻"的产物，与行级分桶互斥）。**不满足则逐字节回退 v3.39.0 的整批口径**——残缺分桶（三项和 ≠ 总量，如"真实行分桶 + 估算段无分桶"混在一起）**绝不静默参与计价**。
+- 分桶沿 `aggregatePerModel` / `aggregateTranscript` / `splitByModelStats` / `incrementalRecord.merge` 各处合并点一路带出；`addModelUsage` 改为**显式搬运计价字段**（不再 `Object.assign` 全量拷贝，防分桶被顺手带进落盘形状）。
+- 轮次明细落盘新增 `peakSplit`（逐模型 `{pIn,pCached,pOut,oIn,oCached,oOut}`），**供 recalc 精确回算**。落盘给用户看的 `models`（`{in,out,cached,total}`）**刻意不带分桶**（形状稳定，外部消费方不受影响）。
+- 附带：把"轮次明细落点路径"抽成唯一实现 `snapshotFileFor()` / `roundsFileOf()`（原先三处手抄同一表达式，是漂移源）；弹窗状态与 `pollState` 新增 `roundsFile` 字段（basename，recalc 据此定位）。
+
+### A3 另一半：`recalc-day.js` 优先用 `peakSplit` 精确回算
+
+- 新增 `peakSplitOf(date, model)`：读 `rounds/rounds-YYYY-MM.jsonl` 的 `peakSplit`，按 `rec.date` + 模型名**双重过滤**累加（跨日期 / 跨模型干扰行不进账），读不到返回 `null`。
+- recalc 主循环新增**优先级①精确分支**：`peakSplitOf` 命中 → 两端各自乘各自倍率，报告口径标 **`精确(逐行)`**；其下才是原有 `else if (peakRatio === null)` 与占位折算分支（老明细无 `peakSplit` 时行为与 v3.39.0 **逐字节一致**，向后兼容）。
+- 报告新增口径来源列（`精确(逐行)` / `占比折算` / `无峰谷`），让"这个数是怎么来的"可追溯。
+
+### 验证
+
+- **隔离环境端到端实证**（`D:\测试临时文件夹\tt-iso-a3b\`，真跑 `--stop`）：一轮跨 12:00 边界（11:58 高峰 100 万 in + 13:02 空闲 100 万 in，`deepseek-v4.1-flash`）
+  - 账本 `cost: **3**`（旧口径为 2）✅
+  - 轮次明细 `costApiEquiv: **3**` + `peakSplit:{"deepseek-v4.1-flash":{"pIn":1000000,…,"oIn":1000000,…}}` ✅
+  - 弹窗显示 **¥3.00**（旧 ¥2.00）✅
+- **recalc 与实时链路同金额**（A3 验收）：先跑 → 「无需修正（各模型金额已一致）当日合计 ¥3.00」；把账本改成 ¥2 后重跑 → `原 ¥2.0000 → 现 ¥3.0000（轮次 0，高峰占比 **精确(逐行)**）` ✅
+- 单点 `calcCost` 三态：半峰半闲 **¥3** / 全高峰 **¥2** / 全空闲 **¥1** ✅；高峰 cached ×`peakMult` → ¥0.04 ✅
+- `selftest.js` 新增 **T44 组 16 条**：c1~c6 行为（价目表内联构造，不依赖本机 `pricing.json`）+ a1~a7 结构（逐行分桶 / 合并点 ≥4 处带分桶 / `peakRulesForAgg` 有 mtime 缓存 / 明细落 `peakSplit` / recalc 精确分支在前）+ b1~b3 行为（真造 `rounds-2026-05.jsonl` 夹具，断言 `peakSplitOf` 逐字段正确、跨日期 / 跨模型干扰行被过滤、无数据 / 月份文件缺失返回 `null`）。
+- **反向验证 4 项全部会红**：① `hasBuckets` 强制 false → c1/c2/c6 红；③ `peakSplitOf` 去日期过滤 → b1 红；④ 去模型过滤 → b1+b2 都红。（② recalc 短路精确分支 → a6 仍绿——**a6 只判源码文本序，防把两路写反**，行为兜底由 b 组承担；此局限已写入 a6 注释。）
+- selftest 全量：**458 过 / 0 败 / 23 环境受限跳过**（v3.40.0 基线 442 → 458，+16）。
+- 守卫基线未破：裸 catch **41 不变**（新代码无裸 catch）、T36/T37/T42-a24 全绿（`T37-b1` main() 恰好 950 行顶格——把 `pollState` 里的 IIFE 抽成 `roundsFileOf()` 才压回来）。
+- 工作区：真机 `--stop` 跑通、账本**零变化**（除刻意改的夹具）。
+
+### 本版没做
+
+- A4（跨日边界双口径）已在 v3.40.0 做过（分桶跟随发生时刻），本版的分桶实现与其口径一致。
+- A5（缓存价缺失兜底）——与既有 `cached_price_unknown`「不凭空造价」哲学冲突，需重新评估。
+- A13（峰谷倍率同乘三项）——**审计猜测，与现状不符**：现实现分桶路径对 `cached_price` 已乘 `peakMult`（符合"峰谷倍率对所有价项同乘"），无需改动；已在 v3.40.0 结论中记录。
+- plan-B 其余 B / C / D 类（计费公式抽共享模块、报表、测试网、`--report rounds` CLI 出口等）。
+
+---
+
 ## v3.40.0（2026-10-10）—— 修复（8 条「静默错」）：价格写入侧闸门 + 状态自愈 + 显示侧陈旧
 
 > 源：plan-B 审计报告 26 条里的 A6 / A7 / A8 / A9 / A10 / A11 / A12 / A21。

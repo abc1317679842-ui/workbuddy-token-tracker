@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.40.0 (2026-10-10)
+// token-usage-tracker v3.41.0 (2026-10-10)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -230,6 +230,14 @@ function writeToastLog(reason, state) {
       //     将来若有人往 toast 里加长标注（模型名变长 / 新增分段），防单行撑爆日志。故**不加宽、不改动**。
       //     审计原话把它与 rounds 的「用户消息前 40 字明文」并列，实为两类数据（那份才真的含用户文本）。
       toastText: st.toastText != null ? String(st.toastText).slice(0, 200) : null,
+      // v3.40.0（plan-B A3）：**本轮的轮次明细文件路径（basename）**——recalc-day.js 据此精准找到
+      //   该轮在 rounds-YYYY-MM.jsonl 里的**逐模型 token 记录**，从而**按行精确判定峰谷**，
+      //   取代原先「按 toast 轮次数占比近似 token 占比」的折算（`1 + (peakMult-1)*ratio`）。
+      //   为什么必须落这里：toast 日志是 recalc 唯一能拿到「轮次 ↔ 时间戳」对应关系的通道，
+      //   而 rounds 明细里没有周几/时段字段（时段要现算）也没有"这是第几轮 toast"的标记 → 两者只能靠
+      //   本字段接起来。旧版本写的日志没有这个键 → recalc 侧读到 undefined 会**自动回退**旧折算口径
+      //   （行为与 v3.39.0 逐字节一致），不会因为历史日志缺字段而算错。
+      roundsFile: st.roundsFile != null ? String(st.roundsFile).slice(0, 64) : null,
     };
     fs.appendFileSync(TOAST_LOG_PATH, JSON.stringify(rec) + '\n', 'utf8');
   } catch (e) { /* 日志写入失败：绝不阻塞主逻辑 */ }
@@ -1088,6 +1096,28 @@ function numTs(v) {
   return NaN;
 }
 
+// v3.40.0（plan-B A3）：聚合期的峰谷规则来源。
+//   aggregateTranscLines / perModelFromRows 的调用链上游拿不到 pricing 对象（签名只收 rows/fromTs），
+//   而 A3 要求「按行逐条判定峰谷」就必须在**逐行循环里**有规则可用 → 这里惰性取一次本机价库的
+//   deepseek_rules 并缓存。为什么要缓存：本函数每行都会被调用一次，若不缓存等于**每行读一次磁盘**。
+//   mtime 失效：价库被 refresh-prices.js / 用户手工改动后，下一次聚合就用上新规则（不需要重启进程）。
+//   失败一律返回 null（不抛）——调用方据此退化为「不分桶」，由 calcCost 走旧的整批单倍率路径。
+let _aggPeakRulesCache = null;   // { rules, mtimeMs, at }
+function peakRulesForAgg() {
+  try {
+    const st = fs.statSync(PRICING);
+    const c = _aggPeakRulesCache;
+    if (c && c.mtimeMs === st.mtimeMs) return c.rules;
+    const pr = JSON.parse(fs.readFileSync(PRICING, 'utf-8').replace(/^\uFEFF/, ''));
+    const rules = (pr && pr.deepseek_rules) || null;
+    _aggPeakRulesCache = { rules, mtimeMs: st.mtimeMs, at: Date.now() };
+    return rules;
+  } catch (e) {
+    // 价库缺失 / 损坏 / 无 deepseek_rules → 不分桶（调用方 `if (peakRulesAgg)` 已是守卫）
+    return null;
+  }
+}
+
 // 聚合 transcript 中 timestamp > fromTs 的全部调用（按 messageId/conversationRequestId 去重）
 function aggregateTranscLines(rows, fromTs) {
   const seen = new Set();
@@ -1130,6 +1160,25 @@ function aggregateTranscLines(rows, fromTs) {
     mb.in += u.in; mb.out += u.out; mb.cached += u.cached; mb.total += u.in + u.out;
     if (ts > mb.lastTs) mb.lastTs = ts;
     if (mb.firstTs === 0 || ts < mb.firstTs) mb.firstTs = ts;
+    // v3.40.0（plan-B A3）：**行级峰谷分桶**——把「按行各自判定再求和」所需的中间量在这里备好。
+    //   病根（审计 A3）：主链路原先只拿一个批级时刻（peakTs）判**整批**一个倍率，而
+    //   `backfill.js rowCost` 是逐行判定、`recalc-day.js costOf` 是按轮次时长占比折算 ——
+    //   跨 12:00 / 18:00 边界的那一轮，三条路径给出三个不同金额。而 recalc 的定位恰恰是
+    //   "改价后回算历史" → **回算工具算出来的数和实时链路不一致 = 回算不可信**。
+    //   现在主链路也按行判定：桶里分「高峰部分」与「空闲部分」两套累计，计价时各自乘各自倍率。
+    //   为什么放这里而不是改 calcCost 的入参：这是**唯一**能拿到每行 ts 的地方（calcCost 只收到
+    //   聚合后的 {in,out,cached}），在更下游补 ts 信息就要重构整个调用链。
+    // ⚠️ 峰谷规则来源：本函数**不**接 pricing 参数（签名 (rows, fromTs)，7 个调用点都在拿不到
+    //   pricing 的上游）→ 走 `peakRulesForAgg()` 惰性取本机 pricing.json 的 deepseek_rules。
+    //   取不到（无价库 / 损坏）→ 返回 null → 本行**不参与分桶**（只进总量），calcCost 侧走
+    //   「整批单倍率」旧路径 → 金额退化到 v3.39.0 行为，绝不因取不到规则而算错或抛异常。
+    //   成本：pricing.json 每轮读**一次**并缓存（见 peakRulesForAgg 的 mtime 失效），不是每行一次。
+    const peakRulesAgg = peakRulesForAgg();
+    if (peakRulesAgg) {
+      const peekRow = isPeakHour(peakRulesAgg, new Date(ts));
+      if (peekRow) { mb.pIn = (mb.pIn || 0) + u.in; mb.pCached = (mb.pCached || 0) + u.cached; mb.pOut = (mb.pOut || 0) + u.out; }
+      else { mb.oIn = (mb.oIn || 0) + u.in; mb.oCached = (mb.oCached || 0) + u.cached; mb.oOut = (mb.oOut || 0) + u.out; }
+    }
     count++;
   }
   if (!count) {
@@ -1266,6 +1315,11 @@ function subagentTagOf(entry) {
 function perModelFromRows(rows, fromTs) {
   const seen = new Set();
   const byModel = {};
+  // v3.40.0（plan-B A3）：峰谷规则惰性取一次（与 aggregateTranscLines 同源函数、同缓存）——
+  //   **这是账本侧的行级峰谷分桶落点**：aggregatePerModel（Stop 的 byModel 来源）就建在它上面，
+  //   所以账本金额走"逐行判定"必须在这里分桶（aggregateTranscLines 只服务弹窗侧）。
+  //   漏了这里 = 弹窗与账本又是两个口径（A3 白改）——第一版实测正是栽在这儿（账本 ¥2 / 应 ¥3）。
+  const peakRulesAgg = peakRulesForAgg();
   for (const r of rows) {
     // v3.33.0（A5）：与上方 aggregateTranscLines 同款 `numTs()`——这对孪生函数（注释自称"完全一致的
     //   去重口径"）此前共用同一个硬判 typeof，只修其中一个会让两者口径分叉，故必须同改。
@@ -1282,6 +1336,14 @@ function perModelFromRows(rows, fromTs) {
     const name = normalizeModelName(pd.model || pd.requestModelId || 'unknown');
     const b = byModel[name] || (byModel[name] = { in: 0, out: 0, cached: 0, total: 0 });
     b.in += u.in; b.out += u.out; b.cached += u.cached; b.total += u.in + u.out;
+    // v3.40.0（plan-B A3）：行级峰谷分桶（形状/语义与 aggregateTranscLines 内那份**完全一致**）。
+    if (peakRulesAgg) {
+      if (isPeakHour(peakRulesAgg, new Date(ts))) {
+        b.pIn = (b.pIn || 0) + u.in; b.pCached = (b.pCached || 0) + u.cached; b.pOut = (b.pOut || 0) + u.out;
+      } else {
+        b.oIn = (b.oIn || 0) + u.in; b.oCached = (b.oCached || 0) + u.cached; b.oOut = (b.oOut || 0) + u.out;
+      }
+    }
   }
   return byModel;
 }
@@ -1339,8 +1401,14 @@ function aggregatePerModel(tsPath, roundStartMs) {
         try { if (fs.statSync(fp).mtimeMs <= roundStartMs) continue; } catch (e) { continue; } // 本轮之前创建的排除
         const sub = perModelFromRows(readTranscLines(fp), 0); // 子代理文件本身只属于本次专家团
         for (const [n, b] of Object.entries(sub)) {
-          if (merged[n]) { merged[n].in += b.in; merged[n].out += b.out; merged[n].cached += b.cached; merged[n].total += b.total; }
-          else merged[n] = b;
+          // v3.40.0（plan-B A3）：合并子代理桶时**必须带上行级峰谷分桶**（否则账本里主模型段有分桶、
+          //   子代理段没有 → 混合轮金额又漂）。规则同 aggregateTranscript：两边任一侧出现该字段才累加。
+          if (merged[n]) {
+            merged[n].in += b.in; merged[n].out += b.out; merged[n].cached += b.cached; merged[n].total += b.total;
+            for (const k of ['pIn', 'pCached', 'pOut', 'oIn', 'oCached', 'oOut']) {
+              if (b[k] !== undefined || merged[n][k] !== undefined) merged[n][k] = (merged[n][k] || 0) + (b[k] || 0);
+            }
+          } else merged[n] = b;
         }
       }
     } catch (e) { /* subagents 读取失败：忽略子代理部分 */ }
@@ -1435,6 +1503,13 @@ function aggregateTranscript(tsPath, roundStartMs) {
       if (b.lastTs > t.lastTs) t.lastTs = b.lastTs;
       // v3.38.2：合并时也要带上 firstTs（否则主+子代理同名桶的首时间戳丢失 → 该条跨度算不出来）
       if (b.firstTs && (!t.firstTs || b.firstTs < t.firstTs)) t.firstTs = b.firstTs;
+      // v3.40.0（plan-B A3）：**必须带上行级峰谷分桶**——否则主链路刚在 aggregateTranscLines 里
+      //   算好的 pIn/oIn… 在这里被丢掉，calcCost 只能回退整批单倍率，A3 白改。
+      //   形状与 aggregateTranscLines 一致：只有**两边都有**该字段时才累加（一边为 undefined
+      //   说明那边没分桶，此时若把 undefined 当 0 加会把已有分桶数吞掉 → 用 `|| 0` 只加已存在的）。
+      for (const k of ['pIn', 'pCached', 'pOut', 'oIn', 'oCached', 'oOut']) {
+        if (b[k] !== undefined || t[k] !== undefined) t[k] = (t[k] || 0) + (b[k] || 0);
+      }
     }
   }
   // v3.19.2（B10）：显式处理"两个 firstTs 都为空"——原 Math.min(...[]) = Infinity，
@@ -1525,10 +1600,16 @@ function splitByModelStats(agg) {
     });
     return keys.map((n) => {
       const b = modelsObj[n];
+      // v3.40.0（plan-B A3）：把行级峰谷分桶一并带进 stat —— 分条弹窗的每条走 toastLine2 →
+      //   calcCost({model, in, out, cached, lastTs: batchTs})，若不带分桶就仍是"整批单倍率"，
+      //   与账本（已按行分桶）**金额对不上**（正是 A3 要消灭的口径分裂，只是换到弹窗侧）。
+      const bSt = { in: b.in || 0, out: b.out || 0, cached: b.cached || 0 };
+      for (const k of ['pIn', 'pCached', 'pOut', 'oIn', 'oCached', 'oOut']) {
+        if (b[k] !== undefined) bSt[k] = b[k];
+      }
       return {
         model: n,
-        stat: {
-          in: b.in || 0, out: b.out || 0, cached: b.cached || 0,
+        stat: Object.assign(bSt, {
           total: b.total || ((b.in || 0) + (b.out || 0)),
           model: n, modelMain: n, subModels: undefined,
           models: { [n]: b }, // 单桶 → 该条只按该模型计价
@@ -1540,7 +1621,7 @@ function splitByModelStats(agg) {
           //   （2 个并行各 4.0s / 6.9s → 显示 6.9s，不是 10.9s）；多批次（返回→主模型再派）含批间等待 → 偏大。
           durMs: Math.max(0, (b.lastTs || agg.lastTs) - (b.firstTs || agg.firstTs)),
           firstTs: b.firstTs || agg.firstTs, lastTs: b.lastTs || agg.lastTs,
-        },
+        }),
       };
     });
   } catch (e) { return []; } // 拆分失败 → 退化为单条，绝不因显示改造丢弹窗
@@ -2665,6 +2746,22 @@ function todayStr() {
   return `${d.getFullYear()}-${m}-${dd}`;
 }
 
+// v3.40.0（plan-B A4）：按**给定时刻**推本地日期串——与 todayStr 同口径（本地时区、YYYY-MM-DD），
+//   唯一差别是不取「当下」而取传入的 epoch ms。
+//   为什么需要：审计 A4 —— 账本分桶原先一律用 `todayStr()`（**写盘时刻**），而金额却按
+//   `peakTs`（**token 实际发生时刻**）判峰谷。23:59:59 发生、00:00:05 才跑 Stop 的轮次：
+//   token 记进**次日**桶，金额却按**前一日**的时段档算 —— 同一批数据两处口径自相矛盾。
+//   现在分桶与计价统一都用「发生时刻」。
+//   边界安全：ts 非法（0 / NaN / 负数）→ 回退 todayStr()，与旧行为一致（不能让异常输入把账记到 1970）。
+function dateStrOfTs(tsMs) {
+  const t = Number(tsMs);
+  if (!Number.isFinite(t) || t <= 0) return todayStr();
+  const d = new Date(t);
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${m}-${dd}`;
+}
+
 // 每日价格自动刷新：当天已刷新（date==今天）→ 不联网直接返回；过期 → 同步调 refresh-prices.js
 // 联网拉 OpenRouter 更新（execFileSync 保证刷新完成才继续；失败保留本地价并 stderr 暴露，不静默）。
 // v3.18.2（R4）→ v3.18.3（F1 做实）→ v3.18.4（G1/G3 修接线）：重建规模护栏（可导出，供 selftest 直接单测）。
@@ -2991,12 +3088,54 @@ function calcCost(stat, pricing, tsMs) {
   const cached = Math.max(0, Number(stat.cached) || 0);
   const outTok = Math.max(0, Number(stat.out) || 0);
   const uncached = Math.max(0, Math.max(0, Number(stat.in) || 0) - cached);
-  const cost = (uncached / 1e6) * (m.input_price || 0) * mult
-             + (cached / 1e6) * (m.cached_price || 0) * mult
-             + (outTok / 1e6) * (m.output_price || 0) * mult;
-  return cost;
+  // v3.40.0（plan-B A13 · 结论是「不改行为、只把语义写清」）：
+  //   审计指出「峰谷倍率由 input 价之比算出，却同乘 input/cached/output 三项」。核实结论：
+  //   **三项同乘是当前官方事实，不是 bug** —— 查 api-docs.deepseek.com 官方定价页（2026-10 复核）：
+  //     相邻两档（空闲 / 高峰）三项价格**全部正好 ×2**，缓存命中价也在内：
+  //       deepseek-flash   缓存命中 0.02 → 0.04 ；未命中 1 → 2 ；输出 4 → 8
+  //       deepseek-v4-pro  缓存命中 0.15 → 0.30 ；未命中 4.5 → 9.0 ；输出 13.5 → 27.0
+  //   → 本机 pricing.json 存的是**空闲价**，peak_multiplier=2 乘三项 = 高峰价，结果正确。
+  //   ⚠️ 所以**不要**把它"修"成只乘 input —— 那会漏收缓存部分的峰谷差（缓存占比常达 95%+，
+  //      漏收幅度可达整轮一半）。将来若某厂商的缓存价不再随峰谷，再改为**三项各自倍率**，
+  //      而不是把倍率从某一项上摘掉。（T43-a6/a7 是这个结论的守卫。）
+  //
+  // v3.40.0（plan-B A3）：**优先用行级峰谷分桶**（pIn/pCached/pOut 高峰 + oIn/oCached/oOut 空闲），
+  //   各自乘各自倍率后求和 —— 与 `backfill.js rowCost`（逐行判定）**口径统一**。
+  //   病根：主链路原先只拿一个批级时刻（peakTs）判**整批**一个倍率 → 跨 12:00 / 18:00 边界的那一轮，
+  //   主链路（整批）与 backfill（逐行）给出两个不同金额，而 recalc 的定位正是"改价后回算历史"
+  //   → 回算工具与实时链路不一致 = 回算不可信。
+  //   数据来源：perModelFromRows（账本侧）与 aggregateTranscLines（弹窗侧）**都在逐行循环里**
+  //   按每行自己的 ts 判峰谷后分桶；aggregatePerModel / aggregateTranscript 合并主+子代理时带上这些桶。
+  //   ⚠️ 有分桶时**不再看 mult**（上面那个按 effTs 算出的倍率）：mult 是"整批一个时刻"的产物，
+  //      分桶里已经逐行分好了高峰/空闲 → 高峰段直接乘 peakMult、空闲段乘 1。
+  //      （第一版实测踩坑：分桶正确但 mult 仍按"当下时刻"算出 1 → 高峰段被当成空闲，金额少了 1/3。）
+  //   回退路径（**行为与 v3.39.0 逐字节一致**，以下情形之一即走）：
+  //     ① 调用方给的 stat 没有分桶（toastLine2 单模型 / splitByModelStats 之外的旧调用点、
+  //        或 peakRulesForAgg 取不到峰谷规则而没分桶）；
+  //     ② 三项之和不等于总量 → 分桶不完整（如"真实行分桶 + 估算段无分桶"混合，见 incrementalRecord
+  //        的 merge 注释）→ 宁可整批，也不静默算错；
+  //     ③ 三项全为 0（= 该桶一行都没落进可见时段，不可能有 token）→ 视为无分桶信息。
+  const pIn = Number(stat.pIn) || 0, pCached = Number(stat.pCached) || 0, pOut = Number(stat.pOut) || 0;
+  const oIn = Number(stat.oIn) || 0, oCached = Number(stat.oCached) || 0, oOut = Number(stat.oOut) || 0;
+  const hasBuckets = (pIn + oIn) === Math.max(0, Number(stat.in) || 0)
+    && (pCached + oCached) === cached
+    && (pOut + oOut) === outTok
+    && (pIn + pCached + pOut) > 0;
+  if (hasBuckets) {
+    // 各自乘各自倍率：高峰段 ×peakMult、空闲段 ×1（三项同乘在本路径同样成立，见上方 A13 结论）。
+    const pc = Math.min(pCached, pIn); // 防御：分桶侧也做 cached ≤ in 钳制（与整批口径一致）
+    const oc = Math.min(oCached, oIn);
+    return ((pIn - pc) / 1e6) * (m.input_price || 0) * peakMult
+         + (pc / 1e6) * (m.cached_price || 0) * peakMult
+         + (pOut / 1e6) * (m.output_price || 0) * peakMult
+         + ((oIn - oc) / 1e6) * (m.input_price || 0)
+         + (oc / 1e6) * (m.cached_price || 0)
+         + (oOut / 1e6) * (m.output_price || 0);
+  }
+  return (uncached / 1e6) * (m.input_price || 0) * mult
+       + (cached / 1e6) * (m.cached_price || 0) * mult
+       + (outTok / 1e6) * (m.output_price || 0) * mult;
 }
-
 function fmtCost(cost) {
   if (cost == null || !Number.isFinite(cost)) return null; // v3.24.0：NaN 也返回 null（原只挡 null → NaN 会直出「¥NaN」上 toast）
   if (cost < 0) return null; // v3.24.0：负价不合常理（上游有非负钳制，这里是 toast 侧最后一道闸）
@@ -3208,6 +3347,28 @@ function inferRoundStartFromText(tsPath) {
   });
   return best;
 }
+// v3.40.0（plan-B A3）：**轮次明细落点路径的唯一实现**——appendRoundDetail（写侧）与 watcher 的
+//   弹窗日志（roundsFile 字段，供 recalc-day.js 读侧）都必须调它，否则两边一旦各写一份判据，
+//   "写进 A 文件、读时去 B 文件找"就会静默失配（recalc 找不到该轮 → 静默回退旧折算，无人察觉）。
+//   判据：月份取**发生时刻**（tsMs）的月份 —— 与 A4（账本分桶）同口径。tsMs 缺失/非法时
+//   dateStrOfTs 内部已回退 todayStr()（= 写盘当天，与旧行为一致）。
+function snapshotFileFor(tsPath, roundStart, tsMs) {
+  // tsMs 显式传入优先；缺省用 roundStart（本轮的起点时刻，与发生时刻同一天，除非跨午夜——
+  //   跨午夜时以 roundStart 的月份为准与本轮绝大多数 token 的归属一致）。
+  const t = (Number(tsMs) > 0) ? Number(tsMs) : (Number(roundStart) > 0 ? Number(roundStart) : 0);
+  return path.join(ROUNDS_DIR, 'rounds-' + dateStrOfTs(t).slice(0, 7) + '.jsonl');
+}
+
+// v3.40.0（plan-B A3）：弹窗日志用的 rounds 文件名（basename）。抽出来只为**一件事**：
+//   让 watcher（pollState）与 showToast 两条路径写出的字段**必然同源**，且把 try/catch 从 main() 里
+//   挪出来（T37-b1 的 main() 行数守卫卡在上限 950 —— 显示用产物的取数逻辑不该占 main 的行数配额）。
+function roundsFileOf(tsPath, roundStart) {
+  try {
+    const rp = snapshotFileFor(tsPath, roundStart);
+    return rp ? path.basename(rp) : null;
+  } catch (e) { return null; }
+}
+
 // 落一条轮次明细。**调用点唯一**（recordUsage 内），且只在账本真正写盘成功后调用——
 //   于是「同一轮无新增用量时不重复落档」由记账自身的幂等性白送，不需要额外维护去重状态
 //   （同轮二次 Stop 时 byModel 为空 → recordUsage 提前 return false → 到这里之前就结束了）。
@@ -3215,28 +3376,62 @@ function inferRoundStartFromText(tsPath) {
 function appendRoundDetail(byModel, stat, pricing, tsMs, meta) {
   if (!meta || typeof meta !== 'object') return;
   const models = {};
+  // v3.40.0（plan-B A3）：`models` 是**落盘产物**（形状稳定，别往里塞 pIn/oIn 这类内部中间量），
+  //   但**计价必须带分桶** → 另存一份 costModels 供下方 calcCost 用（两份同源不同用途）。
+  const costModels = {};
+  const copyCost = (dst, src) => {
+    dst.in = src.in || 0; dst.out = src.out || 0; dst.cached = src.cached || 0;
+    for (const k of ['pIn', 'pCached', 'pOut', 'oIn', 'oCached', 'oOut']) {
+      if (src[k] !== undefined) dst[k] = src[k];
+    }
+  };
   if (byModel && Object.keys(byModel).length) {
     for (const [n, b] of Object.entries(byModel)) {
       models[n] = { in: b.in || 0, out: b.out || 0, cached: b.cached || 0, total: b.total || 0 };
+      costModels[n] = {}; copyCost(costModels[n], b);
     }
   } else if (stat && ((stat.in || 0) + (stat.out || 0)) > 0) {
-    models[stat.model || 'unknown'] = { in: stat.in || 0, out: stat.out || 0, cached: stat.cached || 0, total: stat.total || 0 };
+    const n0 = stat.model || 'unknown';
+    models[n0] = { in: stat.in || 0, out: stat.out || 0, cached: stat.cached || 0, total: stat.total || 0 };
+    costModels[n0] = {}; copyCost(costModels[n0], stat);
   } else return;
   let inT = 0, outT = 0, cachedT = 0, totalT = 0, costT = 0;
   for (const [n, b] of Object.entries(models)) {
     inT += b.in; outT += b.out; cachedT += b.cached; totalT += b.total;
-    const c = calcCost(Object.assign({ model: n }, b), pricing, tsMs);
+    // v3.40.0（plan-B A3）：明细金额同样走行级分桶（与账本 addModelUsage 同一 calcCost 口径）——
+    //   用 costModels 而非 models（后者刻意不带分桶，是落盘形状）。
+    const c = calcCost(Object.assign({ model: n }, costModels[n]), pricing, tsMs);
     if (c != null) costT += c;
+  }
+  // v3.40.0（plan-B A3）：**把行级峰谷切分落进明细**——recalc-day.js 回算时必须与实时链路同口径。
+  //   为什么必须落盘：recalc 之后拿不到原始 transcript（可能已被压缩/删除），只能靠明细里的这份
+  //   切分数据重算。没有它，recalc 就只能退回到「按 toast 轮次数占比近似 token 占比」的估算
+  //   （`1 + (peakMult-1)*ratio`）——那正是 A3 要消灭的口径分裂（同一批数据两个金额）。
+  //   形状：{ "<模型>": { pIn,pCached,pOut,oIn,oCached,oOut } }；**仅在该模型确有分桶时写入**
+  //   （估算段/旧调用点没有分桶 → 不写该模型的键 → recalc 侧对那个模型自动回退旧折算，不硬造）。
+  const peakSplit = {};
+  let hasAnySplit = false;
+  for (const [n, b] of Object.entries(costModels)) {
+    if (b.pIn === undefined && b.oIn === undefined) continue;
+    peakSplit[n] = {
+      pIn: b.pIn || 0, pCached: b.pCached || 0, pOut: b.pOut || 0,
+      oIn: b.oIn || 0, oCached: b.oCached || 0, oOut: b.oOut || 0,
+    };
+    hasAnySplit = true;
   }
   const rec = {
     ts: Date.now(),
-    date: todayStr(),
+    // v3.40.0（plan-B A4）：明细的 date 同样跟随发生时刻（与账本分桶、峰谷同一口径）。
+    date: dateStrOfTs(tsMs),
     sid: String(meta.sid || ''),
     roundStart: Number(meta.roundStart) || 0,
     durMs: Number(meta.durMs) || 0,
     in: inT, out: outT, cached: cachedT, total: totalT,
     hitPct: hitRate(inT, cachedT),
     models,
+    // v3.40.0（plan-B A3）：行级峰谷切分（recalc-day.js 精确回算的依据）。
+    //   无分桶的轮次**不写这个键** → 老明细文件与新明细都天然兼容（读侧 `rec.peakSplit && rec.peakSplit[m]`）。
+    ...(hasAnySplit ? { peakSplit } : {}),
     model: String(meta.model || ''),
     subModels: Array.isArray(meta.subModels) ? meta.subModels : [],
     subCount: Number(meta.subCount) || 0,
@@ -3248,7 +3443,10 @@ function appendRoundDetail(byModel, stat, pricing, tsMs, meta) {
     costApiEquiv: Math.round(costT * 10000) / 10000,
   };
   fs.mkdirSync(ROUNDS_DIR, { recursive: true });
-  fs.appendFileSync(path.join(ROUNDS_DIR, 'rounds-' + todayStr().slice(0, 7) + '.jsonl'),
+  // v3.40.0（plan-B A4）：落哪个文件同样按发生时刻的月份 —— 必须与 incrementalRecord 里算
+  //   `snap.roundsPath` 的判据**逐字一致**，否则水位线回滚会去截断**另一个文件**（既没回滚当真，
+  //   又误伤了别的月份的明细）。v3.40.0（A3）：判据收敛到 snapshotFileFor 一处（三处共用）。
+  fs.appendFileSync(snapshotFileFor(null, 0, tsMs),
     JSON.stringify(rec) + '\n', 'utf-8');
 }
 
@@ -3256,7 +3454,18 @@ function appendRoundDetail(byModel, stat, pricing, tsMs, meta) {
 // tsMs（v3.19.2/B8）：本批 token 的发生时刻，透传给 calcCost 做峰谷判定；缺省回退 stat.lastTs / 当下
 function addModelUsage(day, model, stat, pricing, tsMs) {
   const name = String(model || '').trim() || 'unknown';
-  const cost = calcCost(Object.assign({ model: name }, stat), pricing, tsMs);
+  // v3.40.0（plan-B A3）：**原样透传行级峰谷分桶**（stat 里若有 pIn/oIn… → calcCost 按行各自倍率算）。
+  //   用显式赋值而不是 Object.assign 全量拷贝：Object.assign 会把 stat 里的 total/lastTs 一并带进
+  //   calcCost（当前无害，但将来 calcCost 若读这些字段就会**静默改变计价**）——这里只搬运计价所需字段。
+  const costStat = {
+    model: name,
+    in: stat.in || 0, out: stat.out || 0, cached: stat.cached || 0,
+    lastTs: stat.lastTs,
+  };
+  for (const k of ['pIn', 'pCached', 'pOut', 'oIn', 'oCached', 'oOut']) {
+    if (stat[k] !== undefined) costStat[k] = stat[k];
+  }
+  const cost = calcCost(costStat, pricing, tsMs);
   const m = day.models[name] || (day.models[name] = { in: 0, out: 0, cached: 0, total: 0, cost: 0 });
   m.in += stat.in || 0; m.out += stat.out || 0; m.cached += stat.cached || 0; m.total += stat.total || 0;
   m.hit = hitRate(m.in, m.cached);
@@ -3326,7 +3535,9 @@ function recordUsage(stat, pricing, byModel, tsMs, meta) {
   }
   const r = withFileLock(DAILY_USAGE_FILE + '.lock', () => {
     const d = loadDailyUsage();
-    const date = todayStr();
+    // v3.40.0（plan-B A4）：分桶日期跟随 **token 发生时刻**（tsMs），与峰谷判定同口径。
+    //   改前一律 `todayStr()`（写盘时刻）→ 跨午夜轮会把 token 记进次日、金额按前一日算。
+    const date = dateStrOfTs(tsMs);
     const day = d[date] || (d[date] = { models: {}, total: { in: 0, out: 0, cached: 0, total: 0, cost: 0 } });
     if (byModel && Object.keys(byModel).length) {
       for (const [name, b] of Object.entries(byModel)) addModelUsage(day, name, b, pricing, tsMs);
@@ -3478,6 +3689,14 @@ function incrementalRecord(tsPath, sid, meta) {
     for (const [n, b] of Object.entries(m)) {
       const t = byModel[n] || (byModel[n] = { in: 0, out: 0, cached: 0, total: 0 });
       t.in += b.in; t.out += b.out; t.cached += b.cached; t.total += b.total;
+      // v3.40.0（plan-B A3）：把行级峰谷分桶一起并进来（perModelFromRows 产出的桶带分桶，
+      //   estimateInterrupted 产出的估算桶**不带** → 见下方"估算段"注释：带分桶的桶一旦被并入
+      //   无分桶的估算量，两项之和不等于总量 → calcCost 的 hasBuckets 校验自动失败 → 回退整批口径。
+      //   这是**刻意**的：估算段没有真实 ts（是"往前找最近一次完整调用"推出来的），给它硬塞一个
+      //   峰谷时刻等于编造依据。宁可这段回退整批口径（少收或按整批），也不静默瞎算。
+      for (const k of ['pIn', 'pCached', 'pOut', 'oIn', 'oCached', 'oOut']) {
+        if (b[k] !== undefined || t[k] !== undefined) t[k] = (t[k] || 0) + (b[k] || 0);
+      }
     }
   };
   // v3.19.2（B8）：本批新行的最大 timestamp —— 用作峰谷判定时刻，避免"脚本运行时刻"计价
@@ -3582,12 +3801,16 @@ function incrementalRecord(tsPath, sid, meta) {
     let roundsPath = null;
     let preSize = null;
     try {
-      roundsPath = path.join(ROUNDS_DIR, 'rounds-' + todayStr().slice(0, 7) + '.jsonl');
+      // v3.40.0（plan-B A4）：月份路径同样跟随发生时刻（与账本分桶、峰谷判定同一口径）。
+      //   v3.40.0（A3）：与 appendRoundDetail 收敛到 snapshotFileFor 一处（同判据才可能不打架）。
+      roundsPath = snapshotFileFor(null, 0, peakTs);
       preSize = fs.statSync(roundsPath).size;
     } catch (e) { roundsPath = null; preSize = null; }
     snap = { ledgerPath: DAILY_USAGE_FILE, preLedger, roundsPath, preSize, postSize: null };
   }
   let recorded = true;
+  // v3.40.0（plan-B A4）：第 4 参 tsMs 现在**同时**用于峰谷判定与账本分桶日期（recordUsage 内
+  //   用 dateStrOfTs(tsMs)），改前只用于峰谷、分桶另取写盘时刻 → 跨午夜轮两处口径打架。
   if (willRecord) recorded = recordUsage({}, loadPricing(), byModel, peakTs || undefined, meta);
   if (!recorded) {
     // 记账失败（账本损坏 / 锁获取失败 / 写盘失败）→ 绝不推进水位线，
@@ -4278,6 +4501,14 @@ function showToast(line1, line2, reason, tsPath) {
   // 字段缺失时 writeToastLog 内部以 null 兜底，绝不因诊断而影响弹窗。
   const toastState = Object.assign({}, gLastWatchState || {});
   toastState.toastText = String(line1 || '') + ' | ' + String(line2 || '');
+  // v3.40.0（plan-B A3）：**非 watcher 路径**（Stop / hook 兜底 / 补弹）也把 roundsFile 落进日志——
+  //   watcher 路径已由 pollState 带上，这里补的是"watcher 没跑/被杀，Stop 直接弹"的场景（实测常见）。
+  //   取不到 tsPath（如 'cancelled-round-watch-no-token' 纯提示条）→ 保持 null，recalc 侧自动回退。
+  //   月份取当下时刻：Stop/hook 弹窗的时刻与本轮 token 发生时刻同一天（跨午夜的 Stop 会差一天，
+  //   此时 roundsFile 指向次月文件 → recalc 找不到该轮 → 回退旧折算；**低估不误报**，宁缺毋错）。
+  if (toastState.roundsFile == null && tsPath) {
+    toastState.roundsFile = roundsFileOf(tsPath, 0);
+  }
   writeToastLog(reason, toastState);
   // v2.90：测试静默开关——TOKEN_TRACKER_NO_TOAST=1 时只写诊断日志、不调系统通知。
   // 【硬规矩（用户 2026-09-05 两次强调，已记 ~/.workbuddy/MEMORY.md）：一切测试/回放必须设此开关，
@@ -4705,7 +4936,14 @@ function toastLine2(stat, pricing) {
       if (!b || typeof b !== 'object') continue;
       if (isLocalModel(n)) continue; // 本地模型免费，不进计价也不算「未知」
       cloudCount++;
-      const c = calcCost({ model: n, in: b.in || 0, out: b.out || 0, cached: b.cached || 0, lastTs: batchTs }, pricing);
+      // v3.40.0（plan-B A3）：**优先按行级分桶计价**（b 里若带 pIn/oIn… → calcCost 走分桶路径），
+      //   分桶缺失时才回退整批 batchTs 单倍率。这样跨峰谷边界的混合模型轮，弹窗与账本（已按行分桶）
+      //   金额一致；无分桶的旧调用点（合成 stat / 外部传入）行为与 v3.39.0 逐字节一致。
+      const costIn = { model: n, in: b.in || 0, out: b.out || 0, cached: b.cached || 0, lastTs: batchTs };
+      for (const k of ['pIn', 'pCached', 'pOut', 'oIn', 'oCached', 'oOut']) {
+        if (b[k] !== undefined) costIn[k] = b[k];
+      }
+      const c = calcCost(costIn, pricing);
       if (c != null) { sum += c; known++; } else unknown++;
     }
     if (cloudCount > 0) {
@@ -5473,7 +5711,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.40.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.41.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -6002,6 +6240,8 @@ function main() {
         pendingSubCount: pendingSub.length, interrupted, deadTeam,
         tailFingerprint: tailFingerprint(tsPath), // v3.18（M14）：原 readTailRaw().slice(0,80) 存原文，改指纹
         lastTailFingerprint: fpOfStr(lastTailRaw), // v3.18（M14）：原 lastTailRaw.slice(0,80) 存原文，改指纹
+        // v3.40.0（plan-B A3）：本轮轮次明细文件 → recalc-day.js 据此逐模型精确判峰谷（取代旧"轮次数占比"）；取不到则 null → recalc 回退旧口径
+        roundsFile: roundsFileOf(tsPath, info0 && info0.roundStart),
       };
       gLastWatchState = pollState; // 最近快照供 showToast 内部 writeToastLog 补全诊断字段
       lastPollSnapshot = pollState; // 供循环退出后的 idle-timeout 日志复用
@@ -6599,7 +6839,7 @@ function main() {
 // 导出内部函数供测试/回填脚本复用同一套记账逻辑，避免逻辑复制漂移。
 if (require.main === module) main();
 module.exports = {
-  todayStr, loadDailyUsage, saveDailyUsage, recordUsage, dayTotalOf, hitRate,
+  todayStr, dateStrOfTs, loadDailyUsage, saveDailyUsage, recordUsage, dayTotalOf, hitRate,
   calcCost, findModel, isLocalModel, fmtCost, cleanModelName,
   readTranscLines, parseTranscChunk, readTranscLinesFrom, extractUsage, perModelFromRows, aggregatePerModel,
   aggregateMainOnly, aggregateSubsOnly, aggregateTranscript,

@@ -112,6 +112,41 @@ function costOf(m, inTok, cachedTok, outTok, mult) {
   return Math.round(c * 1e6) / 1e6;
 }
 
+// v3.40.0（plan-B A3）：**按行精确的峰谷合计**——比"轮次数占比折算"高一个量级的口径。
+//   数据来源：rounds/rounds-YYYY-MM.jsonl 里主链路落下的 `peakSplit` 字段（见 token-tracker.js
+//   appendRoundDetail）。主链路是**在逐行循环里**按每行自己的 ts 判峰谷后累加的，所以这里读到的
+//   是真正的高峰/空闲 token 切分，而不是"高峰轮次占几成"的近似。
+//   与旧折算的关系：本函数能给出结果时**一律优先用它**（精确 > 近似）；读不到（当天明细被 prune 掉 /
+//   旧版本落的明细没有该字段 / 文件缺失）→ 返回 null → 调用方回退旧的占比折算（行为与 v3.39.0 相同）。
+//   归集口径：明细里 `date` 字段 = token 发生日（A4 之后跟随发生时刻）→ 按日期过滤；模型名走
+//   sameModelName 归并（明细里的键是 normalizeModelName 后的，账本键可能带别名/大小写差异）。
+function peakSplitOf(date, model) {
+  const monthFile = path.join(SKILL_DIR, 'rounds', `rounds-${String(date).slice(0, 7)}.jsonl`);
+  let raw = '';
+  try { raw = fs.readFileSync(monthFile, 'utf-8'); } catch (e) { return null; }
+  const acc = { pIn: 0, pCached: 0, pOut: 0, oIn: 0, oCached: 0, oOut: 0 };
+  let hit = false;
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    let rec;
+    try { rec = JSON.parse(line); } catch (e) { continue; }
+    if (!rec || !rec.peakSplit) continue;
+    // 归属日期：优先 rec.date（A4 后 = 发生日）；旧明细没有 date → 用 rec.ts 的本地日期兜底
+    const recDate = rec.date || (() => {
+      const d = new Date(Number(rec.ts) || 0);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    })();
+    if (recDate !== date) continue;
+    for (const [n, sp] of Object.entries(rec.peakSplit)) {
+      if (!sameModelName(n, model)) continue;
+      if (!sp || typeof sp !== 'object') continue;
+      hit = true;
+      for (const k of ['pIn', 'pCached', 'pOut', 'oIn', 'oCached', 'oOut']) acc[k] += Number(sp[k]) || 0;
+    }
+  }
+  return hit ? acc : null;
+}
+
 // v3.19.0（P2）：BOM 剥离 + 损坏备份（与主脚本 H6 同口径）。原先裸 JSON.parse，
 // 账本带 BOM 或轻微损坏时直接抛异常崩溃（连备份都不留）。
 function loadJsonSafe(file) {
@@ -185,7 +220,27 @@ function main() {
 
       const base = costOf(m, stat.in, stat.cached, stat.out, 1);
       let cost;
-      if (peakRatio === null) {
+      // v3.40.0（plan-B A3）：**优先级① —— 行级精确切分**（明细里落下的 peakSplit）。
+      //   这条路不依赖 toast 轮次、也不需要"轮次数 ≈ token 数"这个近似：高峰 token 与空闲 token
+      //   是主链路逐行判定的结果，直接各自乘各自倍率即可，**与实时链路逐字节同口径**。
+      //   旧折算（下面 peakRatio 那一支）只在读不到 peakSplit 时才走 —— 于是同一批数据
+      //   "实时链路算的"与"recalc 回算的"不再可能给出两个金额（A3 的验收标准）。
+      const split = peakSplitOf(date, model);
+      let splitUsed = false;
+      if (split && (split.pIn + split.pCached + split.pOut + split.oIn + split.oCached + split.oOut) > 0) {
+        const isDeepSeekS = /(^|[\/\-_])deepseek/i.test(String(model || ''));
+        const peakMultS = typeof m.peak_multiplier === 'number' ? m.peak_multiplier : (isDeepSeekS ? 2 : 1);
+        const pc = Math.min(split.pCached, split.pIn); // 与主链路 calcCost 同款钳制
+        const oc = Math.min(split.oCached, split.oIn);
+        const rawC = ((split.pIn - pc) / 1e6) * Number(m.input_price || 0) * peakMultS
+          + (pc / 1e6) * Number(m.cached_price || 0) * peakMultS
+          + (split.pOut / 1e6) * Number(m.output_price || 0) * peakMultS
+          + ((split.oIn - oc) / 1e6) * Number(m.input_price || 0)
+          + (oc / 1e6) * Number(m.cached_price || 0)
+          + (split.oOut / 1e6) * Number(m.output_price || 0);
+        cost = Math.round(rawC * 1e6) / 1e6;
+        splitUsed = true;
+      } else if (peakRatio === null) {
         // v3.24.0（级联④，补 v3.23.5 的另一半）：峰谷占比未知时**不得瞎改已有金额**。
         // 原实现一律按空闲 ×1 重写 —— 对已有账（按 token 实际发生时刻记的，含高峰 ×2 部分）
         // 是口径改写：任何一次 recalc 都会把历史金额悄悄改小。现在分两种情况：
@@ -209,7 +264,10 @@ function main() {
         report.push({
           model, old, neu: cost,
           rounds: hours ? hours.length : 0,
-          peakRatio: peakRatio === null ? '未知(按空闲)' : `${(peakRatio * 100).toFixed(0)}%`,
+          // v3.40.0（A3）：口径来源可见 —— '精确(逐行)' 表示走的是主链路落下的行级切分；
+          //   百分比表示仍走旧的"轮次数占比"近似（读不到 peakSplit 时的退路）
+          peakRatio: splitUsed ? '精确(逐行)'
+            : (peakRatio === null ? '未知(按空闲)' : `${(peakRatio * 100).toFixed(0)}%`),
         });
       }
       // v3.27.0：官方价补上并回算后，条目不再属于「无公开价」→ 必须清标记，
@@ -275,4 +333,10 @@ function main() {
   console.log(`  当日合计 ¥${recalc.total.toFixed(2)}`);
 }
 
-main();
+// v3.40.0（plan-B A3）：被 require 时**不自动跑 main**（供 selftest 单测 peakSplitOf/精确切分）。
+//   旧实现裸调 main() —— selftest 一旦 require 本文件就会直接执行 CLI（读真实账本、可能改盘），
+//   这在测试里是**不可接受**的副作用。改判 `require.main === module`：直接 `node recalc-day.js`
+//   仍然照常跑（行为零变化），被 require 时只暴露纯函数。
+if (require.main === module) main();
+
+module.exports = { peakSplitOf, costOf };
