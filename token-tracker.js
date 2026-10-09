@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.45.0 (2026-10-10)
+// token-usage-tracker v3.46.0 (2026-10-10)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -3152,6 +3152,8 @@ function isPeakHour(rules, now) {
 //      原本就不钳 cached 上限：脏数据 cached > in 时，原实现按「全部 cached 计价」，triPrice 必须逐字节一致
 //      （deepseek-v4.1-flash 的 cached_price=0.02 非零，加钳会让脏数据金额改变 → 改前/改后比对不过）。
 //      调用方若需要「缓存不超过输入」语义（如 backfill.rowCost），请在传参前自行 Math.min(cached, in)。
+//      v3.46.0（S-9）：分桶路径**不经过本函数** —— 走 costFromPeakSplit（那侧自带 cached ≤ in 钳制，
+//      是 v3.40.0 A3 引入时的既有语义）。不要把两处的钳制语义"对齐"成一样，那是改行为不是收敛。
 //   返回值**不四舍五入**（由调用方决定要不要 round），避免改变主链路既有精度。
 function triPrice(inTok, cachedTok, outTok, m, mult) {
   const inT = Math.max(0, Number(inTok) || 0);
@@ -3168,6 +3170,36 @@ function triPriceRounded(inTok, cachedTok, outTok, m, mult) {
   return Math.round(triPrice(inTok, cachedTok, outTok, m, mult) * 1e6) / 1e6;
 }
 
+// v3.46.0（审计 S-9）：峰谷倍率的**单点实现**（calcCost 与 recalc-day 共用，改前两处各抄一份）。
+//   改前两处表达式写法不同但语义等价（有 peak_multiplier → 用它；否则 DeepSeek 系缺省 2、其余缺省 1），
+//   T14-a2 用**源码正则**盯着这两份抄写 —— 那正是"靠注释/靠测试记着同步"的典型；现在改成调用关系后，
+//   口径一致由**结构**保证（改这里，两个调用方必然同时变），T14-a2 已改盯 `peakMultOf` 的调用点。
+//   ⚠️ DeepSeek 判定正则与旧实现逐字相同（`(^|[\/\-_])deepseek`），勿顺手改宽松/收紧。
+function peakMultOf(m, modelName) {
+  if (m && typeof m.peak_multiplier === 'number') return m.peak_multiplier;
+  return /(^|[\/\-_])deepseek/i.test(String(modelName || '')) ? 2 : 1;
+}
+
+// v3.46.0（审计 S-9）：**行级峰谷分桶计价**的唯一实现（calcCost 分桶支 + recalc-day 精确切分支共用）。
+//   改前是两份手写展开式（recalc 那份还在注释里写「与主链路 calcCost 同款钳制」——其实只对分桶支成立，
+//   对回退支不成立；两份注释各自对一半，合起来让实现分裂）。现在复制 → 调用，口径由结构保证。
+//   表达式**逐字照搬**原主链路分桶支（含 `cached ≤ in` 钳制）→ 行为零变化。
+//     验收：S-9 属"动金额口径"的改动，验收标准是**逐日金额改前/改后一致**（T55-b1 fuzz + 真机 recalc 比对）。
+//   ⚠️ 与 triPrice 的分工：triPrice 管「整批一个倍率」、本函数管「高峰段/空闲段各自倍率」。
+//      两者**都不在内部做 cached ≤ in 的上钳**（回退支要保持脏数据下的原语义），需要钳制的调用方自行传参。
+function costFromPeakSplit(m, s, peakMult) {
+  const pIn = Number(s.pIn) || 0, pCached = Number(s.pCached) || 0, pOut = Number(s.pOut) || 0;
+  const oIn = Number(s.oIn) || 0, oCached = Number(s.oCached) || 0, oOut = Number(s.oOut) || 0;
+  const pc = Math.min(pCached, pIn); // 防御：分桶侧也做 cached ≤ in 钳制（与整批口径一致）
+  const oc = Math.min(oCached, oIn);
+  return ((pIn - pc) / 1e6) * Number(m.input_price || 0) * peakMult
+       + (pc / 1e6) * Number(m.cached_price || 0) * peakMult
+       + (pOut / 1e6) * Number(m.output_price || 0) * peakMult
+       + ((oIn - oc) / 1e6) * Number(m.input_price || 0)
+       + (oc / 1e6) * Number(m.cached_price || 0)
+       + (oOut / 1e6) * Number(m.output_price || 0);
+}
+
 // cost = 未命中输入×输入价 + 命中输入×缓存价 + 输出×输出价（元），按当前时段取倍率
 function calcCost(stat, pricing, tsMs) {
   if (!pricing || !stat) return null;
@@ -3182,8 +3214,10 @@ function calcCost(stat, pricing, tsMs) {
   // 峰谷倍率：DeepSeek 系（不论后缀）统一执行峰谷规则 + 周末低峰（v2.59 用户规则）。
   // 判定：模型名含 'deepseek' 即强制套用峰谷倍率（peak_multiplier 缺省按 2），
   // 再经 isPeakHour()（已含周末→全天×1）；非 DeepSeek 系维持原行为：显式声明 peak_multiplier 才翻倍。
-  const isDeepSeek = /(^|[\/\-_])deepseek/i.test(String(stat.model || ''));
-  const peakMult = isDeepSeek ? (typeof m.peak_multiplier === 'number' ? m.peak_multiplier : 2) : (typeof m.peak_multiplier === 'number' ? m.peak_multiplier : 1);
+  // v3.46.0（审计 S-9）：倍率判定收敛到 peakMultOf 单点（与 recalc-day 共用同一份实现）。
+  //   改前本行是 `isDeepSeek ? (num ? pm : 2) : (num ? pm : 1)`，recalc 侧是 `num ? pm : (isDeepSeek ? 2 : 1)`
+  //   ——写法不同但语义等价，此处改为调用后**行为不变**（T14-a2 仍盯口径，改盯调用点）。
+  const peakMult = peakMultOf(m, stat.model);
   // 时段判定跟随官方 deepseek_rules（通用：官方调时段/周末规则自动生效）
   // v3.19.2（B8）：峰谷必须按 **token 实际发生时刻** 判，而不是「脚本运行时刻」。
   //   原实现 isPeakHour() 内部取 new Date() → Stop/hook 若在跨时段边界（12:00 / 18:00）之后才跑，
@@ -3239,14 +3273,8 @@ function calcCost(stat, pricing, tsMs) {
     && (pIn + pCached + pOut) > 0;
   if (hasBuckets) {
     // 各自乘各自倍率：高峰段 ×peakMult、空闲段 ×1（三项同乘在本路径同样成立，见上方 A13 结论）。
-    const pc = Math.min(pCached, pIn); // 防御：分桶侧也做 cached ≤ in 钳制（与整批口径一致）
-    const oc = Math.min(oCached, oIn);
-    return ((pIn - pc) / 1e6) * (m.input_price || 0) * peakMult
-         + (pc / 1e6) * (m.cached_price || 0) * peakMult
-         + (pOut / 1e6) * (m.output_price || 0) * peakMult
-         + ((oIn - oc) / 1e6) * (m.input_price || 0)
-         + (oc / 1e6) * (m.cached_price || 0)
-         + (oOut / 1e6) * (m.output_price || 0);
+    // v3.46.0（审计 S-9）：展开式 → 调用 costFromPeakSplit（recalc-day 现在调同一个函数，不再抄第二份）。
+    return costFromPeakSplit(m, stat, peakMult);
   }
   return triPrice(stat.in, cached, outTok, m, mult);
 }
@@ -3809,6 +3837,12 @@ function rollbackLedgerAfterWatermarkFailure(snap) {
 function incrementalRecord(tsPath, sid, meta) {
   if (!tsPath || !fs.existsSync(tsPath)) return;
   const lockRes = withFileLock(LEDGER_WATERMARK_FILE + '.lock', () => {
+  // v3.46.0（审计 S-5）：回调体整体包 try/catch —— 下面三个变量**刻意声明在 try 之外**：
+  //   catch 分支要靠它们判断「账本是否已经写进去」，才能决定要不要回滚（详见最下方 catch 注释）。
+  let snap = null;       // 记账前快照（回滚用，见 A2 反向闸门）
+  let willRecord = false; // 本轮是否有用量要记
+  let recorded = true;    // 无用量的轮次视为成功（无需落盘，推进水位线无害）
+  try {
   // 修复1 补充：水位线损坏时跳过记账，宁可少记也不重复计费
   const lw = loadLedgerWatermarkSafe();
   if (lw.corrupt) return;
@@ -3889,9 +3923,17 @@ function incrementalRecord(tsPath, sid, meta) {
   const subMaxTs = {}; // v3.25.0（KI-5）：各子代理文件本批 max ts（写侧持久化为去重判据）
   const subDir = subagentsDirFromTranscript(tsPath);
   if (fs.existsSync(subDir)) {
-    try {
-      for (const f of fs.readdirSync(subDir)) {
-        if (!/^agent-.+\.jsonl$/i.test(f)) continue;
+    // v3.46.0（审计 S-2）：**两阶段** —— ① 逐个文件读（各自独立 try/catch）；② 全部读成功的文件才并入
+    //   byModel 并推进**各自**的水位线。改前的形态是一个 try 裹住整个 for 循环：
+    //     文件 A 读成功 → merge(A) 已并入 byModel；文件 B 读失败 → 抛 → 整个回调终止 →
+    //     **所有**子代理水位线都不推进（含已并入的 A）→ 下轮 A 又被记一遍 = **重复计费**。
+    //   两阶段后：B 失败只影响 B（B 的水位线不推进 → 下轮重读重试），A 照常记账；且失败**可见**（stderr）。
+    let subNames = [];
+    try { subNames = fs.readdirSync(subDir); } catch (e) { subNames = []; } // 目录列举失败 = 本轮无子代理，不致命
+    const pending = []; // { f, subRows, fromTsSub, nextSubVal }
+    for (const f of subNames) {
+      if (!/^agent-.+\.jsonl$/i.test(f)) continue;
+      try {
         const fp = path.join(subDir, f);
         // v2.69 性能：与主 transcript 同口径，只解析水位线之后的新行
         const start = entry.subs[f] || 0;
@@ -3908,26 +3950,37 @@ function incrementalRecord(tsPath, sid, meta) {
             process.stderr.write(`[token-tracker] ⚠ 子代理 ${f} 曾被压缩重写（水位线 ${start}），已按时间戳去重重置到 ${nextSubVal}（KI-5）\n`);
           }
         }
-        if (subTotal > start || fromTsSub > 0) {
-          bumpTs(subRows);
-          subMaxTs[f] = maxTsOf(subRows); // v3.25.0（KI-5）
-          merge(perModelFromRows(subRows, fromTsSub));
-          if (fromTsSub > 0) merge(estimateInterrupted(subRows, 0, fromTsSub));
-          else merge(estimateInterruptedInc(fp, subRows)); // v2.53：子代理被中断思考也估算
-        }
-        // 修复2：子代理水位线同样只许前进（子代理 transcript 也会被 compaction 截断重写）
-        nextSubs[f] = nextSubVal;
+        // ⚠️ 判据沿用原实现（「有新行需要读」），不能退化成 `subRows.length > 0`：
+        //    文件末尾只有残行时 subRows 可能为空，但 estimateInterruptedInc 仍可能给出估算量 ——
+        //    那是既有行为（v2.53 子代理中断补偿），本改动**不得**顺手改掉它。
+        const hasNew = (subTotal > start || fromTsSub > 0);
+        pending.push({ f, subRows, fromTsSub, nextSubVal, hasNew });
+      } catch (e) {
+        // 单文件失败：不并入、不推进该文件水位线（下轮重读重试），**不影响同目录其他子代理**。
+        const m55 = (e && e.message) ? String(e.message) : String(e);
+        process.stderr.write(`[token-tracker] ⚠ 子代理 ${f} 读取失败，本轮跳过该文件（其水位线不推进 → 下轮重试，不丢不重）：${m55}\n`);
       }
-    } catch (e) { /* 忽略 */ }
+    }
+    // ② 合并（只有阶段①完整走完的文件才会到这里）
+    for (const p of pending) {
+      if (p.hasNew) {
+        bumpTs(p.subRows);
+        subMaxTs[p.f] = maxTsOf(p.subRows); // v3.25.0（KI-5）
+        merge(perModelFromRows(p.subRows, p.fromTsSub));
+        if (p.fromTsSub > 0) merge(estimateInterrupted(p.subRows, 0, p.fromTsSub));
+        else merge(estimateInterruptedInc(path.join(subDir, p.f), p.subRows)); // v2.53：子代理被中断思考也估算
+      }
+      nextSubs[p.f] = p.nextSubVal;
+    }
   }
   // 3. 累加进账本（loadDailyUsage + addModelUsage + saveDailyUsage）
   //    无用量的轮次视为成功（无需落盘，推进水位线无害）；有用量时必须确认真的写进去了。
-  const willRecord = Object.keys(byModel).length > 0;
+  willRecord = Object.keys(byModel).length > 0;
   // v3.39.0（A2）：记账前快照，供水位线落盘失败时回滚（只有真要记账才需要）。
   //   顺序刻意保持「先记账、后水位线」：反过来（先水位线）在账本写失败时会**静默永久少记**，
   //   而少记本可由「不推进水位线 + 下轮重记」自动补回，不该退化成丢数据。
   //   代价就是必须补这道反向闸门——记账成功但水位线没落盘 = 下轮重复计费。
-  let snap = null;
+  snap = null;
   if (willRecord) {
     let preLedger = null;
     try { preLedger = fs.existsSync(DAILY_USAGE_FILE) ? fs.readFileSync(DAILY_USAGE_FILE) : null; } catch (e) { preLedger = null; }
@@ -3941,9 +3994,6 @@ function incrementalRecord(tsPath, sid, meta) {
     } catch (e) { roundsPath = null; preSize = null; }
     snap = { ledgerPath: DAILY_USAGE_FILE, preLedger, roundsPath, preSize, postSize: null };
   }
-  let recorded = true;
-  // v3.40.0（plan-B A4）：第 4 参 tsMs 现在**同时**用于峰谷判定与账本分桶日期（recordUsage 内
-  //   用 dateStrOfTs(tsMs)），改前只用于峰谷、分桶另取写盘时刻 → 跨午夜轮两处口径打架。
   if (willRecord) recorded = recordUsage({}, loadPricing(), byModel, peakTs || undefined, meta);
   if (!recorded) {
     // 记账失败（账本损坏 / 锁获取失败 / 写盘失败）→ 绝不推进水位线，
@@ -3975,6 +4025,22 @@ function incrementalRecord(tsPath, sid, meta) {
     const rb = rollbackLedgerAfterWatermarkFailure(snap);
     process.stderr.write(`[token-tracker] ⚠ 水位线落盘失败，已回滚本轮账本${rb.ledger ? '' : '（回滚失败！请人工核对 daily-usage.json）'}，水位线保持 ${prevMain} 不推进（下轮重记，避免重复计费）\n`);
     return;
+  }
+  } catch (e) {
+    // v3.46.0（审计 S-5）：回调体此前**完全没有异常保护** —— 异常一路冒到 withFileLock 之外，
+    //   而真正致命的不是"崩"，是**崩在哪个时点**：
+    //     recordUsage 已把本轮用量写进账本，但异常发生在「推进水位线」之前
+    //     → 水位线保持旧值 → 下轮从旧偏移重读同一批行再累加 = **重复计费**。
+    //   v3.39.0 的 A2 反向闸门只盯「水位线写盘失败」这一条退出路径，**覆盖不到异常这条**。
+    //   现在补上：已记账 → 回滚账本 + 轮次明细，水位线不动 → 下轮重记（少记可恢复，重复不可恢复）。
+    const msg55 = (e && e.message) ? String(e.message) : String(e);
+    if (recorded && willRecord && snap) {
+      const rb = rollbackLedgerAfterWatermarkFailure(snap);
+      process.stderr.write(`[token-tracker] ⚠ 记账回调异常，已回滚本轮账本${rb.ledger ? '' : '（回滚失败！请人工核对 daily-usage.json）'}，水位线不推进（下轮重记，避免重复计费）：${msg55}\n`);
+    } else {
+      process.stderr.write(`[token-tracker] ⚠ 记账回调异常（本轮未落账，水位线不推进，下轮重试）：${msg55}\n`);
+    }
+    try { appendCompactionLog('ledger-callback-error', { sid: String(sid || '').slice(0, 40), msg: msg55.slice(0, 200), recorded: !!recorded }); } catch (e2) {} // silent-ok:诊断 — 诊断日志写失败不得影响记账主流程
   }
   }, { ttl: 300000, retries: 30, retryDelay: 100 }); // v2.82.1：水位线锁；拿不到锁 → 本轮跳过，下轮补记
   // v3.45.0（审计 S-3）：锁获取失败**必须可见**，不能静默。
@@ -5903,7 +5969,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.45.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.46.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -7029,7 +7095,7 @@ function main() {
 if (require.main === module) main();
 module.exports = {
   todayStr, dateStrOfTs, loadDailyUsage, saveDailyUsage, recordUsage, dayTotalOf, hitRate,
-  calcCost, triPrice, triPriceRounded, classifyWatchLock, findModel, isLocalModel, fmtCost, cleanModelName,
+  calcCost, triPrice, triPriceRounded, costFromPeakSplit, peakMultOf, classifyWatchLock, findModel, isLocalModel, fmtCost, cleanModelName,
   readTranscLines, parseTranscChunk, readTranscLinesFrom, extractUsage, perModelFromRows, aggregatePerModel,
   aggregateMainOnly, aggregateSubsOnly, aggregateTranscript,
   todayDisplay, reportTxt, reportSummaryTxt, normalizeDailyUsage,

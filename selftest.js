@@ -1097,10 +1097,20 @@ else {
   ok('T14-a1 ★recalc-day.js 查价必须走 findModel（不得裸查 pricing.models[model]）',
     /findModel\(/.test(recalcCode) && !/\(pricing\.models \|\| \{\}\)\[model\]/.test(recalcCode));
   // b：峰谷倍率缺省必须与主脚本 calcCost 同口径（deepseek 系 2 / 其余 1）
-  const recalcDef = /typeof m\.peak_multiplier === 'number' \? m\.peak_multiplier : \(isDeepSeek \? 2 : 1\)/.test(recalc);
-  const mainDef = /isDeepSeek \? \(typeof m\.peak_multiplier === 'number' \? m\.peak_multiplier : 2\)/.test(main);
-  ok('T14-a2 ★recalc-day.js 与主脚本 calcCost 的 peak_multiplier 缺省口径一致（deepseek=2 / 其余=1）',
-    recalcDef && mainDef);
+  // v3.46.0（审计 S-9）：改前两边各抄一份**写法不同但语义等价**的三元式，本条只能靠正则盯两份抄写
+  //   ——那正是"靠注释/靠测试记着同步"的典型。现在两处都改为调用 peakMultOf 单点：
+  //   口径一致由**调用关系**保证（改单点 → 两边必然同时变），不可能再漂移。
+  //   本条因此改为：两边都必须调 peakMultOf，且**不得**再各自写三元式（负向断言，防回退）。
+  const mainCode = stripComments(main);
+  const recalcDef = /tt\.peakMultOf\(/.test(recalcCode);
+  const mainDef = /peakMultOf\(m, /.test(mainCode);
+  const recalcNoOwn = !/isDeepSeekS/.test(recalcCode)
+    && !/typeof m\.peak_multiplier === 'number' \? m\.peak_multiplier :/.test(recalcCode);
+  const mainNoOwn = !/isDeepSeek \? \(typeof m\.peak_multiplier/.test(mainCode)
+    && !/typeof m\.peak_multiplier === 'number' \? m\.peak_multiplier : \(isDeepSeek/.test(mainCode);
+  ok('T14-a2 ★recalc-day.js 与主脚本 calcCost 的 peak_multiplier 缺省口径一致（v3.46.0 起共调 peakMultOf 单点）',
+    recalcDef && mainDef && recalcNoOwn && mainNoOwn,
+    `recalc调=${recalcDef} main调=${mainDef} recalc无自写=${recalcNoOwn} main无自写=${mainNoOwn}`);
   // c：US 分支必须也有 lock 保护（CN 分支早有）
   ok('T14-b1 ★refresh-prices.js 国外模型（US）分支必须检查 m.lock（CN 分支已有）',
     /else if \(m\.lock === true\)/.test(refresh) && refresh.indexOf('else if (m.lock === true)') < refresh.indexOf('// 国外模型：人民币主价'));
@@ -4322,7 +4332,8 @@ else {
     /out\.ledger = saveLedgerRawAtomic\(/.test(rb53), 'saveLedgerRawAtomic 返回 false 而不抛，调完就置 true 会撒谎');
 
   // b4 ★★ S-3：水位线锁失败必须可见（原实现丢弃返回值 → 静默不记账、弹窗照弹）。
-  const inc53 = seg(tt53, 'function incrementalRecord', 9000);
+  //   v3.46.0（S-2/S-5）：回调体加了 try/catch 与两阶段 merge，本函数变长 → 窗口同步放大（否则段尾被截断误红）。
+  const inc53 = seg(tt53, 'function incrementalRecord', 14000);
   ok('T53-b4 ★★S-3 incrementalRecord 必须接 withFileLock 返回值并在失败时告警留痕',
     /const lockRes = withFileLock\(/.test(inc53) && /ledger-lock-skip/.test(inc53),
     '不接返回值 → 抢锁失败时用户看到"已统计"而账本里没有');
@@ -4398,16 +4409,197 @@ else {
   // b3 ★ 计价展开式（分桶减法形态）所在文件数 ≤ 2（当前：token-tracker.js 的 calcCost 分桶支 + recalc-day.js）。
   //   triPrice 是唯一正统实现；其余两处是历史遗留，**批次 2（S-9）目标是降到 0**。
   //   这里先钉住"不恶化"：谁再抄第三份 → 立刻红。
+  // v3.46.0（审计 S-9 达成）：目标达成 —— 现在只剩 token-tracker.js 里 costFromPeakSplit 这一份，
+  //   recalc-day.js 已改为调用它。断言从「≤2」收紧为「恰好 1 且在 token-tracker.js」：
+  //   谁再把展开式抄回第二个文件 → 立刻红（本条在批次 2 反向验证中实测变红）。
   const splitExprFiles54 = files54.filter((f) => /\((pIn|split\.pIn)\s*-\s*(pc|pcached)\)/i.test(src54[f])
     || /\((oIn|split\.oIn)\s*-\s*(oc|ocached)\)/i.test(src54[f]));
-  ok('T54-b3 ★L0 计价分桶展开式所在文件数 ≤ 2（当前 2，批次 2 目标 0；第三份复制即红）',
-    splitExprFiles54.length <= 2, `实测 ${splitExprFiles54.length} 个文件：${splitExprFiles54.join(', ')}`);
+  ok('T54-b3 ★L0 计价分桶展开式只在 token-tracker.js 内 1 处（S-9 已达成：recalc 改调 costFromPeakSplit）',
+    splitExprFiles54.length === 1 && splitExprFiles54[0] === 'token-tracker.js',
+    `实测 ${splitExprFiles54.length} 个文件：${splitExprFiles54.join(', ')}`);
 
   // b4 ★ 锁实现份数 ≤ 2（withFileLock / withPricingLock）。
   //   报告 A-1 建议三份合一（deepseek-official 不持锁已登记不修），本条先防"第四种写法"出现。
   const lockImpls54 = files54.filter((f) => /function with(?:File|Pricing)Lock\s*\(/.test(src54[f]));
   ok('T54-b4 ★L0 锁实现份数 ≤ 2（防第三份同构锁；A-1 合一后应降到 1）',
     lockImpls54.length <= 2, `实测 ${lockImpls54.length} 份：${lockImpls54.join(', ')}`);
+}
+
+// ===== T55（v3.46.0 审计批次 2）：S-9 计价收敛 / S-5 回调异常 / S-2 子代理逐文件 / S-10 空值守卫 =====
+//   S-9 属「动金额口径」的改动，验收标准不是"代码看着对"，而是**改前/改后金额逐位不变**：
+//     · b1 fuzz：新单点函数 vs 改前两份手写展开式（含脏数据 cached>in / 负值）2000 组逐位 ===
+//     · 真机：WB_ROOT 指向隔离副本，4 个日期跑改前/改后 recalc-day，stdout 逐字一致（见报告第八节）
+{
+  const tt55 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  if (!tt55 || typeof tt55.costFromPeakSplit !== 'function' || typeof tt55.peakMultOf !== 'function') {
+    ok('T55 模块加载（需要 costFromPeakSplit / peakMultOf 导出）', false, '缺少导出');
+  } else {
+    // ── b1 ★★ S-9 等价性 fuzz ──────────────────────────────────────────────
+    //  改前的**两份**手写展开式原样复刻在这里当对照（主链路 calcCost 分桶支 / recalc-day 精确切分支）。
+    //  两份写法不同（有无 Number() 包装、倍率三元式写法不同），fuzz 同时证明：
+    //    ① 新单点函数与两者都逐位一致（= 金额零变化）；② 那两份旧写法彼此也等价（= 当初没算错）。
+    const oldMain55 = (m, s, peakMult) => {
+      const pIn = Number(s.pIn) || 0, pCached = Number(s.pCached) || 0, pOut = Number(s.pOut) || 0;
+      const oIn = Number(s.oIn) || 0, oCached = Number(s.oCached) || 0, oOut = Number(s.oOut) || 0;
+      const pc = Math.min(pCached, pIn);
+      const oc = Math.min(oCached, oIn);
+      return ((pIn - pc) / 1e6) * (m.input_price || 0) * peakMult
+           + (pc / 1e6) * (m.cached_price || 0) * peakMult
+           + (pOut / 1e6) * (m.output_price || 0) * peakMult
+           + ((oIn - oc) / 1e6) * (m.input_price || 0)
+           + (oc / 1e6) * (m.cached_price || 0)
+           + (oOut / 1e6) * (m.output_price || 0);
+    };
+    const oldRecalc55 = (m, s, model) => {
+      const isDeepSeekS = /(^|[\/\-_])deepseek/i.test(String(model || ''));
+      const peakMultS = typeof m.peak_multiplier === 'number' ? m.peak_multiplier : (isDeepSeekS ? 2 : 1);
+      const pc = Math.min(s.pCached, s.pIn);
+      const oc = Math.min(s.oCached, s.oIn);
+      return ((s.pIn - pc) / 1e6) * Number(m.input_price || 0) * peakMultS
+        + (pc / 1e6) * Number(m.cached_price || 0) * peakMultS
+        + (s.pOut / 1e6) * Number(m.output_price || 0) * peakMultS
+        + ((s.oIn - oc) / 1e6) * Number(m.input_price || 0)
+        + (oc / 1e6) * Number(m.cached_price || 0)
+        + (s.oOut / 1e6) * Number(m.output_price || 0);
+    };
+    let seed55 = 20261010;
+    const rnd55 = () => { seed55 = (seed55 * 1103515245 + 12345) & 0x7fffffff; return seed55 / 0x7fffffff; };
+    const pick55 = () => {
+      const r = rnd55();
+      if (r < 0.12) return 0;
+      if (r < 0.2) return -Math.floor(rnd55() * 500);  // 负值（脏数据）
+      if (r < 0.35) return Math.floor(rnd55() * 50);   // 小值（易触发 cached > in）
+      return Math.floor(rnd55() * 9000000);
+    };
+    let diff55 = 0, sample55 = '';
+    for (let i = 0; i < 2000; i++) {
+      const s = { pIn: pick55(), pCached: pick55(), pOut: pick55(), oIn: pick55(), oCached: pick55(), oOut: pick55() };
+      const pr = {
+        input_price: (rnd55() < 0.1 ? undefined : rnd55() * 20),
+        cached_price: (rnd55() < 0.2 ? undefined : rnd55() * 2),
+        output_price: (rnd55() < 0.1 ? undefined : rnd55() * 40),
+        peak_multiplier: (rnd55() < 0.5 ? undefined : (rnd55() < 0.5 ? 2 : 2.5)),
+      };
+      const model55 = rnd55() < 0.5 ? 'deepseek-v4.1-flash' : 'hy4-preview';
+      const pm = tt55.peakMultOf(pr, model55);
+      const a = tt55.costFromPeakSplit(pr, s, pm);
+      const b = oldMain55(pr, s, pm);
+      const c = oldRecalc55(pr, s, model55);
+      if (!(a === b && b === c)) { diff55++; if (!sample55) sample55 = JSON.stringify({ s, pr, model55, a, b, c }); }
+    }
+    ok('T55-b1 ★★S-9 计价收敛零金额变化：新 costFromPeakSplit 与改前两份展开式 2000 组 fuzz 逐位一致',
+      diff55 === 0, `不一致 ${diff55} 组，样本 ${sample55}`);
+
+    // ── b2 ★★ peakMultOf 行为（三处调用点共用同一判据）────────────────────────
+    ok('T55-b2 ★★peakMultOf：显式值优先 / deepseek 缺省 2 / 其余缺省 1',
+      tt55.peakMultOf({ peak_multiplier: 2.5 }, 'hy3') === 2.5
+      && tt55.peakMultOf({ peak_multiplier: 0 }, 'deepseek-flash') === 0
+      && tt55.peakMultOf({}, 'deepseek-v4.1-flash') === 2
+      && tt55.peakMultOf({}, 'hy4-preview') === 1
+      && tt55.peakMultOf({ input_price: 1 }, 'x/deepseek-y') === 2,
+      `ds=${tt55.peakMultOf({}, 'deepseek-v4.1-flash')} other=${tt55.peakMultOf({}, 'hy4-preview')}`);
+
+    // ── b3 ★★ calcCost 分桶支确实走 costFromPeakSplit（行为级，非源码级）──────
+    {
+      const pr55 = { deepseek_rules: { peak_schedule: '9:00 - 12:00、14:00 - 18:00' }, models: { 'deepseek-v4.1-flash': { input_price: 1, cached_price: 0.02, output_price: 4, peak_multiplier: 2 } } };
+      const st55 = { model: 'deepseek-v4.1-flash', in: 3000, cached: 2000, out: 500, pIn: 1000, pCached: 800, pOut: 200, oIn: 2000, oCached: 1200, oOut: 300 };
+      const got55 = tt55.calcCost(st55, pr55, Date.UTC(2026, 2, 4, 12, 0, 0)); // 空闲时刻：分桶路径不看 mult
+      const want55 = tt55.costFromPeakSplit(pr55.models['deepseek-v4.1-flash'], st55, 2);
+      ok('T55-b3 ★★calcCost 分桶支 = costFromPeakSplit（高峰段 ×peakMult、空闲段 ×1）',
+        got55 === want55 && got55 > 0, `calcCost=${got55} 期望=${want55}`);
+    }
+
+    // ── b4/b5/b6：S-5 / S-2 结构（源码级）—— 行为级见 b7 ─────────────────────
+    const srcTT55 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8'));
+    const inc55 = (() => { const i = srcTT55.indexOf('function incrementalRecord'); return i < 0 ? '' : srcTT55.slice(i, i + 14000); })();
+    //  ⚠️ 必须定位到**回调异常 catch 分支**里再找回滚调用：函数里另有一处
+    //     rollbackLedgerAfterWatermarkFailure(snap)（A2 水位线写盘失败闸门），全函数级正则会把它算进来
+    //     → 反向验证时（只删 catch 里的回滚）本条会假绿。改为以「记账回调异常」这条告警锚定。
+    //   ⚠️ 锚点窗口**必须窄**：A2 闸门的回滚就在锚点前约 400 字符处（实测），窗口取 -800 会把它框进来
+    //     → 同样假绿（批次 2 反向验证踩到过一次，故收紧到 -200）。
+    const iCb55 = inc55.indexOf('记账回调异常');
+    const segCb55 = iCb55 < 0 ? '' : inc55.slice(Math.max(0, iCb55 - 200), iCb55 + 1200);
+    ok('T55-b4 ★S-5 记账回调必须整体包 try/catch，且 catch 内回滚账本 + 留痕（否则异常 = 重复计费）',
+      /let snap = null;/.test(inc55) && /try \{/.test(inc55)
+      && /\} catch \(e\) \{/.test(inc55)
+      && /rollbackLedgerAfterWatermarkFailure\(snap\)/.test(segCb55)
+      && /ledger-callback-error/.test(segCb55),
+      `锚点@${iCb55}`);
+    //  三变量必须声明在 try **之前**：否则 catch 里访问不到 → 回滚分支永远走不到（真实的坑）。
+    const iSnap55 = inc55.indexOf('let snap = null;');
+    const iTry55 = inc55.indexOf('try {');
+    ok('T55-b5 ★S-5 snap/willRecord/recorded 必须声明在 try 之前（放 try 内 → catch 访问不到 → 回滚失效）',
+      iSnap55 >= 0 && iTry55 > iSnap55 && inc55.slice(iSnap55, iTry55).includes('let recorded = true;')
+      && inc55.slice(iSnap55, iTry55).includes('let willRecord = false;'),
+      `snap@${iSnap55} try@${iTry55}`);
+
+    const seg55 = inc55.slice(inc55.indexOf('const subDir = subagentsDirFromTranscript'));
+    ok('T55-b6 ★★S-2 子代理读取必须两阶段：① 逐文件独立 try/catch（含 stderr 告警）② merge 与水位线在第二循环',
+      //   ⚠️"告警可见"要匹配 **stderr 字符串**（源码级断言已 stripComments，注释里的措辞不算数）。
+      /const pending = \[\]/.test(seg55) && /读取失败，本轮跳过该文件/.test(seg55)
+      && seg55.indexOf('const pending = []') < seg55.indexOf('for (const p of pending)')
+      && /for \(const p of pending\)/.test(seg55)
+      && !/for \(const f of fs\.readdirSync\(subDir\)\)/.test(seg55),
+      '单 try 裹整循环：一个坏文件 → 已 merge 的其他文件水位线不推进 → 下轮重复计费');
+  }
+
+  // ── b7 ★★ S-2 行为级：坏文件不影响好文件、不重复计费、下轮补记 ──────────────
+  //   夹具：主 transcript + 两个子代理（a 正常 / b 用"目录冒充文件"→ readFileSync 抛 EISDIR）。
+  //   注：readTranscLinesFrom 内部 catch 了 readFileSync → 该场景不会冒泡成异常；本条验的是
+  //   **S-2 的目标结果**（坏文件不拖累好文件 / 水位线各自独立 / 修好后自动补记），异常分支由 b6 守结构。
+  {
+    const savedEnv55b = process.env.WB_ROOT;
+    process.env.WB_ROOT = tmp;
+    const m55b = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+    if (!m55b || typeof m55b.incrementalRecord !== 'function') {
+      ok('T55-b7 模块加载（需要 incrementalRecord 导出）', false, '缺少导出');
+    } else {
+      try {
+        const proj55 = path.join(tmp, 'projects', 'b55');
+        fs.mkdirSync(proj55, { recursive: true });
+        const ts55 = path.join(proj55, 'sess-b55.jsonl');
+        const sub55 = path.join(proj55, 'sess-b55', 'subagents');
+        fs.mkdirSync(sub55, { recursive: true });
+        const mkRow = (n) => JSON.stringify({ type: 'assistant', timestamp: Date.UTC(2026, 2, 4, 12, 0, 0), providerData: { model: 'deepseek-v4.1-flash', messageId: 'm' + n, usage: { inputTokens: 1000, outputTokens: 10 } } }) + '\n';
+        fs.writeFileSync(ts55, mkRow('main'));
+        fs.writeFileSync(path.join(sub55, 'agent-a.jsonl'), mkRow('a'));
+        fs.mkdirSync(path.join(sub55, 'agent-b.jsonl')); // 目录冒充文件 → readFileSync 抛 EISDIR
+        try { fs.rmSync(path.join(skillDir, '.ledger-watermark.json'), { force: true }); } catch (e) { /* 干净起点 */ }
+        const readIn55 = () => {
+          try {
+            const d = JSON.parse(fs.readFileSync(path.join(skillDir, 'daily-usage.json'), 'utf-8').replace(/^\uFEFF/, ''));
+            const day = d['2026-03-04'] || {};
+            return ((day.models || {})['deepseek-v4.1-flash'] || {}).in || 0;
+          } catch (e) { return -1; }
+        };
+        const before55 = readIn55();
+        m55b.incrementalRecord(ts55, 'sess-b55');
+        const after1 = readIn55();
+        m55b.incrementalRecord(ts55, 'sess-b55'); // 第二次：不应翻倍
+        const after2 = readIn55();
+        // 修好 b → 下轮应补记 b 的量
+        try { fs.rmSync(path.join(sub55, 'agent-b.jsonl'), { recursive: true, force: true }); } catch (e) { /* 清理目录 */ }
+        fs.writeFileSync(path.join(sub55, 'agent-b.jsonl'), mkRow('b'));
+        m55b.incrementalRecord(ts55, 'sess-b55');
+        const after3 = readIn55();
+        const d1 = after1 - before55, d2 = after2 - after1, d3 = after3 - after2;
+        ok('T55-b7 ★★S-2 行为级：坏子代理文件不影响好文件（主+a 记账）、重复调用不翻倍、坏文件修好后下轮补记',
+          d1 === 2000 && d2 === 0 && d3 === 1000,
+          `首轮+${d1}（期望 2000=主1000+子a1000） 二轮+${d2}（期望 0=不重复） 修复后+${d3}（期望 1000=b补记）`);
+        try { fs.rmSync(proj55, { recursive: true, force: true }); } catch (e) { /* 清理 */ }
+        try { fs.rmSync(path.join(skillDir, '.ledger-watermark.json'), { force: true }); } catch (e) { /* 清理 */ }
+      } catch (e) { ok('T55-b7 组异常', false, (e && e.message) || String(e)); }
+    }
+    if (savedEnv55b === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv55b;
+  }
+
+  // ── b8 ★ S-10：recalc 空值守卫（models 条目为 null / total 缺失）不得崩在锁内 ──
+  {
+    const rec55 = stripComments(fs.readFileSync(path.join(SRC, 'recalc-day.js'), 'utf-8'));
+    ok('T55-b8 ★S-10 recalc 必须防 models 条目为 null 与 dayObj.total 缺失（否则锁内抛 → 用户只见异常栈）',
+      /if \(!stat \|\| typeof stat !== 'object'\) continue;/.test(rec55)
+      && /if \(!dayObj\.total \|\| typeof dayObj\.total !== 'object'\) dayObj\.total = \{\};/.test(rec55));
+  }
 }
 
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。

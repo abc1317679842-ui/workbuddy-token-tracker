@@ -184,6 +184,10 @@ function main() {
     const report = [];
 
     for (const [model, stat] of Object.entries(dayObj.models || {})) {
+      // v3.46.0（审计 S-10）：账本条目可能是 null / 非对象（手写编辑、第三方工具写坏、半截 JSON 修复后残留）。
+      //   改前 `stat.cost` 直接抛 TypeError → 整个 recalc 崩在**锁内**、账本已备份但未写回 →
+      //   用户只看到一段异常栈。跳过坏条目（不动它的金额），其余模型照常重算。
+      if (!stat || typeof stat !== 'object') continue;
       if (onlyModel && model !== onlyModel) { dayTotal += stat.cost || 0; continue; }
       // v3.23.5：查价改走主脚本的 findModel（归一化 + 边界匹配 + 别名），与 backfill / 主链路同口径。
       // 原先裸查字典 `(pricing.models || {})[model]` —— 账本里的模型名与价库键差一个后缀/别名就取不到价，
@@ -215,16 +219,13 @@ function main() {
       const split = peakSplitOf(date, model);
       let splitUsed = false;
       if (split && (split.pIn + split.pCached + split.pOut + split.oIn + split.oCached + split.oOut) > 0) {
-        const isDeepSeekS = /(^|[\/\-_])deepseek/i.test(String(model || ''));
-        const peakMultS = typeof m.peak_multiplier === 'number' ? m.peak_multiplier : (isDeepSeekS ? 2 : 1);
-        const pc = Math.min(split.pCached, split.pIn); // 与主链路 calcCost 同款钳制
-        const oc = Math.min(split.oCached, split.oIn);
-        const rawC = ((split.pIn - pc) / 1e6) * Number(m.input_price || 0) * peakMultS
-          + (pc / 1e6) * Number(m.cached_price || 0) * peakMultS
-          + (split.pOut / 1e6) * Number(m.output_price || 0) * peakMultS
-          + ((split.oIn - oc) / 1e6) * Number(m.input_price || 0)
-          + (oc / 1e6) * Number(m.cached_price || 0)
-          + (split.oOut / 1e6) * Number(m.output_price || 0);
+        // v3.46.0（审计 S-9）：峰谷倍率与分桶展开式**都改为调用主脚本单点实现**。
+        //   改前这里手写了一份 6 项展开式 + 一份倍率三元式，注释还写「与主链路 calcCost 同款钳制」
+        //   ——只对分桶支成立、对回退支不成立（两份注释各自对一半 = 病根标本）。
+        //   现在两侧调同一个函数：主链路改口径 → recalc 自动跟着变，**不可能再分裂**。
+        //   表达式侧逐字照搬（含 cached ≤ in 钳制）→ 金额零变化（T55-b1 fuzz + 真机逐日比对验收）。
+        const peakMultS = tt.peakMultOf(m, model);
+        const rawC = tt.costFromPeakSplit(m, split, peakMultS);
         cost = Math.round(rawC * 1e6) / 1e6;
         splitUsed = true;
       } else if (peakRatio === null) {
@@ -238,8 +239,9 @@ function main() {
       } else {
         // v3.23.5：缺省值与主脚本 calcCost（token-tracker.js L2599）对齐——DeepSeek 系缺省 2，其余缺省 1。
         // 原先一律 `|| 1`：deepseek 条目若缺 peak_multiplier 字段，回溯重算会比主链路**整整少算一倍**，且不报错。
-        const isDeepSeek = /(^|[\/\-_])deepseek/i.test(String(model || ''));
-        const peakMult = typeof m.peak_multiplier === 'number' ? m.peak_multiplier : (isDeepSeek ? 2 : 1);
+        // v3.46.0（审计 S-9）：倍率判定同样收敛到 tt.peakMultOf（与精确切分支、主链路 calcCost 三处同一判据）。
+        //   改前这里第三份抄写（且写法又不同），注释还写着「与主脚本 calcCost L2599 对齐」——靠人记得同步。
+        const peakMult = tt.peakMultOf(m, model);
         // 加权：高峰部分按 peak_multiplier，其余按 1
         const ratio = Math.min(1, Math.max(0, peakRatio));
         cost = costOf(m, stat.in, stat.cached, stat.out, 1 + (peakMult - 1) * ratio);
@@ -266,6 +268,9 @@ function main() {
       dayTotal += stat.cost;
     }
 
+    // v3.46.0（审计 S-10）：`dayObj.total` 缺失时补空对象再写 cost。
+    //   改前 `dayObj.total.cost = ...` 对没有 total 键的旧/坏账本直接抛（锁内抛出 → 同上，只留异常栈）。
+    if (!dayObj.total || typeof dayObj.total !== 'object') dayObj.total = {};
     dayObj.total.cost = Math.round(dayTotal * 1e6) / 1e6;
     return { total: dayObj.total.cost, report };
   }
