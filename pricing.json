@@ -1,5 +1,5 @@
 {
-  "date": "2026-10-09",
+  "date": "2026-10-10",
   "currency": "CNY",
   "unit": "元/百万 tokens",
   "usd_cny_rate": 7.2,
@@ -212,18 +212,18 @@
         "cached_price": 0.15,
         "output_price": 13.5,
         "peak_multiplier": 2,
-        "at": "2026-10-08"
+        "at": "2026-10-09"
       }
     }
   },
   "last_source": "multi-source",
-  "last_refresh_note": "2026-10-08T18:57:40.293Z 多源刷新：llmabacus(国内·人民币·主)✓ | llm-prices-cn(国内·人民币·备)✓ | openrouter(USD)✓ | litellm(USD)✓ | portkey(USD)✓；人民币主价更新 8 个，USD参考 0 个，region 设定 0 个，lock 价保留 1 个（含被官方价拦下 1 个）（汇率 7.2）；DeepSeek官方价✓；⚠️模糊匹配歧义: glm-4.7-flash: 国内源 唯一模糊命中 glm-4-7（与被查键不同名，已采用但需人工核验）；glm-4.7-flash: USD源 唯一模糊命中 z-ai/glm-4.7-flash（与被查键不同名，已采用但需人工核验）；glm-4.7-flash: USD源 模糊命中 5 个不同价候选(cloudflare/@cf/zai-org/glm-4.7-flash,openrouter/z-ai/glm-4.7-flash,zai.glm-4.7-flash)，已放弃；kimi-k2.5: USD源 模糊命中 19 个不同价候选(azure_ai/FW-Kimi-K2.5,azure_ai/kimi-k2.5,bedrock/ap-northeast-1/moonshotai.kimi-k2.5)，已放弃；minimax-m3: USD源 模糊命中 12 个不同价候选(azure_ai/FW-MiniMax-M3,fireworks_ai/accounts/fireworks/models/minimax-m3,fireworks_ai/minimax-m3)，已放弃；minimax-m2.7: USD源 唯一模糊命中 minimax/minimax-m2.7（与被查键不同名，已采用但需人工核验）；minimax-m2.7: USD源 模糊命中 9 个不同价候选(sambanova/MiniMax-M2.7,pinstripes/ps/minimax-m2.7,novita/minimax/minimax-m2.7-highspeed)，已放弃；minimax-m2.7-highspeed: USD源 唯一模糊命中 novita/minimax/minimax-m2.7-highspeed（与被查键不同名，已采用但需人工核验）；hunyuan-a13b-instruct: USD源 唯一模糊命中 openrouter/tencent/hunyuan-a13b-instruct（与被查键不同名，已采用但需人工核验）；已 lock 条目的歧义 9 条（不挂弹窗，见 _ambig_warnings_locked）；官方价已命中模型的备用源歧义 2 条（备用源结果不被采用 → 不挂弹窗，见 _ambig_warnings_official）",
+  "last_refresh_note": "2026-10-09T16:04:02.064Z 多源刷新：llmabacus(国内·人民币·主)✓ | llm-prices-cn(国内·人民币·备)✓ | openrouter(USD)✓ | litellm(USD)✓ | portkey(USD)✓；人民币主价更新 8 个，USD参考 0 个，region 设定 0 个，lock 价保留 1 个（含被官方价拦下 1 个）（汇率 7.2）；DeepSeek官方价✓；⚠️模糊匹配歧义: glm-4.7-flash: 国内源 唯一模糊命中 glm-4-7（与被查键不同名，已采用但需人工核验）；glm-4.7-flash: USD源 唯一模糊命中 z-ai/glm-4.7-flash（与被查键不同名，已采用但需人工核验）；glm-4.7-flash: USD源 模糊命中 5 个不同价候选(cloudflare/@cf/zai-org/glm-4.7-flash,openrouter/z-ai/glm-4.7-flash,zai.glm-4.7-flash)，已放弃；kimi-k2.5: USD源 模糊命中 19 个不同价候选(azure_ai/FW-Kimi-K2.5,azure_ai/kimi-k2.5,bedrock/ap-northeast-1/moonshotai.kimi-k2.5)，已放弃；minimax-m3: USD源 模糊命中 12 个不同价候选(azure_ai/FW-MiniMax-M3,fireworks_ai/accounts/fireworks/models/minimax-m3,fireworks_ai/minimax-m3)，已放弃；minimax-m2.7: USD源 唯一模糊命中 minimax/minimax-m2.7（与被查键不同名，已采用但需人工核验）；minimax-m2.7: USD源 模糊命中 9 个不同价候选(sambanova/MiniMax-M2.7,pinstripes/ps/minimax-m2.7,novita/minimax/minimax-m2.7-highspeed)，已放弃；minimax-m2.7-highspeed: USD源 唯一模糊命中 novita/minimax/minimax-m2.7-highspeed（与被查键不同名，已采用但需人工核验）；hunyuan-a13b-instruct: USD源 唯一模糊命中 openrouter/tencent/hunyuan-a13b-instruct（与被查键不同名，已采用但需人工核验）；已 lock 条目的歧义 9 条（不挂弹窗，见 _ambig_warnings_locked）；官方价已命中模型的备用源歧义 2 条（备用源结果不被采用 → 不挂弹窗，见 _ambig_warnings_official）",
   "deepseek_rules": {
     "peak_schedule": "9:00 - 12:00、14:00 - 18:00",
     "weekend_off_peak": true,
     "weekend_off_peak_fallback": false,
     "effective_at": null,
-    "updated_at": "2026-10-08T18:57:39.109Z"
+    "updated_at": "2026-10-09T16:03:58.641Z"
   },
   "_manual_audit": [
     {
@@ -246,7 +246,7 @@
         "cached_pct": 0,
         "output_pct": 0
       },
-      "adopted_at": "2026-10-08T18:57:39.107Z",
+      "adopted_at": "2026-10-09T16:03:58.640Z",
       "official_id": "deepseek-flash",
       "official_version": "DeepSeek-V4.1-Flash",
       "matched_by": "key-version"
