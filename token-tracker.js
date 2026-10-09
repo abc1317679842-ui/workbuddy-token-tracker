@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.44.0 (2026-10-10)
+// token-usage-tracker v3.45.0 (2026-10-10)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -615,6 +615,32 @@ function saveDailyUsageRaw(d) {
   } catch (e) {
     try { fs.unlinkSync(tmp); } catch (e2) {}
     process.stderr.write(`[token-tracker] 账本写入失败: ${e.message}\n`);
+    return false;
+  }
+}
+
+// v3.45.0（审计 F-2）：账本**任意写入路径**的原子写单点（tmp + rename）。
+//   与 saveDailyUsageRaw 共用同一 tmp+rename 语义，保证「写账本」这件事只有一种写法。
+//   为什么必须有：回滚（rollbackLedgerAfterWatermarkFailure）是全项目唯一的「账本已写、水位线未落盘」
+//   补救路径，原本用裸 fs.writeFileSync 覆盖 daily-usage.json —— 而它的触发场景（磁盘满/权限/被占用）
+//   **恰恰就是"写盘中途失败"的高概率场景**，于是"触发回滚"与"回滚写一半"高度同时发生。
+//   半截 JSON → 下次 loadDailyUsage 判 SyntaxError → 改名 .corrupt-<ts> → 本进程 gDailyCorrupt=true
+//   且永不复位（S-6）→ 该进程后续记账全停。即最后一道防线自己会损坏账本。
+//   content 允许 string 或 Buffer（回滚传入的是 preLedger 的原始 Buffer，逐字节还原）。
+//   opts.mkdir（默认 true）：是否先建目录。**回滚路径必须传 { mkdir:false }** —— 回滚时目录必然
+//   已存在（刚刚才写过账本），若在回滚里建目录，会把"路径不可写"这种失败态悄悄变成成功，
+//   掩盖真实故障（T41-b7 钉的就是这条：路径不可写 → 返回 false、由调用方如实告警）。
+function saveLedgerRawAtomic(destPath, content, opts) {
+  const mk = !opts || opts.mkdir !== false;
+  const tmp = destPath + '.tmp-' + process.pid;
+  try {
+    if (mk) fs.mkdirSync(path.dirname(destPath), { recursive: true });
+    fs.writeFileSync(tmp, content);
+    fs.renameSync(tmp, destPath);
+    return true;
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch (e2) {} // silent-ok:清理 — tmp 已不存在/删不掉都不影响主流程
+    process.stderr.write(`[token-tracker] 账本原子写入失败: ${e.message}\n`);
     return false;
   }
 }
@@ -2638,9 +2664,19 @@ function maybeRefreshLocalDb() {
         if (idx >= scripts.length) return resolve({ code: 0, timedOut: false });
         let c;
         try {
+          // v3.45.0（审计 S-7）：与 maybeRefreshHolidays（2764）/ spawnRoundWatcher（404）同款加
+          //   `detached:true` + `unref()` —— **与 KI-12/KI-13 同一病根的第三处**。
+          //   本流水线是 fire-and-forget（实测约 12s），而 --hook / --stop 父进程跑完即退出；
+          //   Windows 下宿主 Job Object 会连带杀掉未脱离的子进程（KI-12/KI-13 已实证，detached
+          //   都挡不住，何况原本没 detached）→ Python 链被中途杀 → `index.json` 不更新 →
+          //   `built_at` 永远停在前一天。这正是「本地官方价库自动刷新从未成功」的**并存第二成因**
+          //   （此前只归因于 python 路径探测，属不完整归因）；且退避锁 attempts 已递增 → 白白消耗
+          //   当日 5 次熔断额度。detached 不保证一定不被杀，但至少不再「父进程一退就必死」。
           c = require('child_process').spawn(exe, [scripts[idx]], {
             cwd: CN_PRICE_PIPELINE_DIR, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+            detached: true, // v3.45.0（审计 S-7）：脱离父进程组，父进程退出不再连带回收
           });
+          try { c.unref(); } catch (e) {} // silent-ok:清理 — 子进程已退出/已 unref 都会抛，属预期
         } catch (e) { return resolve({ code: -1, timedOut: false, err: 'spawn 失败: ' + String(e.message).slice(0, 200) }); }
         let timedOut = false;
         const killTimer = setTimeout(() => {
@@ -3606,6 +3642,20 @@ function recordUsage(stat, pricing, byModel, tsMs, meta) {
   //   另外该守卫并非完全无效：同一进程内**第二次**调用 recordUsage 时，`gDailyCorrupt` 已被置为 true，
   //   此时会正确跳过（避免二次覆盖）。每轮通常只调用一次，故该分支很少触发。
   //   结论：**保持现状**。此处仅补充注释，避免后人误"修正"。
+  // v3.45.0（审计 S-6）：**复位判定必须提到本守卫之前** —— 否则它永远执行不到。
+  //   v3.40.0 A21 的复位写在 loadDailyUsage 的 ENOENT 分支（3295），但 recordUsage 在下面就用
+  //   gDailyCorrupt 提前 return —— **根本走不到 loadDailyUsage** → 进程内隔离过一次损坏文件后
+  //   标志永不复位 → 该进程生命周期内所有 recordUsage 恒 false（"隔离一次，永久停记"）。
+  //   A21 声称修掉的"永久失记"在长驻进程里并未闭环（触发面：--flush-delayed / --round-watch）。
+  //   判据与 3295 完全一致：**本进程没隔离过** 且 **账本文件当前不存在**（= 人工已修好/删掉，
+  //   或首次运行）→ 清标志让记账恢复。这是**恢复路径不是覆盖路径**：文件真的不存在时，
+  //   recordUsage 用空账本起步只会丢掉"本来就已不在磁盘上的历史"（那部分在 .corrupt 备份里），
+  //   不会覆盖任何现存数据 —— 而"永久失记"会持续丢掉**将来**的所有用量，危害更大。
+  if (gDailyCorrupt && !gLedgerQuarantined) {
+    let ledgerGone = false;
+    try { ledgerGone = !fs.existsSync(DAILY_USAGE_FILE); } catch (e) { ledgerGone = false; }
+    if (ledgerGone) gDailyCorrupt = false;
+  }
   if (gDailyCorrupt) {
     // 账本此前损坏：跳过写入，避免用空对象覆盖历史（历史已备份为 .corrupt 文件）
     process.stderr.write(`[token-tracker] 账本此前损坏，本轮跳过写入以免覆盖历史（备份在 .corrupt 文件）\n`);
@@ -3733,8 +3783,13 @@ function rollbackLedgerAfterWatermarkFailure(snap) {
       } catch (e) { restore = null; } // 损坏内容 → 落到下面的 '{}'
     }
     // 原本不存在 / 原本损坏 → 写回空账本，**不删文件**（删除是不可逆动作，且空账本与缺失对读侧等价）
-    fs.writeFileSync(snap.ledgerPath, restore !== null ? restore : '{}');
-    out.ledger = true;
+    // v3.45.0（审计 F-2）：裸 writeFileSync → 原子写（详见 saveLedgerRawAtomic 注释）。
+    //   语义不变（原本存在/损坏 → 写回空账本，不删文件），只是写盘方式改为 tmp+rename。
+    //   { mkdir:false }：回滚**不建目录** —— 保住"路径不可写 → 如实返回失败"这条既有语义。
+    //   ⚠ 必须接返回值：saveLedgerRawAtomic 内部 catch 后**返回 false 而不抛**（与裸 writeFileSync 不同）。
+    //     若沿用旧写法「调完就 `out.ledger = true`」，回滚实际失败时标志却说成功 → 调用方的
+    //     「已回滚账本${rb.ledger ? '' : '（回滚失败！请人工核对）'}」会**谎报成功**（T41-b7 钉的正是这条）。
+    out.ledger = saveLedgerRawAtomic(snap.ledgerPath, restore !== null ? restore : '{}', { mkdir: false });
   } catch (e) { /* 回滚失败也不再补救：下面只如实告警 */ }
   try {
     if (snap.roundsPath && Number.isFinite(snap.preSize)) {
@@ -3753,7 +3808,7 @@ function rollbackLedgerAfterWatermarkFailure(snap) {
 // 先到者推进的新水位线，只记增量。锁获取失败 → 本轮跳过（下轮 Stop 补记，不丢不重）。
 function incrementalRecord(tsPath, sid, meta) {
   if (!tsPath || !fs.existsSync(tsPath)) return;
-  withFileLock(LEDGER_WATERMARK_FILE + '.lock', () => {
+  const lockRes = withFileLock(LEDGER_WATERMARK_FILE + '.lock', () => {
   // 修复1 补充：水位线损坏时跳过记账，宁可少记也不重复计费
   const lw = loadLedgerWatermarkSafe();
   if (lw.corrupt) return;
@@ -3922,6 +3977,17 @@ function incrementalRecord(tsPath, sid, meta) {
     return;
   }
   }, { ttl: 300000, retries: 30, retryDelay: 100 }); // v2.82.1：水位线锁；拿不到锁 → 本轮跳过，下轮补记
+  // v3.45.0（审计 S-3）：锁获取失败**必须可见**，不能静默。
+  //   原实现丢弃 withFileLock 返回值 → 抢不到锁时（并发 watcher / 孤儿锁 KI-2）本轮静默不记账、
+  //   水位线也不推进；而弹窗走 aggregateTranscript（与账本独立）**照常弹出** → 用户看到"已统计"
+  //   而账本里没有。理论上水位线未推进可下轮补记（不丢不重），但若之后不再触发 Stop（用户关客户端）
+  //   该轮就永久丢失 —— 而日志里原本**没有任何一行**说明"本轮没记账"（对比 recordUsage 有 stderr）。
+  //   这里只加告警，不改并发语义（拿到锁才记账这条不变）。
+  if (!lockRes || !lockRes.ok) {
+    const why = (lockRes && lockRes.skipped) ? '抢锁失败（可能并发 watcher 或孤儿锁）' : '锁返回异常';
+    process.stderr.write(`[token-tracker] ⚠ 本轮未记账：${why}；水位线未推进，下轮 Stop 会补记（不丢不重）\n`);
+    try { appendCompactionLog('ledger-lock-skip', { sid: String(sid || '').slice(0, 40), reason: why }); } catch (e) {} // silent-ok:诊断 — 诊断日志写失败不得影响记账主流程
+  }
 }
 
 // ===== v3.32.0（P1-1 兜底）：金额格「该显示什么」的唯一判定 =====
@@ -5837,7 +5903,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.44.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.45.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -7018,4 +7084,7 @@ module.exports = {
   // v3.43.0（KI-13 方案 α）：watcher 接管判定导出——selftest 可 monkey-patch child_process.spawn 后
   //   直接单测「锁 mtime 变新但持有者 pid 已死 → 必须返回 false（降级弹窗）」，不必真 spawn 子进程。
   startWatcherVerified, spawnFlushWatcher,
+  // v3.45.0（审计 F-2 / P-20）：账本原子写单点，导出供 backfill.js 复用 —— 回滚路径不再自带
+  //   copyFileSync / writeFileSync（**复制实现靠注释同步**正是本项目要治的病根，这里直接改成调用）。
+  saveLedgerRawAtomic,
 };

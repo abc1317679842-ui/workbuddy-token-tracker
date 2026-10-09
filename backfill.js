@@ -56,6 +56,10 @@ if (!process.env.CN_PRICE_DB_DIR) {
 const tt = require(path.join(__dirname, 'token-tracker.js'));
 const normalizeModelName = tt.normalizeModelName;
 const findModel = tt.findModel;
+// v3.45.0（审计 F-2 / P-20）：账本/水位线的**原子写单点**直接复用主脚本实现。
+//   原回滚路径自带 fs.copyFileSync / fs.writeFileSync（非 tmp+rename）→ 回滚中途失败会留下半截账本，
+//   且这是"写盘最容易失败的场景"（磁盘满/占用），半截概率不低。改成调用后，写盘方式全项目只有一处。
+const saveLedgerRawAtomic = tt.saveLedgerRawAtomic;
 
 const WRITE = process.argv.includes('--write');
 
@@ -447,12 +451,24 @@ function main() {
     //   反向闸门：把账本回滚到写入前备份（bak1）、水位线回滚到 bak2，再退出。
     //   安全方向：少记可恢复（重跑 backfill 即可），重复计费不可恢复。
     let restoredLedger = false;
-    try { if (fs.existsSync(bak1)) { fs.copyFileSync(bak1, DAILY); restoredLedger = true; } } catch (e) {} // silent-ok:降级 — 回滚是尽力而为，失败由下方「回滚失败！请手动用 .bak 还原」告警兜底
-    if (!restoredLedger) {
-      // 写入前账本不存在（首次回填）：写回空账本，**不删文件**（删除不可逆，空账本与缺失对读侧等价）
-      try { fs.writeFileSync(DAILY, '{}'); restoredLedger = true; } catch (e) {} // silent-ok:降级 — 同上，写不回空账本也只是降级为人工告警，不二次补救
+    // v3.45.0（审计 F-1）：把「备份是否存在」与「回滚是否成功」**解耦**后再决定要不要写 `{}`。
+    //   原判据 `restoredLedger === false` 同时覆盖两种完全不同的情形：
+    //     ① 首次回填、账本原本不存在（写 `{}` 合理）；
+    //     ② **bak1 存在但 copy 失败**（权限/占用/磁盘满）——此时账本里明明有数据，却被
+    //        `writeFileSync(DAILY,'{}')` **清空**，全部历史用量归零，且 `--report`/`--csv`/弹窗
+    //        「今日累计」全空。更要命的是错误文案会说"回滚失败！请手动用 .bak 还原"，
+    //        而实际状态是"账本已被主动清空"——**文案与事实不符**，用户不会知道要去救。
+    //   修法：备份存在 → 绝不写 `{}`，保持账本现状并明确告警「请手动用 bak1 还原」；
+    //        只有备份确实不存在（首次回填）才写空账本。写盘统一走 tmp+rename（P-20）。
+    const bak1Exists = fs.existsSync(bak1);
+    // ⚠ 必须接返回值：saveLedgerRawAtomic 内部 catch 后**返回 false 而不抛**（与 copyFileSync 不同）；
+    //   若照旧写成"调完就置 true"，回滚实际失败时标志却说成功 → 告警文案会谎报"已回滚到写入前状态"。
+    try { if (bak1Exists) { restoredLedger = saveLedgerRawAtomic(DAILY, fs.readFileSync(bak1)); } } catch (e) {} // silent-ok:降级 — 回滚是尽力而为，失败由下方告警兜底
+    if (!restoredLedger && !bak1Exists) {
+      // **仅**「备份确实不存在（首次回填）」：写回空账本，**不删文件**（删除不可逆，空账本与缺失对读侧等价）
+      try { restoredLedger = saveLedgerRawAtomic(DAILY, '{}'); } catch (e) {} // silent-ok:降级 — 写不回空账本也只是降级为人工告警，不二次补救
     }
-    try { if (fs.existsSync(bak2)) fs.copyFileSync(bak2, WATERMARK); } catch (e) {} // silent-ok:降级 — 水位线回滚失败同理：下方告警已指明 .bak 路径，人工可恢复
+    try { if (fs.existsSync(bak2)) saveLedgerRawAtomic(WATERMARK, fs.readFileSync(bak2)); } catch (e) {} // silent-ok:降级 — 水位线回滚失败同理：下方告警已指明 .bak 路径，人工可恢复
     console.error('[backfill] 水位线正被占用：本次回填已作废，账本'
       + (restoredLedger ? '已回滚到写入前状态' : '回滚失败！请手动用 .bak-backfill-* 还原')
       + '（否则下轮会把重建值再累加一遍 = 重复计费）；请退出 WorkBuddy 后重跑');

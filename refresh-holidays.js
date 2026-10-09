@@ -31,6 +31,12 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+// v3.45.0（审计 P-11 / L1）：数据根探测**不再自带实现**，改为 require 单点实现。
+//   本文件原先自带第 3 份逐字相同的 detectWorkBuddyRoot（注释只能写「与 token-tracker.js 同序」，
+//   **没有任何机制**保证它真的同步）。这正是全项目的核心病根：正确性靠注释约束而非结构约束。
+//   v3.42.0 抽 wb-root.js 时漏了本文件与 deepseek-official.js，收敛只做了一半。
+//   改为调用后，判据只有一处，改 wb-root.js 即全部生效。
+const { detectWorkBuddyRoot } = require('./wb-root.js');
 
 // v3.31.0（审计 P1-16）：写盘路径必须与**读取方同一解析**，消除「潜在分裂」。
 //   读取方（token-tracker.js HOLIDAYS_FILE / recalc-day.js:41 / backfill.js:49）一律用
@@ -38,16 +44,9 @@ const os = require('os');
 //   本文件原先写 `__dirname/holidays.json`：本机安装目录恰好就是那个路径 → 两者同文件、不受影响；
 //   但安装目录一旦 ≠ 该路径（手动拷贝/自定义技能根），写入者与读取者就分叉 → 两边峰谷各用一张假日表。
 //   这里改为按读取方口径解析；解析不到目录时才退回 __dirname（兜底，保证总能落盘）。
-function detectWorkBuddyRoot() { // 与 token-tracker.js / recalc-day.js 同序
-  const h = os.homedir();
-  const cands = [path.join(h, '.workbuddy-ai'), path.join(h, '.workbuddy')];
-  for (const c of cands) {
-    try {
-      if (fs.existsSync(path.join(c, 'traces')) || fs.existsSync(path.join(c, 'settings.json'))) return c;
-    } catch (e) { /* 单个候选探测失败不影响下一个 */ }
-  }
-  return path.join(h, '.workbuddy');
-}
+// v3.45.0（审计 P-11）：本函数**已删除** —— 改由顶部 `require('./wb-root.js')` 提供（与
+//   token-tracker.js / backfill.js / recalc-day.js / refresh-prices.js 同一份实现）。
+//   （原实现与 wb-root.js 逐字相同，属"复制实现靠注释同步"，无任何机制保证同步。）
 function resolveOutPath() {
   const WB = process.env.WB_ROOT || detectWorkBuddyRoot();
   const skillsRoot = path.join(WB, 'skills', 'token-usage-tracker');

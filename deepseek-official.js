@@ -32,17 +32,10 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-// v3.16：数据根智能探测（与 token-tracker.js 同口径）：WB_ROOT > ~/.workbuddy-ai（新版客户端）> ~/.workbuddy
-function detectWorkBuddyRoot() {
-  const h = os.homedir();
-  const cands = [path.join(h, '.workbuddy-ai'), path.join(h, '.workbuddy')];
-  for (const c of cands) {
-    try {
-      if (fs.existsSync(path.join(c, 'traces')) || fs.existsSync(path.join(c, 'settings.json'))) return c;
-    } catch (e) { /* 单个候选探测失败不影响下一个 */ }
-  }
-  return path.join(h, '.workbuddy');
-}
+// v3.45.0（审计 P-11 / L1）：数据根探测**不再自带实现**，改为 require 单点实现（wb-root.js）。
+//   本文件原带第 2 份逐字相同的 detectWorkBuddyRoot（注释只能写「与 token-tracker.js 同口径」，
+//   没有任何机制保证同步）。至此全仓库只剩 wb-root.js 一处定义 —— T54-b1 守卫会钉死这一点。
+const { detectWorkBuddyRoot } = require('./wb-root.js');
 const WB = process.env.WB_ROOT || detectWorkBuddyRoot();
 const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
 // v3.31.0（P1-14）：只用于**探测**别家是否持锁（本脚本不持锁，见 savePricing 注释）。

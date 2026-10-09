@@ -2417,8 +2417,12 @@ else {
   // v3.40.0：T42 的 A21 夹具虽然也写了 4 处 `catch (e) { /* silent-ok:清理 … */ }`，但本守卫的
   //   判据是 `catch (x) {}`（**空块紧邻**，`BARE33`），带注释的形态**不匹配** → 计数不变（实测确认）。
   //   这里保留显式说明，避免后人看到"多了 4 处静默"却不知道为什么基线没动。
-  ok('T33-a1 ★裸 catch 总数与基线一致（41；新增/删除必须显式改这里，防"顺手吞一个错"）',
-    nAll === 41, `实测 ${nAll} 处`);
+  // v3.45.0（审计批次 1）：基线 41 → 43。新增两处**都带 silent-ok 标记**：
+  //   ① S-7 价库流水线 spawn 后的 `c.unref()`（子进程已退出/已 unref 都会抛，属预期）；
+  //   ② F-2 新抽的 saveLedgerRawAtomic 里失败时删 tmp（tmp 已不存在都属预期）。
+  //   两处都是"清理"类，符合白名单；基线按设计显式上调，不是顺手吞错。
+  ok('T33-a1 ★裸 catch 总数与基线一致（43；新增/删除必须显式改这里，防"顺手吞一个错"）',
+    nAll === 43, `实测 ${nAll} 处`);
   ok('T33-a2 ★每一处裸 catch 都带 silent-ok:<类别> — <理由>（无标记即红）',
     nBad === 0, nBad ? `${nBad} 处无标记：${badSamples.join(', ')}` : '');
   ok('T33-a3 ★类别必须落在白名单四类（诊断/清理/探测/降级）内——写个别的不算数',
@@ -3022,10 +3026,22 @@ else {
 
   // a1/a2：backfill 的水位线锁失败分支必须**回滚**（改前只打印一句"安全"就 exit 1）
   const bfWmBranch = stripComments(rawBF.slice(rawBF.indexOf('if (!wmRes || !wmRes.ok) {')));
+  // v3.45.0（审计 F-2/P-20）：回滚写盘由 `copyFileSync` 改为 `saveLedgerRawAtomic`（tmp+rename），
+  //   且必须接其返回值（它内部 catch 后**返回 false 而不抛**，照旧"调完就置 true"会谎报回滚成功）。
+  //   本断言的**意图**是"回滚必须存在"，不是"必须用哪种写盘方式" → 接受两种实现，将来再改不误红。
   ok('T41-a1 ★backfill 水位线落盘失败 → 账本回滚到写入前备份 bak1（改前只打印不回滚）',
-    /copyFileSync\(bak1, DAILY\)/.test(bfWmBranch), '缺回滚 = 重建值 + 下轮重放增量 = 重复计费');
+    /(saveLedgerRawAtomic|copyFileSync)\(DAILY, [^)]*bak1\)/.test(bfWmBranch), '缺回滚 = 重建值 + 下轮重放增量 = 重复计费');
   ok('T41-a2 ★同分支水位线回滚到 bak2，且仍以 exit 1 退出（不留"半套"状态）',
-    /copyFileSync\(bak2, WATERMARK\)/.test(bfWmBranch) && /process\.exit\(1\)/.test(bfWmBranch));
+    /(saveLedgerRawAtomic|copyFileSync)\(WATERMARK, [^)]*bak2\)/.test(bfWmBranch) && /process\.exit\(1\)/.test(bfWmBranch));
+  // v3.45.0（审计 F-1）：备份存在 → **绝不写 {}**。原判据把"首次回填"与"备份复制失败"混为一谈，
+  //   后者会把有数据的账本清空（全部历史归零），且告警文案谎称"回滚失败请手动还原"。
+  ok('T41-a9 ★F-1：只有「备份确实不存在」才写空账本（备份存在时写 {} = 清空有数据账本）',
+    /if \(!restoredLedger && !bak1Exists\)/.test(bfWmBranch) && /const bak1Exists = fs\.existsSync\(bak1\)/.test(bfWmBranch),
+    '缺 !bak1Exists 判据 = 回滚失败时账本被清空');
+  // v3.45.0（审计 F-1 续）：回滚结果必须接返回值，不能"调完就置 true"（否则谎报成功）。
+  ok('T41-a10 ★F-1：回滚标志取自 saveLedgerRawAtomic 返回值（而非无条件置 true）',
+    /restoredLedger = saveLedgerRawAtomic\(DAILY, fs\.readFileSync\(bak1\)\)/.test(bfWmBranch),
+    '不接返回值 → 回滚实际失败却告警"已回滚到写入前状态"');
   // a3：那条方向错误的自辩注释必须消失——留着会误导后人把"重复计费"当"安全态"
   ok('T41-a3 ★backfill 不得再出现「水位线不改不会重复计费，安全」这句错误自辩',
     rawBF.indexOf('水位线不改不会重复计费') < 0, '该注释把多收钱的方向写成了安全方向');
@@ -4276,6 +4292,122 @@ else {
     } catch (e) { ok('T52 组异常', false, (e && e.message) || String(e)); }
   }
   if (savedEnv52 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv52;
+}
+
+// ===== T53（v3.45.0 审计批次 1）：外部审计报告 v2 的 P0/P1 修复守卫 =====
+//   来源：`workbuddy-token-tracker-代码审计报告-v2.md`（审计基线 24e31f3 = v3.44.0）。
+//   本组钉的是**已在本版落地**的修复，任一条被回退即红。
+{
+  const rd53 = (f) => { try { return fs.readFileSync(path.join(SRC, f), 'utf-8').replace(/\r\n/g, '\n'); } catch (e) { return ''; } };
+  const tt53 = rd53('token-tracker.js');
+  const bf53 = rd53('backfill.js');
+  const rh53 = rd53('refresh-holidays.js');
+  const do53 = rd53('deepseek-official.js');
+  const seg = (s, key, len) => { const i = s.indexOf(key); return i < 0 ? '' : s.slice(i, i + (len || 4000)); };
+
+  // b1 ★★ S-7：价库流水线 spawn 必须 detached + unref。
+  //   与 KI-12/KI-13 同一病根（Windows Job Object 连带杀）的第三处；不脱离 → 父进程一退就死
+  //   → index.json 不更新 → built_at 永远停在前一天（本地官方价库刷新从未成功的并存成因）。
+  const localDb53 = seg(tt53, 'function maybeRefreshLocalDb', 4000);
+  ok('T53-b1 ★★S-7 价库流水线 spawn 必须 detached:true 且 unref()（父进程退出即被连带杀 = 价库永不更新）',
+    /detached:\s*true/.test(localDb53) && /\.unref\(\)/.test(localDb53),
+    '缺 detached/unref → Python 链被中途杀，本地价库长期用旧价');
+
+  // b2 ★★ F-2：回滚不得裸写账本，且必须接原子写的返回值。
+  const rb53 = seg(tt53, 'function rollbackLedgerAfterWatermarkFailure', 2500);
+  ok('T53-b2 ★★F-2 回滚不得裸 writeFileSync 写账本（违反 tmp+rename = 最后一道防线损坏账本）',
+    !/fs\.writeFileSync\(snap\.ledgerPath/.test(rb53) && /saveLedgerRawAtomic\(snap\.ledgerPath/.test(rb53),
+    '回滚是"磁盘满/被占用"时最可能触发的路径，裸写会留下半截 JSON');
+  ok('T53-b3 ★★F-2 回滚结果必须接返回值（不接 = 回滚失败却谎报"已回滚"）',
+    /out\.ledger = saveLedgerRawAtomic\(/.test(rb53), 'saveLedgerRawAtomic 返回 false 而不抛，调完就置 true 会撒谎');
+
+  // b4 ★★ S-3：水位线锁失败必须可见（原实现丢弃返回值 → 静默不记账、弹窗照弹）。
+  const inc53 = seg(tt53, 'function incrementalRecord', 9000);
+  ok('T53-b4 ★★S-3 incrementalRecord 必须接 withFileLock 返回值并在失败时告警留痕',
+    /const lockRes = withFileLock\(/.test(inc53) && /ledger-lock-skip/.test(inc53),
+    '不接返回值 → 抢锁失败时用户看到"已统计"而账本里没有');
+
+  // b5 ★★ S-6：gDailyCorrupt 的复位判定必须在守卫之前（否则永远执行不到 → 进程内永久停记）。
+  const ru53 = seg(tt53, 'function recordUsage', 2500);
+  const iReset53 = ru53.indexOf('if (gDailyCorrupt && !gLedgerQuarantined)');
+  const iGuard53 = ru53.indexOf('if (gDailyCorrupt) {');
+  ok('T53-b5 ★★S-6 gDailyCorrupt 复位判定必须在守卫之前（放后面 = 永远执行不到）',
+    iReset53 >= 0 && iGuard53 > iReset53, `复位@${iReset53} 守卫@${iGuard53}`);
+
+  // b6 ★★ P-11：refresh-holidays / deepseek-official 不得自带数据根探测，必须 require 单点。
+  ok('T53-b6 ★★P-11 refresh-holidays.js 与 deepseek-official.js 均改为 require(\'./wb-root.js\')，不再自带实现',
+    !/function detectWorkBuddyRoot/.test(rh53) && !/function detectWorkBuddyRoot/.test(do53)
+    && /require\('\.\/wb-root\.js'\)/.test(rh53) && /require\('\.\/wb-root\.js'\)/.test(do53),
+    '自带实现 = 靠注释约定同步，无任何机制保证');
+
+  // b7 ★ F-1（源码级）：备份存在 → 绝不写 {}。
+  const bfWm53 = seg(bf53, 'if (!wmRes || !wmRes.ok) {', 2500);
+  ok('T53-b7 ★F-1 只有「备份确实不存在」才写空账本（否则有数据的账本会被清空）',
+    /const bak1Exists = fs\.existsSync\(bak1\)/.test(bfWm53) && /if \(!restoredLedger && !bak1Exists\)/.test(bfWm53),
+    '缺 !bak1Exists → 回滚失败时把有数据的账本写成 {}');
+
+  // b8/b9 ★ F-2 行为级：saveLedgerRawAtomic 的成/败语义（tmp 不残留 / 不可写返回 false 而不抛）。
+  const savedEnv53 = process.env.WB_ROOT;
+  process.env.WB_ROOT = tmp;
+  const mod53 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  if (!mod53 || typeof mod53.saveLedgerRawAtomic !== 'function') {
+    ok('T53-b8 F-2 行为级：saveLedgerRawAtomic 已导出', false, '缺少 saveLedgerRawAtomic 导出');
+  } else {
+    const D53 = path.join(tmp, 't53');
+    fs.mkdirSync(D53, { recursive: true });
+    const lg53 = path.join(D53, 'ledger.json');
+    const w53 = mod53.saveLedgerRawAtomic(lg53, '{"a":1}');
+    ok('T53-b8 ★F-2 行为级：原子写成功返回 true、内容正确、tmp 不残留',
+      w53 === true && fs.readFileSync(lg53, 'utf-8') === '{"a":1}' && !fs.existsSync(lg53 + '.tmp-' + process.pid),
+      `wrote=${w53}`);
+    const bad53 = mod53.saveLedgerRawAtomic(path.join(D53, 'no', 'such', 'x.json'), '{}', { mkdir: false });
+    ok('T53-b9 ★F-2 行为级：路径不可写 → 返回 false 而不抛（调用方据此如实告警）',
+      bad53 === false, `got ${bad53}`);
+  }
+  if (savedEnv53 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedEnv53;
+}
+
+// ===== T54（v3.45.0 L0）：不变量守卫 —— 把「约定」钉成「约束」，防"将来再抄一份" =====
+//   这一组**不修复任何现状问题**，只把结构性约束固化成断言：
+//   同判据的实现份数只许减不许增。新增一份复制实现 → 立刻红，无需任何人记得去同步注释。
+{
+  const files54 = ['token-tracker.js', 'stop-handler.js', 'backfill.js', 'recalc-day.js',
+    'refresh-prices.js', 'refresh-holidays.js', 'deepseek-official.js', 'peak-rules.js', 'wb-root.js'];
+  const src54 = {};
+  for (const f of files54) {
+    try { src54[f] = fs.readFileSync(path.join(SRC, f), 'utf-8').replace(/\r\n/g, '\n'); } catch (e) { src54[f] = ''; }
+  }
+
+  // b1 ★ 数据根探测：全仓库**恰好 1 处**定义，且只能在 wb-root.js。
+  //   v3.42.0 抽 wb-root.js 时只收了 4 处，漏了 refresh-holidays.js 与 deepseek-official.js；
+  //   本版补齐，从此"改判据只要改一个文件"是**被机制保证**的，不再是靠注释。
+  const defs54 = files54.filter((f) => /function detectWorkBuddyRoot/.test(src54[f]));
+  ok('T54-b1 ★L0 数据根探测全仓库恰好 1 处定义（且只在 wb-root.js）',
+    defs54.length === 1 && defs54[0] === 'wb-root.js', `实测 ${defs54.length} 处：${defs54.join(', ')}`);
+
+  // b2 ★ 账本/水位线：不得有裸 writeFileSync 直接写（必须走 tmp+rename）。
+  //   改前 rollbackLedgerAfterWatermarkFailure 就是唯一一处裸写（F-2），已修；这里防止再冒出来。
+  const rawLedgerWrites54 = [];
+  for (const f of files54) {
+    const body = stripComments(src54[f]);
+    if (/fs\.writeFileSync\(\s*(DAILY_USAGE_FILE|LEDGER_WATERMARK_FILE|snap\.ledgerPath|DAILY|WATERMARK)\s*,/.test(body)) rawLedgerWrites54.push(f);
+  }
+  ok('T54-b2 ★L0 账本/水位线不得有裸 writeFileSync 直写（一律 tmp+rename）',
+    rawLedgerWrites54.length === 0, `裸写于：${rawLedgerWrites54.join(', ')}`);
+
+  // b3 ★ 计价展开式（分桶减法形态）所在文件数 ≤ 2（当前：token-tracker.js 的 calcCost 分桶支 + recalc-day.js）。
+  //   triPrice 是唯一正统实现；其余两处是历史遗留，**批次 2（S-9）目标是降到 0**。
+  //   这里先钉住"不恶化"：谁再抄第三份 → 立刻红。
+  const splitExprFiles54 = files54.filter((f) => /\((pIn|split\.pIn)\s*-\s*(pc|pcached)\)/i.test(src54[f])
+    || /\((oIn|split\.oIn)\s*-\s*(oc|ocached)\)/i.test(src54[f]));
+  ok('T54-b3 ★L0 计价分桶展开式所在文件数 ≤ 2（当前 2，批次 2 目标 0；第三份复制即红）',
+    splitExprFiles54.length <= 2, `实测 ${splitExprFiles54.length} 个文件：${splitExprFiles54.join(', ')}`);
+
+  // b4 ★ 锁实现份数 ≤ 2（withFileLock / withPricingLock）。
+  //   报告 A-1 建议三份合一（deepseek-official 不持锁已登记不修），本条先防"第四种写法"出现。
+  const lockImpls54 = files54.filter((f) => /function with(?:File|Pricing)Lock\s*\(/.test(src54[f]));
+  ok('T54-b4 ★L0 锁实现份数 ≤ 2（防第三份同构锁；A-1 合一后应降到 1）',
+    lockImpls54.length <= 2, `实测 ${lockImpls54.length} 份：${lockImpls54.join(', ')}`);
 }
 
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。
