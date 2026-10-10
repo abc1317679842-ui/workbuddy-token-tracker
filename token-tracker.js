@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.46.0 (2026-10-10)
+// token-usage-tracker v3.47.0 (2026-10-11)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -2665,18 +2665,19 @@ function maybeRefreshLocalDb() {
         let c;
         try {
           // v3.45.0（审计 S-7）：与 maybeRefreshHolidays（2764）/ spawnRoundWatcher（404）同款加
-          //   `detached:true` + `unref()` —— **与 KI-12/KI-13 同一病根的第三处**。
-          //   本流水线是 fire-and-forget（实测约 12s），而 --hook / --stop 父进程跑完即退出；
-          //   Windows 下宿主 Job Object 会连带杀掉未脱离的子进程（KI-12/KI-13 已实证，detached
-          //   都挡不住，何况原本没 detached）→ Python 链被中途杀 → `index.json` 不更新 →
-          //   `built_at` 永远停在前一天。这正是「本地官方价库自动刷新从未成功」的**并存第二成因**
-          //   （此前只归因于 python 路径探测，属不完整归因）；且退避锁 attempts 已递增 → 白白消耗
-          //   当日 5 次熔断额度。detached 不保证一定不被杀，但至少不再「父进程一退就必死」。
+          // v3.47.0（KI-14）：**回退 v3.45.0 S-7 加的 `detached:true` + `unref()`** —— 加了之后 10-11 起
+          //   ① Stop 时冒出持久命令行窗口（用户要手动关）：Windows 上 detached 让 python.exe（控制台子系统）
+          //      拿到自己的控制台；② 用户关窗口 → python 被杀 → `.refresh.error` 留档 `exit=3221225786`
+          //      （0xC000013A = 控制台被关闭）→ 刷新失败 → attempts 递增 → 当日熔断 → 价库 built_at 卡在前一天。
+          //   而**不带 detached**：子进程共享父控制台（不新建窗口），node 同步等流水线跑完（~12s）才退出
+          //   → 10-10 00:04 之前每天都这么成功（v3.44.0 已上线、v3.45.0 未上线的时间窗内实证）。
+          //   `unref()` 也必须一起去掉：它会让子进程不再 keep-alive 事件循环 → node 可能在第 1 个脚本
+          //   跑完就退出 → 第 2、3 个脚本根本不启动 → 刷新残缺。**两个是成对加的，必须成对回退。**
+          //   代价：触发刷新那轮 Stop 弹窗晚 ~12s（每天第一次）。若日后在意，走「换触发时机」而不是换进程属性。
           c = require('child_process').spawn(exe, [scripts[idx]], {
             cwd: CN_PRICE_PIPELINE_DIR, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
-            detached: true, // v3.45.0（审计 S-7）：脱离父进程组，父进程退出不再连带回收
           });
-          try { c.unref(); } catch (e) {} // silent-ok:清理 — 子进程已退出/已 unref 都会抛，属预期
+          // 注意：**不要**在这里加 detached / unref —— 理由见上方 KI-14 注释（守卫 T56-b1）。
         } catch (e) { return resolve({ code: -1, timedOut: false, err: 'spawn 失败: ' + String(e.message).slice(0, 200) }); }
         let timedOut = false;
         const killTimer = setTimeout(() => {
@@ -3740,7 +3741,9 @@ function loadLedgerWatermark() {
 function loadLedgerWatermarkSafe() {
   try {
     const j = JSON.parse(fs.readFileSync(LEDGER_WATERMARK_FILE, 'utf-8'));
-    if (j && typeof j === 'object') return { wm: j, corrupt: false };
+    // v3.47.0（审计 M-5）：`typeof [] === 'object'` → 数组会被当对象用，wm[key] 挂到数组上、静默错账。
+    //   显式排除数组 → 落到下方「损坏」降级分支（跳过本轮记账 + 告警），而不是拿着坏结构继续算。
+    if (j && typeof j === 'object' && !Array.isArray(j)) return { wm: j, corrupt: false };
   } catch (e) { /* 主文件缺失或损坏 → 继续降级 */ }
   // v2.99（测试发现的重复计费修复）：**不再自动回退 .bak**。
   //   原实现：主文件损坏 → 回退 .bak。但 .bak 是 saveLedgerWatermark 在写入**前**复制的旧主文件，
@@ -5969,7 +5972,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.46.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.47.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

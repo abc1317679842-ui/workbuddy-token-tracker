@@ -2431,8 +2431,10 @@ else {
   //   ① S-7 价库流水线 spawn 后的 `c.unref()`（子进程已退出/已 unref 都会抛，属预期）；
   //   ② F-2 新抽的 saveLedgerRawAtomic 里失败时删 tmp（tmp 已不存在都属预期）。
   //   两处都是"清理"类，符合白名单；基线按设计显式上调，不是顺手吞错。
-  ok('T33-a1 ★裸 catch 总数与基线一致（43；新增/删除必须显式改这里，防"顺手吞一个错"）',
-    nAll === 43, `实测 ${nAll} 处`);
+  // v3.47.0（KI-14）：基线 43 → 42。回退 S-7 时删掉了 `try { c.unref(); } catch (e) {}` 这一处
+  //   （unref 本身被去掉了，裸 catch 随之消失）。**基线显式下调**，不是顺手吞错。
+  ok('T33-a1 ★裸 catch 总数与基线一致（42；新增/删除必须显式改这里，防"顺手吞一个错"）',
+    nAll === 42, `实测 ${nAll} 处`);
   ok('T33-a2 ★每一处裸 catch 都带 silent-ok:<类别> — <理由>（无标记即红）',
     nBad === 0, nBad ? `${nBad} 处无标记：${badSamples.join(', ')}` : '');
   ok('T33-a3 ★类别必须落在白名单四类（诊断/清理/探测/降级）内——写个别的不算数',
@@ -4315,13 +4317,18 @@ else {
   const do53 = rd53('deepseek-official.js');
   const seg = (s, key, len) => { const i = s.indexOf(key); return i < 0 ? '' : s.slice(i, i + (len || 4000)); };
 
-  // b1 ★★ S-7：价库流水线 spawn 必须 detached + unref。
-  //   与 KI-12/KI-13 同一病根（Windows Job Object 连带杀）的第三处；不脱离 → 父进程一退就死
-  //   → index.json 不更新 → built_at 永远停在前一天（本地官方价库刷新从未成功的并存成因）。
-  const localDb53 = seg(tt53, 'function maybeRefreshLocalDb', 4000);
-  ok('T53-b1 ★★S-7 价库流水线 spawn 必须 detached:true 且 unref()（父进程退出即被连带杀 = 价库永不更新）',
-    /detached:\s*true/.test(localDb53) && /\.unref\(\)/.test(localDb53),
-    '缺 detached/unref → Python 链被中途杀，本地价库长期用旧价');
+  // b1 ★★ S-7 → **v3.47.0（KI-14）结论推翻并反向**：价库流水线 spawn **不得** detached / unref。
+  //   v3.45.0 加了它们之后实测翻车：Windows 上 detached 让 python.exe 拿到自己的控制台 → Stop 时冒出
+  //   持久命令行窗口 → 用户手动关 → python 被杀（.refresh.error 留档 exit=3221225786 = 0xC000013A
+  //   控制台被关闭）→ 刷新失败 → attempts 递增 → 当日熔断 → built_at 卡在前一天。
+  //   而不带它们时（v3.44.0 时代）每天 00:0x 都刷新成功。**detached 挡不住 Job Object，却会造窗口。**
+  //   正向守卫已迁到 T56-b1/b2（窗口更窄、判据更准），这里保留反向断言防止有人"照着旧注释加回去"。
+  //   注意：这里必须走 stripComments —— token-tracker.js 的 KI-14 注释里写了 `detached:true` / `unref()`
+  //   这两个精确串（说明为什么删），不去注释会命中注释 → **断言假红**（v3.46.0 同款教训）。
+  const localDb53 = seg(stripComments(tt53), 'function maybeRefreshLocalDb', 4000);
+  ok('T53-b1 ★★KI-14（推翻 S-7）价库流水线 spawn 不得 detached / unref（detached 会在 Windows 造控制台窗口 → 用户关掉 → 进程被杀）',
+    !/detached:\s*true/.test(localDb53) && !/\.unref\(\)/.test(localDb53),
+    '见 token-tracker.js 内 KI-14 注释：S-7 的 detached/unref 已回退，勿按旧注释加回');
 
   // b2 ★★ F-2：回滚不得裸写账本，且必须接原子写的返回值。
   const rb53 = seg(tt53, 'function rollbackLedgerAfterWatermarkFailure', 2500);
@@ -4600,6 +4607,32 @@ else {
       /if \(!stat \|\| typeof stat !== 'object'\) continue;/.test(rec55)
       && /if \(!dayObj\.total \|\| typeof dayObj\.total !== 'object'\) dayObj\.total = \{\};/.test(rec55));
   }
+}
+
+// ===== T56（v3.47.0 批次 1）：KI-14 抓价流水线不得再 detached/unref + M-5 水位线数组守卫 =====
+//   KI-14 背景：v3.45.0 给抓价流水线 spawn 加 `detached:true`+`unref()` → 10-11 起 Stop 冒持久命令行窗口，
+//   用户手动关 → python 被杀（.refresh.error 留档 exit=3221225786 = 0xC000013A 控制台被关闭）→ 刷新失败熔断。
+//   本段把「不许再加回去」钉死：**反向验证时把 detached 加回去，b1/b2 必须变红。**
+{
+  const srcTT56 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8'));
+  // b1：以 spawn 调用为锚点，**窗口必须窄**（v3.46.0 教训：宽窗口会把别处的同名写法框进来 → 假绿）。
+  //   这里只取 spawn(...) 之后 220 字符 = 恰好一个 options 对象，且不含下一处 spawn。
+  const iSpawn56 = srcTT56.indexOf('spawn(exe, [scripts[idx]]');
+  const segSpin56 = iSpawn56 < 0 ? '' : srcTT56.slice(iSpawn56, iSpawn56 + 220);
+  ok('T56-b1 ★★KI-14 抓价流水线 spawn 选项内不得出现 detached（Windows 上会新建控制台窗口 → 用户手动关 → 进程被杀）',
+    iSpawn56 >= 0 && !/detached/.test(segSpin56), segSpin56.slice(0, 160));
+
+  // b2：窗口内不得出现 unref（unref 会让 node 在第 1 个脚本跑完就退 → 第 2、3 个脚本不启动 → 刷新残缺）
+  ok('T56-b2 ★KI-14 抓价流水线不得 unref 子进程（否则流水线只跑第一个脚本，刷新残缺）',
+    iSpawn56 >= 0 && !/unref/.test(segSpin56), segSpin56.slice(0, 160));
+
+  // b3：windowsHide 必须还在（去掉 detached 之后它是唯一保证不冒窗口的手段）
+  ok('T56-b3 ★KI-14 抓价流水线必须保留 windowsHide:true',
+    /windowsHide: true/.test(segSpin56), segSpin56.slice(0, 160));
+
+  // b4：M-5 水位线数组守卫 —— 匹配**代码本身**（stripComments 已去注释，注释措辞不算数）
+  ok('T56-b4 ★M-5 水位线解析必须排除数组（typeof [] === object → wm[key] 挂到数组上、静默错账）',
+    /typeof j === 'object' && !Array\.isArray\(j\)/.test(srcTT56));
 }
 
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。
