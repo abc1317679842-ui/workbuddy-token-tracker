@@ -4619,7 +4619,8 @@ else {
   //   这里只取 spawn(...) 之后 220 字符 = 恰好一个 options 对象，且不含下一处 spawn。
   const iSpawn56 = srcTT56.indexOf('spawn(exe, [scripts[idx]]');
   const segSpin56 = iSpawn56 < 0 ? '' : srcTT56.slice(iSpawn56, iSpawn56 + 220);
-  ok('T56-b1 ★★KI-14 抓价流水线 spawn 选项内不得出现 detached（Windows 上会新建控制台窗口 → 用户手动关 → 进程被杀）',
+  ok('T56-b1 ★★KI-14 抓价流水线 spawn 选项内不得出现 detached（KI-13 实证：detached 挡不住 Job Object；'
+    + 'A/B/C/D 实测：它既不继承也不新建控制台 → 零收益。真正修到功能的是 T56-b2 的 unref）',
     iSpawn56 >= 0 && !/detached/.test(segSpin56), segSpin56.slice(0, 160));
 
   // b2：窗口内不得出现 unref（unref 会让 node 在第 1 个脚本跑完就退 → 第 2、3 个脚本不启动 → 刷新残缺）
