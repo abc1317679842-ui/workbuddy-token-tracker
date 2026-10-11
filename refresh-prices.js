@@ -307,7 +307,28 @@ function median(arr) {
   // 也可能是源"未提供价格"的哨兵值；两者混在一起会让中位数算成 0 → 主价被写成 ¥0 且无告警。
   // 统一按「仅 > 0 视为有效报价」处理：0/负数/NaN/Infinity 一律丢弃；全被丢弃时返回 null，
   // 上层据此保留本地价（不覆盖），宁可保留旧价也不写错价。
+  // ⚠ 本函数**只用于主价**（输入价/输出价）。缓存价必须用下面的 medianAllowZero——见其注释。
   const v = arr.filter((x) => typeof x === 'number' && isFinite(x) && x > 0);
+  if (!v.length) return null;
+  v.sort((a, b) => a - b);
+  const mid = Math.floor(v.length / 2);
+  return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
+}
+
+// v3.48.0（审计 F3）：缓存价专用聚合——**允许 0 作为有效报价**。
+//   背景：median() 的 `> 0` 下界是 v3.24 F2 为「主价」打的补丁（`:free` 变体报价恒 0，混进中位数
+//   会把主价刷成 ¥0）。同一个下界用在**缓存价**上却是错的：缓存价 0 在业务上意味着「缓存命中免费」
+//   （真实策略，不是缺数据）。三处 USD 解析器（:366/:386/:409）已用 `null` 表示缺失、用 `0` 表示
+//   免费，语义是可区分的；median() 把 0 一并丢弃 → 所有源都报免费时返回 null → applyUsdCachedPrice
+//   退回「输入价×10%」估算并打 cached_price_estimated → **缓存计费被系统性高估**（缓存占总金额约
+//   97% 的模型上偏差极大），且方向是"多收钱"、无任何告警。
+//   本函数只过滤 null/undefined/NaN/非有限/负数，**保留 0**；调用方（applyUsdCachedPrice）的
+//   `cacheUsd != null` 判据对 0 成立 → 写 cached_price=0 并清除估算标记，正确表达"真实免费缓存"。
+//   主价仍走 median()（那里 0 必须丢弃）——两个语义不同，不能合并成一个函数。
+//   安全方向：若某源误报 0（而不是真免费），结果是少收钱（可恢复），优于高估（多收钱且无痕）；
+//   且 priceGate 的 `nv === 0` 分支（v3.40.0 A9）对 0 放行，不会把它当异常拦下。
+function medianAllowZero(arr) {
+  const v = arr.filter((x) => typeof x === 'number' && isFinite(x) && x >= 0);
   if (!v.length) return null;
   v.sort((a, b) => a - b);
   const mid = Math.floor(v.length / 2);
@@ -504,6 +525,8 @@ function cnFind(cnIndex, srcId, localNorm, forKey, locked) {
 // 返回取值来源：'source' | 'kept' | 'kept-estimated' | 'estimated'（供统计/测试）。
 function applyUsdCachedPrice(m, cacheUsd, usdIn, rate) {
   if (cacheUsd != null) {
+    // v3.48.0（审计 F3）：cacheUsd === 0 是「源明确报告缓存免费」，与 null（源未提供）是两件事，
+    //   判据用 `!= null` 正是为了让 0 走到这里（写 cached_price=0 并清估算标记）。
     m.cached_price = Number((cacheUsd * rate).toFixed(2));
     delete m.cached_price_estimated; // 真实值到位 → 估算标记必须清除，否则标记会撒谎
     return 'source';
@@ -811,8 +834,11 @@ async function main() {
 
     const localNorm = norm(key);
     const srcId = SRC_ID_MAP[key] || null;
-    // v3.33.0（A2）：lock 条目下面三个写价分支**全部跳过**（CN: 812 / US: 843），匹配结果不被采用
-    //   → 其歧义告警只留痕不挂弹窗（避免"永久误报"稀释 ⚠价核验 的警示价值）。
+    // v3.33.0（A2）：lock 条目下面三个**写价**分支全部跳过（CN 主价 / US 主价 / 官方价覆盖），
+    //   匹配结果不被采用 → 其歧义告警只留痕不挂弹窗（避免"永久误报"稀释 ⚠价核验 的警示价值）。
+    //   v3.48.0（审计 F4 复核）："lock 在官方价分支不生效"的指控**不成立**——:911 `else if (m.lock === true)`
+    //   确实挡住了官方价覆盖，注释与代码一致。唯一例外是 region=US 的 `usd_*` **参考字段**写入
+    //   （上方 780 行附近，无 lock 守卫）：那不是主价，是有意保留的对比数据，见下两行说明。
     //   为何还要求 `region !== 'US'`：region=US 的条目**在分支之前**就会把匹配值写进 `usd_*` 参考字段
     //   （见上方 780 行 `if (m.region === 'US' && ...)`），那段写入并**没有** lock 守卫 → 此时匹配结果
     //   确实仍被消费，告警不该静音。判据精确到"匹配结果真的没人用"才静音。
@@ -865,7 +891,9 @@ async function main() {
     const usdOut = median(usdSources.map((u) => usdFind(u, key, m.or_id, localNorm, isLocked)?.usdOut));
     // v3.24（F2·A-4c）：USD 缓存命中价（三源中位数，USD/1M tokens 口径）。无任何源提供时为 null，
     // 交由 applyUsdCachedPrice 决定「沿用本地 / 退回 10% 估算并打标记」。
-    const cacheUsd = median(usdSources.map((u) => usdFind(u, key, m.or_id, localNorm, isLocked)?.cacheUsd));
+    // v3.48.0（审计 F3）：缓存价走 medianAllowZero（允许 0 = 真实免费缓存），不再走 median 的 `>0`
+    //   ——否则"所有源都报缓存免费"会被当成"都没提供"，退化成输入价×10% 估算（高估）。
+    const cacheUsd = medianAllowZero(usdSources.map((u) => usdFind(u, key, m.or_id, localNorm, isLocked)?.cacheUsd));
     // v3.18（H3）：usd_* 参考字段只对 region=US 模型写盘——region=CN 的人民币主价是权威口径，
     // 计费从不读 usd_*，留着只会与主价互相矛盾（实测偏差 -78%~+8%）并污染人工对账。
     // CN 模型的 usdIn/usdOut 仍保留在循环变量里，供下方 auto_converted 估算兜底使用。

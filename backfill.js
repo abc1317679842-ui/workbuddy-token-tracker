@@ -382,41 +382,47 @@ function main() {
   // v3.29.0（S-1 加固）：锁内写盘前再比对 preStat 指纹（见扫描前注释）——扫描窗口内账本被改过即中止。
   //   备份 bak1/bak2 放在锁内、指纹比对**之后**（仍在本工具写盘之前）：这样中止分支不会留下多余的
   //   *.bak-backfill-* 残留，且备份内容更贴近真实写入前状态。
-  const lockRes = tt.withFileLock(DAILY + '.lock', () => {
-    const postStat = (() => { try { const s = fs.statSync(DAILY); return { size: s.size, mtimeMs: s.mtimeMs }; } catch (e) { return null; } })();
+  // ══ 提交阶段（v3.48.0 审计 S1：提交顺序倒置为「先水位线、后账本」）══
+  //   病根（原顺序先账本、后水位线）：两步 rename 之间进程被杀（SIGKILL / 断电 / 未捕获异常）时，
+  //   账本已是**全量重建值**而水位线仍是**旧偏移** → 主链路 incrementalRecord 按旧水位线把全部
+  //   历史行再累加一遍 → 重建值 + 重放增量 = 重复计费，且**零报错、不可恢复**。
+  //   这与项目"宁可少记不重记"的哲学正好相反：原写入顺序在崩溃时给出的是**最坏方向**。
+  //   倒置后崩溃只剩「水位线已推满、账本还是旧值」= 少记（重跑 backfill 即恢复），与哲学同向。
+  //   代价：账本写失败/被并发改时，必须把水位线回滚到 bak2（写入前快照）——回滚丢的只是扫描窗口内
+  //   主链路已推进的那部分，下轮重放 = 少记，同样可恢复。
+  //   两把锁仍分开取（主链路从不嵌套持两把锁，无锁序死锁风险）；每把锁内只做一次 rename，
+  //   持握时间几十毫秒，主链路最多多等一个 retryDelay。
+
+  // 步骤 A（DAILY 锁）：中止判定（扫描窗口内账本是否被改过）+ 写入前备份。
+  //   备份必须早于任何写入：步骤 C 失败时要靠 bak2 回滚水位线。
+  const preLock = tt.withFileLock(DAILY + '.lock', () => {
+    const st = (() => { try { const s = fs.statSync(DAILY); return { size: s.size, mtimeMs: s.mtimeMs }; } catch (e) { return null; } })();
     if (preStat === null) {
-      // 扫描前账本不存在：锁内若已被创建，同样视为「扫描期间被改」
-      if (postStat !== null) return { aborted: true };
-    } else if (postStat === null || postStat.size !== preStat.size || postStat.mtimeMs !== preStat.mtimeMs) {
-      // size 或 mtimeMs 任一不同 → 扫描期间有进程写过账本（Windows 上 mtimeMs 精度足够直接 !== 比较）
-      return { aborted: true };
+      if (st !== null) return { aborted: true }; // 扫描前账本不存在：锁内已被创建 → 视为扫描期间被改
+    } else if (st === null || st.size !== preStat.size || st.mtimeMs !== preStat.mtimeMs) {
+      return { aborted: true }; // size 或 mtimeMs 任一不同 → 扫描期间有进程写过账本（Windows 上 mtimeMs 精度足够直接 !== 比较）
     }
-    // 指纹一致：确认扫描窗口内无人改动，再备份 + 合并写入
     try { if (fs.existsSync(DAILY)) fs.copyFileSync(DAILY, bak1); } catch (e) {} // silent-ok:清理 — 备份失败不阻断回填（备份是尽力而为）
     try { if (fs.existsSync(WATERMARK)) fs.copyFileSync(WATERMARK, bak2); } catch (e) {} // silent-ok:清理 — 同上
-    let cur = {};
-    try { cur = JSON.parse(fs.readFileSync(DAILY, 'utf-8')); } catch (e) { cur = {}; }
-    const mergedDaily = Object.assign({}, cur, newDaily); // newDaily 覆盖同日期，cur 的其余日期保留
-    const tmp1 = DAILY + '.tmp-' + process.pid;           // 保留原临时文件名（不与主链路共享固定名）
-    fs.writeFileSync(tmp1, JSON.stringify(mergedDaily, null, 2) + '\n');
-    fs.renameSync(tmp1, DAILY);
-    return mergedDaily;
+    return { aborted: false, stat: st };
   }, { ttl: 600000, retries: 50 }); // ttl/retries 放宽：回填扫描长、持锁久，给足重试等待
-  if (!lockRes || !lockRes.ok) {
-    // 抢锁失败：绝不无锁续写，否则又退回上面的「整体覆盖丢增量」老问题
+  if (!preLock || !preLock.ok) {
+    // 抢锁失败：绝不无锁续写，否则又退回「整体覆盖丢增量」老问题
     console.error('[backfill] 账本正被占用（WorkBuddy 可能正在运行），请先退出 WorkBuddy 再执行 backfill --write');
     process.exit(1);
   }
-  if (lockRes.result && lockRes.result.aborted) {
-    // 扫描窗口内账本被改：本次可能漏掉新写入的当天增量，直接覆盖＝永久丢失；水位线也一并放弃推进
+  if (preLock.result && preLock.result.aborted) {
+    // 扫描窗口内账本被改：本次可能漏掉新写入的当天增量，直接覆盖＝永久丢失；什么都不要写
     console.error('[backfill] 扫描期间账本已被其他进程修改（WorkBuddy 可能正在记账中），为避免覆盖造成不可恢复的丢失，本次写入已中止；请退出 WorkBuddy 后重试');
     process.exit(1);
   }
+  const baseStat = preLock.result.stat; // 步骤 C 的指纹基线：A→C 之间无人改动才算数
 
-  // 水位线：v3.29.0（S-1 加固）—— 与主链路 incrementalRecord 共用**同一把锁**（WATERMARK + '.lock' 即
-  //   token-tracker.js 的 LEDGER_WATERMARK_FILE + '.lock'），锁内「重读现值 → 逐键取 max → 原子写」。
-  //   原先是锁外整份覆盖：backfill 在扫描后才读 oldWm（L316），而扫描期间主链路一直在记账并推水位线，
-  //   主链路在 L316 之后推的会话键/行数不在 mergedWm 里 → 被整份覆盖 → 水位线**回退** → 下轮主链路从
+  // 步骤 B（WATERMARK 锁）：**先**写水位线 —— 与主链路 incrementalRecord 共用**同一把锁**
+  //   （WATERMARK + '.lock' 即 token-tracker.js 的 LEDGER_WATERMARK_FILE + '.lock'），
+  //   锁内「重读现值 → 逐键取 max → 原子写」。
+  //   原先是锁外整份覆盖：backfill 在扫描后才读 oldWm，而扫描期间主链路一直在记账并推水位线，
+  //   主链路在读取之后推的会话键/行数不在 mergedWm 里 → 被整份覆盖 → 水位线**回退** → 下轮主链路从
   //   偏早偏移重读已记账的行 → **重复计费**（历史教训：v2.99 实测 .bak 回退造成重放增量 5500 in / 1600 out）。
   //   「只许前进，绝不回退」的理由：水位线偏低 = 少记（可恢复），水位线回退 = 重记（不可恢复地多收费）；
   //   宁可少记不重记，与主链路 incrementalRecord 的 `if (!recorded) return` 同一哲学。
@@ -444,34 +450,52 @@ function main() {
     return out;
   }, { ttl: 300000, retries: 50 });
   if (!wmRes || !wmRes.ok) {
-    // v3.39.0（A1）：**旧注释是错的，行为方向是"多收钱"**。
-    //   旧注释称"水位线未推进是安全态——下轮会把增量补记（少记可恢复，不重复计费）"，
-    //   该推理只在「主链路按增量追加」时成立；而 backfill 的账本是**整体替换为全量重建值**：
-    //   水位线停在旧偏移 → 下轮主链路把旧偏移之后的**全部行**再累加一遍 → 重建值 + 重放增量 = 重复计费。
-    //   反向闸门：把账本回滚到写入前备份（bak1）、水位线回滚到 bak2，再退出。
-    //   安全方向：少记可恢复（重跑 backfill 即可），重复计费不可恢复。
-    let restoredLedger = false;
-    // v3.45.0（审计 F-1）：把「备份是否存在」与「回滚是否成功」**解耦**后再决定要不要写 `{}`。
-    //   原判据 `restoredLedger === false` 同时覆盖两种完全不同的情形：
-    //     ① 首次回填、账本原本不存在（写 `{}` 合理）；
-    //     ② **bak1 存在但 copy 失败**（权限/占用/磁盘满）——此时账本里明明有数据，却被
-    //        `writeFileSync(DAILY,'{}')` **清空**，全部历史用量归零，且 `--report`/`--csv`/弹窗
-    //        「今日累计」全空。更要命的是错误文案会说"回滚失败！请手动用 .bak 还原"，
-    //        而实际状态是"账本已被主动清空"——**文案与事实不符**，用户不会知道要去救。
-    //   修法：备份存在 → 绝不写 `{}`，保持账本现状并明确告警「请手动用 bak1 还原」；
-    //        只有备份确实不存在（首次回填）才写空账本。写盘统一走 tmp+rename（P-20）。
-    const bak1Exists = fs.existsSync(bak1);
-    // ⚠ 必须接返回值：saveLedgerRawAtomic 内部 catch 后**返回 false 而不抛**（与 copyFileSync 不同）；
-    //   若照旧写成"调完就置 true"，回滚实际失败时标志却说成功 → 告警文案会谎报"已回滚到写入前状态"。
-    try { if (bak1Exists) { restoredLedger = saveLedgerRawAtomic(DAILY, fs.readFileSync(bak1)); } } catch (e) {} // silent-ok:降级 — 回滚是尽力而为，失败由下方告警兜底
-    if (!restoredLedger && !bak1Exists) {
-      // **仅**「备份确实不存在（首次回填）」：写回空账本，**不删文件**（删除不可逆，空账本与缺失对读侧等价）
-      try { restoredLedger = saveLedgerRawAtomic(DAILY, '{}'); } catch (e) {} // silent-ok:降级 — 写不回空账本也只是降级为人工告警，不二次补救
+    // v3.48.0：水位线没写成时**账本还没动过**，本次整体作废即可，不需要任何回滚。
+    //   （原顺序下这里必须回滚账本到 bak1，正因为账本已经先写了——顺序倒置后这个危险分支消失。）
+    console.error('[backfill] 水位线正被占用（WorkBuddy 可能正在运行），本次回填已作废（账本未改动）；请退出 WorkBuddy 后重试');
+    process.exit(1);
+  }
+
+  // v3.48.0：账本没写成时回滚水位线到 bak2（写入前快照）。
+  //   ⚠ 必须接返回值：saveLedgerRawAtomic 内部 catch 后**返回 false 而不抛**（与 copyFileSync 不同）；
+  //     照旧写成"调完就置 true"，回滚实际失败时标志却说成功 → 告警文案会谎报"已回滚"。
+  //   不回滚账本：此时账本根本没被本次改动过，保持原样即可（也不要写 {}——那是旧代码针对
+  //   "账本已写、要撤销"的分支，现在不存在这种情形）。
+  const rollbackWatermark = (why) => {
+    let restored = false;
+    try { if (fs.existsSync(bak2)) restored = saveLedgerRawAtomic(WATERMARK, fs.readFileSync(bak2)); } catch (e) {} // silent-ok:降级 — 回滚是尽力而为，失败由下方告警兜底
+    console.error('[backfill] ' + why + '，本次回填已作废；水位线'
+      + (restored ? '已回滚到写入前状态' : '回滚失败！请手动用 .bak-backfill-* 还原')
+      + '（放任水位线与账本不一致的后果是**少记**而非多收：主链路会按推高的水位线跳过这些行，重跑 backfill 即恢复）；请退出 WorkBuddy 后重试');
+  };
+
+  // 步骤 C（DAILY 锁）：**后**写账本。与主链路 recordUsage 共用**同一把锁**
+  //   （DAILY + '.lock' 即 DAILY_USAGE_FILE + '.lock'，两者都解析到 skills/token-usage-tracker/daily-usage.json；
+  //    锁路径不一致就锁不住主链路，等于没加锁）。锁内**重读账本再合并**：重放结果覆盖同日期，
+  //    同时保留账本里重放不到的日期（如 transcript 已删除、旧日期）。
+  //   锁内还要**再比对一次指纹**（基线是步骤 A 的快照）：A→C 之间又有进程写过账本 → 本次的整体
+  //   重建会覆盖那些增量 → 中止，并把步骤 B 已推高的水位线回滚到 bak2。
+  const lockRes = tt.withFileLock(DAILY + '.lock', () => {
+    const postStat = (() => { try { const s = fs.statSync(DAILY); return { size: s.size, mtimeMs: s.mtimeMs }; } catch (e) { return null; } })();
+    if (baseStat === null) {
+      if (postStat !== null) return { aborted: true };
+    } else if (postStat === null || postStat.size !== baseStat.size || postStat.mtimeMs !== baseStat.mtimeMs) {
+      return { aborted: true };
     }
-    try { if (fs.existsSync(bak2)) saveLedgerRawAtomic(WATERMARK, fs.readFileSync(bak2)); } catch (e) {} // silent-ok:降级 — 水位线回滚失败同理：下方告警已指明 .bak 路径，人工可恢复
-    console.error('[backfill] 水位线正被占用：本次回填已作废，账本'
-      + (restoredLedger ? '已回滚到写入前状态' : '回滚失败！请手动用 .bak-backfill-* 还原')
-      + '（否则下轮会把重建值再累加一遍 = 重复计费）；请退出 WorkBuddy 后重跑');
+    let cur = {};
+    try { cur = JSON.parse(fs.readFileSync(DAILY, 'utf-8')); } catch (e) { cur = {}; }
+    const mergedDaily = Object.assign({}, cur, newDaily); // newDaily 覆盖同日期，cur 的其余日期保留
+    const tmp1 = DAILY + '.tmp-' + process.pid;           // 保留原临时文件名（不与主链路共享固定名）
+    fs.writeFileSync(tmp1, JSON.stringify(mergedDaily, null, 2) + '\n');
+    fs.renameSync(tmp1, DAILY);
+    return mergedDaily;
+  }, { ttl: 600000, retries: 50 }); // ttl/retries 放宽：回填扫描长、持锁久，给足重试等待
+  if (!lockRes || !lockRes.ok) {
+    rollbackWatermark('账本正被占用');
+    process.exit(1);
+  }
+  if (lockRes.result && lockRes.result.aborted) {
+    rollbackWatermark('写入前账本又被其他进程修改');
     process.exit(1);
   }
   // v3.33.0（第四轮审计 B 系列）：`.bak-backfill-*` **有界保留**。

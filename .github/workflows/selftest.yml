@@ -2,8 +2,11 @@
 # 用 windows-latest：selftest 的 watcher/toast/PowerShell 相关断言依赖 Windows 行为。
 # 零依赖：不装任何包，正好验证「零依赖单文件」这个卖点没被悄悄破坏。
 # WB_NO_NET=1：让 refresh-prices / deepseek-official 走模拟断网路径。
-# ⚠ 副作用：selftest 的 T3-R4「⚠价库告警」断言在 CI 不会执行（见 CHANGELOG v3.23.3 的已知覆盖缺口），
-#   该断言只在本机不设此变量时真实验证。
+# ⚠ 副作用：selftest 的 T3-R4「⚠价库告警」断言在**离线这一跑**不会执行。
+#   v3.48.0（审计 S3）：补第二个 step——**不设 WB_NO_NET** 再跑一遍，让 T3-R4 在 CI 也有覆盖。
+#   判据来自 v3.29.0 的有意设计：envSkip 只跳过"前提不成立"的用例（S3 复核确认不是门禁绕过），
+#   但 T3-R4 属"两种模式都该验"（T12 mkVariant 双环境范式），离线跑 + 联网跑各一遍才闭环。
+#   该 step 允许失败（continue-on-error）——runner 网络抖动不该让整条 CI 常红而被习惯性忽略。
 # 注：selftest 内部已自设 TOKEN_TRACKER_NO_TOAST=1 + WB_ROOT=os.tmpdir() 隔离，不碰真实账本。
 name: selftest
 
@@ -27,3 +30,9 @@ jobs:
         run: node selftest.js
         env:
           WB_NO_NET: '1'
+      # v3.48.0（审计 S3）：联网再跑一遍，专门覆盖 T3-R4「⚠价库告警」（离线跑会 envSkip 掉它）。
+      #   两者是**不同模式**而非重复：离线跑锁"断网自愈"路径，联网跑锁"价库告警"路径。
+      #   continue-on-error：GitHub runner 的外网偶发抖动属环境问题，不该把 CI 变成常红噪音。
+      - name: Run selftest (online, covers T3-R4 price-library warning)
+        continue-on-error: true
+        run: node selftest.js

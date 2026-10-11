@@ -2433,8 +2433,12 @@ else {
   //   两处都是"清理"类，符合白名单；基线按设计显式上调，不是顺手吞错。
   // v3.47.0（KI-14）：基线 43 → 42。回退 S-7 时删掉了 `try { c.unref(); } catch (e) {}` 这一处
   //   （unref 本身被去掉了，裸 catch 随之消失）。**基线显式下调**，不是顺手吞错。
-  ok('T33-a1 ★裸 catch 总数与基线一致（42；新增/删除必须显式改这里，防"顺手吞一个错"）',
-    nAll === 42, `实测 ${nAll} 处`);
+  // v3.48.0（审计 S1）：基线 42 → 40。backfill 提交段重写（顺序倒置为「先水位线、后账本」）后，
+  //   旧回滚分支里的三处裸 catch（restoredLedger 赋值 / 写 `{}` / bak2 回滚）收敛成一处
+  //   （rollbackWatermark 内 `restored = saveLedgerRawAtomic(...)`）→ 净减 2。
+  //   方向是"更少的静默"，且 T41-a1/a9/a10 + T53-b7 已把新提交顺序钉死，不是靠删 catch 掩盖问题。
+  ok('T33-a1 ★裸 catch 总数与基线一致（40；新增/删除必须显式改这里，防"顺手吞一个错"）',
+    nAll === 40, `实测 ${nAll} 处`);
   ok('T33-a2 ★每一处裸 catch 都带 silent-ok:<类别> — <理由>（无标记即红）',
     nBad === 0, nBad ? `${nBad} 处无标记：${badSamples.join(', ')}` : '');
   ok('T33-a3 ★类别必须落在白名单四类（诊断/清理/探测/降级）内——写个别的不算数',
@@ -2897,9 +2901,12 @@ else {
   // a7（v3.38.1，2026-10-09 真机复现）：Stop 端 teamDataReady 快速路径（v3.09 加）在 v3.38.0 漏改——
   //   子代理写完后主模型继续写回复 >20s → hasSubagentsRecentlyActive(20s)=false → teamDataReady=true
   //   → 单条弹（「hy4-preview（子代理 hy3）」+ 跨模型混合计价），把分条整个绕过。用户截图质问后定位。
-  ok('T40-a7 ★Stop 端 teamDataReady 快速路径必须先走按模型分条（团队轮不得直接单条弹）',
-    /!isPlainRound && showToastsSplitByModel\(agg/.test(src40),
-    '快速路径直接单条弹 = 分条被绕过（真机 00:52 复现：异模型轮只弹 1 条「hy4-preview（子代理 hy3）」）');
+  // v3.48.0（审计 N1）：再去掉 `!isPlainRound &&` 前置条件——**普通轮也可能多模型**（用户在同一轮里
+  //   切换模型，2026-10-12 03:54 轮同时含 step-5 与 hy4-preview），原假设"普通轮必然单桶"已证伪。
+  ok('T40-a7 ★Stop 端快速路径必须先走按模型分条（任何轮型都不得直接单条弹）',
+    /if \(showToastsSplitByModel\(agg/.test(src40)
+    && !/!isPlainRound && showToastsSplitByModel/.test(src40),
+    '快速路径直接单条弹 = 分条被绕过（真机 00:52 复现：异模型轮只弹 1 条「hy4-preview（子代理 hy3）」）；普通轮同样可能多模型，不得旁路分条');
   // a8（v3.38.2）：分条耗时必须取**该模型桶自己的跨度**，不能照抄整轮 durMs。
   //   改前 `durMs: agg.durMs` → 主条与子代理条显示同一个整轮时长（真机实测两条都是 9m2s，
   //   而 hy3 子代理实际只跑 6.9s）。修法两步：桶补记 firstTs + 跨度改 firstTs~lastTs。
@@ -3036,23 +3043,30 @@ else {
   const saveWmSrc = stripComments(grabFn(rawTT, 'saveLedgerWatermark'));
   const incSrc = stripComments(grabFn(rawTT, 'incrementalRecord'));
 
-  // a1/a2：backfill 的水位线锁失败分支必须**回滚**（改前只打印一句"安全"就 exit 1）
-  const bfWmBranch = stripComments(rawBF.slice(rawBF.indexOf('if (!wmRes || !wmRes.ok) {')));
+  // a1/a2：backfill 的提交阶段必须「先水位线、后账本」，且账本写失败时回滚水位线
+  // v3.48.0（审计 S1）：原顺序**先账本、后水位线**在两步 rename 之间崩溃（SIGKILL/断电/未捕获异常）时，
+  //   账本已是全量重建值而水位线仍是旧偏移 → 主链路 incrementalRecord 按旧水位线把全部历史行再累加
+  //   一遍 → 重复计费、零报错、不可恢复。这与项目"宁可少记不重记"哲学正好相反（原顺序给出最坏方向）。
+  //   倒置后崩溃只剩「水位线推满、账本旧」= 少记，重跑 backfill 即恢复。
+  const bfCommit = stripComments(rawBF.slice(rawBF.indexOf('// ══ 提交阶段')));
+  const wmPos = bfCommit.indexOf('const wmRes = tt.withFileLock(WATERMARK');
+  const ldPos = bfCommit.indexOf('const lockRes = tt.withFileLock(DAILY');
+  ok('T41-a1 ★★S1：backfill 提交顺序必须「先水位线、后账本」（改前先账本 → 崩溃即永久重复计费）',
+    wmPos >= 0 && ldPos > wmPos,
+    `先账本后水位线 = 两步之间被杀时账本已是重建值、水位线仍是旧偏移 → 主链路重放全部历史行 = 重复计费且零报错（wmRes@${wmPos} lockRes@${ldPos}）`);
   // v3.45.0（审计 F-2/P-20）：回滚写盘由 `copyFileSync` 改为 `saveLedgerRawAtomic`（tmp+rename），
   //   且必须接其返回值（它内部 catch 后**返回 false 而不抛**，照旧"调完就置 true"会谎报回滚成功）。
-  //   本断言的**意图**是"回滚必须存在"，不是"必须用哪种写盘方式" → 接受两种实现，将来再改不误红。
-  ok('T41-a1 ★backfill 水位线落盘失败 → 账本回滚到写入前备份 bak1（改前只打印不回滚）',
-    /(saveLedgerRawAtomic|copyFileSync)\(DAILY, [^)]*bak1\)/.test(bfWmBranch), '缺回滚 = 重建值 + 下轮重放增量 = 重复计费');
-  ok('T41-a2 ★同分支水位线回滚到 bak2，且仍以 exit 1 退出（不留"半套"状态）',
-    /(saveLedgerRawAtomic|copyFileSync)\(WATERMARK, [^)]*bak2\)/.test(bfWmBranch) && /process\.exit\(1\)/.test(bfWmBranch));
-  // v3.45.0（审计 F-1）：备份存在 → **绝不写 {}**。原判据把"首次回填"与"备份复制失败"混为一谈，
-  //   后者会把有数据的账本清空（全部历史归零），且告警文案谎称"回滚失败请手动还原"。
-  ok('T41-a9 ★F-1：只有「备份确实不存在」才写空账本（备份存在时写 {} = 清空有数据账本）',
-    /if \(!restoredLedger && !bak1Exists\)/.test(bfWmBranch) && /const bak1Exists = fs\.existsSync\(bak1\)/.test(bfWmBranch),
-    '缺 !bak1Exists 判据 = 回滚失败时账本被清空');
-  // v3.45.0（审计 F-1 续）：回滚结果必须接返回值，不能"调完就置 true"（否则谎报成功）。
-  ok('T41-a10 ★F-1：回滚标志取自 saveLedgerRawAtomic 返回值（而非无条件置 true）',
-    /restoredLedger = saveLedgerRawAtomic\(DAILY, fs\.readFileSync\(bak1\)\)/.test(bfWmBranch),
+  //   v3.48.0（S1）：回滚对象从「账本」变成「水位线」——账本在新顺序下根本没被写过，动它才会丢数据。
+  ok('T41-a2 ★账本写失败时水位线回滚到 bak2，且仍以 exit 1 退出（不留"半套"状态）',
+    /saveLedgerRawAtomic\(WATERMARK, fs\.readFileSync\(bak2\)\)/.test(bfCommit) && /process\.exit\(1\)/.test(bfCommit));
+  // v3.48.0（S1）：新顺序下「账本写失败」时账本**从未被本次改动过** → 既不回滚账本、更不写 {}。
+  //   （旧代码在这里回滚账本到 bak1 / 首次回填写 {}，是因为账本已经先写了；顺序倒置后该分支消失。）
+  ok('T41-a9 ★S1：账本写失败时**不动账本**（不回滚 bak1、不写 {}——它根本没被改过）',
+    !/saveLedgerRawAtomic\(DAILY/.test(bfCommit),
+    '回滚一个没被写过的账本 = 用旧备份覆盖窗口内主链路新增量（丢数据）；写 {} = 清空有数据账本');
+  // v3.48.0（S1 续）：回滚结果必须接返回值，不能"调完就置 true"（否则谎报成功）。
+  ok('T41-a10 ★回滚标志取自 saveLedgerRawAtomic 返回值（而非无条件置 true）',
+    /let restored = false;[\s\S]{0,240}restored = saveLedgerRawAtomic\(WATERMARK/.test(bfCommit),
     '不接返回值 → 回滚实际失败却告警"已回滚到写入前状态"');
   // a3：那条方向错误的自辩注释必须消失——留着会误导后人把"重复计费"当"安全态"
   ok('T41-a3 ★backfill 不得再出现「水位线不改不会重复计费，安全」这句错误自辩',
@@ -4224,8 +4238,10 @@ else {
     block50.length > 0 && !/startWatcherVerified|spawnFlushWatcher/.test(block50),
     block50.length ? '分支内仍调用 watcher 启动' : '未提取到分支块');
 
-  ok('T50-b7 团队轮弹窗 reason 标签区分（+team-sync，便于诊断）',
-    /'\+team-sync'/.test(src50), '未找到 +team-sync 标签');
+  ok('T50-b7 团队轮弹窗 reason 标签区分（team-sync / plain-immediate，便于诊断）',
+    /'team-sync'/.test(src50) && /'plain-immediate'/.test(src50)
+    && !/toastReason \+/.test(src50),
+    'D1：toastReason 是 watcher 路径（token-tracker.js:6460）的局部变量、从未进 stop-handler 的 tx 名单 → typeof 恒 undefined，前缀拼接是死代码（v3.48.0 已删）');
 }
 
 // ===== T51（v3.44.0）：主模型与子代理「同模型」合并成单条弹窗时，第一行必须标明含子代理 =====
@@ -4358,11 +4374,11 @@ else {
     && /require\('\.\/wb-root\.js'\)/.test(rh53) && /require\('\.\/wb-root\.js'\)/.test(do53),
     '自带实现 = 靠注释约定同步，无任何机制保证');
 
-  // b7 ★ F-1（源码级）：备份存在 → 绝不写 {}。
-  const bfWm53 = seg(bf53, 'if (!wmRes || !wmRes.ok) {', 2500);
-  ok('T53-b7 ★F-1 只有「备份确实不存在」才写空账本（否则有数据的账本会被清空）',
-    /const bak1Exists = fs\.existsSync\(bak1\)/.test(bfWm53) && /if \(!restoredLedger && !bak1Exists\)/.test(bfWm53),
-    '缺 !bak1Exists → 回滚失败时把有数据的账本写成 {}');
+  // b7 ★ S1（源码级）：新提交顺序下**不得再出现**「回滚账本到 bak1 / 写空账本 {}」——
+  //   账本在失败那一刻根本没被本次写过，动它才会抹掉窗口内主链路增量（回滚 bak1）或清空有数据账本（{}）。
+  ok('T53-b7 ★S1：backfill 全文不得出现 saveLedgerRawAtomic(DAILY, …)（账本不再被回滚/清空）',
+    !/saveLedgerRawAtomic\(DAILY/.test(bf53),
+    '回滚一个没被写过的账本 = 用旧备份覆盖窗口内主链路新增量；写 {} = 清空有数据账本');
 
   // b8/b9 ★ F-2 行为级：saveLedgerRawAtomic 的成/败语义（tmp 不残留 / 不可写返回 false 而不抛）。
   const savedEnv53 = process.env.WB_ROOT;
@@ -4634,6 +4650,94 @@ else {
   // b4：M-5 水位线数组守卫 —— 匹配**代码本身**（stripComments 已去注释，注释措辞不算数）
   ok('T56-b4 ★M-5 水位线解析必须排除数组（typeof [] === object → wm[key] 挂到数组上、静默错账）',
     /typeof j === 'object' && !Array\.isArray\(j\)/.test(srcTT56));
+}
+
+// ===== T58（v3.48.0 审计响应批次）：S1 提交顺序 / S2 条件方向 / S5 token 钳制 / N1·N2·D1 显示层 / 拉取器三修 =====
+//   本段把本轮 6 项修复**逐个钉死**：每一条都是"注释与代码曾经相反/曾经缺失"的类型，
+//   只靠注释同步必然再次腐化 → 一律源码级 + 行为级双断言。
+//   **反向验证要求**：把任一修复改回修复前形态，对应断言必须变红（见 KNOWN-ISSUES KI-15）。
+{
+  const srcTT58 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8'));
+  const srcSH58 = stripComments(fs.readFileSync(path.join(SRC, 'stop-handler.js'), 'utf-8'));
+  const srcBF58 = stripComments(fs.readFileSync(path.join(SRC, 'backfill.js'), 'utf-8'));
+  const srcRP58 = stripComments(fs.readFileSync(path.join(SRC, 'refresh-prices.js'), 'utf-8'));
+  const srcPT58 = fs.readFileSync(path.join(SRC, 'parse_tokenhub.py'), 'utf-8').replace(/\r\n/g, '\n');
+  const srcFC58 = fs.readFileSync(path.join(SRC, 'fetch-cn-prices.py'), 'utf-8').replace(/\r\n/g, '\n');
+
+  // a1 ★★S2：unpublished 重查窗口的**比较方向**。v3.39.0 A8 把方向写反了（`>=`），
+  //   注释与 stderr 文案都写着"过了 30 天窗口才放行去查"，只有代码是反的 → 必须钉住 `<`。
+  ok('T58-a1 ★★S2：unpublished 重查窗口必须用 `< dueAt`（未到期 return；写成 >= 会让过期条目永不重查）',
+    /if \(!isUnpub \|\| \(dueAt > 0 && Date\.now\(\) < dueAt\)\) return/.test(srcTT58),
+    '方向写反的后果：30 天后官方公布了单价也回填不了 + 30 天内每轮 Stop 重复联网查价');
+  // a2 ★S5（源码级）：单次 token 值必须做上限钳制。
+  //   判据必须钉到"常量有**具体数值**"——只查字符串出现是不够的（反向验证实测：删掉定义行后
+  //   `n > TOKEN_SANITY_MAX` 那行还在，两个宽松正则会照样绿 → 假绿）。故要求 `= <数字>` 开头，
+  //   `Infinity`/缺定义/被注掉都匹配不上。
+  //   注：反向验证时若**删掉定义行**，本断言来不及跑——模块在 T58-a3/a4 调用 extractUsage 时抛
+  //   ReferenceError，selftest 以非零退出 + 栈结束。那同样是"红"（CI 看得见），比假绿强；
+  //   干净的红由 `= Infinity` 这种"改值不改结构"的形态提供（实测 a3 变红）。
+  ok('T58-a2 ★S5：extractUsage 必须对单次 token 值做上限钳制（常量须有具体数值，不能是 Infinity）',
+    /const TOKEN_SANITY_MAX = [0-9]/.test(srcTT58) && /n > TOKEN_SANITY_MAX/.test(srcTT58),
+    '只防字符串拼接与负数、不防量级 → 单轮 in/out 虚高、金额系统性失真且静默');
+  // a3/a4 ★★S5（行为级）：超大值按 0 计、正常量级不受影响、cached 同样受钳
+  const mod58 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  ok('T58-a3 ★★S5 行为级：inputTokens=1e12 → in=0（不是 1e12），同结构小值不受影响',
+    !!mod58 && typeof mod58.extractUsage === 'function'
+    && mod58.extractUsage({ inputTokens: 1e12, outputTokens: 100 }).in === 0
+    && mod58.extractUsage({ inputTokens: 100, outputTokens: 100 }).in === 100,
+    '超大值被原样采信 → 当日合计与 calcCost 金额失真');
+  ok('T58-a4 ★★S5 行为级：正常量级（本机实测 186,861）不得被钳；cached 同样受钳制',
+    !!mod58
+    && mod58.extractUsage({ inputTokens: 186861, outputTokens: 519 }).in === 186861
+    && mod58.extractUsage({ inputTokens: 100, inputTokensDetails: [{ cached_tokens: 1e15 }] }).cached === 0,
+    '上限误伤正常值 = 少记；cached 不受钳 = 虚高照样进账本');
+
+  // b1 ★N1：Stop 端快速路径不得再排除普通轮（普通轮也可能多模型——用户轮内切模型）
+  ok('T58-b1 ★N1：Stop 快速路径不得再写 `!isPlainRound && showToastsSplitByModel`（普通轮同样可能多模型）',
+    !/!isPlainRound && showToastsSplitByModel/.test(srcSH58),
+    '普通轮直接单条弹 = 把整轮所有模型的 token 显示在主模型名下（2026-10-12 03:54 轮：30.2万里 21.8万实际是 hy4）');
+  // b2 ★N2：分模型弹窗 i>0 不得再显示今日累计（与 balI 同样只在第一条）
+  ok('T58-b2 ★N2：分模型弹窗只有第一条显示今日累计（i>0 分支必须是空串，不得调 todayUsageTxt）',
+    /const todayI = i === 0 \? \(o\.firstToday != null \? o\.firstToday : todayUsageTxt\(\)\) : '';/.test(srcTT58),
+    '每条都挂同一个"今日¥5.33"（全天总计）→ 被误读成各模型累计、或几条可以相加');
+  // b3 ★D1：stop-handler 不得再引用从未注入的 toastReason
+  ok('T58-b3 ★D1：stop-handler 不得引用 toastReason（watcher 路径局部变量，从未进 tx 名单 → typeof 恒 undefined）',
+    !/toastReason/.test(srcSH58),
+    '死代码让"诊断前缀"看起来生效，实际 reason 恒为裸值，排错时反被误导');
+
+  // c1 ★★S1：提交顺序必须「先水位线、后账本」
+  ok('T58-c1 ★★S1：backfill 必须先写水位线后写账本（崩溃窗口方向 = 少记可恢复，而非永久重复计费）',
+    (() => {
+      const w = srcBF58.indexOf('const wmRes = tt.withFileLock(WATERMARK');
+      const l = srcBF58.indexOf('const lockRes = tt.withFileLock(DAILY');
+      return w >= 0 && l > w;
+    })(),
+    '先账本后水位线 = 两步之间被杀 → 账本已是重建值、水位线仍是旧偏移 → 主链路重放全部历史行 = 重复计费且零报错');
+  // c2 ★S1：账本写失败时不得回滚账本（那一刻它根本没被本次写过）
+  ok('T58-c2 ★S1：backfill 不得出现 saveLedgerRawAtomic(DAILY, …)（账本不再被回滚/清空）',
+    !/saveLedgerRawAtomic\(DAILY/.test(srcBF58),
+    '回滚一个没被写过的账本 = 用旧备份覆盖窗口内主链路增量（丢数据）');
+
+  // d1 ★S6：parse_tokenhub 的 requests 分支必须校验 HTTP 状态（与 urllib 分支同为 fail-closed）
+  ok('T58-d1 ★S6：parse_tokenhub 的 requests 分支必须 raise_for_status',
+    /resp\.raise_for_status\(\)/.test(srcPT58),
+    '5xx/Cloudflare 页被 .text 原样吃下 → 错误价表进库，或 0 模型"假成功"');
+  // d2 ★F8：0 模型 / 无目标表必须**不写文件 + 非零退出**，且退出点在写文件之前
+  ok('T58-d2 ★F8：parse_tokenhub 解析 0 模型/无目标表必须 sys.exit(2)，且退出点在 os.replace 之前',
+    /sys\.exit\(2\)/.test(srcPT58)
+    && srcPT58.indexOf('sys.exit(2)') < srcPT58.indexOf('os.replace(tmp'),
+    '0 模型仍覆盖 = 用好数据覆盖坏数据；退出码 0 = 假成功，CI/人都看不出');
+
+  // e1 ★F2：fetch-cn-prices 读 lock 价必须用 .get()（下标缺键的 KeyError 会被外层 except 吞掉）
+  ok('T58-e1 ★F2：fetch-cn-prices 读 lock 价必须用 .get()，不得再用 v[\'input_price\'] 下标',
+    /in_p = v\.get\('input_price'\)/.test(srcFC58) && /out_p = v\.get\('output_price'\)/.test(srcFC58)
+    && !/v\['input_price'\]/.test(srcFC58),
+    '下标缺键 → except 吞掉 → deepseek 厂商整轮 0 价、摘要失真，且看不出是缺键还是网络失败');
+
+  // f1 ★F3：USD 缓存价聚合必须允许 0（"缓存免费"是真实策略，不是缺数据）
+  ok('T58-f1 ★F3：USD 缓存价必须走 medianAllowZero（0 = 缓存免费；被 median 的 >0 丢掉会退化成 ×10% 估算 → 高估）',
+    /const cacheUsd = medianAllowZero\(/.test(srcRP58) && /function medianAllowZero\(/.test(srcRP58),
+    '缓存占总金额约 97% → 高估方向是多收钱且无告警');
 }
 
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.47.0 (2026-10-11)
+// token-usage-tracker v3.48.0 (2026-10-12)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -873,6 +873,8 @@ function aggregateRound(roundStartMs, sessionId, anchorFile) {
   };
 }
 
+// v3.48.0（审计 S5）：token 钳位告警去重（进程级：同一量级只报一次，防几十行 transcript 刷屏）
+const gTokenClampSeen = new Set();
 // v2.25（2026-08-12）：transcript 数据源——专家团/Agent 子代理的调用不落盘 traces，但
 // transcript(jsonl) 的 providerData.usage 完整记录每次模型调用（主会话 + subagents/*.jsonl）。
 // usage 字段为 camelCase：{requests, inputTokens, outputTokens, totalTokens, inputTokensDetails:[{cached_tokens}]}
@@ -883,7 +885,26 @@ function extractUsage(u) {
   //   JS 隐式转换会让下游 `inSum += u.in` 变成**字符串拼接**（"100200"），账本彻底脏掉且难以察觉；
   //   负数/浮点同样会污染累加与计费。
   //   真实数据实测（9574 个样本）当前全为 int 且无负值，故本条为**防御性**改动、正常路径行为不变。
-  const num = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.round(n) : 0; };
+  // v3.48.0（审计 S5）：补**上限**钳制。原 num 只防字符串拼接与负数，不防量级错位——上游把
+  //   totalTokens/累计值当 inputTokens 写进来（或客户端塞进 1e12 之类）时，单轮 in/out 虚高 →
+  //   当日合计与 calcCost 金额**系统性失真且静默无告警**（注释自称"防御性"却只防了一半）。
+  //   实测本机单次调用最大约 19 万输入，1 亿是宽到不可能误伤的钳位；命中按 0 计 = 少记（可恢复：
+  //   上游修好后重跑 backfill 即补回），与项目"宁可少记不重记"同向，并 stderr 告警让人知道去核对。
+  const TOKEN_SANITY_MAX = 1e8;
+  const num = (v) => {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    if (n > TOKEN_SANITY_MAX) {
+      const k = 'clamp:' + Math.round(n);
+      if (!gTokenClampSeen.has(k)) {
+        gTokenClampSeen.add(k);
+        if (gTokenClampSeen.size > 64) gTokenClampSeen.clear(); // 有界：异常量级组合再多也不会无界增长
+        process.stderr.write(`[token-tracker] ⚠ usage token 值异常（${Math.round(n)} > 上限 ${TOKEN_SANITY_MAX}）→ 按 0 计；疑似上游字段错位/脏数据，请核对 transcript 原始行\n`);
+      }
+      return 0;
+    }
+    return Math.round(n);
+  };
   const inT = num(u.inputTokens != null ? u.inputTokens : (u.input_tokens != null ? u.input_tokens : u.prompt_tokens));
   const outT = num(u.outputTokens != null ? u.outputTokens : (u.output_tokens != null ? u.output_tokens : u.completion_tokens));
   if (!inT && !outT) return null;
@@ -1736,7 +1757,10 @@ function showToastsSplitByModel(agg, opts) {
     const needTag = o.alwaysTag || (!isMain && entry);
     const tag = (entry) ? subagentTagOf(entry) : '（子代理使用）';
     // 余额 / 今日累计只在第一条显示：多条重复同一个累计值易被误读成"要累加"
-    const todayI = i === 0 ? (o.firstToday != null ? o.firstToday : todayUsageTxt()) : todayUsageTxt();
+    // v3.48.0（审计 N2）：**原实现与注释不符**——i>0 的分支仍调 todayUsageTxt()，于是分模型弹窗
+    //   每条都挂同一个"今日¥5.33"（全天总计），用户会以为那是各模型累计、或几条可以相加。
+    //   改为 ''（与 balI 同样只在第一条显示）；单条路径不受影响（i 恒为 0）。
+    const todayI = i === 0 ? (o.firstToday != null ? o.firstToday : todayUsageTxt()) : '';
     const balI = i === 0 ? (o.bal || '') : '';
     const periodI = periodNote(p.stat, pricing);
     if (needTag) {
@@ -5655,8 +5679,14 @@ function ensureNewModelPricing(pricing, stat) {
   if (hit && typeof hit.m.input_price === 'number') {
     const isUnpub = hit.m.pricing_status === 'unpublished';
     const dueAt = Number(hit.m.unpublished_at || 0) + NO_PUBLIC_RECHECK_MS;
-    if (!isUnpub || (dueAt > 0 && Date.now() >= dueAt)) return { status: 'none', note: '' };
-    // unpublished 且未到窗口 → 走下面的重查流程；顺手记一次"本轮查过了"供排查
+    // v3.48.0（审计 S2）：**比较方向写反了**（v3.39.0 A8 引入，此后一直没人发现）——
+    //   原 `Date.now() >= dueAt` 的实际行为与注释/stderr 文案正好相反：
+    //   ① 「已过 30 天重查窗口」→ return none → **永不重新联网**，官方日后公布单价也回填不了；
+    //   ② 「还没到窗口」→ 反而放行去查 → 30 天内**每轮 Stop 都重复联网查价**（浪费 / 限流 / 弹窗延迟）。
+    //   改为 `< dueAt`：未到期 → return none；已到期 → 放行重查（与 v3.39.0 注释意图一致）。
+    //   到期后也不会每轮查：重查未命中会经 rememberNoPublicPrice 记入已查列表，下轮走 looked 短路。
+    if (!isUnpub || (dueAt > 0 && Date.now() < dueAt)) return { status: 'none', note: '' };
+    // unpublished 且已过重查窗口 → 走下面的重查流程；顺手记一次"本轮查过了"供排查
     hit.m.unpublished_checked_at = Date.now();
     process.stderr.write(`[token-tracker] ${stat.model} 为「无公开价」条目且已过重查窗口 → 本轮重新联网确认官方是否已公布单价\n`);
   }
@@ -5972,7 +6002,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.47.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.48.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

@@ -275,14 +275,23 @@ function handleStopEnd(ctx) {
             //   teamDataReady 时直接单条弹（旧标注「（子代理 hy3）」+ 跨模型混合计价），把 C3③ 的
             //   按模型分条整个绕过。时序洞：子代理 00:50:23 写完 → 主模型继续写回复 110s → Stop 时
             //   hasSubagentsRecentlyActive(20s)=false（mtime 已出窗）→ teamDataReady=true → 单条弹。
-            //   修法：团队轮（!isPlainRound）先试 showToastsSplitByModel——≥2 模型 → 分条弹
-            //   （与 watcher 收口同一实现）；单模型返回 false → 回落原单条，逐字节不变。
-            //   真普通轮（isPlainRound）不试分条：无子代理，models 必然单桶，白扫盘。
-            // v3.44.0：reason 标签区分轮型（诊断用）——普通轮 `+plain-immediate`，团队轮 `+team-sync`。
-            const syncReason = (typeof toastReason === 'string' && toastReason)
-              ? toastReason + (isPlainRound ? '+plain-immediate' : '+team-sync')
-              : (isPlainRound ? 'plain-immediate' : 'team-sync');
-            if (!isPlainRound && showToastsSplitByModel(agg, {
+            //   修法：先试 showToastsSplitByModel——≥2 模型 → 分条弹（与 watcher 收口同一实现）；
+            //   单模型返回 false → 回落原单条，逐字节不变。（v3.48.0 起不再排除普通轮，见下方 N1）
+            // v3.44.0：reason 标签区分轮型（诊断用）——普通轮 `plain-immediate`，团队轮 `team-sync`。
+            // v3.48.0（审计 D1）：删掉对 `toastReason` 的引用——它是 roundWatchMain（watcher 路径，
+            //   token-tracker.js:6460）里的**局部变量**，从未注入 stop-handler 的 tx（tx 名单 :30-79
+            //   无此名）→ 在本文件里是自由变量 → `typeof` 恒为 'undefined' → 前缀拼接是死代码，
+            //   reason 恒为裸值。保留裸值（与 watcher 路径的 idle-timeout 等同形，也是长期实际行为，
+            //   弹窗计数守卫不会翻）；若日后想要诊断前缀，正确做法是把它加进 tx 注入名单。
+            const syncReason = isPlainRound ? 'plain-immediate' : 'team-sync';
+            // v3.48.0（审计 N1）：去掉 `!isPlainRound &&` 前置条件——**普通轮也可能多模型**。
+            //   原假设"普通轮无子代理 → models 必然单桶"已被实测证伪：用户在同一轮里切换模型
+            //   （2026-10-12 03:54 轮同时含 step-5-preview 与 hy4-preview）时 isPlainRound=true，
+            //   于是走下方单条 showToast(agg) → 把**整轮所有模型**的 in/out/cached 显示在主模型名下
+            //   （该轮 30.2万 里 21.8万 实际是 hy4），用户无法从弹窗看出真实构成。
+            //   改为统一先试按模型分条：≥2 模型才分条，单模型时该函数返回 false → 回落原单条
+            //   路径（逐字节不变）。它只遍历已聚合的 agg.models，不额外扫盘，"白扫盘"的顾虑不存在。
+            if (showToastsSplitByModel(agg, {
               pricing, tsPath, roundStart: aggStart0,
               bal: balanceText(), firstToday: todayUsageTxt(),
               reason: syncReason,
@@ -381,7 +390,7 @@ function handleStopEnd(ctx) {
               showToast(
                 toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), balanceText(), todayUsageTxt(), noPriceTag1(agg, pricing)),
                 toastLine2(agg, pricing),
-                (typeof toastReason === 'string' && toastReason) ? toastReason + '+no-watcher' : 'no-watcher-fallback',
+                'no-watcher-fallback', // v3.48.0（审计 D1）：删 toastReason 死引用（它是 watcher 路径局部变量，从未进 tx 名单）
                 tsPath
               );
               clearCoalesce(effSid);

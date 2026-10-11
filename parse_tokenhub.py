@@ -9,7 +9,7 @@ TLS 证书一律严格校验，不再全局关闭（价格影响计费）。
   - 分档 tiers：type=peak(峰谷:空闲/高峰) 或 length(输入长度分档) 或 base
   - 每档 输入/输出/缓存命中 单价（元/百万 tokens）
 """
-import os, re, json, ssl, gzip, zlib, urllib.request
+import os, re, json, ssl, gzip, zlib, urllib.request, sys
 try:
     import requests  # 可选依赖：缺失时 fetch() 自动回退 urllib（本页服务端渲染，不需要 requests 的任何特性）
 except ImportError:
@@ -85,7 +85,15 @@ def decode_body(raw, encoding):
 
 def fetch():
     if requests is not None:
-        return requests.get(URL, headers={'User-Agent': UA}, timeout=30).text
+        # v3.48.0（审计 S6）：原实现 `requests.get(URL,...).text` **不校验 HTTP 状态**——腾讯文档页临时
+        #   5xx / Cloudflare 挑战页会被 .text 原样吃下：页面里恰有含"峰谷计费"的块时，错误价表直接写进
+        #   tokenhub_lang.json；没切出块则 0 模型"假成功"。而 urllib 分支非 2xx 直接抛 → 同一故障两条
+        #   分支给出两种结局。raise_for_status 让 requests 分支与 urllib 分支对齐（fail-closed）。
+        #   另：requests 分支的 verify 与 urllib 分支同受 CN_PRICES_INSECURE_TLS 控制（见 ssl_context
+        #   上方注释），无需在此重复处理。
+        resp = requests.get(URL, headers={'User-Agent': UA}, timeout=30)
+        resp.raise_for_status()
+        return resp.text
     req = urllib.request.Request(URL, headers={'User-Agent': UA})
     resp = urllib.request.urlopen(req, timeout=30, context=ssl_context())
     return decode_body(resp.read(), resp.headers.get('Content-Encoding'))
@@ -218,11 +226,33 @@ def main():
         target = b
         break
     if target is None and cands:
+        # v3.48.0（审计 F8）：原 fallback `target = cands[0]` 会把"只命中部分特征"的块当目标——
+        #   新加坡区域块正是这样混进来的（靠 `\d+\.\d{3,}` 随机侥幸排除）。保留 fallback（页面真
+        #   改版时还能捞回一部分），但必须**明确告知**，不能再静默。
+        sys.stderr.write('[parse_tokenhub][WARN] 未找到同时满足三特征的表格块，退回第一个候选块（可能是区域块/页面改版）\n')
         target = cands[0]
+    if target is None:
+        # v3.48.0（审计 F8）：一个候选块都没有 → **不写文件 + 非零退出**。
+        #   原实现把 target=None 传进 parse_lang_table → `if not block: return []` → 0 模型 → 照写
+        #   tokenhub_lang.json → **用好数据覆盖坏数据**，且 print 正常、退出码 0（假成功，最坏的一类）。
+        sys.stderr.write('[parse_tokenhub][ERROR] 页面未含目标表格（可能改版/被拦/结构变化），不写入；保留上一版本\n')
+        print('解析到模型数: 0 | 页面未含目标表格，已保留上一版 tokenhub_lang.json')
+        sys.exit(2)
     models = parse_lang_table(target)
     # 只保留腾讯自家(混元)模型；页面里其余是腾讯转售的第三方(智谱/Kimi/DeepSeek/MiniMax)，一律不要
     models = [m for m in models if m.get('brand') == 'hunyuan']
+    if not models:
+        # v3.48.0（审计 F8）：0 模型一律不写、非零退出。5xx/Cloudflare/列序变化都可能切出 0 模型，
+        #   而 0 模型文件会让 build_index 的"逐模型沿用 ≤7 天"失效 → Hunyuan 从索引消失 →
+        #   该模型按 0/未收录计费。宁可这次没数据，也不能用空数据覆盖好数据。
+        sys.stderr.write('[parse_tokenhub][ERROR] 解析到 0 个混元模型（页面可能改版/被拦/列序变化），不写入；保留上一版本\n')
+        print('解析到模型数: 0 | 未解析到混元模型，已保留上一版 tokenhub_lang.json')
+        sys.exit(2)
     peak_rule = parse_peak_rule(html)
+    if not peak_rule:
+        # 峰谷规则缺失只告警、仍写模型价：模型价是主数据，峰谷规则缺失时 build_index 会沿用上一版
+        #   （:217-273 的逐模型沿用逻辑）。若为此整份不写，反而会让 Hunyuan 整条源消失（F5 的过度保守）。
+        sys.stderr.write('[parse_tokenhub][WARN] 未提取到峰谷时段规则（页面文案可能变化）；仍写入模型价，峰谷规则由 build_index 沿用上一版\n')
     out = {
         'source': '腾讯云大模型服务平台 TokenHub 模型价格文档',
         'url': URL,

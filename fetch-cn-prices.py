@@ -474,22 +474,33 @@ def parse_pricing_deepseek():
         if not v.get('lock'):
             continue
         mult = v.get('peak_multiplier', 1)
+        # v3.48.0（审计 F2）：原实现用**下标**读这两个字段——lock 条目缺键时 KeyError 被外层
+        #   `except Exception` 吞掉 → 整个 deepseek 厂商**当轮 0 价**、摘要失真，且只留一行 stderr，
+        #   看不出是"缺键"还是"网络失败"。改为显式取 + 缺键跳过该条（其余厂商/模型不受影响），
+        #   并明确告警让人去补 pricing.json。
+        in_p = v.get('input_price')
+        out_p = v.get('output_price')
+        if in_p is None or out_p is None:
+            sys.stderr.write('[WARN] pricing.json lock 条目 %s 缺 input_price/output_price，已跳过该条（请手动补价）\n' % key)
+            continue
         rec = {
             'name': v.get('name', key),
             'api_name': key,
             'source_type': 'first_party',
-            'in_price': ['%s元' % v['input_price']],
-            'out_price': ['%s元' % v['output_price']],
+            'in_price': ['%s元' % in_p],
+            'out_price': ['%s元' % out_p],
             'cache_hit': ['%s元' % v.get('cached_price', 0)],
             'tier_note': v.get('tier_note', 'pricing.json 用户已校对官方价'),
             'source': 'pricing.json(用户已校对官方价)',
         }
         # 峰谷：高峰价 = 基础价 × peak_multiplier（DeepSeek 原厂系）
+        # v3.48.0（审计 F2）：这里原来也是下标访问（与上面 in_p/out_p 同源）——能走到这里说明
+        #   in_p/out_p 都已取到，直接复用即可，别再碰一遍原始字典。
         if mult and mult != 1:
             rec['peak'] = {
-                'idle': {'in': v['input_price'], 'out': v['output_price'],
+                'idle': {'in': in_p, 'out': out_p,
                          'cache': v.get('cached_price', 0)},
-                'peak': {'in': v['input_price'] * mult, 'out': v['output_price'] * mult,
+                'peak': {'in': in_p * mult, 'out': out_p * mult,
                          'cache': v.get('cached_price', 0) * mult},
             }
         out.append(rec)
