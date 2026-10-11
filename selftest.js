@@ -2437,8 +2437,13 @@ else {
   //   旧回滚分支里的三处裸 catch（restoredLedger 赋值 / 写 `{}` / bak2 回滚）收敛成一处
   //   （rollbackWatermark 内 `restored = saveLedgerRawAtomic(...)`）→ 净减 2。
   //   方向是"更少的静默"，且 T41-a1/a9/a10 + T53-b7 已把新提交顺序钉死，不是靠删 catch 掩盖问题。
-  ok('T33-a1 ★裸 catch 总数与基线一致（40；新增/删除必须显式改这里，防"顺手吞一个错"）',
-    nAll === 40, `实测 ${nAll} 处`);
+  // v3.49.0（审计响应批次 2）：基线 40 → 44。T59 的端到端夹具（backfill --write 实跑）新增 4 处：
+  //   ① 夹具清场 rmSync（clearWm59，`silent-ok:清理`）；
+  //   ②③ spawn 后关两个 stdio fd（`silent-ok:清理`——spawn 异常路径下 fd 可能已被关，重复 close 不致命）；
+  //   ④ 读回水位线文件失败（`silent-ok:降级`——缺失/损坏即视为"键不对"，由上一条断言报红，不需要静默续跑）。
+  //   四处全部带标记且类别落在白名单；T33-a2/a3 仍守"必须带标记 + 类别合法"，改数字不削弱守卫生效面。
+  ok('T33-a1 ★裸 catch 总数与基线一致（44；新增/删除必须显式改这里，防"顺手吞一个错"）',
+    nAll === 44, `实测 ${nAll} 处`);
   ok('T33-a2 ★每一处裸 catch 都带 silent-ok:<类别> — <理由>（无标记即红）',
     nBad === 0, nBad ? `${nBad} 处无标记：${badSamples.join(', ')}` : '');
   ok('T33-a3 ★类别必须落在白名单四类（诊断/清理/探测/降级）内——写个别的不算数',
@@ -4738,6 +4743,211 @@ else {
   ok('T58-f1 ★F3：USD 缓存价必须走 medianAllowZero（0 = 缓存免费；被 median 的 >0 丢掉会退化成 ×10% 估算 → 高估）',
     /const cacheUsd = medianAllowZero\(/.test(srcRP58) && /function medianAllowZero\(/.test(srcRP58),
     '缓存占总金额约 97% → 高估方向是多收钱且无告警');
+}
+
+// ===== T59（v3.49.0 审计响应批次 2）：A3 水位线校验覆盖 subs / B3·C6 backfill 收敛到单点 / G10·G11·G12 部署清单·文档·CI =====
+//   本批 6 项修复分两类：① 「复制实现靠注释同步」（B3 峰谷倍率、C6 水位线键）—— 收敛为调用关系后，
+//      口径一致由**结构**保证；② 「文档与实测打架」（G11）或「清单漏项」（G10/G12）。
+//   全部源码级 + 行为级双断言；**反向验证要求**：把任一修复改回修复前形态，对应断言必须变红（见 KNOWN-ISSUES KI-16）。
+{
+  const rawTT59 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const rawBF59 = fs.readFileSync(path.join(SRC, 'backfill.js'), 'utf-8').replace(/\r\n/g, '\n');
+  // 取单个函数体（到下一个顶层 function 为止）——断言钉在函数内部，不能用"全文出现过"蒙混（同 T41 规矩）
+  const grabFn59 = (src, name) => {
+    const i = src.indexOf('function ' + name + '(');
+    if (i < 0) return '';
+    const j = src.indexOf('\nfunction ', i + 1);
+    return j < 0 ? src.slice(i) : src.slice(i, j);
+  };
+  const wmSrc59 = stripComments(grabFn59(rawTT59, 'saveLedgerWatermark'));
+  const bfCode59 = stripComments(rawBF59);
+
+  // ── a 组：A3 写后校验必须覆盖 subs / subTs（改前只比 main / lastTs） ──
+  //   病根：entry = { main, subs:{子代理文件:行数}, lastTs, subTs:{文件:ts} }，而校验只比 main/lastTs。
+  //   subs 落盘丢失/被写旧（torn write、磁盘满、被别的进程覆盖）时 main/lastTs 仍对得上 → 放行 →
+  //   子代理水位线停旧偏移 → 下轮从旧偏移重读同一批子代理行 = **重复计费**（与 A2 同一类洞，开在另一字段）。
+  ok('T59-a1 ★★A3：水位线写后校验必须比对 subs（子代理文件→行数）',
+    /if \(!sameSubMap\(a\.subs, b\.subs\)\) return false;/.test(wmSrc59),
+    '只比 main/lastTs = 子代理水位线没落盘也判成功 → 下轮重读同一批子代理行 = 重复计费且不可恢复');
+  ok('T59-a2 ★★A3：水位线写后校验必须比对 subTs（KI-5 截断恢复判据，丢失 = 恢复退化为冻结）',
+    /if \(!sameSubMap\(a\.subTs, b\.subTs\)\) return false;/.test(wmSrc59));
+  ok('T59-a3 ★A3：subs 比对必须含键集合大小检查（回读少一个文件也要判失败）',
+    /if \(ka\.length !== kb\.length\) return false;/.test(wmSrc59),
+    '只比值不查键集合 → 丢文件/多文件的形态可能蒙混过关');
+
+  // a4~a7 行为级（真落盘 + 回读篡改，隔离目录内；沿用 T41 c 组手法）
+  const mod59 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  const WM59 = path.join(skillDir, '.ledger-watermark.json');
+  const quiet59 = (fn) => {
+    const old = process.stderr.write.bind(process.stderr);
+    const buf = [];
+    process.stderr.write = (s) => { buf.push(String(s)); return true; };
+    let v = null;
+    try { v = fn(); } finally { process.stderr.write = old; }
+    return { v, err: buf.join('') };
+  };
+  const clearWm59 = () => { try { fs.rmSync(WM59, { recursive: true, force: true }); } catch (e) {} }; // silent-ok:清理 — 测试夹具清场
+  const tamper59 = (mutate) => {
+    const orig = fs.readFileSync;
+    fs.readFileSync = function (p) {
+      const res = orig.apply(fs, arguments);
+      if (String(p) === WM59) {
+        try { const j = JSON.parse(res.toString('utf-8')); mutate(j); return Buffer.from(JSON.stringify(j)); }
+        catch (e) { return res; }
+      }
+      return res;
+    };
+    return () => { fs.readFileSync = orig; };
+  };
+  // a4：正常带 subs 写入 → true（防误判：严格比对不能把正常路径打死）
+  clearWm59();
+  const a4 = quiet59(() => mod59.saveLedgerWatermark({ 'sid-t59-a4': { main: 10, subs: { 'agent-a.jsonl': 5 }, lastTs: 111, subTs: { 'agent-a.jsonl': 222 } } }));
+  ok('T59-a4 ★A3 行为级：正常带 subs 写入 → true（严格比对不误判正常路径）',
+    a4.v === true, `返回=${a4.v}`);
+  // a5 ★核心：main/lastTs 不变、只篡改 subs → 必须 false（改前正是这种形态静默放行）
+  clearWm59();
+  const restoreA5 = tamper59((j) => { j['sid-t59-a5'].subs = { 'agent-a.jsonl': 1 }; });
+  let a5v = null;
+  try { a5v = mod59.saveLedgerWatermark({ 'sid-t59-a5': { main: 10, subs: { 'agent-a.jsonl': 5 }, lastTs: 111, subTs: { 'agent-a.jsonl': 222 } } }); }
+  finally { restoreA5(); }
+  ok('T59-a5 ★★A3 行为级：main/lastTs 不变、只篡改 subs → 返回 false（改前此形态静默放行 = 重复计费）',
+    a5v === false, `返回=${a5v}（true = 子代理行下轮重读一遍）`);
+  // a6：篡改 subTs → false
+  clearWm59();
+  const restoreA6 = tamper59((j) => { j['sid-t59-a6'].subTs = { 'agent-a.jsonl': 1 }; });
+  let a6v = null;
+  try { a6v = mod59.saveLedgerWatermark({ 'sid-t59-a6': { main: 10, subs: { 'agent-a.jsonl': 5 }, lastTs: 111, subTs: { 'agent-a.jsonl': 222 } } }); }
+  finally { restoreA6(); }
+  ok('T59-a6 ★A3 行为级：篡改 subTs → 返回 false', a6v === false, `返回=${a6v}`);
+  // a7：旧形态 entry（无 subs/subTs 字段，旧版本水位线升级而来）→ true（不能把升级兼容打死）
+  clearWm59();
+  const a7 = quiet59(() => mod59.saveLedgerWatermark({ 'sid-t59-a7': { main: 3, lastTs: 0 } }));
+  ok('T59-a7 ★A3 行为级：旧形态 entry（无 subs 字段）→ true（升级兼容，不误判）',
+    a7.v === true, `返回=${a7.v}`);
+  clearWm59();
+
+  // ── b 组：B3 backfill 峰谷倍率收敛到 tt.peakMultOf ──
+  ok('T59-b1 ★B3：backfill 峰谷倍率必须调 tt.peakMultOf（DeepSeek 缺省 2 的内联抄写已删）',
+    /tt\.peakMultOf\(m, modelName\)/.test(bfCode59)
+    && !/const isDeepSeek/.test(bfCode59)
+    && !/typeof m\.peak_multiplier === 'number' \? m\.peak_multiplier : 2/.test(bfCode59),
+    '内联手抄 = "等价"只靠注释维护；peakMultOf 一侧改语义（如新增厂商峰谷规则）不会传导到这里 → 回填与增量记账系统性分歧且零报错');
+  ok('T59-b2 ★B3 行为级：peakMultOf 语义钉死（有 pm 用 pm；无 pm 时 deepseek→2、其余→1、边界子串不误判）',
+    !!mod59 && typeof mod59.peakMultOf === 'function'
+    && mod59.peakMultOf({ peak_multiplier: 3 }, 'deepseek-v4.1-flash') === 3
+    && mod59.peakMultOf({}, 'deepseek-v4.1-flash') === 2
+    && mod59.peakMultOf({}, 'glm-5.3-flash') === 1
+    && mod59.peakMultOf({}, 'notdeepseek') === 1,
+    'peakMultOf 是 calcCost / recalc-day / backfill 三处共用单点，语义一改三处金额同时变——必须由断言盯着');
+
+  // ── c 组：C6 backfill 水位线键收敛到 tt.ledgerKey ──
+  ok('T59-c1 ★C6：backfill 不得本地拼水位线键（无 crypto import、无 sha1 内联；两处均走 tt.ledgerKey）',
+    !/require\('crypto'\)/.test(bfCode59) && !/createHash\('sha1'\)/.test(bfCode59)
+    && (bfCode59.match(/tt\.ledgerKey\(/g) || []).length === 2,
+    '本地拼键 = 与主链路 ledgerKey 契约仅靠注释同步；键不一致 → backfill 推满的键主链路不认 → 主链路按自己 key 从 0 重读 = 重复计费（根直放布局下旧实现正是 path-hash vs sid 分歧）');
+  ok('T59-c2 ★C6 行为级：ledgerKey 契约本体（sid 非空→sid；sid 空→path-+sha1(resolve) 前 16 位）',
+    !!mod59 && typeof mod59.ledgerKey === 'function'
+    && mod59.ledgerKey('abc-sid', '/wb/projects/p/abc-sid.jsonl') === 'abc-sid'
+    && mod59.ledgerKey('', '/wb/projects/p/x.jsonl')
+      === 'path-' + require('crypto').createHash('sha1').update(path.resolve('/wb/projects/p/x.jsonl')).digest('hex').slice(0, 16),
+    'c1 只保证"调了单点"，c2 保证"单点本身没被改坏"');
+
+  // c3/c4 ★★端到端（spawn）：backfill --write 实跑，验键 = sid（C6）+ 金额 = 主脚本单点逐行计算（B3）
+  if (!SPAWN_OK) {
+    envSkip('T59-c3 端到端：backfill --write 水位线键 = sid', SPAWN_SKIP_REASON);
+    envSkip('T59-c4 端到端：backfill 回填金额 = 主脚本单点计算', SPAWN_SKIP_REASON);
+  } else {
+    const sub = path.join(tmp, 't59bf');
+    const subSkill = path.join(sub, 'skills', 'token-usage-tracker');
+    fs.mkdirSync(subSkill, { recursive: true });
+    for (const f of ['token-tracker.js', ...RUNTIME_COMPANIONS]) {
+      try { fs.copyFileSync(path.join(skillDir, f), path.join(subSkill, f)); } catch (e) { /* 单个缺失由下方退出码暴露 */ }
+    }
+    const SID59 = 't59-e2e-sid';
+    const projA = path.join(sub, 'projects', 'projA');
+    fs.mkdirSync(projA, { recursive: true });
+    const tsP59 = path.join(projA, SID59 + '.jsonl');
+    const ts59 = Date.now() - 3600000;
+    fs.writeFileSync(tsP59, JSON.stringify({ type: 'message', role: 'assistant', id: 'm1', timestamp: ts59, status: 'completed',
+      providerData: { model: 'deepseek-v4.1-flash', messageId: 'm1',
+        usage: { input_tokens: 1000, output_tokens: 100, inputTokensDetails: [{ cached_tokens: 500 }] } } }) + '\n');
+    const oF59 = fs.openSync(path.join(sub, 'out.txt'), 'w');
+    const eF59 = fs.openSync(path.join(sub, 'err.txt'), 'w');
+    // stdio 重定向到文件（不用管道）：抓价流水线可能派生子进程持有管道 → spawnSync 会干等到超时
+    const r59 = spawnSync(NODE, [path.join(subSkill, 'backfill.js'), '--write'], {
+      stdio: ['ignore', oF59, eF59], windowsHide: true, timeout: 90000,
+      env: Object.assign({}, process.env, { WB_ROOT: sub, WB_NO_NET: '1', TOKEN_TRACKER_NO_TOAST: '1', CN_PRICE_DB_DIR: pricesDir }),
+    });
+    try { fs.closeSync(oF59); } catch (e) {} // silent-ok:清理 — spawn 异常路径下 fd 可能已被关闭，重复 close 不致命
+    try { fs.closeSync(eF59); } catch (e) {} // silent-ok:清理 — 同上（两个 fd 各自独立关）
+    let keys59 = [];
+    try { keys59 = Object.keys(JSON.parse(fs.readFileSync(path.join(subSkill, '.ledger-watermark.json'), 'utf-8'))); } catch (e) {} // silent-ok:降级 — 水位线缺失/损坏即视为"键不对"，由上一条断言报红
+    ok('T59-c3 ★★C6 端到端：backfill --write 后水位线键 = sid（不含 path- 前缀键）',
+      r59.status === 0 && keys59.length === 1 && keys59[0] === SID59,
+      `退出=${r59.status}${r59.error ? ' ' + r59.error.message : ''} 键=${JSON.stringify(keys59)}（path- 前缀 = 与主链路 sid 键分歧 → 重复计费）`);
+    // c4：账本金额必须等于主脚本单点（peakMultOf + triPriceRounded）对同一行的计算值
+    let c4ok = false, c4d = '';
+    try {
+      const daily59 = JSON.parse(fs.readFileSync(path.join(subSkill, 'daily-usage.json'), 'utf-8'));
+      const pr59 = require(path.join(skillDir, 'peak-rules.js'));
+      const pricing59 = JSON.parse(fs.readFileSync(path.join(skillDir, 'pricing.json'), 'utf-8'));
+      const m59 = mod59.findModel(pricing59, 'deepseek-v4.1-flash', 'price').m;
+      const mult59 = pr59.isPeakAt(ts59, pricing59, path.join(skillDir, 'holidays.json'))
+        ? mod59.peakMultOf(m59, 'deepseek-v4.1-flash') : 1;
+      const expect59 = Math.round(mod59.triPriceRounded(1000, 500, 100, m59, mult59) * 1e6) / 1e6;
+      let got59 = null;
+      for (const day of Object.values(daily59)) {
+        for (const [mn, mv] of Object.entries(day.models || {})) {
+          if (mn === 'deepseek-v4.1-flash') got59 = mv;
+        }
+      }
+      c4ok = !!got59 && Math.abs((got59.cost || 0) - expect59) < 1e-6 && (got59.in || 0) === 1000 && (got59.out || 0) === 100;
+      c4d = `期望 ¥${expect59} 实际 ¥${got59 ? got59.cost : 'N/A'}（倍率 ${mult59}）`;
+    } catch (e) { c4d = String(e && e.message); }
+    ok('T59-c4 ★B3 端到端：backfill 回填金额与主脚本单点逐行计算一致', c4ok, c4d);
+  }
+
+  // ── d 组：G10 部署清单漏项 ──
+  const man59 = (() => { try { return fs.readFileSync(path.join(SRC, 'manifest.yaml'), 'utf-8'); } catch (e) { return ''; } })();
+  const skillMd59 = (() => { try { return fs.readFileSync(path.join(SRC, 'SKILL.md'), 'utf-8'); } catch (e) { return ''; } })();
+  const sibs59 = ['peak-rules.js', 'refresh-holidays.js', 'refresh-prices.js', 'stop-handler.js', 'wb-root.js'];
+  ok('T59-d1 ★G10：manifest.yaml 部署清单列全五个同目录必需文件',
+    sibs59.every((f) => man59.indexOf(f) >= 0),
+    `缺：${sibs59.filter((f) => man59.indexOf(f) < 0).join(',') || '无'}（按旧清单部署 → 运行时 MODULE_NOT_FOUND）`);
+  ok('T59-d2 ★G10：SKILL.md 环境要求同样列全五个文件',
+    sibs59.every((f) => skillMd59.indexOf(f) >= 0),
+    `缺：${sibs59.filter((f) => skillMd59.indexOf(f) < 0).join(',') || '无'}`);
+  // d3 结构性：全仓所有 require('./X.js') 的 X 必须已在隔离随行清单（自动提取，防将来新增兄弟模块漏抄）
+  //   ⚠️ 必须先剥注释再扫：本守卫自己的注释里就要引用 `require('./X.js')` 这个形态，
+  //      不剥注释会把自己数进去（v3.49.0 实测踩到：d3 第一版报"缺失 X.js"正是命中文注释自身）。
+  const allReq59 = [];
+  for (const f of fs.readdirSync(SRC).filter((x) => /\.js$/.test(x))) {
+    try {
+      const s = stripComments(fs.readFileSync(path.join(SRC, f), 'utf-8'));
+      for (const m of s.matchAll(/require\('\.\/([A-Za-z0-9_.-]+\.js)'\)/g)) allReq59.push(m[1]);
+    } catch (e) { /* 单个文件读失败不影响其余 */ }
+  }
+  const missing59 = [...new Set(allReq59)].filter((f) => f !== 'token-tracker.js' && RUNTIME_COMPANIONS.indexOf(f) < 0);
+  ok('T59-d3 ★G10：全仓 require 的兄弟模块全部在隔离随行清单（新增模块漏抄 = 整段 selftest 崩）',
+    allReq59.length > 0 && missing59.length === 0,
+    `缺失：${missing59.join(',') || '无'}`);
+
+  // ── e 组：G11 文档与实测打架 ──
+  const ki59 = (() => { try { return fs.readFileSync(path.join(SRC, 'KNOWN-ISSUES.md'), 'utf-8'); } catch (e) { return ''; } })();
+  ok('T59-e1 ★G11：SKILL.md 不得保留被实测推翻的「代价：触发刷新那轮弹窗晚 ~12s」',
+    skillMd59.indexOf('代价：触发刷新那轮弹窗晚 ~12s') < 0,
+    'KI-14 真机实测（弹窗 04:23:45 → 刷新完成 04:23:54，全部弹窗在前）已证明刷新异步、弹窗零延迟；留着错说法会误导后人去"优化"一个不存在的问题');
+  ok('T59-e2 ★G11：SKILL.md 与 KNOWN-ISSUES 都必须写明「弹窗零延迟」（两处说法不得再打架）',
+    skillMd59.indexOf('弹窗零延迟') >= 0 && ki59.indexOf('弹窗零延迟') >= 0);
+
+  // ── f 组：G12 CI 覆盖 ──
+  const ci59 = (() => { try { return fs.readFileSync(path.join(SRC, '.github', 'workflows', 'selftest.yml'), 'utf-8'); } catch (e) { return ''; } })();
+  const py59 = ['fetch-cn-prices.py', 'parse_tokenhub.py', 'build_index.py'];
+  ok('T59-f1 ★G12：CI 必须对三个 Python 脚本跑 py_compile（此前 Python 侧零语法守卫）',
+    /py_compile/.test(ci59) && py59.every((f) => ci59.indexOf(f) >= 0),
+    `缺：${py59.filter((f) => ci59.indexOf(f) < 0).join(',') || '无'}（selftest 的 T0 只覆盖 JS 的 node --check）`);
+  ok('T59-f2 ★G12：CI 必须有 pull_request 触发（只有 push main = 分支回归要到合并后才暴露）',
+    /pull_request:/.test(ci59));
 }
 
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。

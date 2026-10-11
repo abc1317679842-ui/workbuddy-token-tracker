@@ -15,6 +15,10 @@ on:
     branches: [main]
     # 只挂 main（default_branch）：历史上每次推送 master+main 双镜像会让每个 commit 跑两遍 CI。
     # v3.23.4：master 镜像分支已删除（单分支），双跑问题从源头消失。
+  # v3.49.0（审计 G12）：补 PR 触发 —— 改前只有 push main 才跑，特性分支上的回归要到**合并后**才暴露，
+  #   门禁形同虚设。PR 与 push 跑同一套断言（无重复定义，仅触发面扩大）。
+  pull_request:
+    branches: [main]
 
 jobs:
   selftest:
@@ -26,6 +30,11 @@ jobs:
           node-version: 20
       - name: Verify runner can spawn node subprocesses (selftest 前提)
         run: node -e "const r=require('child_process').spawnSync(process.execPath,['-e','console.log(1)']); if(r.status!==0){console.error('spawn 探测失败：本 runner 上 selftest 的端到端用例会静默跳过');process.exit(1)} console.log('spawn OK')"
+      # v3.49.0（审计 G12）：Python 三脚本语法守卫 —— selftest 的 T0 只做 JS 的 `node --check`，
+      #   价格流水线三个 .py 此前**零 CI 覆盖**（语法回归无拦截；本地 py_compile 靠人记着）。
+      #   不设 continue-on-error：语法错误是确定性回归，该红就红。
+      - name: Syntax check Python price-pipeline scripts
+        run: python -m py_compile fetch-cn-prices.py parse_tokenhub.py build_index.py
       - name: Run selftest (offline, isolated)
         run: node selftest.js
         env:

@@ -513,3 +513,27 @@ G1–G14 / H 组未在本批处理——按"修必配守卫 + 反向验证 + 零
 - 2026-10-12 那轮"输入 159.1万 / hy3 子代理 371.1万"**全部属实**：transcript 独立复算（绕开 token-tracker 全部代码）、rounds 明细、`--report` 账本三方逐位一致；账本 167.5万 vs transcript 前 27 行精确和（04:25–04:29 的 99.9万尚未触发 Stop，属正常增量时延，下一轮自动补记）。
 - **积分谜题解开**：积分 ≈ step-5 token ÷ 2.94万，hy3 / hy4 在 WorkBuddy 内 0.00x 限免 → "积分才 57"与"token 100 多万"是口径差，不是数据差。
 - **本地落盘真实性**：usage 字段名与 StepFun 官方文档一致、58 次调用输入曲线自洽（round 边界 cached 精确重置）、子代理与账本逐位吻合 —— 未发现伪造/估算迹象。唯一无法本地闭合的缺口：失败重试与后台调用不计入 transcript（需去 StepFun 控制台核对）。
+
+## KI-16 全量审计响应批次 2（2026-10-12，v3.49.0）—— A3/B3/C6/G10/G11/G12
+
+### 修复清单（详见 CHANGELOG v3.49.0）
+
+| # | 项 | 一句话结论 |
+|---|---|---|
+| A3 | 水位线写后校验不覆盖 subs | 比对从 `main`/`lastTs` 扩展到 **`subs`/`subTs`**（逐文件键集合 + 数值）——改前子代理水位线丢失也判成功 → 下轮重读子代理行 = 重复计费 |
+| B3 | backfill 峰谷倍率内联手抄 | 改调 `tt.peakMultOf`（11 组矩阵验证语义等价；`m=null` 时原内联会抛而单点不会，生产不可达，单向增强） |
+| C6 | backfill 水位线键本地拼接 | 两处改调 `tt.ledgerKey` + 删 `crypto` import；根直放布局旧实现 `path-hash` vs 主链路 `sid` 的键分歧已消除 |
+| G10 | 部署清单漏三个必需文件 | manifest/SKILL.md 补全五个同目录文件 + 全仓 require 自动提取的结构守卫（T59-d3） |
+| G11 | SKILL.md 与被实测推翻的说法打架 | 「代价：触发刷新那轮弹窗晚 ~12s」改为「弹窗零延迟」（KI-14 真机实测：弹窗 04:23:45 → 刷新完成 04:23:54） |
+| G12 | CI 无 PR 触发 + Python 零语法守卫 | 补 `pull_request` 触发 + 三脚本 `py_compile` step |
+
+### 本批新增的两条方法论（写进记忆，防再犯）
+
+- **源码守卫别只查"字符串出现"**：T58-a2 已踩过一次（删定义行后宽松正则仍绿）。本批 T59-d3 又踩到变体——**守卫自己的注释里引用了要扫的形态**（`require('./X.js')`），不剥注释会把自己数进去（实测报"缺失 X.js"）。规矩：扫源码前先 `stripComments`，断言要能区分"真代码"与"注释里的示例"。
+- **端到端夹具的 stdio 必须重定向到文件**：用管道跑 `spawnSync(node backfill.js)` 会被抓价流水线派生的子进程持有管道 → 父进程干等到超时（本批实测 status=null）。改 `stdio: ['ignore', fd, fd]` 后稳定。另：`backfill.js` 被 require 时会跑 main 并 `process.exit`，**不能**在测试进程内 require 它，必须 spawn。
+
+### 仍未修（承接 KI-15，本批未触及）
+
+A5（缓存命中价缺失按 0 计，需重新定夺优先级）/ A22（hook-fallback 轮只写账本不写 rounds 明细）/
+A14 / B2 / B4 / B5 / D4 / C 类；`recalc-day` 的 `roundHoursOf()` 展示名匹配时段标签（KI-15 留档的残留小隐患）；
+`fetch-cn-prices.py` 的 `_fetch_summary` 死链。B3/C6 已于本批修掉，从待修清单移除。

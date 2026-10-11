@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.48.0 (2026-10-12)
+// token-usage-tracker v3.49.0 (2026-10-12)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -3802,16 +3802,31 @@ function saveLedgerWatermark(wm) {
     // 水位线没推进 → 下轮从旧偏移重读同一批行再累加一遍 = **重复计费**（不可恢复地多收钱）。
     return false;
   }
-  // v3.39.0（A2）：写后校验。磁盘满 / 权限 / 被别的进程覆盖都可能「没抛异常但内容不对」，
-  // 只靠 try/catch 抓不到。只校验本次涉及的键（别的会话键可能是别的进程写的，不算失败）。
+  // v3.49.0（审计 A3）：写后校验必须覆盖 subs / subTs，不能只比 main / lastTs。
+  //   病根：水位线 entry 结构是 { main, subs:{子代理文件:行数}, lastTs, subTs:{子代理文件:ts} }，
+  //   而原校验只比 main / lastTs —— subs 落盘丢失或被并发进程写旧（torn write / 磁盘满 / 被覆盖）时，
+  //   main / lastTs 仍对得上 → 校验放行 → 子代理水位线停旧偏移 → 下轮从旧偏移重读同一批子代理行
+  //   = **重复计费**（不可恢复）。这与 A2 修的是同一类洞，只是洞开在另一个字段上。
+  //   严格比对的代价仅是"误判 → 回滚账本 → 下轮重记"（少记可恢复），与项目哲学同向；
+  //   且主链路全程持 .ledger-watermark.lock、backfill 也持锁写，同键并发写实际不可发生 → 无误判成本。
   try {
     const back = JSON.parse(fs.readFileSync(LEDGER_WATERMARK_FILE, 'utf-8'));
+    // 子代理水位线逐文件比对（键集合与数值都要一致——少一个文件 = 该文件下轮从 0 重读 = 重复计费）
+    const sameSubMap = (x, y) => {
+      const a = x || {}, b = y || {};
+      const ka = Object.keys(a), kb = Object.keys(b);
+      if (ka.length !== kb.length) return false;
+      for (const f of ka) { if (Number(a[f]) !== Number(b[f] || 0)) return false; }
+      return true;
+    };
     for (const k of Object.keys(wm || {})) {
       const a = wm[k] || {};
       const b = (back && back[k]) || null;
       if (!b) return false;
       if ((a.main || 0) !== (b.main || 0)) return false;
       if ((a.lastTs || 0) !== (b.lastTs || 0)) return false;
+      if (!sameSubMap(a.subs, b.subs)) return false;
+      if (!sameSubMap(a.subTs, b.subTs)) return false;
     }
   } catch (e) {
     return false;
@@ -6002,7 +6017,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.48.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.49.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

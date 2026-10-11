@@ -23,13 +23,17 @@
 // 已知差异（如实标注）：
 // - 「被中断思考」估算已包含（v2.52 镜像），但归属日期 = reasoning 行自身时间戳（增量版归记账当天），
 //   且增量版的回溯基数可能与全量扫描略有差异 → 单日金额允许小幅出入。
-// - 水位线键假设 transcript 文件名 = session_id（WorkBuddy 实际落盘即如此）。
+// - 水位线键由 tt.ledgerKey(sid, path) 生成（v3.49.0 起改调用，原为本地内联 sha1 拼接）：
+//   项目目录布局取文件名去扩展名（WorkBuddy 实际落盘即 session_id）、根直放布局同理；
+//   文件名与 hook 的 session_id 不一致时（改版/外部改名）仍会各按各的键记账——该残差与主链路
+//   自身的 sid 来源相同，不是本脚本独有，故不再试图在扫描侧"猜" session_id。
 
 const fs = require('fs');
 const peakRules = require('./peak-rules.js'); // v3.19.0（P1）：峰谷判定单一实现（原先这里硬编码 PEAK_RANGES，与官方动态时段脱节）
 const path = require('path');
 const os = require('os');
-const crypto = require('crypto');
+// v3.49.0（审计 C6）：crypto 导入已删——水位线键的两处内联 sha1 拼接改为调用 tt.ledgerKey 后，
+//   本文件不再需要任何哈希。（保留无人使用的 import 会诱导下一个人继续在本地拼键。）
 const { detectWorkBuddyRoot } = require('./wb-root.js'); // v3.42.0（plan-B B1）：数据根探测单点实现，已抽到 wb-root.js
 
 const WB = process.env.WB_ROOT || detectWorkBuddyRoot();
@@ -116,11 +120,11 @@ function rowCost(pricing, modelName, u, tsMs) {
   if (!hit) return null;
   const m = hit.m;
   if (typeof m.input_price !== 'number') return null;
-  const isDeepSeek = /(^|[\/\-_])deepseek/i.test(String(modelName));
-  const peakMult = isDeepSeek
-    ? (typeof m.peak_multiplier === 'number' ? m.peak_multiplier : 2)
-    : (typeof m.peak_multiplier === 'number' ? m.peak_multiplier : 1);
-  const mult = isPeakBeijingTs(tsMs) ? peakMult : 1;
+  // v3.49.0（审计 B3）：峰谷倍率收敛到主脚本单点 tt.peakMultOf（calcCost / recalc-day 共用同一份）。
+  //   改前这里是内联手抄（DeepSeek 缺省 2、其余缺省 1）——语义虽与单点等价，但"等价"只靠注释维护，
+  //   peakMultOf 一侧改动（如新增厂商峰谷规则）不会传导到这里 → 回填与增量记账系统性分歧且零报错。
+  //   收敛后口径由**调用关系**保证，不再有"复制实现靠注释同步"这最后一处。
+  const mult = isPeakBeijingTs(tsMs) ? tt.peakMultOf(m, modelName) : 1;
   const inT = u.in || 0, cached = Math.min(u.cached || 0, inT), outT = u.out || 0;
   const uncached = Math.max(0, inT - cached);
   // v3.42.0（plan-B B1）：收敛到 token-tracker.js 单点实现 triPriceRounded（带 1e-6 四舍五入）
@@ -278,9 +282,14 @@ function main() {
     let st = null;
     try { st = fs.statSync(dp); } catch (e) { continue; }
     if (!st.isDirectory()) {
-      if (/\.jsonl?$/.test(d)) { // 根直放布局（罕见）
+      if (/\.jsonl?$/.test(d)) { // 根直放布局（罕见，projects/<sid>.jsonl）
         const rows = scanFile(dp, acc, modelNames);
-        newWm['path-' + crypto.createHash('sha1').update(path.resolve(dp)).digest('hex').slice(0, 16)] = { main: rows, subs: {} };
+        // v3.49.0（审计 C6）：水位线键改调主脚本单点 tt.ledgerKey（原为本地内联 sha1 拼接）。
+        //   根直放布局下主链路用 sid 作键（hook 的 session_id 恒有值），此处却用 path-hash →
+        //   backfill 推满的键主链路不认 → 主链路按自己的键从旧偏移重读 = 重复计费。
+        //   根直放布局的文件名即 sid（与项目目录布局同构），故取文件名去扩展名传入。
+        const sidRoot = d.replace(/\.jsonl?$/, '');
+        newWm[tt.ledgerKey(sidRoot, dp)] = { main: rows, subs: {} };
         filesMain++;
       }
       continue;
@@ -289,7 +298,9 @@ function main() {
       if (!/\.jsonl$/.test(f)) continue;
       const fp = path.join(dp, f);
       const sid = f.replace(/\.jsonl$/, '');
-      const key = String(sid).trim() || ('path-' + crypto.createHash('sha1').update(path.resolve(fp)).digest('hex').slice(0, 16));
+      // v3.49.0（审计 C6）：同上——本地内联 `sid || sha1(path)` 与主脚本 ledgerKey 契约仅靠注释同步，
+      //   一侧改键规则另一侧不传导 → 同一次回填写出两个键、各按各的重读。改为调用后由单点保证。
+      const key = tt.ledgerKey(sid, fp);
       const mainLines = scanFile(fp, acc, modelNames);
       filesMain++;
       const subs = {};
