@@ -1534,12 +1534,12 @@ else {
     const lLong19 = l2of(long19, pMine19);
     ok('T19-b1 ★长行时「缓存百分比」不被「⚠价核验」顶掉（v3.27.0 用户定版优先级）',
       lLong19.indexOf('缓存95.57%') >= 0 && lLong19.indexOf('价核验') < 0, lLong19);
-    ok('T19-b2 ★长行结果宽度 ≤ 上限', mod19.dispWidth(lLong19) <= 51, 'w=' + mod19.dispWidth(lLong19));
+    ok('T19-b2 ★长行结果宽度 ≤ 上限', mod19.dispWidth(lLong19) <= 44, 'w=' + mod19.dispWidth(lLong19));
     const huge19 = { model: M19, in: 199800000, out: 11100000, cached: 190000000 };
     const lHuge19 = l2of(huge19, P19());
     ok('T19-b3 ★超长行不留孤悬「｜」结尾 / 不出现「｜｜」',
       !/｜$/.test(lHuge19) && lHuge19.indexOf('｜｜') < 0, lHuge19);
-    ok('T19-b4 ★超长行宽度仍 ≤ 上限', mod19.dispWidth(lHuge19) <= 51, 'w=' + mod19.dispWidth(lHuge19));
+    ok('T19-b4 ★超长行宽度仍 ≤ 上限', mod19.dispWidth(lHuge19) <= 44, 'w=' + mod19.dispWidth(lHuge19));
 
     // ── c. 显示宽度模型（用户疑问③：⚠ 按 emoji 呈现，实际 ≈ 2 个汉字）──
     ok('T19-c1 ★dispWidth(⚠) === 4（emoji 呈现宽；旧模型按 2 计 → 每个 ⚠ 低估 2u）',
@@ -4948,6 +4948,84 @@ else {
     `缺：${py59.filter((f) => ci59.indexOf(f) < 0).join(',') || '无'}（selftest 的 T0 只覆盖 JS 的 node --check）`);
   ok('T59-f2 ★G12：CI 必须有 pull_request 触发（只有 push main = 分支回归要到合并后才暴露）',
     /pull_request:/.test(ci59));
+}
+
+// ===== T60：v3.50.0 行2 自适应宽度守卫（用户弹窗截图复盘）=====
+// 起因：2026-10-12 用户发通知中心截图 —— 5:37 那条 step-5-preview 弹窗行2 末尾「｜¥11.47」消失，
+//   问"是长度受限被吞了吗"。定位结论（toast log 原文完整、calcCost 复算 11.4718 逐分一致）：
+//   **不是代码吞的，是 Windows 通知卡片把超宽行整行砍掉行尾**——而金额恰好在行尾。
+//   宽度实测：被砍行 46u；同批保住行 44u（hy3）/44u（4:59）→ 通知卡片正文小字真实极限在 44~46u 之间；
+//   旧代码阈值 TOAST_LINE_MAX_W=51 **高于 UI 极限** → 守卫永不触发 → 代码不抢在 Windows 前舍。
+// 修法（用户定调"上限改小 + 自适应：超限先把输入小数点压缩掉，那个应该就够了"，主代理补充落地）：
+//   阈值 51→44（46 被砍/44 保住的实证间取保守值，45 无样本不冒险）；
+//   宽度守卫改三级：① 输入数字去小数（2558.2万→2558万）② 仍超→输出数字去小数 ③ 仍超→丢缓存段（旧行为兜底）。
+//   缓存% 与金额两个信息在前两级全程保留；⚠未计价/⚠账缺 三级都不丢。
+{
+  const mod60 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  if (!mod60) ok('T60 行2 自适应宽度守卫（主模块加载失败）', false, 'token-tracker.js require 失败 —— CI 正常环境下这必是代码回归，不允许静默跳过');
+  else {
+    const main60 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+    const tl2Start = main60.indexOf('function toastLine2');
+    const tl2End = main60.indexOf('\nfunction ', tl2Start + 10);
+    const tl2Body = tl2End > tl2Start ? stripComments(main60.slice(tl2Start, tl2End)) : '';
+    // 隔离 ⚠账缺 旗标（同 T19 理由）：它优先级最高、三级都不丢，会稳定吃掉行2 约 12u 预算，
+    // 把本组要验的"瘦身保金额/缓存"行为全部掩盖（首轮 T60 的红就是这么来的——日志里那几条
+    // 失败输出全带「⚠账缺」）。断言期间临时移走、结束后原样恢复。
+    const tfPath60 = mod60.TRANSC_TRUNCATED_FILE;
+    let tfSaved60 = null;
+    try { tfSaved60 = fs.readFileSync(tfPath60, 'utf-8'); fs.unlinkSync(tfPath60); } catch (e) { tfSaved60 = null; }
+    try {
+
+    // ── a. 源码守卫：阈值与三级结构 ──
+    ok('T60-a1 ★TOAST_LINE_MAX_W 必须为 44（51 高于通知卡片真实极限 ~46u → 守卫永不触发 → Windows 直接砍行尾金额）',
+      /const TOAST_LINE_MAX_W = 44;/.test(main60), '红 = 有人把阈值改回 51/45 等无实证值');
+    // 注意 c4 必须匹配「replace(ratioTxt」这次**使用**（第三级）而非定义处——
+    // ratioTxt 的定义在守卫之前很远，用 indexOf('ratioTxt') 会恒假（首轮就这么红过）。
+    ok('T60-a2 ★三级宽度守卫：输入瘦身 → 输出瘦身 → 丢缓存段（顺序即优先级）',
+      /输入 \(\\d\+\)\\\.\\d\+\(\?=\[万亿\]\)/.test(tl2Body)
+      && /输出 \(\\d\+\)\\\.\\d\+\(\?=\[万亿\]\)/.test(tl2Body)
+      && tl2Body.indexOf('输入 (') < tl2Body.indexOf('输出 (')
+      && tl2Body.indexOf('replace(ratioTxt') > tl2Body.indexOf('输出 ('),
+      '红 = 前两级被删/顺序被调/缓存兜底被提前');
+    ok('T60-a3 ★瘦身正则带 [万亿] 前瞻（不得碰缓存百分比与金额）',
+      /\(\?=\[万亿\]\)/.test(tl2Body) && !/\\\.\\d\+\(\?=%\)/.test(tl2Body),
+      '红 = 前瞻被去掉或误扩展到 % / ¥ 段');
+
+    // ── b. 行为守卫：5:37 现场复现（合成价 = 官方真实价 ¥7/¥0.35/¥20，与 loadPricing 一致）──
+    //   刻意不依赖 loadPricing()：隔离环境（WB_NO_NET / CI）下真实价库可能不含 step-5 条目，
+    //   会退化成「未收录｜⚠未计价」把本组要验的宽度行为全部掩盖（首轮 T60 就这样红过）。
+    const p60 = { models: {
+      'step-5-preview': { input_price: 7, cached_price: 0.35, output_price: 20, region: 'CN' },
+      'deepseek-v4.1-flash': { input_price: 1, cached_price: 0.02, output_price: 4, region: 'CN' },
+    } };
+    const ts60 = Date.parse('2026-10-11T21:37:35.937Z'); // UTC = 北京 05:37（toast log 原事件时刻）
+    const s537 = { model: 'step-5-preview', in: 25582000, out: 88000, cached: 25468000, total: 34382000, count: 1, lastTs: ts60 };
+    const l537 = mod60.toastLine2(s537, p60);
+    ok('T60-b1 ★5:37 复现：金额 ¥11.47 必须保住（UI 被砍的那段正是它）',
+      l537.indexOf('¥11.47') >= 0, l537);
+    ok('T60-b2 ★5:37 复现：缓存百分比必须保住（用户定版"行2 留给缓存%"）',
+      /缓存\d\d\.\d\d%/.test(l537), l537);
+    ok('T60-b3 ★5:37 复现：输入数字被瘦身（2558.2万→2558万，去小数即降 2u）',
+      l537.indexOf('输入 2558万') >= 0 && l537.indexOf('2558.2万') < 0, l537);
+    ok('T60-b4 ★5:37 复现：成品宽度 ≤ 44u（通知卡片实测极限内，不会再被 Windows 砍）',
+      mod60.dispWidth(l537) <= 44, 'w=' + mod60.dispWidth(l537) + ' ' + l537);
+
+    // ── c. 不误伤：短行带小数不得被瘦身（瘦身只在超限时发生）──
+    const sShort = { model: 'step-5-preview', in: 123400, out: 5678, cached: 0, total: 129078, count: 1, lastTs: ts60 };
+    const lShort = mod60.toastLine2(sShort, p60);
+    ok('T60-c1 ★短行带小数原样保留（12.3万 不被瘦；阈值内零行为变化）',
+      lShort.indexOf('输入 12.3万') >= 0 && mod60.dispWidth(lShort) <= 44, lShort);
+
+    // ── d. 兜底：极端长行仍 ≤ 上限且金额在（前两级救不回时第三级丢缓存段）──
+    const sHuge = { model: 'deepseek-v4.1-flash', in: 199800000, out: 11100000, cached: 190000000, total: 210900000, count: 1, lastTs: ts60 };
+    const lHuge = mod60.toastLine2(sHuge, p60);
+    ok('T60-d1 ★极端行宽度仍 ≤ 44u（三级守卫总收口）', mod60.dispWidth(lHuge) <= 44, 'w=' + mod60.dispWidth(lHuge) + ' ' + lHuge);
+    ok('T60-d2 ★极端行金额仍在（任何一级都不得把金额段弄丢）', /¥[\d.]+/.test(lHuge), lHuge);
+    } finally {
+      // 原样恢复被临时移走的 ⚠账缺 旗标
+      if (tfSaved60 !== null) { try { fs.writeFileSync(tfPath60, tfSaved60); } catch (e) { /* 恢复失败不影响被测逻辑 */ } }
+    }
+  }
 }
 
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。
