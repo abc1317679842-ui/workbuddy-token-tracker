@@ -8,6 +8,14 @@ TLS 证书一律严格校验，不再全局关闭（价格影响计费）。
   - 模型名 / 归一化 api 名 / 品牌 / 是否原厂直供(自营 or 转售)
   - 分档 tiers：type=peak(峰谷:空闲/高峰) 或 length(输入长度分档) 或 base
   - 每档 输入/输出/缓存命中 单价（元/百万 tokens）
+
+v3.51.0（2026-10-12，审计批1·A）：地域与币种改为**显式解析**，废止一切猜测。
+  旧实现用「三特征匹配 + \\d+\\.\\d{3,} 小数位数排除新加坡块 + cands[0] fallback」挑目标表，
+  输出 region='广州'/currency='CNY' 却是 L260-261 硬编码 —— 2026-10-12 实测该猜测链**已触发
+  fallback**：广州表里 MiMo 缓存命中价 0.025 是合法 3 位小数，被排除规则误杀 → 三候选全灭 →
+  靠 cands[0] 蒙对。一旦腾讯调整 tab 顺序（新加坡面板在前），USD/新加坡价就会盖上「广州/CNY」戳
+  静默入账。现改为解析页面 tse-tabs 组件的「地域标签 → 面板」结构（见 find_region_panels），
+  单位/币种从价表表头声明读取（见 parse_unit_currency），任何一环不符即 exit(2) 保留旧文件。
 """
 import os, re, json, ssl, gzip, zlib, urllib.request, sys
 try:
@@ -213,32 +221,111 @@ def parse_peak_rule(html):
     return rules
 
 
+# v3.51.0（审计批1·A）：本库只收「广州」地域人民币价。地域不再靠猜（小数位数/数量级/
+# 区域名推断一律禁用），改为解析页面 tse-tabs 组件的「地域标签 → 面板」显式结构。
+TARGET_REGION = '广州'
+
+
+def find_region_panels(html):
+    """解析 tse-tabs 组件的「地域标签 → 面板内容」显式映射。
+
+    页面结构（2026-10-12 实测 cloud.tencent.com/document/product/1823/130055）：
+      <div class="tse-tabs">
+        <div class="tse-tabs__bar">…<div class="tse-tabs__list">
+          <div class="tse-tabs__item is-active">…<div class="tse-tabs__item-label">广州</div>…
+          <div class="tse-tabs__item">…<div class="tse-tabs__item-label">新加坡</div>…
+        </div></div>
+        <div class="tse-tabs__cont is-active">…广州面板（语言模型价表）…</div>
+        <div class="tse-tabs__cont">…新加坡面板（语言模型价表）…</div>
+      </div>
+    标签与面板按同序一一对应；is-active 在两个维度必须指向同一下标（错位即结构异常）。
+    返回 [(label, panel_html), ...]；任何组件结构不符即跳过该组件（宁缺勿错）。
+    """
+    panels = []
+    comps = [m.start() for m in re.finditer(r'class="tse-tabs"', html)]
+    conts = [m.start() for m in re.finditer(r'class="tse-tabs__cont', html)]
+    if not comps or not conts:
+        return panels
+    for ci, cs in enumerate(comps):
+        ce = comps[ci + 1] if ci + 1 < len(comps) else len(html)
+        my = [c for c in conts if cs <= c < ce]
+        if not my:
+            continue
+        # 标签只出现在第一个面板之前（tse-tabs__list 位于 bar 内）
+        labels = [s.strip() for s in re.findall(r'tse-tabs__item-label">([^<]*)<', html[cs:my[0]])]
+        if len(labels) != len(my):
+            continue  # 标签与面板数量不符 → 该组件不可信
+        # is-active 错位检查：激活项与激活面板必须同下标（防标签/面板相对顺序被改）
+        act_items = [i for i, _ in enumerate(re.finditer(r'tse-tabs__item is-active"', html[cs:my[0]]))]
+        act_conts = [i for i, c in enumerate(my) if 'is-active' in html[c:c + 64]]
+        if len(act_items) == 1 and len(act_conts) == 1 and act_items[0] != act_conts[0]:
+            continue
+        for i, c in enumerate(my):
+            end = my[i + 1] if i + 1 < len(my) else ce
+            panels.append((labels[i], html[c:end]))
+    return panels
+
+
+def parse_unit_currency(tbl):
+    """从价表表头显式解析计价单位与币种（如「（元/百万 tokens）」→ ('元/百万 tokens', 'CNY')）。
+    禁止按小数位数/数量级猜测币种；解析不出返回 (None, None)（调用方按契约不全处理）。"""
+    hdr = ''
+    for seg in re.split(r'<tr', tbl)[:40]:
+        if '模型名称' in seg:
+            hdr = seg
+            break
+    if not hdr:
+        return None, None
+    for um in re.finditer(r'[（(]([^（()）]*)[）)]', hdr):
+        u = um.group(1).strip()
+        if not u:
+            continue
+        if '美元' in u or 'USD' in u.upper() or '$' in u:
+            return u, 'USD'
+        if '元' in u:
+            return u, 'CNY'
+    return None, None
+
+
 def main():
     html = fetch()
-    blocks = re.split(r'<table', html)[1:]
-    # 候选块：含 Hy4 preview + 峰谷计费 + 推理输入
-    cands = [b for b in blocks if 'Hy4 preview' in b and '峰谷计费' in b and '推理输入' in b]
-    target = None
-    for b in cands:
-        # 排除新加坡区域（价格多位小数，如 10.07524）；广州价为整数/一位小数
-        if re.search(r'\d+\.\d{3,}', b):
-            continue
-        target = b
-        break
-    if target is None and cands:
-        # v3.48.0（审计 F8）：原 fallback `target = cands[0]` 会把"只命中部分特征"的块当目标——
-        #   新加坡区域块正是这样混进来的（靠 `\d+\.\d{3,}` 随机侥幸排除）。保留 fallback（页面真
-        #   改版时还能捞回一部分），但必须**明确告知**，不能再静默。
-        sys.stderr.write('[parse_tokenhub][WARN] 未找到同时满足三特征的表格块，退回第一个候选块（可能是区域块/页面改版）\n')
-        target = cands[0]
-    if target is None:
-        # v3.48.0（审计 F8）：一个候选块都没有 → **不写文件 + 非零退出**。
-        #   原实现把 target=None 传进 parse_lang_table → `if not block: return []` → 0 模型 → 照写
-        #   tokenhub_lang.json → **用好数据覆盖坏数据**，且 print 正常、退出码 0（假成功，最坏的一类）。
-        sys.stderr.write('[parse_tokenhub][ERROR] 页面未含目标表格（可能改版/被拦/结构变化），不写入；保留上一版本\n')
-        print('解析到模型数: 0 | 页面未含目标表格，已保留上一版 tokenhub_lang.json')
+    # v3.51.0（审计批1·A）：显式区域绑定 —— 按页面 tse-tabs 结构找「广州」面板，再取面板内
+    # 的语言模型价表。废止：三特征猜块 + 小数位数排除 + cands[0] fallback（会把新加坡块当
+    # 广州块：实测新加坡块 GLM-5.3 为 10.07524 而广州为 8，错价 26% 且无任何告警）。
+    panels = find_region_panels(html)
+    if not panels:
+        sys.stderr.write('[parse_tokenhub][ERROR] 页面未找到 tse-tabs 地域选项卡结构（可能改版/被拦/结构变化），不写入；保留上一版本\n')
+        print('解析到模型数: 0 | 页面无地域选项卡结构，已保留上一版 tokenhub_lang.json')
         sys.exit(2)
-    models = parse_lang_table(target)
+    hits = [(lb, p) for lb, p in panels if TARGET_REGION in lb]
+    if len(hits) != 1:
+        sys.stderr.write('[parse_tokenhub][ERROR] 地域面板匹配异常：期望恰好 1 个含「%s」的面板，实际 %d 个（全部标签: %s）；不写入；保留上一版本\n'
+                         % (TARGET_REGION, len(hits), [lb for lb, _ in panels]))
+        print('解析到模型数: 0 | 地域面板匹配异常，已保留上一版 tokenhub_lang.json')
+        sys.exit(2)
+    region_label, panel = hits[0]
+    # 面板内取语言模型价表（表头含 模型名称 + 推理输入 + 峰谷计费）
+    tbl = None
+    for t in re.split(r'<table', panel)[1:]:
+        if '模型名称' in t and '推理输入' in t and '峰谷计费' in t:
+            tbl = t
+            break
+    if tbl is None:
+        sys.stderr.write('[parse_tokenhub][ERROR] 「%s」面板内未找到语言模型价表（页面可能改版），不写入；保留上一版本\n' % region_label)
+        print('解析到模型数: 0 | 面板内无语言模型价表，已保留上一版 tokenhub_lang.json')
+        sys.exit(2)
+    unit, currency = parse_unit_currency(tbl)
+    if not unit or not currency:
+        sys.stderr.write('[parse_tokenhub][ERROR] 价表表头未声明计价单位/币种（契约不全，禁止猜测），不写入；保留上一版本\n')
+        print('解析到模型数: 0 | 表头无单位/币种声明，已保留上一版 tokenhub_lang.json')
+        sys.exit(2)
+    if currency != 'CNY':
+        # 区域与币种矛盾（CN 区出现 $）→ 拒收。本库只收人民币价，非 CNY 一律不写。
+        sys.stderr.write('[parse_tokenhub][ERROR] 「%s」面板表头声明币种 %s（%s）——本库只收人民币价，区域与币种矛盾，不写入；保留上一版本\n'
+                         % (region_label, currency, unit))
+        print('解析到模型数: 0 | 区域币种矛盾（%s/%s），已保留上一版 tokenhub_lang.json' % (region_label, currency))
+        sys.exit(2)
+    models = parse_lang_table(tbl)
     # 只保留腾讯自家(混元)模型；页面里其余是腾讯转售的第三方(智谱/Kimi/DeepSeek/MiniMax)，一律不要
     models = [m for m in models if m.get('brand') == 'hunyuan']
     if not models:
@@ -253,22 +340,37 @@ def main():
         # 峰谷规则缺失只告警、仍写模型价：模型价是主数据，峰谷规则缺失时 build_index 会沿用上一版
         #   （:217-273 的逐模型沿用逻辑）。若为此整份不写，反而会让 Hunyuan 整条源消失（F5 的过度保守）。
         sys.stderr.write('[parse_tokenhub][WARN] 未提取到峰谷时段规则（页面文案可能变化）；仍写入模型价，峰谷规则由 build_index 沿用上一版\n')
+    fetched_at = __import__('datetime').datetime.now().isoformat(timespec='seconds')
+    # v3.51.0（审计批1·A/B）：region/currency/unit 全部来自页面显式解析（标签 + 表头声明），
+    # 不再硬编码；每条模型记录携带完整契约字段，供 build_index 契约海关校验。
+    for m in models:
+        m['unit'] = unit
+        m['currency'] = currency
+        m['region'] = region_label
+        m['source_url'] = URL
+        m['fetched_at'] = fetched_at
     out = {
         'source': '腾讯云大模型服务平台 TokenHub 模型价格文档',
         'url': URL,
-        'fetched_at': __import__('datetime').datetime.now().isoformat(timespec='seconds'),
-        'region': '广州',
-        'currency': 'CNY',
+        'fetched_at': fetched_at,
+        'region': region_label,
+        'currency': currency,
+        'unit': unit,
         'peak_rule': peak_rule,
         'models': models,
     }
     import os
-    os.makedirs('prices', exist_ok=True)
+    # v3.51.0（审计批1·C）：输出目录改为 HERE 锚定。原实现 `os.makedirs('prices')` 是
+    #   **cwd 相对路径**——换个工作目录跑就写到别处，而 build_index.py 只读
+    #   HERE/prices/tokenhub_lang.json → 混元价从索引静默消失（靠 ≤7 天逐模型沿用兜底，
+    #   无人察觉）。与 fetch-cn-prices.py 的 HERE/OUT_DIR 模式对齐。
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prices')
+    os.makedirs(out_dir, exist_ok=True)
     # v2.82：原子写（唯一 tmp + os.replace），防多会话并发时读方拿到半截 JSON
-    tmp = os.path.join('prices', 'tokenhub_lang.json.tmp-%d' % os.getpid())
+    tmp = os.path.join(out_dir, 'tokenhub_lang.json.tmp-%d' % os.getpid())
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(out, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, os.path.join('prices', 'tokenhub_lang.json'))
+    os.replace(tmp, os.path.join(out_dir, 'tokenhub_lang.json'))
     print('解析到模型数:', len(models), '| 峰谷规则:', len(peak_rule))
     print('已写入 prices/tokenhub_lang.json')
     return models

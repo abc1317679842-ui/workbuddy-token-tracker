@@ -19,6 +19,7 @@ import datetime
 import json
 import os
 import re
+import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LATEST = os.path.join(HERE, 'prices', 'latest.json')
@@ -106,16 +107,35 @@ def src_type(vk, m):
 
 
 def main():
-    d = json.load(open(LATEST, encoding='utf-8'))
+    # v3.51.0（审计批1·C）：latest.json 缺失/损坏不再裸崩。原实现 json.load 直接抛异常 →
+    #   build_index 非零退出、index.json 停留在上一版（表面无事，实则今日抓取数据全丢且无告警）。
+    #   改为 WARN + 按「今日无抓取数据」处理：下方逐模型沿用逻辑整体继承上一版索引
+    #   （missing_since 计时，连续 >CARRY_MAX_DAYS 天才淘汰），与「厂商抓取失败」同路径。
+    try:
+        d = json.load(open(LATEST, encoding='utf-8'))
+    except Exception as e:
+        sys.stderr.write('[build_index][WARN] latest.json 缺失或损坏（%r）；本次无抓取数据，全部模型沿用上一版索引\n' % (e,))
+        d = {'vendors': {}}
     groups = {}
+    # v3.51.0（审计批1·B/C）：被跳过的条目不再静默 continue —— 统一收集，结尾 WARN 列出。
+    #   静默跳过的后果：官网改版/契约缺失时模型从索引悄悄消失，用户按未收录计费而无任何提示。
+    skipped = []
     for vk, v in d['vendors'].items():
         for m in v.get('models', []):
             key = norm(m.get('api_name') or m.get('name'))
             if not key:
+                skipped.append(('%s/?' % vk, '无模型名'))
                 continue
             inp, outp, cache = in_out_cache(m)
             if inp is None and outp is None and cache is None:
-                continue  # 无价格，跳过
+                skipped.append(('%s/%s' % (vk, key), '无价格'))
+                continue
+            # v3.51.0（审计批1·B）：契约海关 —— 缺 currency/unit 的条目拒收。
+            #   理由：不可验证币种/单位的价格不许入账（猜错币种 = 金额差一个数量级）。
+            miss = [f for f in ('currency', 'unit') if not m.get(f)]
+            if miss:
+                skipped.append(('%s/%s' % (vk, key), '契约字段缺失: %s' % ','.join(miss)))
+                continue
             st = src_type(vk, m)
             groups.setdefault(key, []).append({
                 'vendor': vk,
@@ -125,6 +145,11 @@ def main():
                 'in': inp, 'out': outp, 'cache': cache,
                 'tier_note': m.get('tier_note', ''),
                 'source': m.get('source', vk),
+                'currency': m.get('currency'),
+                'unit': m.get('unit'),
+                'region': m.get('region'),
+                'source_url': m.get('source_url'),
+                'fetched_at': m.get('fetched_at'),
             })
 
     # 摄入腾讯云 TokenHub 文档（含峰谷分档 / 原厂直供 / 输入长度分档）
@@ -134,9 +159,13 @@ def main():
     #   "看起来支持各厂商峰谷" 的空字段误导后人。
     if os.path.exists(TOKENHUB):
         th = json.load(open(TOKENHUB, encoding='utf-8'))
+        # v3.51.0（审计批1·A）：地域从 tokenhub_lang.json 的解析结果读，不再硬编码「广州」——
+        #   硬编码会让「解析器选错面板」与「正确数据」在索引里长得一模一样，无从审计。
+        th_region = th.get('region') or '未知地域'
         for m in th.get('models', []):
             key = norm(m.get('api_name') or m.get('name'))
             if not key:
+                skipped.append(('tokenhub/?', '无模型名'))
                 continue
             # 基线价：优先“空闲时段”峰谷档；否则 base / 首个长度分档
             idle = peak = None
@@ -148,11 +177,18 @@ def main():
             base_t = idle or next((t for t in m['tiers'] if t['type'] == 'base'), None) \
                     or (m['tiers'][0] if m['tiers'] else None)
             if base_t is None:
+                skipped.append(('tokenhub/%s' % key, '无价格档位'))
                 continue
             inp = base_t['in']
             outp = base_t['out']
             cache = base_t['cache']
             if inp is None and outp is None and cache is None:
+                skipped.append(('tokenhub/%s' % key, '无价格'))
+                continue
+            # v3.51.0（审计批1·B）：契约海关（同 latest.json 路径）
+            miss = [f for f in ('currency', 'unit') if not m.get(f)]
+            if miss:
+                skipped.append(('tokenhub/%s' % key, '契约字段缺失: %s' % ','.join(miss)))
                 continue
             st = 'first_party' if m.get('first_party') else 'channel'
             cand = {
@@ -163,7 +199,12 @@ def main():
                 'in': inp, 'out': outp, 'cache': cache,
                 'tier_note': ('峰谷计费' if (idle or peak) else '') +
                              ('；输入长度分档' if any(t['type'] == 'length' for t in m['tiers']) else ''),
-                'source': '腾讯云TokenHub文档(广州,' + (m.get('sku') or '') + ')',
+                'source': '腾讯云TokenHub文档(' + th_region + ',' + (m.get('sku') or '') + ')',
+                'currency': m.get('currency'),
+                'unit': m.get('unit'),
+                'region': m.get('region'),
+                'source_url': m.get('source_url'),
+                'fetched_at': m.get('fetched_at'),
                 'sku': m.get('sku'),
             }
             if idle or peak:
@@ -196,6 +237,12 @@ def main():
             'tier_note': primary['tier_note'],
             'all_sources': cands,
         }
+        # v3.51.0（审计批1·B）：契约字段随主候选落进索引。下游 mergeLocalPriceDb
+        #   （token-tracker.js:2544-2571）按固定字段白名单读取，未知字段直接忽略 →
+        #   对计费侧零影响；这些字段供契约海关校验与人工审计消费。
+        for f in ('currency', 'unit', 'region', 'source_url', 'fetched_at'):
+            if primary.get(f):
+                entry[f] = primary[f]
         # 携带峰谷价格：优先主候选；主候选无 peak 时从同组 first_party 候选里补
         peak_src = primary
         if not primary.get('peak'):
@@ -216,6 +263,10 @@ def main():
     injected = 0
     if os.path.exists(PRICING):
         p = json.load(open(PRICING, encoding='utf-8'))
+        # v3.51.0（审计批1·B）：pricing.json 文件级 currency/unit 传播到 lock 覆盖/注入条目
+        #   （lock 条目是用户已校对官方价，同样必须带契约字段，否则索引里两类条目口径不一）
+        p_currency = p.get('currency') or 'CNY'
+        p_unit = p.get('unit') or '元/百万 tokens'
         # v3.19.2（B4）：原先此处把 DeepSeek 峰谷规则串并入顶层 peak_rules，已随该字段一并删除
         for key, v in p.get('models', {}).items():
             if not v.get('lock'):
@@ -232,6 +283,7 @@ def main():
                              'out': v.get('output_price') * mult,
                              'cache': v.get('cached_price', 0) * mult},
                 }
+            contract = {'currency': p_currency, 'unit': p_unit, 'region': v.get('region') or 'CN'}
             if k in merged:
                 upd = {
                     'in_price': v.get('input_price'),
@@ -242,6 +294,7 @@ def main():
                     'tier_note': v.get('tier_note', merged[k].get('tier_note', '')),
                     'authoritative': True,
                 }
+                upd.update(contract)
                 if peak:
                     upd['peak'] = peak
                 merged[k].update(upd)
@@ -267,6 +320,7 @@ def main():
                         'source_type': 'first_party',
                     }],
                 }
+                rec.update(contract)
                 if peak:
                     rec['peak'] = peak
                 merged[k] = rec
@@ -322,10 +376,20 @@ def main():
                 by.setdefault(t, []).append(k)
             print('沿用前一天（厂商今日抓取失败）: ' + '; '.join('%s %d个(%s)' % (t, len(ks), ','.join(ks)) for t, ks in sorted(by.items())))
 
+    # v3.51.0（审计批1·B/C）：被跳过条目统一 WARN 列出（此前全部静默 continue，
+    #   官网改版/契约缺失时模型从索引悄悄消失、用户按未收录计费而无任何提示）。
+    if skipped:
+        sys.stderr.write('[build_index][WARN] %d 个条目未进索引（无价/契约不全/无名，已跳过）：\n' % len(skipped))
+        for src, why in skipped[:20]:
+            sys.stderr.write('  - %s: %s\n' % (src, why))
+        if len(skipped) > 20:
+            sys.stderr.write('  …另 %d 条\n' % (len(skipped) - 20))
+
     result = {
         'built_at': datetime.date.today().isoformat(),  # 每日刷新闸门：skill 读此字段判断是否需要重抓
         'merged_at': d.get('fetched_at'),
         'currency': 'CNY',
+        'unit': '元/百万 tokens',
         'conflict_resolved': conflicts,
         'authoritative_overrides': overlay,
         'models': merged,
@@ -336,8 +400,8 @@ def main():
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     os.replace(tmp, OUT)
-    print('合并完成：%d 个归一化模型，解决 %d 处来源冲突，%d 个被 pricing.json(lock) 权威覆盖（其中 %d 个为新注入的官方项）'
-          % (len(merged), conflicts, overlay, injected))
+    print('合并完成：%d 个归一化模型，解决 %d 处来源冲突，%d 个被 pricing.json(lock) 权威覆盖（其中 %d 个为新注入的官方项）；跳过 %d 条契约不全/无价条目（详见 stderr）'
+          % (len(merged), conflicts, overlay, injected, len(skipped)))
     print('已写入 %s' % OUT)
     # 打印关键冲突 / 覆盖样例
     print('\n--- 官方 vs 转售 冲突（已采用官方 first_party）---')

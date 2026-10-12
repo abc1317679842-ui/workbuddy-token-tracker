@@ -196,6 +196,26 @@ function parseOfficial(html) {
     throw new Error(`官方页价格解析不完整: ${JSON.stringify(prices)}${grabMismatch.length ? `；列错位嫌疑（已按 P0-4 拒绝采信）: ${grabMismatch.join('；')}` : ''}`);
   }
   out.prices = prices;
+  // v3.51.0（审计批1·D）：解析「旧模型名」正文段 —— 厂商显式声明的改名/转服映射。
+  // 页面原文（2026-10-12 实测）：「旧模型名 deepseek-v4-flash 、 deepseek-v4-flash-vision-exp
+  //   仍可调用，但对应模型已下线，请求将由 DeepSeek-V4.1-Flash 模型提供服务，并按 Flash 价格计费。」
+  // 这是厂商自己写在页面上的权威依据（无需按名字猜身份），供 main() 把旧名条目绑定到现行价。
+  // 匹配不到（官方撤下该段/改句式）→ old_names 为空 → 旧名条目维持原状（fail-safe，不猜）。
+  {
+    const plain = html.replace(/<script[\s\S]*?<\/script>/gi, ' ')
+                      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+                      .replace(/<[^>]+>/g, ' ');
+    const OLD_RE = /旧模型名\s*([^。]*?)\s*仍可调用[^。]*?请求将由\s*([A-Za-z0-9.\-]+)\s*模型提供服务/g;
+    const oldNames = [];
+    let om;
+    while ((om = OLD_RE.exec(plain)) !== null) {
+      for (const nm of om[1].split(/[、，,\s]+/)) {
+        const t = nm.trim();
+        if (t) oldNames.push({ old: t, serving_version: om[2] });
+      }
+    }
+    out.old_names = oldNames;
+  }
   return out;
 }
 
@@ -538,6 +558,73 @@ async function main() {
             );
           }
         });
+        // 1.6) v3.51.0（审计批1·D）：旧模型名自动绑定。
+        // 官方页「旧模型名」正文显式声明（2026-10-12 实测）：「旧模型名 deepseek-v4-flash 、
+        //   deepseek-v4-flash-vision-exp 仍可调用，但对应模型已下线，请求将由 DeepSeek-V4.1-Flash
+        //   模型提供服务，并按 Flash 价格计费。」——厂商自己给出的映射，无需猜身份。
+        // 旧实现不接这段 → 旧名条目带 lock+retired 双标记**永久冻结在过期价**
+        // （deepseek-v4-flash 冻结 1.5/4.5/0.05，而官方现行 Flash 价为 1/0.02/4）→
+        // 运行时一上报旧名就按过期价入账，且无任何告警。现按页面声明绑定到转服模型现行价。
+        // 只绑定「本地 key/name 与旧模型名同源」的条目；已绑定同一官方 ID 的跳过（幂等）。
+        {
+          const verList = Array.isArray(parsed.versions) ? parsed.versions : [];
+          const oldNames = Array.isArray(parsed.old_names) ? parsed.old_names : [];
+          let oldAdopted = 0;
+          for (const { old, serving_version } of oldNames) {
+            const svkey = alnumOf(serving_version);
+            if (!svkey) continue;
+            // 转服目标 = 官方清单中「模型版本」与 serving_version 去标点相等的条目
+            const servingIdx = parsed.models.findIndex((mk, i) => alnumOf(verList[i]) === svkey);
+            if (servingIdx < 0) continue;  // 官方清单找不到转服目标 → 不动（fail-closed）
+            const servingId = parsed.models[servingIdx];
+            const sblk = toModelBlock(parsed.prices, parsed.models, servingIdx);
+            const okey = alnumOf(old);
+            if (!okey) continue;
+            for (const key of Object.keys(pricing.models)) {
+              if (key === servingId) continue;
+              const m = pricing.models[key];
+              if (!m || typeof m !== 'object') continue;
+              if (alnumOf(key) !== okey && alnumOf(m.name) !== okey) continue;
+              if (m.alias_of === servingId) continue;  // 已绑定同一官方 ID → 幂等跳过
+              const before = { input_price: m.input_price, cached_price: m.cached_price, output_price: m.output_price };
+              const official = { input_price: sblk.input_price, cached_price: sblk.cached_price, output_price: sblk.output_price };
+              m.input_price = official.input_price;
+              m.cached_price = official.cached_price;
+              m.output_price = official.output_price;
+              m.peak_multiplier = sblk.peak_multiplier || m.peak_multiplier || 2;
+              m.price_source = 'deepseek官方';
+              m.region = 'CN';
+              m.alias_of = servingId;  // 旧名保留为本地 key（运行时匹配用），价格走现行官方价
+              delete m.manual;
+              delete m.manual_at;
+              delete m.lock;
+              delete m.retired;
+              if (!Array.isArray(pricing._manual_audit)) pricing._manual_audit = [];
+              const rec = pricing._manual_audit.find((r) => r && r.model === key);
+              const patch = {
+                manual: before,
+                official,
+                status: 'official-adopted',
+                adopted_at: new Date().toISOString(),
+                official_id: servingId,
+                official_version: serving_version,
+                matched_by: 'old-name-prose',
+                note: '官方页「旧模型名」段声明该旧名仍可调用、由 ' + serving_version + ' 提供服务并按现行价计费',
+              };
+              if (rec) Object.assign(rec, patch);
+              else pricing._manual_audit.push({ model: key, manual_at: null, source: m.price_source || null, ...patch });
+              oldAdopted++;
+              process.stderr.write(
+                `[deepseek-official] 旧模型名绑定：本地 ${key} ≡ 官方 ${servingId}（旧名仍可调用，由 ${serving_version} 提供服务）→ ` +
+                `价格 ${before.input_price}/${before.cached_price}/${before.output_price} → ${official.input_price}/${official.cached_price}/${official.output_price}，已解除 lock/retired 冻结\n`
+              );
+            }
+          }
+          if (oldNames.length && !oldAdopted) {
+            process.stderr.write('[deepseek-official][WARN] 官方页声明了旧模型名映射，但本地无匹配条目（可能 key 不同名）：' +
+              JSON.stringify(oldNames) + '\n');
+          }
+        }
         // 2) 本地 DeepSeek 系、官方清单没有的 → 标记 retired（**仅作来源标注**，供人工排查「官方已下线」）
         //    ⚠ D-3 事实说明（v3.29.0 更正）：`retired` **只写不读** —— token-tracker.js 全仓无任何
         //    `retired` 读取（grep 零命中），`findModel` / `calcCost` 都不检查该标记；被打上 retired 的

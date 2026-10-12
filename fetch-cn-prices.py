@@ -91,6 +91,20 @@ PRICING_PATH = os.path.join(WB_ROOT, 'skills', 'token-usage-tracker', 'pricing.j
 # 注意：腾讯混元只走 parse_tokenhub.py，不受此规则影响(Hy4 preview 含 preview 但必须保留)
 SNAP_RE = re.compile(r'-20\d\d-\d\d-\d\d|-us$|-latest$|-preview$|快照', re.I)
 
+# v3.51.0（审计批1·B/L2 活样例）：阶跃官方定价页 2026-10-12 当天改版（Mintlify 重构）——
+#   新页面价格数字不再内联「元」字（单位挪到正文「单位：元／百万 tokens。」段落），旧 parse_tr
+#   靠「行内有元」取价 → 实测解析出 0 个模型（A/B 实证：git HEAD 旧版同时段同样 0 个，
+#   排除本地改动因素）。Mintlify 全站暴露 .md 源（llms.txt 标准，Kimi 解析器已在用同款路子），
+#   改抓 .md：语义表头按列名映射列（不按位置）；单位从正文声明读取；「自北京时间…起由 A
+#   调整为 B」公告按生效日期取当日有效值。
+STEPFUN_MD_URL = 'https://platform.stepfun.com/docs/zh/guides/pricing/details.md'
+
+# 调价公告（组：年/月/日/时/分/旧值/新值）：「自北京时间 2026 年 10 月 14 日 00:30 起由
+# 0.35 元／百万 tokens 调整为 0.70 元／百万 tokens」。full-width ／与 half-width / 都认。
+STEP_ADJ_RE = re.compile(
+    r'自北京时间\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*(\d{1,2}):(\d{2})\s*起'
+    r'由\s*([\d.]+)\s*元[／/]百万\s*tokens\s*调整为\s*([\d.]+)\s*元[／/]百万\s*tokens')
+
 # 厂商配置。mode:
 #   tr     —— 页面含 <table>，逐行提取含"元"的行
 #   bundle —— SPA，价格硬编码在前端 JS bundle 里，需三步解析
@@ -106,13 +120,12 @@ VENDORS = {
     },
     'stepfun': {
         'name': '阶跃星辰',
-        'url': 'https://platform.stepfun.com/docs/zh/guides/pricing/details',
-        'mode': 'tr',
+        # v3.51.0（2026-10-12 页面改版）：HTML 页价格数字不再内联「元」→ 旧 tr 模式实测 0 模型；
+        #   Mintlify 暴露 .md 源（语义表头 + 正文单位声明），远比 HTML 行内正则稳。
+        'url': STEPFUN_MD_URL,
+        'mode': 'stepfun_md',
         # 剔除语音/图像类与坏行(stepaudio·step-tts按万字符/step-asr按小时/audio列序不可靠/仅单价行)；保留 step-1o-audio(按token计价)
         'drop_re': re.compile(r'step-?tts|step-?asr|step-?audio|step-image|step-2x-large', re.I),
-        # v0.3(2026-09-28)：列序修正——表头实为「输入(缓存未命中)/输入(缓存命中)/输出」，
-        # 旧版按 [in,out,cache] 映射导致 out/cache 整体错位（step-3.7-flash 输出 ¥8.1 被记成 ¥0.27）
-        'order': ('in', 'cache', 'out'),
         # step-5-preview 是真实产品名（非快照别名），SNAP_RE 的 -preview$ 会误杀，白名单放行
         'keep_over_re': re.compile(r'^step-5-preview$', re.I),
     },
@@ -401,6 +414,140 @@ def parse_minimax(html):
 KIMI_PAGES = ['chat-k3']
 
 
+def parse_stepfun_md(md, drop_re=None, keep_over_re=None):
+    """阶跃官方定价页 .md 源（v3.51.0，2026-10-12 页面改版后切换）。
+
+    结构（实测）：
+      单位：元／百万 tokens。
+      | Model ID | 输入价格（缓存未命中） | 输入价格（缓存命中） | 输出价格 |
+      | `step-5-preview` | 7 | 0.70 | 20 |
+    规则：
+      - 只收表头同时含「输入价格」「输出价格」的表（按 Token 计价）；TTS/ASR/复刻等
+        「单价」表（元／万字符、元／小时、元／音色）不是 token 计价，直接跳过；
+      - 列语义按表头文本映射（缓存未命中→in、缓存命中→cache、输出→out），不按位置；
+      - 单位从表格上方最近的「单位：X。」正文读取，读不到即该表契约不全、跳过；
+      - 调价公告（生效日期在未来）→ 当日按公告的「由」值入账，future 值写 tier_note；
+        生效日期已过/无公告 → 按表格现值。全部取页面显式数据，不猜测。
+    """
+    out = []
+    lines = md.splitlines()
+    # 预扫描：调价公告（归一化模型名 → 字段/旧值/新值/生效时间）。
+    # 公告句形如「Step 5 Preview 的缓存命中输入价格自北京时间 2026 年 10 月 14 日 00:30 起由 0.35
+    #   元／百万 tokens 调整为 0.70 元／百万 tokens」——模型名是显示名（有空格），与 API id
+    #   （step-5-preview）不同形，两边都去标点归一后对齐。
+    adjustments = {}
+    for ln in lines:
+        m = STEP_ADJ_RE.search(ln)
+        if not m:
+            continue
+        y, mo, d, hh, mm, old_v, new_v = m.groups()
+        nm_m = re.search(r'([A-Za-z][A-Za-z0-9 .\-]{2,40}?)\s*的\s*(缓存命中)?(输入|输出)价格', ln)
+        fld_m = re.search(r'的\s*(缓存命中)?(输入|输出)价格', ln)
+        names = set()
+        if nm_m:
+            names.add(re.sub(r'[\s_\-.]', '', nm_m.group(1).lower()))
+        for nm in re.findall(r'`(step-[0-9a-z.\-]+)`', ln):
+            names.add(re.sub(r'[\s_\-.]', '', nm.lower()))
+        if not names:
+            continue
+        field = 'cache' if (fld_m and fld_m.group(1)) else ('out' if (fld_m and fld_m.group(2) == '输出') else 'in')
+        for nk in names:
+            adjustments[nk] = {
+                'old': float(old_v), 'new': float(new_v),
+                'effective': '%04d-%02d-%02dT%02d:%02d' % (int(y), int(mo), int(d), int(hh), int(mm)),
+                'field': field,
+            }
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if not ln.lstrip().startswith('|'):
+            i += 1
+            continue
+        # 收集连续表格行
+        tbl = []
+        while i < len(lines) and lines[i].lstrip().startswith('|'):
+            tbl.append(lines[i].strip())
+            i += 1
+        if len(tbl) < 3:
+            continue
+        hdr = [c.strip() for c in tbl[0].strip('|').split('|')]
+        if not (any('输入价格' in c for c in hdr) and any('输出价格' in c for c in hdr)):
+            continue  # 非 token 计价表（单价表：元／万字符、元／小时…）
+        # 单位：向上找最近的「单位：X。」
+        unit = None
+        for j in range(i - len(tbl) - 1, -1, -1):
+            um = re.search(r'单位[：:]\s*([^。\n]+)。', lines[j])
+            if um:
+                unit = um.group(1).strip().replace('／', '/')
+                break
+        if not unit or '元' not in unit:
+            continue  # 契约不全（无单位声明）→ 不收
+        col_in = col_cache = col_out = None
+        for ci, c in enumerate(hdr):
+            if '输入价格' in c and '缓存未命中' in c:
+                col_in = ci
+            elif '输入价格' in c and '缓存命中' in c:
+                col_cache = ci
+            elif '输出价格' in c:
+                col_out = ci
+        if col_in is None or col_out is None:
+            continue
+        for row in tbl[2:]:  # 跳过表头与分隔行
+            cells = [c.strip().strip('`') for c in row.strip('|').split('|')]
+            if len(cells) <= max(col_in, col_out):
+                continue
+            name = cells[0].strip()
+            if not re.match(r'^step-[0-9a-z.\-]+$', name, re.I):
+                continue
+            if keep_over_re and keep_over_re.search(name):
+                pass  # 白名单：真模型名含 -preview 等快照样式，放行
+            elif SNAP_RE.search(name):
+                continue
+            if drop_re and drop_re.search(name):
+                continue
+            def _num(s):
+                m = re.match(r'^(\d+(?:\.\d+)?)$', (s or '').strip())
+                return float(m.group(1)) if m else None
+            in_v = _num(cells[col_in])
+            cache_v = _num(cells[col_cache]) if col_cache is not None and col_cache < len(cells) else None
+            out_v = _num(cells[col_out])
+            if in_v is None and out_v is None:
+                continue  # 限时免费（—）等非计价行
+            note = '阶跃官方定价页现行价（.md 源）'
+            # 生效日期公告：仅当表格现值 == 公告新值时才判定「该公告针对此列」（防误伤）；
+            #   未来生效 → 当日按公告旧值；已生效 → 表格现值。全部取页面显式数据。
+            adj = adjustments.get(re.sub(r'[\s_\-.]', '', name.lower()))
+            if adj:
+                cur = {'in': in_v, 'cache': cache_v, 'out': out_v}[adj['field']]
+                fld_label = ('缓存命中' if adj['field'] == 'cache' else '') + ('输出' if adj['field'] == 'out' else '输入')
+                if cur is not None and abs(cur - adj['new']) < 1e-9:
+                    now_iso = datetime.datetime.now().strftime('%Y-%m-%dT%H:%M')
+                    if adj['effective'] > now_iso:
+                        if adj['field'] == 'in':
+                            in_v = adj['old']
+                        elif adj['field'] == 'cache':
+                            cache_v = adj['old']
+                        else:
+                            out_v = adj['old']
+                        note += '；⚠官方公告：%s价 %s 起 %s→%s（生效前按 %s 计）' % (
+                            fld_label, adj['effective'], adj['old'], adj['new'], adj['old'])
+                    else:
+                        note += '；官方公告：%s价 %s 起 %s→%s（已生效）' % (
+                            fld_label, adj['effective'], adj['old'], adj['new'])
+            out.append({
+                'name': name,
+                'brand': 'stepfun',
+                'api_name': name.lower(),
+                'source_type': 'first_party',
+                'in_price': ['%s元' % in_v] if in_v is not None else [],
+                'out_price': ['%s元' % out_v] if out_v is not None else [],
+                'cache_hit': ['%s元' % cache_v] if cache_v is not None else [],
+                'tier_note': note,
+                'source': '阶跃官方定价页(platform.stepfun.com .md 源)',
+            })
+    return out
+
+
 def parse_kimi():
     """Kimi(Moonshot) 官方价：各模型单独的 mintlify 文档页(.md 源，比 HTML 干净)。
     v0.3(2026-09-28)：moonshot.cn 文档已 301 迁至 platform.kimi.com（requests 自动跟随，
@@ -512,6 +659,8 @@ def main():
     result = {
         'fetched_at': datetime.datetime.now().isoformat(timespec='seconds'),
         'currency': 'CNY',
+        'unit': '元/百万 tokens',
+        'region': 'CN',
         'source_type': 'vendor-official-page',
         'vendors': {},
     }
@@ -534,9 +683,20 @@ def main():
                     entry['models'] = parse_zhipu_docs(html)
                 elif cfg['mode'] == 'kimi':
                     entry['models'] = parse_kimi()
+                elif cfg['mode'] == 'stepfun_md':
+                    entry['models'] = parse_stepfun_md(html, cfg.get('drop_re'), cfg.get('keep_over_re'))
             # 补全 source 标注（解析器未设时回退到厂商名）
+            # v3.51.0（审计批1·B）：补全契约字段 —— 本脚本只抓国内厂商官方人民币价页，
+            #   unit/currency/region 由设计前提恒定（页面价格均以「X元」形式给出，见
+            #   extract_prices / 各 parse_* 的 '%s元' 构造）；逐条显式落到模型记录上，
+            #   供 build_index 契约海关校验（缺字段的条目会被拒收+告警，不会静默入账）。
             for mm in entry['models']:
                 mm.setdefault('source', cfg['name'])
+                mm.setdefault('unit', '元/百万 tokens')
+                mm.setdefault('currency', 'CNY')
+                mm.setdefault('region', 'CN')
+                mm.setdefault('source_url', cfg['url'])
+                mm.setdefault('fetched_at', result['fetched_at'])
             total += len(entry['models'])
             print('[OK]   %-22s %d 个模型' % (cfg['name'], len(entry['models'])))
         except Exception as e:

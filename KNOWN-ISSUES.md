@@ -565,3 +565,37 @@ A14 / B2 / B4 / B5 / D4 / C 类；`recalc-day` 的 `roundHoursOf()` 展示名匹
 
 - 若哪天用户又报"金额不见了"：先看 `~/.workbuddy/token-tracker-toast.log` 原文（金额在不在），在 → 就是 UI 裁剪复发（阈值/格式又变了）；不在 → 才是代码问题（查 hideCost 分支）。
 - 合成价复算入口：`toastLine2({model:'step-5-preview', in:25582000, out:88000, cached:25468000}, {models:{'step-5-preview':{input_price:7, cached_price:0.35, output_price:20}}})` → 应得 `输入 2558万 / 输出 8.8万｜缓存99.55%｜¥11.47`（w=44）。
+
+## KI-18 价格抓取「猜区块 + 硬编码地域/币种」+ 阶跃页面改版静默 0 模型（2026-10-12）—— **v3.51.0 已修**
+
+> 触发：用户要求对价格抓取器做**防御性预优化**（「尽量自动化、更多适配未来厂商价格页变化，厂商新模型价格自动抓取匹配」）。
+> 用户纠偏（关键）：**币种/区域本就是页面上的显式文本（¥/$、地域标签），能读出来就不该算"不可判定"** → 解析器适配即可，不该进人工缝。
+
+### 现场与定位（真实失效路径）
+
+`parse_tokenhub.py`（腾讯云 TokenHub 混元价表）用「三特征匹配 + `\d+\.\d{3,}` 小数位数排除新加坡块 + `target = cands[0]` fallback」挑目标表，而输出 `region='广州'`/`currency='CNY'` 是**硬编码**。
+- **实测该猜测链当天已触发 fallback**：广州表里 MiMo 缓存命中价 `0.025` 是合法 3 位小数 → 被小数排除规则误杀 → 三个候选块全灭 → 靠 `cands[0]` 蒙对（stderr 有 WARN）。
+- 页面真实结构（原始 HTML 实证）：`tse-tabs__list` 标签 `[广州(is-active), 新加坡]` → 其后 `tse-tabs__cont` 面板**同序对应**，广州面板内恰好 1 张语言模型表，价格与 `pricing.json` 人工核对价一致；新加坡表面头同样写「元/百万 tokens」但第三方模型价格不同 → **选错块 = 区域错价**，且会被盖上「广州/CNY」戳、无告警。
+
+阶跃星辰官方定价页 **2026-10-12 当天 Mintlify 重构**：价格数字不再内联「元」字（单位挪到正文段落），旧 `mode=tr` 解析器实测 **0 模型**（**A/B 实证排除本地改动**：git HEAD 旧版脚本同一时段同样 0 个）。
+
+DeepSeek 官方页「旧模型名」正文段（`deepseek-v4-flash` 等旧名「仍可调用、由 V4.1-Flash 提供服务、按 Flash 价计费」）**从未被解析** → 旧名条目带 `lock+retired` 永久冻结在过期价 `1.5/4.5/0.05`，一出现就按过期价入账、无告警。
+
+### 修法（v3.51.0）
+
+- **A·地域显式绑定**：解析 `tse-tabs` 的「地域标签→面板」显式结构锁「广州」面板，币种/单位从价表表头声明读；**删除整条猜测链**（小数位数排除 + `cands[0]` fallback）；区域币种矛盾或结构不符 → `exit(2)` 保留旧文件，绝不静默。
+- **B·契约海关**：三解析器输出补 `unit/currency/region/source_url/fetched_at`；`build_index.py` 缺 `currency/unit` 的条目**拒收 + WARN 列出**；`latest.json` 裸崩改 try + WARN + 逐模型沿用；静默 `continue` 全改 WARN 汇总；TokenHub 来源串地域改用解析值。
+- **C·阶跃 `.md` 语义解析**：改抓 Mintlify 暴露的 `.md` 源，**按表头列名语义映射**（缓存未命中→in / 缓存命中→cache / 输出→out）+ 正文单位声明；「自北京时间…起由 A 调整为 B」的调价公告**按生效日期取当日有效值**（生效前按旧值计，`tier_note` 留痕，不静默采用未来价）。
+- **D·旧模型名自动绑定**：解析官方页「旧模型名」正文，命中即自动绑定 `alias_of` + 采用现行价 + 解除 `lock/retired` + `_manual_audit` 留痕。
+
+### 复发条件与排查入口
+
+- 某源解析出 **0 模型**：先看 stderr 的 `[parse_tokenhub]` / `[build_index][WARN]` 行，再核对源页面结构是否改版（`exit(2)` 会保留旧文件，不覆盖好数据）。
+- Mintlify 系站点（文档站）一般暴露 `llms.txt` 与页面 `.md` 源，页面改版时可优先切 `.md` 语义解析（Kimi 解析器已在用同款路子）。
+- 新模型「先上线、官方价页后更新」：官方页无价时走聚合源顶（现有 region=US 三 USD 源中位数 × 汇率路径），官方页一更新自动切回官方价。
+
+### 顺带修复的 selftest 夹具 bug（长期被 `SPAWN_OK=false` 掩盖）
+
+- T59-c3/c4 的端到端夹具拷贝清单 `['token-tracker.js', ...RUNTIME_COMPANIONS]` **漏了 `backfill.js`**（它是入口脚本、不在那份"主脚本 require 的兄弟模块"清单里）→ spawn 报 `MODULE_NOT_FOUND`、退出码 1 → 假失败。
+- T59-c4 读 `skillDir/pricing.json` 取期望值，但该文件**在中途被别的用例（如 T11）改写成夹具价（只有 `m-x`）且从不还原** → `findModel` 返回 null → `.m` 抛错。改用 `subSkill/pricing.json`（c3/c4 setup 刚从 SRC 拷贝、正是 backfill 实跑时消费的那份）。
+- 两者仅在 `SPAWN_OK=true` 的环境/CI 暴露；本沙箱此前恒跳过 → 从未真正跑到。

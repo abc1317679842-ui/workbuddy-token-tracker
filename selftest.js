@@ -4860,8 +4860,12 @@ else {
     const sub = path.join(tmp, 't59bf');
     const subSkill = path.join(sub, 'skills', 'token-usage-tracker');
     fs.mkdirSync(subSkill, { recursive: true });
-    for (const f of ['token-tracker.js', ...RUNTIME_COMPANIONS]) {
-      try { fs.copyFileSync(path.join(skillDir, f), path.join(subSkill, f)); } catch (e) { /* 单个缺失由下方退出码暴露 */ }
+    // ★backfill.js 必须随行（v3.51.0 修复）：它是**入口脚本**、不在 RUNTIME_COMPANIONS 里（那份清单是
+    //   「主脚本 require 的兄弟模块」）。旧代码只拷 ['token-tracker.js', ...RUNTIME_COMPANIONS] 且源是主夹具
+    //   → 隔离目录缺 backfill.js → spawn 报 MODULE_NOT_FOUND、退出码 1 → c3/c4 假失败。此坑长期被本沙箱
+    //   SPAWN_OK=false（c3/c4 走 envSkip）掩盖，SPAWN_OK=true 的环境/CI 才暴露。源改用仓库 SRC（与主夹具内容等价，且含 backfill.js）。
+    for (const f of ['token-tracker.js', 'backfill.js', ...RUNTIME_COMPANIONS]) {
+      try { fs.copyFileSync(path.join(SRC, f), path.join(subSkill, f)); } catch (e) { /* 单个缺失由下方退出码暴露 */ }
     }
     const SID59 = 't59-e2e-sid';
     const projA = path.join(sub, 'projects', 'projA');
@@ -4890,9 +4894,13 @@ else {
     try {
       const daily59 = JSON.parse(fs.readFileSync(path.join(subSkill, 'daily-usage.json'), 'utf-8'));
       const pr59 = require(path.join(skillDir, 'peak-rules.js'));
-      const pricing59 = JSON.parse(fs.readFileSync(path.join(skillDir, 'pricing.json'), 'utf-8'));
+      // ⚠️ c4 的"期望值"必须用 **backfill 实跑时消费的那份** 价库/假日表（subSkill —— c3/c4 setup 刚从 SRC 拷贝的原版）：
+      //    skillDir/pricing.json 在中途被别的用例（如 T11 的 :726）改写成夹具价（只有 m-x）且从不还原，
+      //    读它 → findModel 找不到 deepseek-v4.1-flash → 返回 null → `.m` 抛错（v3.51.0 实测；此坑长期被
+      //    本沙箱 SPAWN_OK=false 掩盖，SPAWN_OK=true 的环境/CI 才暴露）。
+      const pricing59 = JSON.parse(fs.readFileSync(path.join(subSkill, 'pricing.json'), 'utf-8'));
       const m59 = mod59.findModel(pricing59, 'deepseek-v4.1-flash', 'price').m;
-      const mult59 = pr59.isPeakAt(ts59, pricing59, path.join(skillDir, 'holidays.json'))
+      const mult59 = pr59.isPeakAt(ts59, pricing59, path.join(subSkill, 'holidays.json'))
         ? mod59.peakMultOf(m59, 'deepseek-v4.1-flash') : 1;
       const expect59 = Math.round(mod59.triPriceRounded(1000, 500, 100, m59, mult59) * 1e6) / 1e6;
       let got59 = null;
@@ -5026,6 +5034,84 @@ else {
       if (tfSaved60 !== null) { try { fs.writeFileSync(tfPath60, tfSaved60); } catch (e) { /* 恢复失败不影响被测逻辑 */ } }
     }
   }
+}
+
+// ===== T61：v3.51.0 价格抓取「契约海关 + 地域显式绑定 + 语义表头」（审计批1）=====
+// 起因：v3.50.0 后新审计 + 用户三轮纠正（币种/区域可分辨、改名要自动、官方页抓不到走聚合源过渡）。
+// 核心失效路径（2026-10-12 实测坐实）：parse_tokenhub 用「\d+\.\d{3,} 小数位数」排除新加坡块，
+//   而广州表里 MiMo 缓存命中价 0.025 是合法 3 位小数 → 三候选全灭 → 靠 cands[0] 蒙对；
+//   一旦腾讯调整 tab 顺序，新加坡块价格就会盖上硬编码的「广州/CNY」戳静默入账。
+// 同族活样例：阶跃官方页当天改版（Mintlify 重构，价格不再内联「元」）→ 旧 tr 模式 0 模型
+//   （A/B 实证 git HEAD 同时段同样 0，排除本地因素）；页面还带 10-14 生效的调价公告。
+// 本组守四件事：A 地域/币种显式绑定禁猜测 / B 契约海关 + 静默转 WARN / C 阶跃 .md 语义解析 /
+//   D DeepSeek 旧模型名自动绑定。行为证据（隔离目录真实页面流水线 + 零索引差异）见 CHANGELOG。
+{
+  const pt61 = fs.readFileSync(path.join(SRC, 'parse_tokenhub.py'), 'utf-8').replace(/\r\n/g, '\n');
+  const fc61 = fs.readFileSync(path.join(SRC, 'fetch-cn-prices.py'), 'utf-8').replace(/\r\n/g, '\n');
+  const bi61 = fs.readFileSync(path.join(SRC, 'build_index.py'), 'utf-8').replace(/\r\n/g, '\n');
+  const ds61 = fs.readFileSync(path.join(SRC, 'deepseek-official.js'), 'utf-8').replace(/\r\n/g, '\n');
+
+  // ── a. parse_tokenhub：地域/币种显式绑定，废止一切猜测 ──
+  // ⚠️ 负向断言必须**先剥整行注释**再匹配（v3.51.0 实测踩到）：源码里的说明注释必须引用
+  //    反例形态（cwd 相对的 makedirs 写法 / 小数位数正则）来解释"为何废止"，不剥注释会把这些
+  //    说明文字数进去 → 假红。（同 T59-d3「扫源码先剥注释」的坑，v3.49.0 已踩过一次。）
+  const pt61code = pt61.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
+  ok('T61-a1 ★parse_tokenhub 不得再用小数位数猜区域（re.search(r\'\d+\.\d{3,}\') 排除链必须删除）',
+    !/re\.search\(r'\\d\+\\\.\\d\{3,\}'/.test(pt61code),
+    '红 = 小数位数猜测链复活（广州表 0.025 缓存价被误杀 → fallback 蒙块 → 新加坡价盖广州/CNY 戳入账）');
+  ok('T61-a2 ★parse_tokenhub 不得保留位置 fallback（target = cands[0] 会把仅部分命中的块当目标）',
+    !/target = cands\[0\]/.test(pt61code), '红 = cands[0] fallback 复活（选错块 = 区域错价且无告警）');
+  ok('T61-a3 ★显式区域绑定函数必须存在（find_region_panels 按 tse-tabs 标签↔面板配对）',
+    pt61.indexOf('def find_region_panels') >= 0 && pt61.indexOf('def parse_unit_currency') >= 0);
+  ok('T61-a4 ★输出 region/currency/unit 必须来自页面解析值，不得硬编码',
+    pt61.indexOf("'region': region_label") >= 0 && pt61.indexOf("'currency': currency") >= 0
+    && pt61.indexOf("'unit': unit") >= 0 && pt61.indexOf("'region': '广州'") < 0,
+    '红 = 回归硬编码（错区块价格会被盖上正确戳，无从审计）');
+  ok('T61-a5 ★输出目录必须 HERE 锚定（cwd 相对的 makedirs(\'prices\') 写错地方且 build_index 静默找不到）',
+    !/os\.makedirs\('prices'/.test(pt61code)
+    && pt61.indexOf("out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prices')") >= 0);
+
+  // ── b. build_index：契约海关 + latest.json 不裸崩 + 静默 skip 转 WARN ──
+  ok('T61-b1 ★latest.json 读取必须 try 保护（裸崩 = 今日抓取数据全丢且无任何告警）',
+    /try:\s*\n\s*d = json\.load\(open\(LATEST/.test(bi61));
+  ok('T61-b2 ★契约海关：缺 currency/unit 的条目必须拒收并记入 skipped（不可验证价不许入账）',
+    bi61.indexOf("miss = [f for f in ('currency', 'unit') if not m.get(f)]") >= 0);
+  ok('T61-b3 ★被跳过条目必须 WARN 列出（静默 continue = 模型从索引悄悄消失、按未收录计费）',
+    bi61.indexOf('skipped.append(') >= 0 && bi61.indexOf('[build_index][WARN] %d 个条目未进索引') >= 0);
+  ok('T61-b4 ★TokenHub 来源串地域必须用解析值 th_region，不得硬编码「广州」',
+    bi61.indexOf("th_region = th.get('region')") >= 0 && bi61.indexOf("'腾讯云TokenHub文档(广州,'") < 0);
+  ok('T61-b5 ★索引条目必须透出契约字段（下游 mergeLocalPriceDb 按白名单读、未知字段忽略 → 计费侧零影响）',
+    bi61.indexOf("for f in ('currency', 'unit', 'region', 'source_url', 'fetched_at')") >= 0);
+
+  // ── c. fetch-cn-prices：契约字段 + 阶跃 .md 语义解析（2026-10-12 页面改版活样例）──
+  ok('T61-c1 ★每条模型记录必须补契约字段（unit/currency/region/source_url/fetched_at）',
+    fc61.indexOf("mm.setdefault('unit', '元/百万 tokens')") >= 0
+    && fc61.indexOf("mm.setdefault('currency', 'CNY')") >= 0
+    && fc61.indexOf("mm.setdefault('region', 'CN')") >= 0);
+  ok('T61-c2 ★阶跃必须走 .md 语义解析（HTML 改版后价格不带「元」，tr 模式实测 0 模型）',
+    fc61.indexOf("STEPFUN_MD_URL = 'https://platform.stepfun.com/docs/zh/guides/pricing/details.md'") >= 0
+    && fc61.indexOf("'mode': 'stepfun_md'") >= 0 && fc61.indexOf('def parse_stepfun_md') >= 0);
+  ok('T61-c3 ★阶跃表头必须按列名语义映射（缓存未命中→in/缓存命中→cache/输出→out），不按位置',
+    fc61.indexOf("'输入价格' in c and '缓存未命中' in c") >= 0
+    && fc61.indexOf("'输入价格' in c and '缓存命中' in c") >= 0
+    && fc61.indexOf("'输出价格' in c") >= 0);
+  ok('T61-c4 ★调价公告必须按生效日期取当日有效值（未来生效按旧值 + tier_note 留痕，不静默采用未来价）',
+    fc61.indexOf('STEP_ADJ_RE = re.compile') >= 0 && fc61.indexOf("adj['effective'] > now_iso") >= 0);
+
+  // ── d. deepseek-official：旧模型名自动绑定（官方页显式改名映射，无需猜身份）──
+  ok('T61-d1 ★必须解析官方页「旧模型名」正文段（旧名条目曾被 lock+retired 永久冻结在过期价）',
+    ds61.indexOf('旧模型名\\s*([^。]*?)\\s*仍可调用') >= 0);
+  ok('T61-d2 ★旧模型名命中必须：绑定 alias_of + 采用现行价 + 解除 lock/retired + _manual_audit 留痕',
+    ds61.indexOf("matched_by: 'old-name-prose'") >= 0
+    && ds61.indexOf('delete m.lock;') >= 0 && ds61.indexOf('delete m.retired;') >= 0
+    && ds61.indexOf("m.alias_of = servingId;") >= 0);
+
+  // ── e. 端到端夹具完整性（v3.51.0 修复：c3/c4 夹具漏拷 backfill.js → MODULE_NOT_FOUND 假失败）──
+  //   ⚠️ 目标串拆成两段拼接，避免守卫自身源码把它数进去（自匹配 = 恒绿假象，v3.49.0 踩过同族坑）。
+  const st61 = fs.readFileSync(path.join(SRC, 'selftest.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const bfNeed61 = "'back" + "fill.js', ...RUNTIME_COMPANIONS]";
+  ok('T61-e1 ★backfill 端到端夹具必须随行 backfill.js（入口脚本不在 RUNTIME_COMPANIONS → 漏拷即 MODULE_NOT_FOUND 假失败）',
+    st61.indexOf(bfNeed61) >= 0);
 }
 
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。
