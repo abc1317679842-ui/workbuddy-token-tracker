@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.52.0 (2026-10-13)
+// token-usage-tracker v3.53.0 (2026-10-13)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -2693,8 +2693,19 @@ function maybeRefreshLocalDb() {
       //        → **自定义价库目录永远不被填充**（C1 混合部署场景，S1 报告实测）。
       //   修法：脚本路径按 [流水线目录, 技能目录] 依次 existsSync 取真存在的那个（cwd 不再参与定位）；
       //   同时把 CN_PRICE_DIR 以 env CN_PRICES_DIR 传给 py 侧，两端目录从此唯一。
+      // v3.53.0（审计批3·S1 残余，实网事故）：候选顺序改为 **技能目录优先于价库目录**。
+      //   v3.52.0 的 [流水线目录, 技能目录] 顺序在真机上踩到：价库目录（如
+      //   ~/WorkBuddy/2026-08-30-22-25-15/）里存着 **2026-09 的旧脚本副本**（fetch-cn-prices.py 9-28、
+      //   build_index.py 9-01），流水线目录恒命中它们 → **每日刷新一直在跑 9 月的代码**
+      //   → v3.51/v3.52 的契约海关、地域绑定、语义同义词表、结构指纹**在生产环境一次都没生效**
+      //   （实测 latest.json 全部条目缺 currency/unit，索引靠「逐模型沿用」续命）。
+      //   代码只有一个权威来源 = 技能目录 __dirname；价库目录是**数据**目录，里面躺什么旧副本都不该被当成代码。
+      //   CN_PRICE_PIPELINE_DIR 环境变量仍是最高优先（显式指定时尊重用户）。
       const resolveScript = (name) => {
-        const cands = [CN_PRICE_PIPELINE_DIR, __dirname];
+        const cands = [];
+        if (process.env.CN_PRICE_PIPELINE_DIR) cands.push(process.env.CN_PRICE_PIPELINE_DIR);
+        cands.push(__dirname);                                    // 代码权威源
+        if (CN_PRICE_DIR) cands.push(path.dirname(CN_PRICE_DIR)); // 价库目录兜底（历史部署）
         for (const base of cands) {
           if (!base) continue;
           const p = path.join(base, name);
@@ -6046,7 +6057,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.52.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.53.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

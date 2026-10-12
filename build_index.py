@@ -66,6 +66,26 @@ TOKENHUB = os.path.join(PRICES_DIR, 'tokenhub_lang.json')
 # 连续缺失超过此天数则判定模型已真下架，自动淘汰，避免僵尸条目永久占位。
 CARRY_MAX_DAYS = 7
 
+# ── v3.53.0（审计批3·L3 变更分级 / L4 人工缝前置闸门 / 审计流水）─────────────────────
+# 背景：index.json 每日**整份重建**，却没有任何「今天到底变了什么」的记录。三类事故无从发现：
+#   ① 厂商调价 → 金额突变，只能靠人肉记忆对比；
+#   ② 解析把「元/千 tokens」当「元/百万 tokens」→ 价格差 1000 倍，索引里长得完全正常；
+#   ③ 官方页改版/下架 → 条目被转售价顶替（first_party → channel 降级），静默发生。
+# 分级口径（用户定调）：**值变=自动，语义变=人工**。
+#   - 值变（in/out/cache 数字变了）→ 自动采纳（可能就是真调价），只留痕；
+#   - 语义变（unit / currency 变了）→ 计价基准变了，采用会让金额差一个数量级
+#     → **保留上一版价格 + `_manual_audit` 挂起**，等人确认（fail-closed 优于猜错）。
+CHANGE_FILE = os.path.join(PRICES_DIR, 'changes.jsonl')
+CHANGE_ROLL_TO = os.path.join(PRICES_DIR, 'changes.1.jsonl')
+CHANGE_ROLL_MAX = 2 * 1024 * 1024  # 滚动阈值：超阈值先转存 .1，防审计流水无限增长
+
+CONTRACT_MIN = ('currency', 'unit')          # 所有条目（含沿用）的底线（v3.51.0 契约海关）
+CONTRACT_FULL = ('currency', 'unit', 'region', 'source_url', 'fetched_at')
+#   ↑ 新条目必须齐全：新模型没有完整溯源 = 事后无法人工核验「这价从哪来、什么单位、哪个区」。
+PRICE_MIN, PRICE_MAX = 0.0005, 5000.0        # 元/百万 tokens，与 fetch-cn-prices 的 priceGate 同口径
+SEMANTIC_GUARDED = ('unit', 'currency')      # 这两个字段变了 = 计价基准变了
+BIG_JUMP = 5.0                               # 价格跳变阈值：>5× 或 <1/5 → 采纳但仍 WARN
+
 # aliyun 上挂的非阿里品牌 → 降为 channel（模型广场转售）
 FOREIGN_IN_ALIYUN = ('deepseek', 'glm', 'kimi', 'minimax', 'hunyuan', 'step-',
                      'yi-', 'ernie', 'qianfan', 'llama', 'claude', 'gpt',
@@ -111,6 +131,94 @@ def src_type(vk, m):
     return 'first_party'  # zhipu/minimax/stepfun/deepseek 均为自家官方页
 
 
+# ===== v3.53.0：变更分级 / 新条目闸门 / 审计流水 =====
+def price_values(e):
+    """参与闸门校验的价格（只认数字；None 表示官方未列，不算越界）。"""
+    return [e.get(f) for f in ('in_price', 'out_price') if isinstance(e.get(f), (int, float))]
+
+
+def gate_new_model(e, full):
+    """新条目闸门：返回 (ok, reason)。
+
+    full=False（**首次构建**或上一版索引不可读）时只校验最小契约 + 价格区间：
+    此时若按 CONTRACT_FULL 卡，任何字段不齐都会让整份索引变空 —— 闸门是保险，
+    不能反过来变成数据灾难。有上一版可对比时才启用完整溯源要求。
+    lock（authoritative）条目是用户已校对的价，闸门不干预。
+    """
+    if e.get('authoritative'):
+        return True, ''
+    need = CONTRACT_FULL if full else CONTRACT_MIN
+    miss = [f for f in need if not e.get(f)]
+    if miss:
+        return False, '契约不全（缺 %s）' % ','.join(miss)
+    vals = price_values(e)
+    if not vals:
+        return False, '无可校验价格'
+    for v in vals:
+        if not (PRICE_MIN <= v <= PRICE_MAX):
+            return False, '价格越界（%s，合法区间 %.4f~%s %s）' % (v, PRICE_MIN, PRICE_MAX, '元/百万 tokens')
+    return True, ''
+
+
+def classify_change(pe, ne):
+    """对比上一版条目 pe 与本次条目 ne，返回 (kinds:list[str], detail:dict)。
+
+    ⚠️ 只在**两边都有值且不同**时才判变化 —— 上一版缺字段（老索引）而本版补上是「补全」，
+       不是变化；判成 semantic 会保留旧价，等于把新解析结果整体作废。
+    """
+    kinds = []
+    detail = {}
+    for f in SEMANTIC_GUARDED:
+        po, pn = pe.get(f), ne.get(f)
+        if po and pn and po != pn:
+            kinds.append('semantic')
+            detail.setdefault('semantic', {})[f] = {'old': po, 'new': pn}
+    po, pn = pe.get('region'), ne.get('region')
+    if po and pn and po != pn:
+        kinds.append('region')
+        detail['region'] = {'old': po, 'new': pn}
+    for f in ('in_price', 'out_price', 'cache_hit'):
+        o, n = pe.get(f), ne.get(f)
+        if o != n:
+            kinds.append('price')
+            detail.setdefault('price', {})[f] = {'old': o, 'new': n}
+    # 跳变：值变自动采纳（可能就是真调价），但 >5×/÷5 多半是单位或列取错 → 让人看一眼
+    for f, d in (detail.get('price') or {}).items():
+        o, n = d['old'], d['new']
+        if isinstance(o, (int, float)) and isinstance(n, (int, float)) and o > 0:
+            r = n / o
+            if r >= BIG_JUMP or r <= 1.0 / BIG_JUMP:
+                kinds.append('big_jump')
+                detail.setdefault('jump', {})[f] = round(r, 2)
+    to, tn = pe.get('primary_source_type'), ne.get('primary_source_type')
+    if to and tn and to != tn:
+        kinds.append('source_downgrade' if to == 'first_party' else 'source_upgrade')
+        detail['source'] = {'old': to, 'new': tn}
+    return sorted(set(kinds)), detail
+
+
+def append_changes(records):
+    """审计流水 append-only（滚动上限内）。写失败只 WARN —— 审计是留痕，不能阻断索引产出。"""
+    if not records:
+        return 0
+    try:
+        if os.path.exists(CHANGE_FILE) and os.path.getsize(CHANGE_FILE) > CHANGE_ROLL_MAX:
+            shutil.copyfile(CHANGE_FILE, CHANGE_ROLL_TO)
+            os.remove(CHANGE_FILE)
+    except Exception as e:
+        sys.stderr.write('[build_index][WARN] changes.jsonl 滚动失败（%r）；继续追加，文件可能超限\n' % (e,))
+    n = 0
+    try:
+        with open(CHANGE_FILE, 'a', encoding='utf-8') as f:
+            for r in records:
+                f.write(json.dumps(r, ensure_ascii=False) + '\n')
+                n += 1
+    except Exception as e:
+        sys.stderr.write('[build_index][WARN] changes.jsonl 写入失败（%r）；本次无审计流水，索引照常产出\n' % (e,))
+        return 0
+    return n
+
+
 def main():
     # v3.51.0（审计批1·C）：latest.json 缺失/损坏不再裸崩。原实现 json.load 直接抛异常 →
     #   build_index 非零退出、index.json 停留在上一版（表面无事，实则今日抓取数据全丢且无告警）。
@@ -121,6 +229,16 @@ def main():
     except Exception as e:
         sys.stderr.write('[build_index][WARN] latest.json 缺失或损坏（%r）；本次无抓取数据，全部模型沿用上一版索引\n' % (e,))
         d = {'vendors': {}}
+    # v3.53.0（审计批3）：上一版索引**提前读取** —— 新条目闸门与变更分级都以它为基线
+    #   （原先只在「逐模型沿用」段读，闸门/分级拿不到基线就无法判断什么是「新」）。
+    prev = None
+    try:
+        prev = json.load(open(OUT, encoding='utf-8'))
+    except Exception:
+        prev = None
+    prev_models = (prev or {}).get('models') or {}
+    # gate_mode：有上一版可对比 → 新条目必须带完整溯源；首次构建 → 只卡最小契约（防整库清空）
+    gate_full = bool(prev_models)
     groups = {}
     # v3.51.0（审计批1·B/C）：被跳过的条目不再静默 continue —— 统一收集，结尾 WARN 列出。
     #   静默跳过的后果：官网改版/契约缺失时模型从索引悄悄消失，用户按未收录计费而无任何提示。
@@ -332,13 +450,77 @@ def main():
                 injected += 1
                 overlay += 1
 
+    # ── v3.53.0（审计批3）：新条目闸门 + 变更分级 ──────────────────────────────
+    #   ① 闸门：上一版没有的条目，契约不全 / 价格越界 → 拒收（不进索引）+ 审计留痕。
+    #      拒收的代价是「按未收录计价」，仍优于「收一个差 1000 倍的价并按它记账」。
+    #   ② 安全阀：闸门若把整库清空而上一版非空 → 整体回退上一版（fail-closed 到已知好状态）。
+    #   ③ 分级：与上一版逐条对比，值变自动采纳并留痕；语义变（unit/currency）保留旧价挂起。
+    changes = []
+    today_iso0 = datetime.date.today().isoformat()
+    rejected = []
+    for key in list(merged.keys()):
+        e = merged[key]
+        pe = prev_models.get(key)
+        if pe is None:
+            ok, why = gate_new_model(e, gate_full)
+            if not ok:
+                rejected.append((key, why))
+                changes.append({'ts': datetime.datetime.now().isoformat(timespec='seconds'),
+                                'built_at': today_iso0, 'model': key, 'kind': 'rejected',
+                                'reason': why, 'values': {f: e.get(f) for f in
+                                                          ('in_price', 'out_price', 'cache_hit', 'unit', 'currency')}})
+                del merged[key]
+                continue
+            changes.append({'ts': datetime.datetime.now().isoformat(timespec='seconds'),
+                            'built_at': today_iso0, 'model': key, 'kind': 'new',
+                            'values': {f: e.get(f) for f in ('in_price', 'out_price', 'cache_hit')},
+                            'source': e.get('primary_source')})
+            continue
+        kinds, detail = classify_change(pe, e)
+        if 'semantic' in kinds:
+            # 语义变 = 计价基准变了 → 保留上一版价格与单位，本次新值挂 _manual_audit 供人工对照
+            new_vals = {f: e.get(f) for f in ('in_price', 'out_price', 'cache_hit')}
+            for f in ('in_price', 'out_price', 'cache_hit'):
+                if pe.get(f) is not None:
+                    e[f] = pe[f]
+            for f in SEMANTIC_GUARDED:
+                if pe.get(f):
+                    e[f] = pe[f]
+            e['_manual_audit'] = {
+                'kind': 'semantic',
+                'reason': '单位/币种变化（计价基准变了，多为解析取错单位或列），已保留上一版价格待人工核验',
+                'field_diff': detail.get('semantic'),
+                'new_values': new_vals,
+                'since': today_iso0,
+            }
+        elif 'region' in kinds:
+            e['_manual_audit'] = {
+                'kind': 'region',
+                'reason': '地域变化（同币种下可能是真实区域差价），价格已采用新值，需人工确认是否为预期区域',
+                'field_diff': detail.get('region'),
+                'since': today_iso0,
+            }
+        for k in kinds:
+            changes.append({'ts': datetime.datetime.now().isoformat(timespec='seconds'),
+                            'built_at': today_iso0, 'model': key, 'kind': k, 'detail': detail})
+    # 安全阀：闸门把整库清空 → 回退上一版（宁可沿用旧价，也不能交付空索引）
+    if not merged and prev_models:
+        merged = {k: dict(v) for k, v in prev_models.items()}
+        changes.append({'ts': datetime.datetime.now().isoformat(timespec='seconds'),
+                        'built_at': today_iso0, 'model': '*', 'kind': 'rollback',
+                        'reason': '本次所有条目被闸门拒收（或抓取全空），已整体回退上一版索引',
+                        'rejected': len(rejected)})
+        sys.stderr.write('[build_index][ERROR] 本次 %d 个条目被新模型闸门拒收且索引将为空 → 已整体回退上一版（%d 个模型），请检查抓取与契约字段\n'
+                         % (len(rejected), len(prev_models)))
+    if rejected:
+        sys.stderr.write('[build_index][WARN] %d 个新条目被闸门拒收（契约不全/价格越界，未进索引 → 该模型按未收录计价）：\n' % len(rejected))
+        for key, why in rejected[:20]:
+            sys.stderr.write('  - %s: %s\n' % (key, why))
+        if len(rejected) > 20:
+            sys.stderr.write('  …另 %d 条\n' % (len(rejected) - 20))
+
     # 单厂商当天抓取失败 → 该厂商模型整体缺席时沿用上一份完整库（计费不降级到聚合源；次日该厂恢复自动更新）
     # 注意不限定 built_at：今天早上成功/晚上失败重建时，早上那份就是最新完整版，同样要沿用
-    prev = None
-    try:
-        prev = json.load(open(OUT, encoding='utf-8'))
-    except Exception:
-        prev = None
     if prev:
         VEND_TAGS = (('TokenHub', '腾讯混元'), ('bigmodel', '智谱'), ('智谱', '智谱'), ('Kimi', 'Kimi'),
                      ('moonshot', 'Kimi'), ('阶跃', '阶跃'), ('stepfun', '阶跃'), ('MiniMax', 'MiniMax'), ('minimax', 'MiniMax'))
@@ -368,9 +550,17 @@ def main():
             except Exception:
                 gap = 0
             if gap > CARRY_MAX_DAYS:
+                # v3.53.0：淘汰也要进审计流水（否则"模型从索引消失过"这件事无据可查）
+                changes.append({'ts': datetime.datetime.now().isoformat(timespec='seconds'),
+                                'built_at': today_iso, 'model': k, 'kind': 'retired',
+                                'reason': '连续缺失 %d 天 > %d 天上限，判定已下架' % (gap, CARRY_MAX_DAYS)})
                 continue  # 真下架：连续缺失过久，淘汰
             vv['missing_since'] = since
             vv['carried_from'] = prev.get('built_at')
+            changes.append({'ts': datetime.datetime.now().isoformat(timespec='seconds'),
+                            'built_at': today_iso, 'model': k, 'kind': 'carried',
+                            'reason': '本版抓取未返回该模型，沿用 %s 价（第 %d 天）'
+                                      % (prev.get('built_at') or '上版', gap)})
             if tag_of(v.get('primary_source')) in today_tags:
                 vv['tier_note'] = '官网当日未返回该模型（可能改版/下架），沿用 %s 价' % (prev.get('built_at') or '上版')
             merged[k] = vv
@@ -390,11 +580,50 @@ def main():
         if len(skipped) > 20:
             sys.stderr.write('  …另 %d 条\n' % (len(skipped) - 20))
 
+    # ── v3.53.0：审计流水落盘 + 分级告警（「今天变了什么」的唯一留痕）──────────────
+    counts = {}
+    for c in changes:
+        counts[c['kind']] = counts.get(c['kind'], 0) + 1
+    written = append_changes(changes)
+
+    def models_of(kind):
+        return [c.get('model') for c in changes if c.get('kind') == kind]
+
+    sem = models_of('semantic')
+    if sem:
+        sys.stderr.write('[build_index][WARN] %d 个条目「单位/币种」发生变化 —— 计价基准可能已被解析取错，'
+                         '已**保留上一版价格**并挂 _manual_audit 待人工核验：%s\n'
+                         % (len(sem), ', '.join(str(x) for x in sem[:10])))
+    jm = models_of('big_jump')
+    if jm:
+        sys.stderr.write('[build_index][WARN] %d 个条目价格跳变 >%g× 或 <1/%g（多为单位或列取错；'
+                         '按「值变=自动」已采纳，请复核）：%s\n'
+                         % (len(jm), BIG_JUMP, BIG_JUMP, ', '.join(str(x) for x in jm[:10])))
+    dg = models_of('source_downgrade')
+    if dg:
+        sys.stderr.write('[build_index][WARN] %d 个条目来源降级（first_party → channel/reseller，'
+                         '官方价退化为转售价）：%s\n' % (len(dg), ', '.join(str(x) for x in dg[:10])))
+    rg = models_of('region')
+    if rg:
+        sys.stderr.write('[build_index][WARN] %d 个条目地域变化（价格已采用新值，请确认是否为预期区域）：%s\n'
+                         % (len(rg), ', '.join(str(x) for x in rg[:10])))
+    if counts.get('new'):
+        print('新增模型 %d 个（契约 + 价格闸门已过，自动采纳；明细见 %s）'
+              % (counts['new'], os.path.basename(CHANGE_FILE)))
+
     result = {
         'built_at': datetime.date.today().isoformat(),  # 每日刷新闸门：skill 读此字段判断是否需要重抓
         'merged_at': d.get('fetched_at'),
         'currency': 'CNY',
         'unit': '元/百万 tokens',
+        # v3.53.0（审计批3）：变更分级汇总。**仅供审计消费** —— mergeLocalPriceDb
+        #   （token-tracker.js:2544-2571）按固定字段白名单读取，顶层新字段对计费零影响。
+        '_changes': {
+            'file': os.path.basename(CHANGE_FILE),
+            'counts': counts,
+            'written': written,
+            'gate_mode': 'full' if gate_full else 'min',
+        },
         'conflict_resolved': conflicts,
         'authoritative_overrides': overlay,
         'models': merged,

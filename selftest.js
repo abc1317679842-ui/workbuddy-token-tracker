@@ -5232,6 +5232,167 @@ else {
     && !/in_price|out_price|cache_hit/.test(segFp62), segFp62.slice(-160));
 }
 
+// ===== T63：v3.53.0 变更分级 + 审计流水 + 新模型闸门 + 脚本定位纠偏（审计批3）=====
+// 三条主线：
+//   ① **脚本定位纠偏（真网事故）**：v3.52.0 把脚本名改成绝对路径时保留了「价库目录优先」的顺序，
+//      而价库目录（~/WorkBuddy/2026-08-30-22-25-15/）里躺着 **2026-09 的旧脚本副本**
+//      → 每日刷新一直在跑 9 月的代码，v3.51/v3.52 的契约海关、地域绑定、语义同义词表、结构指纹
+//      **在生产环境一次都没生效**（实测 latest.json 全部条目缺 currency/unit，索引靠"逐模型沿用"续命）。
+//   ② 变更分级 + 审计流水：index.json 每日整份重建却无"今天变了什么"的记录 —— 调价、单位取错、
+//      来源降级三类事故全部静默。口径：**值变=自动，语义变=人工**。
+//   ③ 新模型闸门：契约不全 / 价格越界的新条目不进索引（不可溯源、不可复算的价不许入账）。
+// 源码守卫证明不了"语义变后索引里到底是新价还是旧价"，故 e 组用**真跑 build_index.py** 兜底。
+{
+  const tt63 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const bi63 = fs.readFileSync(path.join(SRC, 'build_index.py'), 'utf-8').replace(/\r\n/g, '\n');
+  const bi63c = bi63.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
+
+  // ── a. 脚本定位：技能目录（代码权威源）必须优先于价库目录（数据目录）──
+  //   ⚠️ 断言锚点用**候选入栈顺序**（`cands.push(...)` 的先后），不要绑变量名 —— 绑变量名时
+  //   有人改个常量名就能绕过守卫（v3.52.0 反向验证踩过同族坑）。
+  const iRs63 = tt63.indexOf('const resolveScript = (name) =>');
+  const segRs63 = iRs63 < 0 ? '' : tt63.slice(iRs63, iRs63 + 900);
+  ok('T63-a1 ★流水线脚本定位必须技能目录(__dirname)优先于价库目录（价库目录常驻旧副本 → 每日跑旧代码）',
+    iRs63 >= 0 && segRs63.indexOf('cands.push(__dirname)') >= 0
+    && segRs63.indexOf('cands.push(path.dirname(CN_PRICE_DIR))') >= 0
+    && segRs63.indexOf('cands.push(__dirname)') < segRs63.indexOf('cands.push(path.dirname(CN_PRICE_DIR))'),
+    '红 = 顺序回到「价库目录优先」：价库目录里的 2026-09 旧脚本会被当成代码跑，所有新修复静默失效');
+  ok('T63-a2 ★CN_PRICE_PIPELINE_DIR 显式指定时仍是最高优先（用户显式覆盖必须尊重）',
+    segRs63.indexOf('cands.push(process.env.CN_PRICE_PIPELINE_DIR)') >= 0
+    && segRs63.indexOf('cands.push(process.env.CN_PRICE_PIPELINE_DIR)') < segRs63.indexOf('cands.push(__dirname)'));
+
+  // ── b. 新模型闸门 ──
+  ok('T63-b1 ★必须有新条目闸门函数，且 lock(authoritative) 条目豁免（用户已校对的价不受闸门干预）',
+    bi63.indexOf('def gate_new_model(e, full)') >= 0 && bi63.indexOf("if e.get('authoritative'):") >= 0
+    && bi63.indexOf("return True, ''") >= 0);
+  ok('T63-b2 ★新条目必须校验完整契约五字段 + 价格区间（缺溯源 / 越界 = 不可入账）',
+    bi63.indexOf('CONTRACT_FULL = (') >= 0 && bi63.indexOf("'source_url', 'fetched_at')") >= 0
+    && bi63.indexOf('PRICE_MIN, PRICE_MAX = ') >= 0
+    && bi63.indexOf('if not (PRICE_MIN <= v <= PRICE_MAX)') >= 0);
+  ok('T63-b3 ★首次构建（无上一版可对比）必须降级为最小契约（否则闸门会清空整库）',
+    bi63.indexOf('gate_full = bool(prev_models)') >= 0
+    && bi63.indexOf('need = CONTRACT_FULL if full else CONTRACT_MIN') >= 0);
+  ok('T63-b4 ★闸门必须有安全阀：整库将空时回退上一版（保险不能反过来变成数据灾难）',
+    bi63.indexOf('if not merged and prev_models:') >= 0 && bi63.indexOf("'kind': 'rollback'") >= 0
+    && bi63.indexOf('[build_index][ERROR]') >= 0);
+
+  // ── c. 变更分级 ──
+  ok('T63-c1 ★必须有变更分级函数，语义字段 = unit/currency（值变自动采纳，语义变进人工缝）',
+    bi63.indexOf('def classify_change(pe, ne)') >= 0
+    && bi63.indexOf("SEMANTIC_GUARDED = ('unit', 'currency')") >= 0);
+  ok('T63-c2 ★只有两边都有值且不同才算变化（上一版缺字段而本版补上是"补全"，判成语义变会作废新价）',
+    bi63.indexOf('if po and pn and po != pn:') >= 0);
+  ok('T63-c3 ★语义变必须保留上一版价格与单位，并挂 _manual_audit（新值可能差 1000 倍）',
+    bi63.indexOf("if 'semantic' in kinds:") >= 0 && bi63.indexOf('e[f] = pe[f]') >= 0
+    && bi63.indexOf("'kind': 'semantic'") >= 0 && bi63.indexOf("'new_values': new_vals") >= 0);
+  ok('T63-c4 ★价格跳变阈值：值变自动采纳，但 >5× / <1/5 必须 WARN（多半是单位或列取错）',
+    bi63.indexOf('BIG_JUMP = 5.0') >= 0 && bi63.indexOf('r >= BIG_JUMP or r <= 1.0 / BIG_JUMP') >= 0);
+
+  // ── d. 审计流水 ──
+  //   ⚠️ 断言必须覆盖「阈值判定真的被用上」（`os.path.getsize(...) > CHANGE_ROLL_MAX`）——
+  //   只查常量与 copyfile 存在的话，把判定改成 `False`（滚动失效、文件无限增长）仍然恒绿
+  //   （v3.53.0 反向验证 R9 实测：回退后守卫全绿，等于没设）。
+  ok('T63-d1 ★审计流水必须 append-only（模式 \'a\'）+ 超限滚动（不能只写不留，也不能无限增长）',
+    bi63.indexOf("open(CHANGE_FILE, 'a', encoding='utf-8')") >= 0
+    && bi63.indexOf('CHANGE_ROLL_MAX = ') >= 0 && bi63.indexOf('shutil.copyfile(CHANGE_FILE, CHANGE_ROLL_TO)') >= 0
+    && bi63.indexOf('os.path.getsize(CHANGE_FILE) > CHANGE_ROLL_MAX') >= 0);
+  ok('T63-d2 ★分级种类必须覆盖 new/rejected/price/semantic/big_jump/source_downgrade/region/carried/retired',
+    ["kinds.append('price')", "'kind': 'new'", "'kind': 'rejected'", "'kind': 'semantic'",
+     "kinds.append('big_jump')", "kinds.append('source_downgrade' if", "kinds.append('region')",
+     "'kind': 'carried'", "'kind': 'retired'"].every((s) => bi63.indexOf(s) >= 0));
+  ok('T63-d3 ★审计流水写失败不得阻断索引产出（留痕是保险，不能反过来卡住当日价库）',
+    bi63.indexOf('[build_index][WARN] changes.jsonl 写入失败') >= 0);
+
+  // ── e. 行为验证：真跑 build_index.py（源码守卫证明不了"索引里最后是旧价还是新价"）──
+  {
+    const py63 = (() => {
+      if (process.env.CN_PYTHON) return process.env.CN_PYTHON;
+      try {
+        const root = path.join(os.homedir(), '.workbuddy', 'binaries', 'python', 'versions');
+        for (const v of fs.readdirSync(root).sort().reverse()) {
+          const p = path.join(root, v, 'python.exe');
+          if (fs.existsSync(p)) return p;
+        }
+      } catch (e) { /* 探测失败 → 回退裸 python */ }
+      return 'python';
+    })();
+    const probe63 = spawnSync(py63, ['-c', 'print(1)'], { timeout: 20000, windowsHide: true });
+    const pyOk63 = !!(probe63.status === 0);
+    if (!SPAWN_OK || !pyOk63) {
+      for (const n of ['T63-e1', 'T63-e2', 'T63-e3', 'T63-e4', 'T63-e5', 'T63-e6']) {
+        envSkip(n + ' ★build_index 行为验证（真跑 python）',
+          !SPAWN_OK ? SPAWN_SKIP_REASON : ('未找到可用 python（试探 ' + py63 + ' 失败）；CI 上应为 0'));
+      }
+    } else {
+      const d63 = path.join(tmp, 't63');
+      const p63 = path.join(d63, 'prices');
+      fs.mkdirSync(p63, { recursive: true });
+      fs.mkdirSync(path.join(d63, 'wbroot'), { recursive: true }); // 空 WB_ROOT → 跳过 pricing.json(lock) 覆盖层
+      const U63 = '元/百万 tokens';
+      const mk63 = (i, o, over) => Object.assign({
+        in_price: i, out_price: o, cache_hit: 0.1, currency: 'CNY', unit: U63,
+        region: 'CN', source_url: 'http://x', fetched_at: '2026-10-13T00:00:00',
+      }, over || {});
+      const ent63 = (i, o) => ({
+        name: 'n', api_name: 'n', in_price: i, out_price: o, cache_hit: 0.1,
+        primary_source: 'src', primary_source_type: 'first_party', tier_note: '', all_sources: [],
+        currency: 'CNY', unit: U63, region: 'CN',
+      });
+      fs.writeFileSync(path.join(p63, 'index.json'), JSON.stringify({
+        built_at: new Date().toISOString().slice(0, 10),
+        models: { a: ent63(1.0, 2.0), b: ent63(1.0, 2.0), gone: ent63(1.0, 2.0),
+                  // f：上一版**缺** unit（老索引），本版补上 → 属"补全"不是"变化"，必须采用新价
+                  f: Object.assign(ent63(1.0, 2.0), { unit: null }) },
+      }));
+      fs.writeFileSync(path.join(p63, 'latest.json'), JSON.stringify({
+        fetched_at: '2026-10-13T00:00:00',
+        vendors: {
+          zhipu: { name: '智谱', models: [
+            Object.assign(mk63(1.2, 2.0), { name: 'a', api_name: 'a' }),                              // 值变
+            Object.assign(mk63(1000.0, 2000.0, { unit: '元/千 tokens' }), { name: 'b', api_name: 'b' }), // 语义变
+            Object.assign(mk63(5.0, 6.0), { name: 'f', api_name: 'f' }),                              // 补全 unit → 采用新价
+          ] },
+          minimax: { name: 'MiniMax', models: [
+            Object.assign(mk63(2.0, 4.0), { name: 'newok', api_name: 'newok' }),                       // 契约全 → 收录
+            Object.assign(mk63(2.0, 4.0, { region: undefined }), { name: 'newnoregion', api_name: 'newnoregion' }), // 缺 region → 拒
+            Object.assign(mk63(99999.0, 4.0), { name: 'newbadprice', api_name: 'newbadprice' }),       // 越界 → 拒
+          ] },
+        },
+      }));
+      const env63 = Object.assign({}, process.env, { CN_PRICES_DIR: p63, WB_ROOT: path.join(d63, 'wbroot') });
+      const r63 = spawnSync(py63, [path.join(SRC, 'build_index.py')],
+        { cwd: d63, env: env63, timeout: 120000, windowsHide: true, encoding: 'utf-8' });
+      let idx63 = null, ch63 = [];
+      try { idx63 = JSON.parse(fs.readFileSync(path.join(p63, 'index.json'), 'utf-8')); } catch (e) { /* 下方断言会红 */ }
+      try {
+        ch63 = fs.readFileSync(path.join(p63, 'changes.jsonl'), 'utf-8').split('\n')
+          .filter((l) => l.trim()).map((l) => JSON.parse(l));
+      } catch (e) { /* 同上 */ }
+      const M63 = (idx63 && idx63.models) || {};
+      const kinds63 = ch63.reduce((a, c) => { a[c.kind] = (a[c.kind] || 0) + 1; return a; }, {});
+      const log63 = String((r63 && (r63.stdout + r63.stderr)) || '');
+      ok('T63-e1 ★值变自动采纳（a 的新价 1.2 进索引）', M63.a && M63.a.in_price === 1.2,
+        JSON.stringify(M63.a) + ' | ' + log63.slice(-200));
+      ok('T63-e2 ★语义变保留旧价 + 旧单位 + 挂 _manual_audit（不采用可能差 1000 倍的新值）',
+        M63.b && M63.b.in_price === 1.0 && M63.b.unit === U63
+        && (M63.b._manual_audit || {}).kind === 'semantic'
+        && (M63.b._manual_audit.new_values || {}).in_price === 1000.0,
+        JSON.stringify(M63.b));
+      ok('T63-e3 ★新条目：契约全 → 收录；缺 region / 价格越界 → 拒收',
+        !!M63.newok && !M63.newnoregion && !M63.newbadprice, Object.keys(M63).join(','));
+      ok('T63-e4 ★缺失模型沿用旧价（gone 仍在）', !!M63.gone);
+      ok('T63-e5 ★审计流水落盘且含 new/rejected/price/semantic/carried 五类',
+        ['new', 'rejected', 'price', 'semantic', 'carried'].every((k) => kinds63[k] > 0), JSON.stringify(kinds63));
+      ok('T63-e6 ★闸门模式：有上一版时为 full，且拒收有 WARN 输出',
+        (idx63 && idx63._changes && idx63._changes.gate_mode === 'full')
+        && log63.indexOf('被闸门拒收') >= 0 && log63.indexOf('单位/币种') >= 0,
+        JSON.stringify(idx63 && idx63._changes) + ' | ' + log63.slice(-300));
+      ok('T63-e7 ★上一版缺字段而本版补上 = 补全，必须采用新价（判成语义变会作废新解析结果）',
+        M63.f && M63.f.in_price === 5.0 && !M63.f._manual_audit, JSON.stringify(M63.f));
+    }
+  }
+}
+
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。
 //   为什么需要：主脚本在被 require 时会跑 loadPricing → maybeRefreshHolidays（每进程一次、四条件命中即
 //   **detach** spawn 一个 refresh-holidays.js 子进程并往 SNAP_DIR 写 `.holidays-refresh.json`）。该子进程
