@@ -35,6 +35,7 @@ const os = require('os');
 // v3.49.0（审计 C6）：crypto 导入已删——水位线键的两处内联 sha1 拼接改为调用 tt.ledgerKey 后，
 //   本文件不再需要任何哈希。（保留无人使用的 import 会诱导下一个人继续在本地拼键。）
 const { detectWorkBuddyRoot } = require('./wb-root.js'); // v3.42.0（plan-B B1）：数据根探测单点实现，已抽到 wb-root.js
+const { mergeDailyLedger } = require('./ledger-merge.js'); // v3.55.0（S3）：账本合并抽成可单测纯函数
 
 const WB = process.env.WB_ROOT || detectWorkBuddyRoot();
 const SKILL_DIR = path.join(WB, 'skills', 'token-usage-tracker');
@@ -495,7 +496,15 @@ function main() {
     }
     let cur = {};
     try { cur = JSON.parse(fs.readFileSync(DAILY, 'utf-8')); } catch (e) { cur = {}; }
-    const mergedDaily = Object.assign({}, cur, newDaily); // newDaily 覆盖同日期，cur 的其余日期保留
+    // v3.55.0（审计批5·S3）：日期级整块替换 → **模型级 merge**（纯函数已抽到 ledger-merge.js，可单测）。
+    //   旧式 `Object.assign({}, cur, newDaily)` 的 key 是日期 → 同日期整块被 newDaily 顶掉：
+    //   某模型的用量只存在于已删除/归档的 transcript（重放抓不到）时，账本里该模型当天的量被抹掉。
+    //   :270-274 的扫描指纹比对（+锁内二次比对）只缓解了「扫描期间新写入被覆盖」，管不了这一路。
+    const { merged: mergedDaily, carriedSummary } = mergeDailyLedger(cur, newDaily, dayTotalOf);
+    if (carriedSummary.length > 0) {
+      console.error('[backfill] 已保留重放未覆盖的旧模型记录（标记 stale_carried）：' + carriedSummary.join('、')
+        + '；这些用量来自本次扫描不到的 transcript（已删除/归档），保留以免被整块覆盖抹掉');
+    }
     const tmp1 = DAILY + '.tmp-' + process.pid;           // 保留原临时文件名（不与主链路共享固定名）
     fs.writeFileSync(tmp1, JSON.stringify(mergedDaily, null, 2) + '\n');
     fs.renameSync(tmp1, DAILY);

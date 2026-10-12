@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.54.0 (2026-10-13)
+// token-usage-tracker v3.55.0 (2026-10-13)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -4980,7 +4980,7 @@ function peakRuleTag(pricing) {
 // v3.29.0（A-8）：价格诊断告警链修复 —— refresh-prices.js 会往 pricing.json 落四类诊断字段，
 //   但此前 token-tracker.js **只消费 last_refresh_error**，其余（_price_audit / last_refresh_note /
 //   _ambig_warnings）全部只写不读，用户在弹窗里完全看不到。这里补上：toast 只挂一个**极短**标签
-//   「⚠价核验」（行2 宽度敏感，TOAST_LINE_MAX_W=51，绝不能塞整段文本），详细告警走 stderr 落日志。
+//   「⚠价核验」（行2 宽度敏感，TOAST_LINE_MAX_W=44，绝不能塞整段文本），详细告警走 stderr 落日志。
 // 触发源（任一命中即标；字段类型容错，缺字段/类型异常都安全忽略）：
 //   ① pricing._price_audit        —— refresh-prices.js 价格一致性自检 { at, warnings:[...] }，无告警即 delete
 //   ② pricing._ambig_warnings     —— 模糊匹配歧义（纯字符串数组），无歧义即 delete
@@ -6057,7 +6057,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.54.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.55.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

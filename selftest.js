@@ -85,7 +85,8 @@ fs.mkdirSync(skillDir, { recursive: true });
 // v3.42.0（plan-B B1）：wb-root.js 必须随行——数据根探测抽成单点实现后，主脚本/backfill/recalc/
 //   refresh-prices 四个文件顶层都 require 它；隔离目录缺它 = 全段 MODULE_NOT_FOUND（同上两坑的第三次）。
 const RUNTIME_COMPANIONS = ['refresh-prices.js', 'deepseek-official.js', 'refresh-holidays.js',
-  'pricing.json', 'holidays.json', 'peak-rules.js', 'recalc-day.js', 'stop-handler.js', 'wb-root.js'];
+  'pricing.json', 'holidays.json', 'peak-rules.js', 'recalc-day.js', 'stop-handler.js', 'wb-root.js',
+  'ledger-merge.js']; // v3.55.0（S3）：账本合并抽成独立模块，backfill 顶层 require → 必须随行
 for (const f of ['token-tracker.js', ...RUNTIME_COMPANIONS]) {
   fs.copyFileSync(path.join(SRC, f), path.join(skillDir, f));
 }
@@ -5575,6 +5576,196 @@ else {
         JSON.stringify(C64));
       ok('T64-e8 ★交叉冲突**只留痕不删条目**（deepseekx/ci/pk/oldusd 全部仍在索引里）',
         ['deepseekx', 'ci', 'pk', 'oldusd', 'oldusd2'].every((k) => !!M64[k]), Object.keys(M64).join(','));
+    }
+  }
+}
+
+
+// ===== T65：v3.55.0 未映射模型可见化 + 账本模型级 merge + 缓存价比值校验 + 文档口径对齐（审计批5）=====
+// 四条主线：
+//   ① **A2 未映射模型不再静默丢**：parse_tokenhub 只收混元，旧实现一条 `brand == 'hunyuan'` 了事 →
+//      BRAND_MAP 里没有的新混元模型 brand=None，被同一条语句丢掉且**无声**；0 模型 exit(2) 只在
+//      「全都没映射」时兜住，**部分失效**（新混元上线 / 老模型改名）时旧模型照常解析 → 静默消失。
+//      修法守住「品牌不许猜」红线：不新增启发式，只把「丢弃」分三路记账（第三方=预期 / 未识别=意外+告警）。
+//   ② **S3 账本合并改模型级**：backfill --write 旧式 `Object.assign({}, cur, newDaily)` 的 key 是**日期**
+//      → 同日期整块被顶掉 → 只存在于已删除 transcript 里的模型用量被抹掉（该文件 :270 注释自己承认）。
+//   ③ **G2 缓存价/输入价比值**：priceGate 此前只拦 `cached > input`，拦不住「缓存价填成别的档位价」
+//      （<= 输入价 → 全部放行），而金额 ≈ 缓存价 × 缓存量（本机命中率 ~97%）→ 同向错且无提示。
+//   ④ **G8/G9 文档债**：阈值字面量与峰谷口径注释与代码脱节（代码 44 / 文档 51；UTC 表述 vs 北京时间实现）。
+// ⚠️ 断言纪律（v3.52~3.54 反向验证连踩过）：匹配**使用点**而非定义处；扫源码先 stripComments；
+//    锚点必须唯一到那一处；期望集按「该回退真正断掉哪条路径」写，不写宽。
+{
+  const rd65 = (f) => fs.readFileSync(path.join(SRC, f), 'utf-8').replace(/\r\n/g, '\n');
+  const pth65 = stripComments(rd65('parse_tokenhub.py'));
+  const bf65 = stripComments(rd65('backfill.js'));
+  const rp65 = stripComments(rd65('refresh-prices.js'));
+  const tt65c = stripComments(rd65('token-tracker.js'));
+  const tt65 = rd65('token-tracker.js');   // d4 要查**注释**里的旧值 → 必须未剥注释
+  const rh65 = rd65('refresh-holidays.js'); // d5 同理（澄清口径就写在头注释里）
+  const lm65 = stripComments(rd65('ledger-merge.js'));
+  const sk65 = fs.readFileSync(path.join(SRC, 'SKILL.md'), 'utf-8');
+  const rdm65 = fs.readFileSync(path.join(SRC, 'README.md'), 'utf-8');
+
+  // ── a. A2：未映射模型可见化 ──
+  ok('T65-a1 ★keep_hunyuan 必须定义且在解析结果处被真正调用（定义了不用 = 白写）',
+    pth65.indexOf('def keep_hunyuan(models)') >= 0
+    && pth65.indexOf('models, unmapped = keep_hunyuan(models)') >= 0);
+  ok('T65-a2 ★三路分流：混元收 / 已知第三方丢 / 未识别进 unmapped；且**不得新增品牌启发式**',
+    pth65.indexOf("if b == 'hunyuan':") >= 0
+    && pth65.indexOf('elif b:') >= 0
+    && pth65.indexOf("unmapped.append(m.get('name') or '?')") >= 0
+    && !/startswith\(\s*['"]Hy/.test(pth65),
+    '红 = 有人用前缀猜品牌（红线：品牌必须显式解析）');
+  ok('T65-a3 ★未映射必须落进输出的 _unmapped 字段（只 WARN 不留痕 = 事后无从查证）',
+    pth65.indexOf("'_unmapped': unmapped") >= 0);
+  ok('T65-a4 ★未映射必须有 stderr WARN 且带模型名清单（只给计数 = 无法定位是哪个模型）',
+    pth65.indexOf('个模型名未在 BRAND_MAP 中映射') >= 0
+    && pth65.indexOf('[parse_tokenhub][WARN]') >= 0);
+
+  // ── b. S3：账本模型级 merge ──
+  ok('T65-b1 ★账本合并必须抽成可单测的 ledger-merge.js 纯函数模块（否则行为无从验证）',
+    lm65.indexOf('function mergeDailyLedger(cur, newDaily, dayTotalOf)') >= 0
+    && lm65.indexOf('module.exports = { mergeDailyLedger }') >= 0);
+  ok('T65-b2 ★backfill 必须 require 且在提交处调用（只 require 不调用 = 没接上）',
+    bf65.indexOf("require('./ledger-merge.js')") >= 0
+    && bf65.indexOf('mergeDailyLedger(cur, newDaily, dayTotalOf)') >= 0,
+    '红 = 有人把合并逻辑又塞回锁内');
+  ok('T65-b3 ★旧式「日期级整块替换」必须消失（以日期为 key → 同日期整块被顶掉）',
+    !/Object\.assign\(\{\},\s*cur,\s*newDaily\)/.test(bf65),
+    '红 = 账本合并退回整块覆盖，重放抓不到的模型会被抹掉');
+  ok('T65-b4 ★重放抓不到的模型必须保留并打 stale_carried（不打标记 = 事后分不清哪些是沿用）',
+    lm65.indexOf('{ stale_carried: true }') >= 0);
+  ok('T65-b5 ★同日期 total 必须按合并后的 models 重算（沿用旧 total = 汇总少一块）',
+    lm65.indexOf('total: dayTotalOf(m)') >= 0);
+
+  // ── c. G2：缓存价 / 输入价 比值校验 ──
+  ok('T65-c1 ★必须有正常带常量 CACHE_RATIO（实证：本机 16 模型实测 2.0%~28.7%，两侧各留一倍余量）',
+    /const CACHE_RATIO = \{ lo: 0\.005, hi: 0\.5 \};/.test(rp65));
+  ok('T65-c2 ★比值必须用**有效价**算（effCa/effIn，不能用已判异常回退掉的旧值）',
+    rp65.indexOf('const ratio = effCa / effIn;') >= 0
+    && rp65.indexOf('ratio > CACHE_RATIO.hi || ratio < CACHE_RATIO.lo') >= 0);
+  ok('T65-c3 ★越界**只告警不阻断**（比值越界 ≠ 错价；设 out.cached 会冻住价库）',
+    (() => {
+      const i = rp65.indexOf('const ratio = effCa / effIn;');
+      if (i < 0) return false;
+      const body = rp65.slice(i, i + 400);
+      return body.indexOf('warnSink.push') >= 0 && body.indexOf('out.cached = true') < 0;
+    })(), '红 = 比值校验开始阻断刷新');
+  ok('T65-c4 ★CACHE_RATIO 必须导出（否则行为守卫无法真跑 priceGate）',
+    rp65.indexOf('PRICE_SANITY, CACHE_RATIO, DEFAULT_RATE') >= 0);
+
+  // ── d. G8/G9：文档与注释口径 ──
+  ok('T65-d1 ★TOAST_LINE_MAX_W 代码常量必须为 44（51 高于通知卡片真实极限 → 宽度守卫永不触发）',
+    /const TOAST_LINE_MAX_W = 44;/.test(tt65c));
+  ok('T65-d2 ★SKILL.md 不得再写 51，且必须写 44（文档漂移 → 照文档改代码 = 改回无实证值）',
+    sk65.indexOf('TOAST_LINE_MAX_W=51') < 0 && sk65.indexOf('TOAST_LINE_MAX_W=44') >= 0);
+  ok('T65-d3 ★README.md 同上',
+    rdm65.indexOf('TOAST_LINE_MAX_W=51') < 0 && rdm65.indexOf('TOAST_LINE_MAX_W=44') >= 0);
+  ok('T65-d4 ★token-tracker.js 行内注释也不得残留 51（注释里的旧值会误导下一个人）',
+    tt65.indexOf('TOAST_LINE_MAX_W=51') < 0, '红 = 有人把注释改回 51');
+  ok('T65-d5 ★refresh-holidays 头注释必须澄清「峰时段判定不在本脚本」并指向 peak-rules.js',
+    rh65.indexOf('peak-rules.js') >= 0 && rh65.indexOf('DEFAULT_RANGES') >= 0);
+
+  // ── e. 行为守卫（源码守卫证明不了「合并后到底保留没保留 / 告警到底出没出」）──
+  //   S3/G2 已抽成可 require 的纯函数模块 → 直接真跑；A2 是 python，走与 T64-e 相同的探测 + envSkip 通道。
+  {
+    const { mergeDailyLedger } = require(path.join(SRC, 'ledger-merge.js'));
+    const tot65 = (models) => {
+      const t = { in: 0, out: 0, cached: 0, total: 0, cost: 0 };
+      for (const m of Object.values(models || {})) {
+        t.in += m.in || 0; t.out += m.out || 0; t.cached += m.cached || 0;
+        t.total += m.total || 0; t.cost += m.cost || 0;
+      }
+      return t;
+    };
+    const cur65 = {
+      '2026-10-01': { models: { hy3: { in: 100, out: 10, cached: 50, total: 160, cost: 0.01 },
+                                ghost: { in: 5, out: 1, cached: 0, total: 6, cost: 0.001 } }, total: {} },
+      '2026-09-30': { models: { hy3: { in: 1, out: 1, cached: 0, total: 2, cost: 0 } }, total: {} },
+    };
+    const new65 = {
+      '2026-10-01': { models: { hy3: { in: 200, out: 20, cached: 100, total: 320, cost: 0.02 } }, total: {} },
+      '2026-10-03': { models: { hy3: { in: 7, out: 1, cached: 0, total: 8, cost: 0 } }, total: {} },
+    };
+    const R65 = mergeDailyLedger(cur65, new65, tot65);
+    const M1 = (R65.merged && R65.merged['2026-10-01']) || {};
+    ok('T65-e1 ★重放权威覆盖同 key（hy3.in 100→200；不取 max、不叠加）',
+      M1.models && M1.models.hy3 && M1.models.hy3.in === 200, JSON.stringify(M1.models && M1.models.hy3));
+    ok('T65-e2 ★重放抓不到的模型必须保留（ghost 仍在）且打 stale_carried',
+      M1.models && M1.models.ghost && M1.models.ghost.in === 5 && M1.models.ghost.stale_carried === true,
+      JSON.stringify(M1.models && M1.models.ghost));
+    ok('T65-e3 ★carriedSummary 按日期计数，供调用方打 stderr 汇总',
+      R65.carriedSummary.length === 1 && R65.carriedSummary[0] === '2026-10-01(1个模型)',
+      JSON.stringify(R65.carriedSummary));
+    ok('T65-e4 ★旧日期原样保留 + 同日期 total 按合并后重算（in = 200+5）',
+      !!R65.merged['2026-09-30'] && M1.total && M1.total.in === 205, JSON.stringify(M1.total));
+
+    const rpM65 = require(path.join(SRC, 'refresh-prices.js'));
+    const pr65 = JSON.parse(fs.readFileSync(path.join(SRC, 'pricing.json'), 'utf-8'));
+    const ms65 = pr65.models || pr65;
+    let miss65 = 0; const out65 = [];
+    for (const [k, v] of Object.entries(ms65)) {
+      if (!v || typeof v !== 'object') continue;
+      const ip = v.input_price, cp = v.cached_price;
+      if (typeof ip !== 'number' || ip <= 0 || typeof cp !== 'number' || cp <= 0) continue;
+      const sink = [];
+      rpM65.priceGate(k, { input_price: ip, cached_price: cp }, { input_price: ip, cached_price: cp * 0.9 }, sink);
+      if (sink.some((s) => String(s).indexOf('缓存命中价/输入价') >= 0)) { miss65 += 1; out65.push(k + ':' + sink.join('|')); }
+    }
+    ok('T65-e5 ★真实价库全量零误伤：现有模型的缓存/输入比值都在正常带内（不得一改就满屏告警）',
+      miss65 === 0, out65.join(' ; '));
+    const sHi65 = [];
+    rpM65.priceGate('t65-hi', { input_price: 2, cached_price: 1.6 }, { input_price: 2, cached_price: 1.0 }, sHi65);
+    ok('T65-e6 ★比值 80% 越上界必须告警（拦「缓存价填成别的档位价」这一路）',
+      sHi65.some((s) => String(s).indexOf('缓存命中价/输入价') >= 0), JSON.stringify(sHi65));
+    const sLo65 = [];
+    rpM65.priceGate('t65-lo', { input_price: 20, cached_price: 0.05 }, { input_price: 20, cached_price: 0.08 }, sLo65);
+    ok('T65-e7 ★比值 0.25% 越下界必须告警',
+      sLo65.some((s) => String(s).indexOf('缓存命中价/输入价') >= 0), JSON.stringify(sLo65));
+    const sIn65 = [];
+    rpM65.priceGate('t65-in', { input_price: 2, cached_price: 0.4 }, { input_price: 2, cached_price: 0.3 }, sIn65);
+    ok('T65-e8 ★带内（20%）不得告警（误杀 = 正常刷新被拒 = 价库停滞）',
+      !sIn65.some((s) => String(s).indexOf('缓存命中价/输入价') >= 0), JSON.stringify(sIn65));
+
+    // A2 行为验证（真跑 python）
+    const pyB65 = (() => {
+      if (process.env.CN_PYTHON) return process.env.CN_PYTHON;
+      try {
+        const root = path.join(os.homedir(), '.workbuddy', 'binaries', 'python', 'versions');
+        for (const v of fs.readdirSync(root).sort().reverse()) {
+          const p = path.join(root, v, 'python.exe');
+          if (fs.existsSync(p)) return p;
+        }
+      } catch (e) { /* 探测失败 → 回退裸 python */ }
+      return 'python';
+    })();
+    const probeB65 = spawnSync(pyB65, ['-c', 'print(1)'], { timeout: 20000, windowsHide: true });
+    if (!SPAWN_OK || probeB65.status !== 0) {
+      for (const n of ['T65-e9', 'T65-e10']) {
+        envSkip(n + ' ★keep_hunyuan 行为验证（真跑 python）',
+          !SPAWN_OK ? SPAWN_SKIP_REASON : ('未找到可用 python（试探 ' + pyB65 + ' 失败）；CI 上应为 0'));
+      }
+    } else {
+      const pySrc65 = [
+        'import sys, importlib.util',
+        "spec = importlib.util.spec_from_file_location('pth65', sys.argv[1])",
+        'm = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)',
+        "ms = [{'name':'Hy3','brand':'hunyuan'},{'name':'Kimi K3','brand':'kimi'},{'name':'Hy-New','brand':None}]",
+        'kept, unmapped = m.keep_hunyuan(ms)',
+        "print('KEPT=' + ','.join(x['name'] for x in kept))",
+        "print('UNMAPPED=' + ','.join(unmapped))",
+        "k2, u2 = m.keep_hunyuan([{'name':'Hy3','brand':'hunyuan'}])",
+        "print('PURE_KEPT=%d PURE_UNMAPPED=%d' % (len(k2), len(u2)))",
+      ].join('\n');
+      const rB65 = spawnSync(pyB65, ['-c', pySrc65, path.join(SRC, 'parse_tokenhub.py')],
+        { timeout: 60000, windowsHide: true, encoding: 'utf-8' });
+      const logB65 = String(((rB65 && rB65.stdout) || '') + ((rB65 && rB65.stderr) || ''));
+      ok('T65-e9 ★三路分流：混元收、第三方丢、**未识别进 unmapped**（旧实现此处静默丢）',
+        logB65.indexOf('KEPT=Hy3') >= 0 && logB65.indexOf('UNMAPPED=Hy-New') >= 0,
+        logB65.slice(-300));
+      ok('T65-e10 ★纯混元输入不得误报未映射（否则每次刷新都刷假告警，真告警被淹没）',
+        logB65.indexOf('PURE_KEPT=1') >= 0 && logB65.indexOf('PURE_UNMAPPED=0') >= 0,
+        logB65.slice(-300));
     }
   }
 }

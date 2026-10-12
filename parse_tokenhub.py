@@ -227,6 +227,31 @@ def parse_lang_table(block):
     return models
 
 
+def keep_hunyuan(models):
+    """从价表解析结果中挑出腾讯自家(混元)模型。
+
+    v3.55.0（审计批5·A2）：**未映射模型不再静默丢弃**。
+      旧实现就一条 `brand == 'hunyuan'` 过滤：BRAND_MAP 里没有的新混元模型 → brand=None →
+      被同一条语句丢掉且**无声**。0 模型 exit(2) 只在「全都没映射」时兜住，**部分失效**
+      （新混元上线 / 老模型改名）时旧模型照常解析 → models 非空 → 新模型静默消失，无人察觉。
+      修法遵守「品牌不许猜」红线：**不新增任何启发式**（如按名字前缀推断品牌），
+      而是把「丢弃」分三路记账 —— 已知第三方=预期丢弃(不告警) / 未识别=意外(告警 + _unmapped 留痕)。
+
+    返回 (kept, unmapped)：kept = 收录的混元模型；unmapped = 未识别被丢的模型名（调用方负责告警）。
+    """
+    unmapped = []
+    kept = []
+    for m in models:
+        b = m.get('brand')
+        if b == 'hunyuan':
+            kept.append(m)
+        elif b:
+            pass  # 已知第三方品牌（deepseek/zhipu/kimi/minimax/qwen 等）：预期丢弃，不告警
+        else:
+            unmapped.append(m.get('name') or '?')
+    return kept, unmapped
+
+
 def parse_peak_rule(html):
     """从正文提取峰谷时段规则（结构化文本）。"""
     rules = []
@@ -388,7 +413,11 @@ def main():
         sys.exit(2)
     models = parse_lang_table(tbl)
     # 只保留腾讯自家(混元)模型；页面里其余是腾讯转售的第三方(智谱/Kimi/DeepSeek/MiniMax)，一律不要
-    models = [m for m in models if m.get('brand') == 'hunyuan']
+    models, unmapped = keep_hunyuan(models)
+    if unmapped:
+        sys.stderr.write('[parse_tokenhub][WARN] 以下 %d 个模型名未在 BRAND_MAP 中映射，本次未收录：%s\n'
+                         '  -> 若为腾讯混元新模型/改名，请补 BRAND_MAP（本库不猜品牌：宁可不收，也不误收）\n'
+                         % (len(unmapped), '、'.join(unmapped)))
     if not models:
         # v3.48.0（审计 F8）：0 模型一律不写、非零退出。5xx/Cloudflare/列序变化都可能切出 0 模型，
         #   而 0 模型文件会让 build_index 的"逐模型沿用 ≤7 天"失效 → Hunyuan 从索引消失 →
@@ -420,6 +449,8 @@ def main():
         'unit': unit,
         'peak_rule': peak_rule,
         'models': models,
+        # v3.55.0（A2）：本次被丢弃的未映射模型名（留痕，供人工补 BRAND_MAP；build_index 不消费）
+        '_unmapped': unmapped,
     }
     import os
     # v3.51.0（审计批1·C）：输出目录改为 HERE 锚定。原实现 `os.makedirs('prices')` 是

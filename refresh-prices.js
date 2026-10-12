@@ -585,6 +585,10 @@ const PRICE_SANITY = {
   warnAt: 1.5,  // 相对旧值 ≥50% → 只告警不阻断（真调价属正常，不能把价库冻住）
 };
 const PRICE_FIELD_LABEL = { input_price: '输入价', output_price: '输出价', cached_price: '缓存命中价' };
+// v3.55.0（审计批5·G2）：缓存命中价 / 输入价 的**正常带**。
+//   实测本机 pricing.json 16 个模型 = 2.0% ~ 28.7%（deepseek 系最低 2.0%，glm-5.3-flash 最高 28.7%），
+//   两侧各留约一倍余量取 [0.5%, 50%] → 现有价库**零误伤**（已用真实 pricing.json 全量验证）。
+const CACHE_RATIO = { lo: 0.005, hi: 0.5 };
 
 // 对单个模型「本次刷新后的值 now」与「刷新前的快照 pre」做体检。
 // 返回 { main:boolean, cached:boolean }：main=输入价/输出价异常（整块回退）；cached=仅缓存价异常。
@@ -639,9 +643,20 @@ function priceGate(key, now, pre, warnSink) {
   const effCa = out.cached ? pre.cached_price : now.cached_price;
   if (typeof effIn === 'number' && effIn > 0 && typeof effCa === 'number' && effCa > effIn) {
     warnSink.push(`${key}: 缓存命中价 ${effCa} 高于输入价 ${effIn}（缓存应是折扣价），疑似列错位/单位错误，请人工核验`);
-    // 有旧值才回退；无旧值时保留新值（回退成 null 会被 calcCost 按 0 计，比错价更隐蔽）
-    if (pre.cached_price != null) out.cached = true;
-  }
+      // 有旧值才回退；无旧值时保留新值（回退成 null 会被 calcCost 按 0 计，比错价更隐蔽）
+      if (pre.cached_price != null) out.cached = true;
+    }
+    // v3.55.0（审计批5·G2）：补「缓存价/输入价 = 几折」这一维。
+    //   上面只拦 `cached > input`（列错位）与区间/骤变，拦不住**缓存价填成了别的档位价**（把输出价、
+    //   或别的模型的价填进来）—— 这类错价 ≤ 输入价，旧校验全线放行；而金额 ≈ 缓存价 × 缓存量
+    //   （本机缓存命中率 ~97%）→ toast / 账本 / --report 同向错且**无任何提示**。
+    //   **只告警不阻断**：比值越界不等于错（新模型定价可能本来就特殊），照本函数头顶「宁可漏报绝不误杀」。
+    if (typeof effIn === 'number' && effIn > 0 && typeof effCa === 'number' && effCa > 0) {
+      const ratio = effCa / effIn;
+      if (ratio > CACHE_RATIO.hi || ratio < CACHE_RATIO.lo) {
+        warnSink.push(`${key}: 缓存命中价/输入价 = ${(ratio * 100).toFixed(1)}%（正常带 ${(CACHE_RATIO.lo * 100).toFixed(1)}%~${(CACHE_RATIO.hi * 100).toFixed(0)}%），疑似档位填错，请人工核验`);
+      }
+    }
   return out;
 }
 
@@ -1159,4 +1174,4 @@ if (require.main === module) {
 // retiredLockWarnings / applyRetiredLocked，供单元测试直接验证（纯函数，无副作用）
 // v3.31.0（P0-5 / P1-7）：导出价格体检纯函数与阈值，供 selftest 离线单测（行为可验证，不靠源码守卫）
 // v3.37.0（L1'）：导出 SOURCES / TIMEOUT_MS / BIG_SOURCE_TIMEOUT_MS，供 selftest T39 断言「大载荷源有独立超时预算」。
-module.exports = { save, load, todayStr, PRICING, usdFind, cnFind, looseFind, norm, median, AMBIG_WARNINGS, AMBIG_WARNINGS_LOCKED, AMBIG_WARNINGS_OFFICIAL, isFreeVariant, parseLlma, parseLlc, parseOr, parseLitellm, parsePortkey, mergeWithDisk, applyUsdCachedPrice, retiredLockWarnings, applyRetiredLocked, priceGate, restoreBlock, restoreCached, PRICE_SANITY, DEFAULT_RATE, SOURCES, TIMEOUT_MS, BIG_SOURCE_TIMEOUT_MS };
+module.exports = { save, load, todayStr, PRICING, usdFind, cnFind, looseFind, norm, median, AMBIG_WARNINGS, AMBIG_WARNINGS_LOCKED, AMBIG_WARNINGS_OFFICIAL, isFreeVariant, parseLlma, parseLlc, parseOr, parseLitellm, parsePortkey, mergeWithDisk, applyUsdCachedPrice, retiredLockWarnings, applyRetiredLocked, priceGate, restoreBlock, restoreCached, PRICE_SANITY, CACHE_RATIO, DEFAULT_RATE, SOURCES, TIMEOUT_MS, BIG_SOURCE_TIMEOUT_MS };
