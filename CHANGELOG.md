@@ -3,6 +3,37 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.56.0（2026-10-13）—— Portkey 补源（USD 3→5）+ 查找缓存 + toast 单次读入 + 源独立性口径（审计批6）
+
+> 触发：待做计划台账（`.workbuddy/memory/PLAN-price-pipeline-2026-10.md`）批 6（A1 + G4/G6）。
+
+### 修复
+
+- **A1 Portkey USD 源 3→5**（`refresh-prices.js`）
+  - 联网探测 `configs.portkey.ai/pricing/<provider>.json`：**16 个 provider 可用**（openai 189 条 / anthropic 38 条 / google 143 / bedrock 239 / deepinfra 225 / openrouter 748 / zhipu 18 / moonshot 17 / deepseek 5 等）。
+  - 定案补 **openai + anthropic** 两个（与原 deepseek 并列，`parsePortkey` 复用）：
+    - **不选 openrouter**（748 条，覆盖最广）——Portkey 的 openrouter.json 就是源 C（OpenRouter API）的镜像，加它 = 假独立源（与 llm-prices-cn 同源镜像同一个坑）；
+    - **暂不加 zhipu / moonshot**——虽直接覆盖价库 glm/kimi 系列，但 `usd_*` 只对 region=US 写盘、CN 模型又有国内源价 → 对现价库零收益，反而新增歧义告警（`glm-5.3-flash` 模糊命中 `glm-5`、`kimi-k3-1` 命中 `kimi-k3`）；
+    - openai/anthropic **零本地命中** → 零告警零污染，纯增量扩大 USD 中位数样本（未来 US region 模型上线时中位数更稳）。
+  - `SOURCES` / `PARSERS` / `usdSources` / `usdOk` 同步扩到 7 源（5 个 USD 源）。
+- **G4 查找缓存**（`refresh-prices.js`）
+  - 病根：`looseFind` 每次调用都对**整个源索引**跑 `norm(k)`；`usdFind` 每模型被 3 个 median（usdIn/usdOut/cacheUsd）各查一次 → A1 扩到 5 源后 17 模型 × 5 源 × 3 = **255 次全索引遍历**（litellm 1000+ 键 → 几十万次重复字符过滤）。
+  - 修法：`looseNormIndex()` 按 index 对象（WeakMap）缓存归一化结果，每索引只算一次；`usdFind` 加 `(index, localKey, orId)` 结果 memo。`locked` 只影响告警分流不影响返回值 → memo 安全；`looseFind` 签名不变（T28 直接单测不受影响）。
+- **G6 toast 日志单次读入**（`recalc-day.js`）
+  - 病根：预热对当天全部模型逐个调 `roundHoursOf`，每次 `readFileSync` 整份 toast 日志 + 全量 JSON.parse → N 个模型 = N 次整份读同一份日志（v3.29.0 的"锁外预热"只把 I/O 移出锁，没消除重复本身）；日志随使用时间单调增长，recalc 成本线性恶化。
+  - 修法：`readToastRounds()` 一次读入、`groupToastLines()` 纯函数按 `roundOwner` 仲裁归属分组；`contested`（互前缀轮次被更长名抢走）按模型归集后统一 stderr 打点，语义与 roundHoursOf 内逐字一致。`roundHoursOf` 保留作锁内 fallback（并发新出现的模型才现场读）。
+
+### 文档 / 口径
+
+- **`docs/pricing-refresh.md` 新增「源的独立性口径」节**：llm-prices-cn 与 llmabacus 是同一份数据（每日镜像）→ 国内实际只有 **1 个独立源**，"国内 2 源独立交叉验证"不成立；Portkey 的 openrouter.json 与源 C 同源故不选；Portkey 0 价占位（未定价用 `price=0` 表示，实测 zhipu 的 glm-4.7-flash）由 `parsePortkey` 的 request+response 同时 >0 收录规则拦截。
+- SKILL.md 摘要 / README 源清单表同步 7 源口径 + 镜像关系。
+
+### 验证
+
+- selftest 新增守卫组 **T66（20 条）**：源码 12 条（新源注册/URL/PARSERS/usdSources/usdOk、G4 两个缓存使用点、G6 三个结构点、文档 4 条）+ 行为 8 条（全 require 真跑：SOURCES 结构、parsePortkey 0 价过滤、缓存命中同一引用、memo 等价+告警不重复、groupToastLines 整名归属/contested/前缀兜底、looseFind 语义回归）。
+- 单元验证 20/20（含 A1 三家 provider 价格换算抽检：kimi-k2.5 $0.6 / kimi-k3 $3.0 与公开国际价一致）。
+- 零账本影响：新源对现价库零影响（`usd_*` 仅 region=US 写盘、唯一 US 模型 space-bunny 三源均无命中；CN 模型 cached_price 走国内源）→ `--report` 逐字一致。
+
 ## v3.55.0（2026-10-13）—— 未映射模型可见化 + 账本模型级 merge + 缓存价比值校验 + 文档口径对齐（审计批5）
 
 > 触发：待做计划台账（`.workbuddy/memory/PLAN-price-pipeline-2026-10.md`）批 5。

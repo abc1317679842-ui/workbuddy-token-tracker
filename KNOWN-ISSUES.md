@@ -637,6 +637,52 @@ DeepSeek 官方页「旧模型名」正文段（`deepseek-v4-flash` 等旧名「
   字节数与昨天**相同**多为解析逻辑问题，**骤变**（页面改版/挑战页）多为源侧变化。
 - 索引里出现带 `-preview` 的新条目 → 看 `pending_confirm`：确认是真型号后把后缀加进对应厂商的 `keep_over_re` 消告警。
 
+## KI-23 USD 源补 2 个 Portkey provider + 查找双缓存 + toast 轮次单次读入 + 源独立性口径（2026-10-13）—— **v3.56.0 已修**
+
+> 来源：待做计划台账批 6（A1/G4/G6），非事故复盘；A1 含联网探测实证。
+
+### 一、A1 USD 源补 Portkey openai/anthropic 两 provider（3→5）
+
+- **探测实证**（`configs.portkey.ai/pricing/<provider>.json`）：**16 个 provider 可用**——openai 189 条 /
+  anthropic 38 / google 143 / bedrock 239 / deepinfra 225 / openrouter 748 / zhipu 18 / moonshot 17 / deepseek 5 等；
+  mistral / together / qwen 等 17 个返回 403。
+- **定案补 openai + anthropic**：本价库 17 个模型中 region=US 仅 `space-bunny`（且三源均无命中）→
+  补这两个源对现价库**零价格影响、零告警噪音**，纯冗余备份。
+- **不选 openrouter**：Portkey 的 `openrouter.json` 就是源 C（openrouter）的镜像 —— 与 `llm-prices-cn`
+  同坑，**同源不构成独立互证**（详见第四节）。
+- **暂不加 zhipu / moonshot**：对现价库零收益，且会新增歧义告警（glm-5.3-flash 模糊命中 glm-5、
+  kimi-k3-1 命中 kimi-k3）。
+- **数据结构与换算**：`{model: {pricing_config: {pay_as_you_go: {request_token/response_token/
+  cache_read_input_token: {price}}, currency}}}`；**美分/token × 1e4 = USD/1M**（deepseek-chat
+  1.4e-05×1e4 = $0.14/1M ✓）。
+- **0 价占位不污染**：未定价模型用 `price=0`（实测 zhipu 的 glm-4.7-flash 全 0）；
+  `parsePortkey` 既有 `if (!(rIn > 0 && rOut > 0)) continue;` 双价过滤 → 0 占位进不了索引、不污染中位数。
+- `usdOk` 判定与 `usdSources` 收集同步扩到 5 源（or / litellm / portkey / portkeyOpenai / portkeyAnthropic）。
+
+### 二、G4 查找归一化 / 结果双缓存
+
+- **背景**：A1 把 USD 源 3→5 后，每模型 `usdFind` 调用 9→15 次，每次 `looseFind` 都对整个 USD 索引重跑
+  `norm()` 归一化键名 → 纯浪费。
+- **修法**：`LOOSE_NORM_CACHE`（`WeakMap<index, {k,kn}[]>`）缓存归一化结果；`USD_MEMO`
+  （`WeakMap<usdIndex, Map<localKey\0orId, 结果>>`）缓存查找结果。
+- **安全论证**：`locked` 只影响 `ambigAdd` 的告警分流（AMBIG_WARNINGS / _locked / _official），不影响返回值
+  → memo 不回漏告警；同一 `(index, localKey)` 只属一个模型的一轮循环，不跨模型串味；AMBIG_WARNINGS 是 Set，
+  同 msg 重复 add 无副作用。
+
+### 三、G6 toast 轮次单次读入 + 分组逻辑纯函数化
+
+- **病根**：`roundHoursOf()` 每模型一次整份 `readFileSync(TOAST_LOG)` + split → N 模型读 N 次；
+  且分组逻辑混在 I/O 里，沙箱内无法做行为测试。
+- **修法**：`groupToastLines(lines, date, allModels)` 纯函数分组（整名归属 + 互为前缀 contested 打点），
+  `readToastRounds()` 只留读文件外壳；`roundHoursOf` 保留作锁内 fallback。
+- **顺带修**：互为前缀的模型名（kimi-k3-1 vs kimi-k3）旧实现两边都计入高峰占比 → 改为按最长名归属 +
+  stderr WARN，回算金额不再双算。
+
+### 四、源独立性口径（代码注释 + docs + SKILL/README + 守卫同步）
+
+- `llm-prices-cn`（源 A）是 llmabacus（源 B）的**每日镜像** → 同源，**不构成独立交叉验证**；
+- Portkey `openrouter.json` 同源不选；「N 源一致」必须是真的独立源，否则是假互证。
+
 ## KI-22 未映射模型静默丢弃 + `backfill --write` 整块抹模型 + 缓存价比值不校验（2026-10-13）—— **v3.55.0 已修**；A5 缓存价缺失按 0 计 = Won't fix
 
 > 来源：待做计划台账批 5，非事故复盘。用户 2026-10-13 定夺：**A5 不修**。

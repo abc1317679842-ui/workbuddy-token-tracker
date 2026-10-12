@@ -39,8 +39,8 @@ type: skill
 
 ## 当前功能总览（版本以 manifest.yaml 为准）
 
-> **v3.55.0 要点（2026-10-13）：`parse_tokenhub` 未映射模型不再静默丢弃（三路分流 + `_unmapped` 留痕，**不猜品牌**）+ `backfill --write` 改**模型级 merge**（重放权威覆盖、抓不到的保留并打 `stale_carried`，无人工确认）+ 缓存价/输入价比值校验（正常带 0.5%~50%，只告警不阻断）；**A5 缓存价缺失按 0 计判 Won't fix**（= 厂商未公布价，合法常态）
-> **v3.54.0 要点（2026-10-13）：冗余交叉校验（多源 / 条目内，只留痕不改价）+ CN/USD 一致性（非 CNY 新条目拒收、已有条目挂起**不折算**）+ 峰谷规则 `peak_effective_from` 留痕（审计批4）。 ① **L5 冗余交叉**：索引此前按 `first_party > channel` 排序后**无条件取第一个候选**，`all_sources` 只是存档 → 多源价格差 1000×（元/千 被当元/百万）也静默通过；新增 `cross_check()`（两源价比 ≥10× 记冲突、>3× 记提示）+ `intra_check()`（缓存价 > 输入价 = 列取串），**一律只留痕 + WARN，不改价**（改价 = 用一个猜测覆盖另一个猜测）。 ② **币种一致性**：索引口径写死 CNY、下游按人民币计 → USD 混入会差一个汇率（≈7×）且完全静默；新条目由闸门拒收，已有/沿用条目挂 `_manual_audit{currency_mismatch}`，**缺失不算不一致**（老索引整批无 currency，判成不一致会整库挂起）；顶层新增 `_contract`（币种分布 / 非 CNY 清单 / 交叉阈值）。 ③ **峰谷 `effective_from`**：peak 倍率一变，recalc 出来的历史金额整体漂移（"金额=派生值"口径允许），但生效日期必须落进索引 → 新增分级 `peak_rule`（两边都有值且不同才算变化）+ `peak_effective_from`。守卫 **T64(20)**（含 8 条真跑 build_index.py 的行为用例）。**
+> **v3.56.0 要点（2026-10-13）：Portkey USD 源 3→5**（补 openai / anthropic 两个 provider；**不选 openrouter**——Portkey 的 openrouter.json 就是 OpenRouter 的镜像，加了就是假独立源；zhipu/moonshot 暂不加：对现价库零收益还新增歧义告警）+ **文档写明源的独立性口径**（llm-prices-cn 是 llmabacus 每日镜像，同源不构成互证）+ **G4 查找缓存**（looseFind 全索引归一化 + usdFind 结果 memo，A1 扩源后 255 次全索引遍历降到每索引一次）+ **G6 toast 单次读入**（recalc 预热从 N 个模型各整份读一遍改成一次读入分组，纯函数 `groupToastLines` 可单测）。守卫 **T66(20)**（源码 12 + 行为 8，全 require 真跑）。
+> **v3.55.0 要点（2026-10-13）：`parse_tokenhub` 未映射模型不再静默丢弃（三路分流 + `_unmapped` 留痕，**不猜品牌**）+ `backfill --write` 改**模型级 merge**（重放权威覆盖、抓不到的保留并打 `stale_carried`，无人工确认）+ 缓存价/输入价比值校验（正常带 0.5%~50%，只告警不阻断）；**A5 缓存价缺失按 0 计判 Won't fix**（= 厂商未公布价，合法常态）**
 > **逐版细节、动机、取舍一律查 `CHANGELOG.md`** —— 本文件不再堆版本要点；上面若与旧说法冲突，**以本条为准**。
 
 > **⚠️ 强制（查询触发总纲）：所有统计查询必须调用 `--report` 命令并原样贴出脚本输出，禁止自行解析 JSON。** 无论用户问「今日消耗」「今天用了多少」「账本」「报告」「统计」「花费」还是历史某天，一律先跑 `node token-tracker.js --report`（或 `--report <日期>`），再把脚本打印的 Markdown 表格原文贴给用户；不得自行读取 `daily-usage.json`、不得自行汇总、不得转成列表/纯文本/代码块。详细规则见下方「查询触发规则（强制）」与「展示格式约束（强制）」。
@@ -264,7 +264,7 @@ WorkBuddy 是 Claude Code fork，支持 `Stop` 事件（回答**结束后**触�
 **细节**（原理 / 启用条件 / 模式识别判据 / 显示位置与宽度让位规则 / 隐私）：Read `docs/balance.md`。
 ## 每日价格刷新策略
 
-**摘要**：`pricing.json` **每天自动刷新一次**——只在 `--hook`（用户提交提问时）触发，`--stop` 不刷；当天刷过就跳过。5 源并行（国内 llmabacus / llm-prices-cn + 国外 OpenRouter / LiteLLM / Portkey），按模型 `region` 区分取价。
+**摘要**：`pricing.json` **每天自动刷新一次**——只在 `--hook`（用户提交提问时）触发，`--stop` 不刷；当天刷过就跳过。7 源并行（国内 llmabacus / llm-prices-cn + 国外 OpenRouter / LiteLLM / Portkey×3 provider——deepseek / openai / anthropic），按模型 `region` 区分取价。⚠️ llm-prices-cn 是 llmabacus 每日镜像（同源，不构成独立互证）；Portkey 的 openrouter.json 与 OpenRouter 同源故不选。
 
 **细节**（触发点 / 多源策略 / 新模型补录 / 陈旧清理 / 峰谷时段口径 / 计费公式）：Read `docs/pricing-refresh.md`。
 

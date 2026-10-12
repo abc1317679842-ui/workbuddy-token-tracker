@@ -999,6 +999,27 @@ else {
     src('README.md').indexOf(`badge/version-v${v}-blue`) >= 0);
   ok('T12-i3 SKILL_VERSION 与 CHANGELOG 顶部条目一致',
     new RegExp(`^## v${v.replace(/\./g, '\\.')}（`, 'm').test(src('CHANGELOG.md')));
+  // i7（v3.56.0 补，真实缺陷复发防护）：顶部**第二条**版本标题必须是上一版。
+  //   病象（发版前自查抓到）：往 CHANGELOG 顶部插新版本段时，把上一版的 `## v3.55.0（…）` 标题行
+  //   直接覆盖掉 → 上一版的正文还在、标题没了，版本史出现"无标题孤儿段"（v3.56.0 直接接 v3.54.0）。
+  //   i3 只查"含当前版本"，抓不到这个。"上一版"的算法必须兼容两种发版节奏，否则守卫自身误红
+  //   （v3.56.0 首版实测踩坑：当时写死 patch-1，而本仓库历来是 minor 进位发版、补丁号归 0，
+  //   `3.56.-1` 永远匹配不到 `3.55.0` → 数据全对却恒红）：
+  //   ① 补丁节奏（c>0）：prev = a.b.(c-1)；② minor 节奏（c===0，本仓库实际节奏）：prev = a.(b-1).任意补丁；
+  //   ③ 大版本首位（b===0, c===0）：prev = (a-1).任意.任意。若改发版 cadence，同步改这里。
+  ok('T12-i7 ★CHANGELOG 顶部第二条版本标题必须是上一版（防新段覆盖旧标题行）', (() => {
+    const hdrs = [...src('CHANGELOG.md').matchAll(/^## v(\d+)\.(\d+)\.(\d+)（/gm)]
+      .map((m) => `${m[1]}.${m[2]}.${m[3]}`);
+    const [a, b, c] = v.split('.').map(Number);
+    const prevRe = c > 0 ? new RegExp(`^${a}\\.${b}\\.${c - 1}$`)
+      : b > 0 ? new RegExp(`^${a}\\.${b - 1}\\.\\d+$`)
+        : new RegExp(`^${a - 1}\\.\\d+\\.\\d+$`);
+    return hdrs.length >= 2 && hdrs[0] === v && prevRe.test(hdrs[1]);
+  })(), (() => {
+    const hdrs = [...src('CHANGELOG.md').matchAll(/^## v(\d+)\.(\d+)\.(\d+)（/gm)]
+      .map((m) => `${m[1]}.${m[2]}.${m[3]}`);
+    return '顶部三条: ' + hdrs.slice(0, 3).join(' / ') + `（hdrs[0] 应为 ${v}，hdrs[1] 应为上一版）`;
+  })());
   ok('T12-i4 SKILL_VERSION 与主脚本头注释一致',
     new RegExp(`^// token-usage-tracker v${v.replace(/\./g, '\\.')} `, 'm').test(mainSrc));
   // i5：SKILL.md「当前功能总览」标题不得内嵌硬版本号（版本以 manifest 为准——标题里的硬版本号是历史漂移源）
@@ -5767,6 +5788,155 @@ else {
         logB65.indexOf('PURE_KEPT=1') >= 0 && logB65.indexOf('PURE_UNMAPPED=0') >= 0,
         logB65.slice(-300));
     }
+  }
+}
+
+// ===== T66：v3.56.0 A1 Portkey 补源 + G4 查找缓存 + G6 toast 单次读入（审计批6）=====
+// 三条主线：
+//   ① **A1 Portkey USD 源 3→5**：探测 16 个可用 provider 后定案补 openai / anthropic 两个
+//      （零本地命中 → 零告警零污染，纯增量扩中位数样本）；**不选 openrouter**（Portkey 的
+//      openrouter.json 就是源 C 的镜像 → 假独立源，同 llm-prices-cn 之坑）；zhipu/moonshot
+//      暂不加（对现价库零收益 + 新增歧义告警）。文档同步写明镜像关系与选型依据。
+//   ② **G4 查找缓存**：looseFind 每次全索引 norm() + usdFind 每模型 3 次重复查询 → A1 扩到
+//      5 源后 17×5×3=255 次全索引遍历。WeakMap 缓存归一化结果与 usdFind 返回值（locked 只影响
+//      告警分流不影响返回值 → memo 安全）。
+//   ③ **G6 toast 单次读入**：预热逐模型各整份读一遍 toast 日志（N 模型 = N 次全量读+parse）
+//      → readToastRounds 一次读入分组（纯函数 groupToastLines 可单测），roundHoursOf 留作锁内 fallback。
+// ⚠️ 断言纪律：匹配**使用点**；行为守卫全走 require 真跑（groupToastLines 是纯函数，沙箱也能跑）。
+{
+  const rd66 = (f) => fs.readFileSync(path.join(SRC, f), 'utf-8').replace(/\r\n/g, '\n');
+  const rp66 = stripComments(rd66('refresh-prices.js'));
+  const rc66 = stripComments(rd66('recalc-day.js'));
+  const sk66 = fs.readFileSync(path.join(SRC, 'SKILL.md'), 'utf-8');
+  const rdm66 = fs.readFileSync(path.join(SRC, 'README.md'), 'utf-8');
+  const prd66 = fs.readFileSync(path.join(SRC, 'docs/pricing-refresh.md'), 'utf-8');
+
+  // ── a. A1：Portkey 补 2 个 provider ──
+  ok('T66-a1 ★SOURCES 必须注册 portkeyOpenai / portkeyAnthropic（定义了不注册 = 白写）',
+    rp66.indexOf('portkeyOpenai: { name:') >= 0 && rp66.indexOf('portkeyAnthropic: { name:') >= 0);
+  ok('T66-a2 ★两个新源 URL 必须指向 configs.portkey.ai 的对应 provider.json',
+    rp66.indexOf("'https://configs.portkey.ai/pricing/openai.json'") >= 0
+    && rp66.indexOf("'https://configs.portkey.ai/pricing/anthropic.json'") >= 0);
+  ok('T66-a3 ★三个 Portkey 源必须都挂 parsePortkey（新源不接解析器 = 拉了个寂寞）',
+    rp66.indexOf('portkey: parsePortkey') >= 0
+    && rp66.indexOf('portkeyOpenai: parsePortkey') >= 0
+    && rp66.indexOf('portkeyAnthropic: parsePortkey') >= 0);
+  ok('T66-a4 ★usdSources 收集必须含 5 源（少收一个 = 中位数样本缩水，A1 白做）',
+    rp66.indexOf('const usdSources = [or, litellm, portkey, portkeyOpenai, portkeyAnthropic].filter(Boolean);') >= 0);
+  ok('T66-a5 ★usdOk 判定必须覆盖两个新源（否则新源全挂也不影响"至少一个 USD 源可用"的判断）',
+    rp66.indexOf('results.portkeyOpenai.ok || results.portkeyAnthropic.ok') >= 0);
+
+  // ── b. G4：查找缓存 ──
+  ok('T66-b1 ★looseNormIndex 必须定义且 looseFind 必须走它（否则每次全索引 norm，缓存白建）',
+    rp66.indexOf('function looseNormIndex(index)') >= 0
+    && rp66.indexOf('for (const e of looseNormIndex(index))') >= 0);
+  ok('T66-b2 ★USD_MEMO 必须定义且 usdFind 必须查它（否则每模型 3 次重复全索引遍历）',
+    rp66.indexOf('const USD_MEMO = new WeakMap();') >= 0
+    && rp66.indexOf('USD_MEMO.get(usdIndex)') >= 0);
+
+  // ── c. G6：toast 单次读入 ──
+  ok('T66-c1 ★readToastRounds 必须定义且预热处必须用它（逐模型整份读 = G4 同款浪费）',
+    rc66.indexOf('function readToastRounds(date, allModels)') >= 0
+    && rc66.indexOf('const toastRounds = readToastRounds(date, allModels);') >= 0);
+  ok('T66-c2 ★分组逻辑必须抽成纯函数 groupToastLines 且被 readToastRounds 委托（可单测 = 可守卫）',
+    rc66.indexOf('function groupToastLines(lines, date, allModels)') >= 0
+    && rc66.indexOf('return groupToastLines(') >= 0);
+  ok('T66-c3 ★roundHoursOf 必须保留作锁内 fallback（并发新模型仍要现场读）',
+    rc66.indexOf('function roundHoursOf(date, model, allModels)') >= 0
+    && rc66.indexOf('roundHoursOf(date, model, cands)') >= 0);
+  ok('T66-c4 ★预热 contested 打点必须保留（互前缀轮次归属纠正是 v3.31.0 的真缺陷修复，不能随重构丢）',
+    rc66.indexOf('toastRounds.contested.get(model)') >= 0
+    && rc66.indexOf('同属更长的模型名') >= 0);
+
+  // ── d. 文档：源清单与独立性口径 ──
+  ok('T66-d1 ★SKILL.md 摘要必须写 7 源 + 三个 Portkey provider（文档漂移 = 照文档改代码的人被带歪）',
+    sk66.indexOf('7 源并行') >= 0 && sk66.indexOf('Portkey×3 provider') >= 0);
+  ok('T66-d2 ★SKILL.md 必须写明 llm-prices-cn 同源不互证 + openrouter 同源不选',
+    sk66.indexOf('每日镜像（同源，不构成独立互证）') >= 0
+    && sk66.indexOf('openrouter.json 与 OpenRouter 同源故不选') >= 0);
+  ok('T66-d3 ★docs/pricing-refresh.md 必须有「源的独立性口径」段 + 7 源计数口径（A1 的核心交付是认知纠正）',
+    prd66.indexOf('源的独立性口径') >= 0
+    && prd66.indexOf('Portkey 已配 3 个 provider') >= 0
+    && prd66.indexOf('暂不加 `zhipu` / `moonshot`') >= 0
+    && prd66.indexOf('并行拉 **7 源**') >= 0);
+  ok('T66-d4 ★README 价格源表必须同步 7 源口径',
+    rdm66.indexOf('**7 个公开价格源**') >= 0 && rdm66.indexOf('Portkey×3 provider') >= 0);
+
+  // ── e. 行为守卫（require 真跑，纯函数沙箱可跑） ──
+  const rp66m = (() => { try { return require(path.join(SRC, 'refresh-prices.js')); } catch (e) { return null; } })();
+  const rc66m = (() => { try { return require(path.join(SRC, 'recalc-day.js')); } catch (e) { return null; } })();
+  if (!rp66m || !rc66m) {
+    ok('T66 模块加载', false, 'require 失败（refresh-prices / recalc-day）');
+  } else {
+    ok('T66 模块加载（refresh-prices + recalc-day）', true);
+    ok('T66-e1 ★SOURCES 运行时结构：7 源、两新源 URL 正确、**不得含 openrouter provider**（同源陷阱）',
+      Object.keys(rp66m.SOURCES).length === 7
+      && rp66m.SOURCES.portkeyOpenai && rp66m.SOURCES.portkeyOpenai.url === 'https://configs.portkey.ai/pricing/openai.json'
+      && rp66m.SOURCES.portkeyAnthropic && rp66m.SOURCES.portkeyAnthropic.url === 'https://configs.portkey.ai/pricing/anthropic.json'
+      && !Object.keys(rp66m.SOURCES).some((k) => k !== 'or' && /openrouter/i.test(rp66m.SOURCES[k].url)),
+      Object.keys(rp66m.SOURCES).map((k) => k + '=' + rp66m.SOURCES[k].url).join(' | '));
+    ok('T66-e2 ★parsePortkey 必须过滤全 0 占位条目（Portkey 用 price=0 表示未定价，混进中位数即错价）',
+      (() => {
+        const out = rp66m.parsePortkey({
+          'glm-4.7-flash': { pricing_config: { pay_as_you_go: { request_token: { price: 0 }, response_token: { price: 0 }, cache_read_input_token: { price: 0 } } } },
+          'glm-4.7': { pricing_config: { pay_as_you_go: { request_token: { price: 6e-05 }, response_token: { price: 0.00022 }, cache_read_input_token: { price: 1.1e-05 } } } },
+        });
+        return !('glm-4.7-flash' in out) && out['glm-4.7']
+          && Math.abs(out['glm-4.7'].usdIn - 0.6) < 1e-9 && Math.abs(out['glm-4.7'].cacheUsd - 0.11) < 1e-9;
+      })());
+    ok('T66-e3 ★looseNormIndex 缓存命中必须返回同一引用（重建数组 = 缓存失效，G4 白做）',
+      (() => {
+        const idx = { 'kimi-k3': { usdIn: 3 }, 'glm-4.7': { usdIn: 0.6 } };
+        const a = rp66m.looseNormIndex(idx);
+        return Array.isArray(a) && a.length === 2 && a.every((x) => x.k && x.kn)
+          && rp66m.looseNormIndex(idx) === a;
+      })());
+    ok('T66-e4 ★usdFind memo：同 (index,key) 多次查询同值，且告警不重复（Set 语义保持）',
+      (() => {
+        const idx = { 'kimi-k3': { usdIn: 3 }, 'glm-4.7': { usdIn: 0.6 } };
+        const u1 = rp66m.usdFind(idx, 'kimi-k3', null, rp66m.norm('kimi-k3'), false);
+        const u2 = rp66m.usdFind(idx, 'kimi-k3', null, rp66m.norm('kimi-k3'), false);
+        const before = rp66m.AMBIG_WARNINGS.size;
+        rp66m.usdFind(idx, 'glm-4.7-flash', null, rp66m.norm('glm-4.7-flash'), false);
+        rp66m.usdFind(idx, 'glm-4.7-flash', null, rp66m.norm('glm-4.7-flash'), false);
+        return u1 === u2 && u1 && u1.usdIn === 3 && (rp66m.AMBIG_WARNINGS.size - before) === 1;
+      })());
+    ok('T66-e5 ★groupToastLines：当天轮次按整名归属；跨天行/坏行/无归属行全部不计入',
+      (() => {
+        const D = '2026-10-13';
+        const lines = [
+          JSON.stringify({ ts: D + 'T10:00:00.000Z', toastText: 'kimi-k3 ｜¥1.2' }),
+          JSON.stringify({ ts: D + 'T11:00:00.000Z', toastText: 'kimi-k3-1 ｜¥0.9' }),
+          JSON.stringify({ ts: '2026-10-12T23:00:00.000Z', toastText: 'kimi-k3 跨天' }),
+          'not-json',
+          JSON.stringify({ ts: D + 'T13:00:00.000Z', toastText: 'unknown-model ｜¥0' }),
+        ];
+        const g = rc66m.groupToastLines(lines, D, ['kimi-k3', 'kimi-k3-1']);
+        return g.byModel.get('kimi-k3').length === 1 && g.byModel.get('kimi-k3-1').length === 1
+          && !g.byModel.has('unknown-model')
+          && [...g.byModel.values()].reduce((a, b) => a + b.length, 0) === 2;
+      })());
+    ok('T66-e6 ★groupToastLines contested：互前缀轮次归属更长名时，短名侧必须记 contested（v3.31.0 修复回归）',
+      (() => {
+        const D = '2026-10-13';
+        const lines = [JSON.stringify({ ts: D + 'T10:00:00.000Z', toastText: 'kimi-k3-1 ｜¥0.9' })];
+        const g = rc66m.groupToastLines(lines, D, ['kimi-k3', 'kimi-k3-1']);
+        const c = g.contested.get('kimi-k3');
+        return c && c.n === 1 && c.owner === 'kimi-k3-1';
+      })());
+    ok('T66-e7 ★groupToastLines 前缀兜底：表里缺更长名时归最长前缀，且无 contested',
+      (() => {
+        const D = '2026-10-13';
+        const lines = [JSON.stringify({ ts: D + 'T10:00:00.000Z', toastText: 'kimi-k3-1 ｜¥0.9' })];
+        const g = rc66m.groupToastLines(lines, D, ['kimi-k3']);
+        return g.byModel.get('kimi-k3').length === 1 && g.contested.size === 0;
+      })());
+    ok('T66-e8 ★looseFind 模糊唯一命中不受缓存影响（T28 语义回归：缓存不得改变匹配结果）',
+      (() => {
+        const idx = { 'kimi-k2.5': { usdIn: 0.6 }, 'kimi-k3': { usdIn: 3 } };
+        const f = rp66m.looseFind(idx, rp66m.norm('kimi-k3'), 'USD源', 'kimi-k3-9', false);
+        return f && f.usdIn === 3;
+      })());
   }
 }
 

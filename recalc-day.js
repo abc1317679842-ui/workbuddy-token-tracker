@@ -71,7 +71,52 @@ function roundOwner(head, allModels) {
   return best;
 }
 
+// v3.56.0（G6）：toast 日志**一次读入、按模型分组**。
+//   病根：roundHoursOf 每次调用都 `fs.readFileSync(TOAST_LOG)` 整份读 + 全量 JSON.parse，
+//   而预热对「当天全部模型」逐个调用 → N 个模型 = N 次整份读同一份日志（v3.29.0 的"锁外预热"
+//   只把 I/O 移出锁，没消除重复 I/O 本身）。日志随使用时间单调增长，recalc 一天的成本线性恶化。
+//   修法：readToastRounds 读一次文件，逐行委托 groupToastLines 仲裁归属，产出 Map<model, ts[]>；
+//   contested 统计（互前缀轮次被更长模型名抢走）按模型归集，由调用方统一 stderr —— 与 roundHoursOf
+//   内逐模型打点的语义逐字对齐（同样一条不落，只是从"N 次读里各打一次"变成"一次读里归类打"）。
+//   分组逻辑（groupToastLines）是纯函数：不碰文件系统，selftest 可直接喂行数组断言，
+//   不必为了一条行为守卫去伪造整个 WB_ROOT 目录树。
+function groupToastLines(lines, date, allModels) {
+  const byModel = new Map();
+  const contested = new Map();
+  for (const line of (lines || [])) {
+    if (!line || !line.includes(date)) continue;
+    let d;
+    try { d = JSON.parse(line); } catch (e) { continue; }
+    if (!d.ts || !d.ts.startsWith(date)) continue;
+    const head = toastHeadModel(d.toastText);
+    const owner = roundOwner(head, allModels);
+    if (owner) {
+      if (!byModel.has(owner)) byModel.set(owner, []);
+      byModel.get(owner).push(d.ts);
+    }
+    // 与本模型互为前缀、但归属了更长模型名的轮次（旧前缀口径会两边都算 → 金额偏离）
+    if (!owner) continue;
+    for (const m of (allModels || [])) {
+      if (owner === m || sameModelName(owner, m)) continue;
+      if (!String(head).startsWith(m)) continue;
+      const c = contested.get(m) || { n: 0, owner: '' };
+      c.n += 1;
+      c.owner = owner;
+      contested.set(m, c);
+    }
+  }
+  return { byModel: byModel, contested: contested };
+}
+
+function readToastRounds(date, allModels) {
+  let raw = '';
+  try { raw = fs.readFileSync(TOAST_LOG, 'utf-8'); } catch (e) { raw = ''; }
+  return groupToastLines(raw ? raw.split('\n') : [], date, allModels);
+}
+
 // 读 toast 日志中某天某模型的轮次（只取「已结算」的记账行，避免与 watcher 补弹重复计数）
+// v3.56.0（G6）：保留作锁内 fallback —— 预热已用 readToastRounds 一次读入分组，只有并发新出现
+//   （预热后才写进账本）的模型才会走到这里现场读，正常路径不再重复整份读。
 function roundHoursOf(date, model, allModels) {
   let raw = '';
   try { raw = fs.readFileSync(TOAST_LOG, 'utf-8'); } catch (e) { return null; }
@@ -171,10 +216,21 @@ function main() {
   if (!day) { console.error(`账本中无 ${date} 记录`); process.exit(1); }
 
   // v3.29.0（S-2 补漏）：锁外预热 roundHoursOf —— 它是本工具里唯一的重 I/O（每次调用都整份读 toast 日志）。
-  //   锁内重算时优先查缓存，只对缓存里没有的模型（并发新出现的）才现场调用，账本锁持有时间基本不增加。
+  //   v3.56.0（G6）：预热改走 readToastRounds **一次读入、按模型分组** —— 原实现逐模型各整份读一遍
+  //   （N 模型 = N 次全量读 + N 次全量 JSON.parse），日志随使用时间单调增长，成本线性恶化；
+  //   现在整份日志只读一次，锁内仍只对「预热后并发新出现」的模型现场读（见 recalcDay 内 hoursCache 分支）。
   const hoursCache = new Map();
   const allModels = Object.keys(day.models || {}); // v3.31.0（P1-15）：轮次归属要按「当天全部模型」仲裁归属
-  for (const model of allModels) hoursCache.set(model, roundHoursOf(date, model, allModels));
+  const toastRounds = readToastRounds(date, allModels);
+  for (const model of allModels) {
+    const rows = toastRounds.byModel.get(model);
+    hoursCache.set(model, rows && rows.length ? rows : null);
+    const c = toastRounds.contested.get(model);
+    if (c && c.n > 0) {
+      // 与 roundHoursOf 内的打点逐字一致（同一条不落，只是从"N 次读里各打一次"归到"一次读里归类打"）
+      process.stderr.write(`[recalc-day] ⚠ ${model}: toast 日志有 ${c.n} 条轮次同属更长的模型名 ${c.owner}（互为前缀），已按最长名归属、不再并入本模型的高峰占比（旧实现会两边都算 → 回算金额偏离当日）\n`);
+    }
+  }
 
   // v3.29.0（S-2 补漏）：把「重算一天」抽成函数，逻辑逐字搬自原 L115-175（findModel/峰谷/no_price/costOf 一律不动）。
   //   基准改为**传入的 dayObj**：锁内传入的是 cur[date] 现值（不再是锁外旧快照），
@@ -331,4 +387,4 @@ function main() {
 //   仍然照常跑（行为零变化），被 require 时只暴露纯函数。
 if (require.main === module) main();
 
-module.exports = { peakSplitOf, costOf };
+module.exports = { peakSplitOf, costOf, readToastRounds, groupToastLines };

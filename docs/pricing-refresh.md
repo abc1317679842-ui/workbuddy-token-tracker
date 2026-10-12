@@ -7,15 +7,23 @@
 
 - **触发点（v2.65 起收敛）**：**仅 `--hook`（用户提交提问时）**才检查 `pricing.json` 的 `date`，**过期才**同步调用 `refresh-prices.js` 联网刷新；`--stop` 路径**不再**做全量刷新（此前会在 Stop 时联网，阻塞弹窗）。判定仍是「当天已刷新则直接跳过、不联网」。手动运行 `node refresh-prices.js`（加 `--force` 可强制）随时可刷。**v2.66 补充**：`pricing.json` 缺失或损坏时会自动尝试重建；刷新子进程超时为 60 秒。
 - **v3.23.5（内外层 timeout 打架修复）**：这里的 60 秒是**外层**（`execFileSync` 同步阻塞，发生在用户提交提问时）。而 `refresh-prices.js` 内部 `spawnSync(deepseek-official.js)` 的 timeout 是 120 秒（含 2 次重试 × 60 秒间隔）——**外层先到点把整个刷新杀掉，内层重试从未生效过**。修复：自动路径显式传 `DS_RETRIES=0`（内层只跑一次，单次 15 秒，总耗时远小于 60 秒），失败即沿用旧价、次日再试；**手动跑 `node refresh-prices.js` 不受影响，仍保留重试**（后台场景不在乎时长）。
-- **多源 + 国内外区分（v2.2，2026-08-14）**：并行拉 **5 源**——
+- **多源 + 国内外区分（v2.2，2026-08-14）**：并行拉 **7 源**（v3.56.0 / A1 起 Portkey 配 3 个 provider，USD 源 3→5）——
   - 国内 2 个：llmabacus（`llmabacus.com/api/prices`，**主**，每日自动核价、人民币、含 vendors country）、llm-prices-cn（`raw.githubusercontent.com/szp2005/llm-prices-cn/main/prices.json`，**备份**，llmabacus 每日镜像）；
-  - 国外 3 个：OpenRouter（USD，接近实时）、LiteLLM `model_prices_and_context_window.json`（USD，1-3 天滞后）、Portkey `configs.portkey.ai/pricing/<provider>.json`（USD，美分/token）；
-  - **按模型 `region` 区分国内外**（CN=国内模型主价来自国内源人民币价；US=国外模型主价用三 USD 源中位数×汇率），region 自动从 llmabacus vendors country 推断；USD 参考价取三源中位数；国内源都没有的模型仅当本地原本是 `auto_converted` 才用 USD 兜底，人工核验过的官方价保留不被覆盖；
+  - 国外 5 个：OpenRouter（USD，接近实时）、LiteLLM `model_prices_and_context_window.json`（USD，1-3 天滞后）、Portkey `configs.portkey.ai/pricing/<provider>.json`（USD，美分/token）**×3 个 provider：deepseek / openai / anthropic**；
+  - **按模型 `region` 区分国内外**（CN=国内模型主价来自国内源人民币价；US=国外模型主价用 USD 源中位数×汇率），region 自动从 llmabacus vendors country 推断；USD 参考价取 USD 源中位数（**仅 region=US 写盘**，CN 模型不写 `usd_*` 参考字段——v3.18/H3 起，避免与人民币主价互相矛盾）；国内源都没有的模型仅当本地原本是 `auto_converted` 才用 USD 兜底，人工核验过的官方价保留不被覆盖；
   - **全源失败写 `last_refresh_error`**，token-tracker 在 toast 显示「价⚠️」提示费用按上次价格估算；当天已刷新则直接跳过、不联网；`--force` 可强制刷新。
 - **新模型补录（v2.31）**：`ensureNewModelPricing` 检测到未收录模型时**立即联网补录**——先查国内源 llmabacus（`priceCurrency=CNY` 直接人民币价补录 region=CN；`USD` 走 USD×汇率 region=US），再回退 OpenRouter（region=US）。已收录模型不触发，只有真遇到新模型才联网。**v2.67 起匹配变严格后**，新模型/新构建名更容易落到这条路径（找不到精确键即触发）。
 - **陈旧模型清理（v2.65）**：每次刷新时删除「曾出现在 `daily-usage.json` 且超过 14 天未使用」的模型（**从未出现在账本的模型一律保留**——v2.82 修复后与代码一致），`lock: true` 的三个（deepseek-v4-flash / -vision-exp / v4-pro）始终保留。被删模型再次使用时会由上面的新模型补录自动回补。
 - **人工权威核验（兜底）**：**每日首次对话时**，若发现自动刷新覆盖的国内源价格与厂商官方定价页有出入（尤其峰谷模型如 DeepSeek 的基准价口径），按数据源清单核对官方定价页后修正 `pricing.json`。自动刷新的 `last_refresh_note` 会在峰谷模型价差 >60% 时提示人工核验。
 - **价格源清单（已全部接入自动刷新）**：**llmabacus.com/api/prices**（国内人民币主源，每日自动核价，szp2005/llm-prices-cn 的上游，含 vendors country/currency）、**llm-prices-cn**（国内人民币备份源，每日镜像同步）、OpenRouter API（USD，接近实时）、LiteLLM `model_prices_and_context_window.json`（USD，社区 PR 1-3 天滞后）、Portkey `https://configs.portkey.ai/pricing/<provider>.json`（USD，美分/token，SaaS 即时）、厂商官方定价页（权威，兜底人工核验）。国内网页参考（不可程序化）：51token.com / jingxialai.com / tokenbijia.com。
+
+### ⚠️ 源的独立性口径（v3.56.0 / A1 补写，防「假交叉验证」）
+
+- **llm-prices-cn 与 llmabacus 是同一份数据**（前者是后者的每日 GitHub 镜像）→ 国内实际只有 **1 个独立源**，两者一致**不构成互证**，只在主源挂掉时顶班。
+- **Portkey 的 `openrouter.json` 与源 C（OpenRouter API）同源** → 不选（加了就是假独立源，和上面同一个坑）。
+- **Portkey 已配 3 个 provider**（v3.56.0 探测 16 个可用 provider 后定案）：`deepseek`（原有）、`openai`（189 条）、`anthropic`（38 条，cache 覆盖 37/38）。后两个**零本地命中** → 零告警零污染，纯增量扩大 USD 中位数样本。
+- **暂不加 `zhipu` / `moonshot`**：虽直接覆盖价库 glm/kimi 系列，但 `usd_*` 只对 region=US 写盘、CN 模型又有国内源价 → 对现价库零收益，反而新增歧义告警（`glm-5.3-flash` 模糊命中 `glm-5`、`kimi-k3-1` 命中 `kimi-k3`）。等 US region 模型真实上线再评估。
+- **Portkey 的 0 价占位**：部分 provider 用 `request_token.price=0` 表示「未定价」（实测 `zhipu` 的 `glm-4.7-flash` 全 0）→ `parsePortkey` 要求 request+response 同时 >0 才收录（v3.24 起），0 价条目不会污染中位数。
 
 ## Python 抓取流水线（v3.23.4 起）
 

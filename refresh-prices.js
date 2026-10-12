@@ -7,18 +7,28 @@
 //   3) 区分国内外模型：国内模型优先国内源人民币价，国外模型用国外 USD 源定价；
 //   4) 所有源都拉取失败时，写 last_refresh_error，供 token-tracker.js 在 toast 提示「价⚠️」。
 //
-// 数据源（5 个，并行拉取，互不依赖）：
+// 数据源（7 个，并行拉取，互不依赖）：
 //   国内（人民币）：A. llmabacus.com/api/prices（主，每日自动核价，含 vendors country/currency）
-//                  B. llm-prices-cn GitHub raw（备，llmabacus 的每日镜像）
+//                  B. llm-prices-cn GitHub raw（备，**llmabacus 的每日镜像，与 A 同源**——
+//                     不构成独立交叉验证，只在 A 挂掉时顶班；文档已如实写明，勿当"2 源互证"）
 //   国外（USD）：   C. OpenRouter（接近实时）
 //                  D. LiteLLM model_prices_and_context_window.json（社区 PR，1-3 天滞后）
-//                  E. Portkey configs.portkey.ai/pricing/<provider>.json（美分/token ×1e4）
+//                  E. Portkey configs.portkey.ai/pricing/<provider>.json（美分/token ×1e4），
+//                     v3.56.0（A1）起配 3 个 provider：deepseek / openai / anthropic（USD 源 3→5）。
+//                     探测实证（2026-10-13，16 个可用 provider 全量清单见 docs/pricing-refresh.md）：
+//                     · **不选 openrouter** —— Portkey 的 openrouter.json（748 条）就是源 C 的镜像，
+//                       加它 = 假独立源（与 llm-prices-cn 同源镜像同一个坑）；
+//                     · **暂不加 zhipu / moonshot** —— 虽直接覆盖价库 glm/kimi 系列，但 usd_* 只对
+//                       region=US 写盘、CN 模型又有国内源价 → 对现价库零收益，反而新增歧义告警
+//                       （glm-5.3-flash 模糊命中 glm-5、kimi-k3-1 命中 kimi-k3）；
+//                     · openai（189 条）/ anthropic（38 条，cache 覆盖 37/38）**零本地命中** →
+//                       零告警零污染，纯增量扩大中位数样本（未来 US 模型上线时中位数更稳）。
 //
 // 更新规则（按模型 region 区分）：
 //   - region=CN（国内模型，默认）：人民币主价 先 A 再 B；两者都无 → 保留本地价
 //     （仅当本地原本是 USD 估算价 auto_converted=true 时，才用 USD 中位数×汇率换算兜底）；
-//   - region=US（国外模型）：人民币主价 = 三 USD 源中位数 × usd_cny_rate（标 auto_converted）；
-//   - USD 参考价（usd_input_price/usd_output_price）：三 USD 源中位数（所有模型都更新）；
+//   - region=US（国外模型）：人民币主价 = USD 源中位数 × usd_cny_rate（标 auto_converted）；
+//   - USD 参考价（usd_input_price/usd_output_price）：USD 源中位数（仅 region=US 写盘，见 :912）；
 //   - region 推断：模型无 region 字段时，用 A 的 vendors country 判断（US→US，其余→CN）；
 //   - 峰谷保护：peak_multiplier>1（DeepSeek），源价当「空闲/基准价」，高峰倍率保留本地；
 //     若源价与本地价差异 >60% 写入 last_refresh_note 提示人工核验；
@@ -62,7 +72,10 @@ const SOURCES = {
   or: { name: 'openrouter(USD)', url: 'https://openrouter.ai/api/v1/models' },
   // v3.37.0（L1'）：唯一的大载荷源 → 给它单独的超时预算（理由见 BIG_SOURCE_TIMEOUT_MS 注释）
   litellm: { name: 'litellm(USD)', url: 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json', timeoutMs: BIG_SOURCE_TIMEOUT_MS },
-  portkey: { name: 'portkey(USD)', url: 'https://configs.portkey.ai/pricing/deepseek.json' },
+  portkey: { name: 'portkey-deepseek(USD)', url: 'https://configs.portkey.ai/pricing/deepseek.json' },
+  // v3.56.0（A1）：Portkey 补 2 个 provider（选型依据见文件头注释：零本地命中 → 零告警零污染）
+  portkeyOpenai: { name: 'portkey-openai(USD)', url: 'https://configs.portkey.ai/pricing/openai.json' },
+  portkeyAnthropic: { name: 'portkey-anthropic(USD)', url: 'https://configs.portkey.ai/pricing/anthropic.json' },
 };
 
 // 本地 pricing.json 的 key → llm-prices-cn / llmabacus 的 id（归一化匹配兜不住的特殊映射）
@@ -470,14 +483,32 @@ function ambigAdd(msg, locked) {
   else if (AMBIG_SILENT) AMBIG_WARNINGS_OFFICIAL.add(msg);
   else AMBIG_WARNINGS.add(msg);
 }
+// v3.56.0（G4）：looseFind 的归一化结果按 index 对象缓存。
+//   病根：looseFind 每次调用都对**整个索引**跑 `norm(k)`（小写 + 逐字符过滤），而主循环里
+//   usdFind 的调用次数 = 模型数 × USD 源数 × 3（usdIn/usdOut/cacheUsd 三个 median 各查一次）。
+//   A1 把 USD 源扩到 5 个后，17 模型 × 5 源 × 3 = 255 次调用，每次对 litellm（1000+ 键）全量
+//   norm → 几十万次重复字符过滤，纯浪费（索引内容一次都没变）。
+//   修法：WeakMap key = index 对象 → `[{k, kn}]` 只算一次；本项目索引都是解析后的一次性产物，
+//   无原地改写场景，故不做失效处理（真出现改写时 WeakMap 仍按对象标识命中——由调用方保证）。
+const LOOSE_NORM_CACHE = new WeakMap();
+function looseNormIndex(index) {
+  let arr = LOOSE_NORM_CACHE.get(index);
+  if (arr) return arr;
+  arr = [];
+  for (const k of Object.keys(index)) {
+    const kn = norm(k);
+    if (kn) arr.push({ k: k, kn: kn });
+  }
+  LOOSE_NORM_CACHE.set(index, arr);
+  return arr;
+}
+
 function looseFind(index, localNorm, kind, forKey, locked) {
   if (!index) return null;
   let hits = [];
-  for (const k of Object.keys(index)) {
-    const kn = norm(k);
-    if (!kn) continue;
-    if (kn === localNorm) return index[k];
-    if (localNorm.length >= 4 && kn.length >= 4 && (kn.includes(localNorm) || localNorm.includes(kn))) hits.push(k);
+  for (const e of looseNormIndex(index)) {
+    if (e.kn === localNorm) return index[e.k];
+    if (localNorm.length >= 4 && e.kn.length >= 4 && (e.kn.includes(localNorm) || localNorm.includes(e.kn))) hits.push(e.k);
   }
   if (!hits.length) return null;
   if (hits.length === 1) {
@@ -500,11 +531,25 @@ function looseFind(index, localNorm, kind, forKey, locked) {
 
 // v3.33.0（A2）：末位 `locked` 由调用方传 `m.lock === true`——已锁条目的匹配结果不会被采用（见上方注释），
 //   故其歧义只记入 `_ambig_warnings_locked`（独立字段 + stderr），不再挂弹窗「⚠价核验」。
+// v3.56.0（G4）：usdFind 结果 memo。
+//   主循环每模型对同一 (index, localKey, orId) 查 3 次（usdIn / usdOut / cacheUsd 三个 median），
+//   未命中精确键时每次都全索引走一遍 looseFind（含歧义告警）——纯重复。
+//   安全性：`locked` 只影响 ambigAdd 的告警分流（AMBIG_WARNINGS / _locked / _official），
+//   **不影响返回值**；且同一 (index, localKey) 只属于一个模型的一轮循环，不会跨模型串味。
+//   AMBIG_WARNINGS 是 Set，同 msg 重复 add 本就去重 → memo 后第 2/3 次不再触发告警无行为差异。
+const USD_MEMO = new WeakMap();
 function usdFind(usdIndex, localKey, orId, localNorm, locked) {
   if (!usdIndex) return null;
-  if (usdIndex[localKey]) return usdIndex[localKey];
-  if (orId && usdIndex[orId]) return usdIndex[orId];
-  return looseFind(usdIndex, localNorm, 'USD源', localKey, locked);
+  let byKey = USD_MEMO.get(usdIndex);
+  if (!byKey) { byKey = new Map(); USD_MEMO.set(usdIndex, byKey); }
+  const mk = localKey + '\u0000' + (orId || '');
+  if (byKey.has(mk)) return byKey.get(mk);
+  const r = usdIndex[localKey]
+    || (orId && usdIndex[orId])
+    || looseFind(usdIndex, localNorm, 'USD源', localKey, locked)
+    || null;
+  byKey.set(mk, r);
+  return r;
 }
 
 // 在人民币源索引里找模型：先 srcId（归一化），再精确，再模糊（带歧义防护）
@@ -673,7 +718,7 @@ function restoreCached(m, snap) {
 
 // v3.18（M6）：解析器注册表——拉取后立即解析并校验"解析出 >0 个模型"，
 // 上游 schema 变更/返回空体不再被计为"源成功"。
-const PARSERS = { llma: parseLlma, llc: parseLlc, or: parseOr, litellm: parseLitellm, portkey: parsePortkey };
+const PARSERS = { llma: parseLlma, llc: parseLlc, or: parseOr, litellm: parseLitellm, portkey: parsePortkey, portkeyOpenai: parsePortkey, portkeyAnthropic: parsePortkey };
 
 async function main() {
   // DeepSeek 官方定价抓取（v2.59，2026-08-23）放在 load() 之前：
@@ -726,7 +771,7 @@ async function main() {
     return;
   }
 
-  // 并行拉 5 源（v3.18/M6：拉取后立刻解析+校验，解析失败/零模型 = 源失败）
+  // 并行拉 7 源（v3.18/M6：拉取后立刻解析+校验，解析失败/零模型 = 源失败）
   const results = NO_NET
     ? Object.fromEntries(Object.keys(SOURCES).map((k) => [k, { ok: false, err: 'WB_NO_NET=1' }]))
     : await Promise.all(Object.entries(SOURCES).map(async ([k, s]) => {
@@ -746,7 +791,8 @@ async function main() {
 
   const okCount = Object.values(results).filter((r) => r.ok).length;
   const cnOk = (results.llma.ok || results.llc.ok);
-  const usdOk = (results.or.ok || results.litellm.ok || results.portkey.ok);
+  const usdOk = (results.or.ok || results.litellm.ok || results.portkey.ok
+    || results.portkeyOpenai.ok || results.portkeyAnthropic.ok);
 
   // 全源失败 → 写错误标记，date 不变（次日重试），token-tracker 会 toast 提示
   if (okCount === 0) {
@@ -769,7 +815,9 @@ async function main() {
   const or = results.or.ok ? results.or.data : null;
   const litellm = results.litellm.ok ? results.litellm.data : null;
   const portkey = results.portkey.ok ? results.portkey.data : null;
-  const usdSources = [or, litellm, portkey].filter(Boolean);
+  const portkeyOpenai = results.portkeyOpenai.ok ? results.portkeyOpenai.data : null;
+  const portkeyAnthropic = results.portkeyAnthropic.ok ? results.portkeyAnthropic.data : null;
+  const usdSources = [or, litellm, portkey, portkeyOpenai, portkeyAnthropic].filter(Boolean);
 
   const rate = Number(pricing.usd_cny_rate) > 0 ? pricing.usd_cny_rate : DEFAULT_RATE;
   const models = pricing.models || {};
@@ -901,10 +949,10 @@ async function main() {
       if (!llmaHit) regionInferred.push(key);
     }
 
-    // USD 参考价：三 USD 源中位数
+    // USD 参考价：USD 源中位数（v3.56.0 A1 起 5 源；仅 region=US 写盘，见下）
     const usdIn = median(usdSources.map((u) => usdFind(u, key, m.or_id, localNorm, isLocked)?.usdIn));
     const usdOut = median(usdSources.map((u) => usdFind(u, key, m.or_id, localNorm, isLocked)?.usdOut));
-    // v3.24（F2·A-4c）：USD 缓存命中价（三源中位数，USD/1M tokens 口径）。无任何源提供时为 null，
+    // v3.24（F2·A-4c）：USD 缓存命中价（USD 源中位数，USD/1M tokens 口径）。无任何源提供时为 null，
     // 交由 applyUsdCachedPrice 决定「沿用本地 / 退回 10% 估算并打标记」。
     // v3.48.0（审计 F3）：缓存价走 medianAllowZero（允许 0 = 真实免费缓存），不再走 median 的 `>0`
     //   ——否则"所有源都报缓存免费"会被当成"都没提供"，退化成输入价×10% 估算（高估）。
@@ -1002,7 +1050,7 @@ async function main() {
       if (usdIn != null && usdOut != null) {
         m.input_price = Number((usdIn * rate).toFixed(2));
         m.output_price = Number((usdOut * rate).toFixed(2));
-        // v3.24（F2·A-4c）：缓存价优先用 USD 源真实值（三源中位数×汇率），无源值才退回 10% 估算 + 标记
+        // v3.24（F2·A-4c）：缓存价优先用 USD 源真实值（USD 源中位数×汇率），无源值才退回 10% 估算 + 标记
         applyUsdCachedPrice(m, cacheUsd, usdIn, rate);
         m.price_source = 'usd×汇率(国外源)';
         m.auto_converted = true;
@@ -1098,7 +1146,7 @@ async function main() {
   //（不逐条塞 _price_audit，避免刷屏）。这些条目的 cached_price 缺真实源值，用户需知晓。
   const cacheEstimatedKeys = Object.keys(models).filter((k) => models[k] && models[k].cached_price_estimated === true);
   if (cacheEstimatedKeys.length) {
-    process.stderr.write(`[refresh-prices] ⚠cached_price 为估算值（输入价×10%）的条目 ${cacheEstimatedKeys.length} 个（三 USD 源均未提供缓存价）: ${cacheEstimatedKeys.slice(0, 10).join('、')}${cacheEstimatedKeys.length > 10 ? ' 等' : ''}\n`);
+    process.stderr.write(`[refresh-prices] ⚠cached_price 为估算值（输入价×10%）的条目 ${cacheEstimatedKeys.length} 个（USD 源均未提供缓存价）: ${cacheEstimatedKeys.slice(0, 10).join('、')}${cacheEstimatedKeys.length > 10 ? ' 等' : ''}\n`);
   }
 
   // v3.24（F2·缺陷2）：模糊匹配告警必须落盘（旧版只进 last_refresh_note 文本，进程结束即丢）。
@@ -1174,4 +1222,4 @@ if (require.main === module) {
 // retiredLockWarnings / applyRetiredLocked，供单元测试直接验证（纯函数，无副作用）
 // v3.31.0（P0-5 / P1-7）：导出价格体检纯函数与阈值，供 selftest 离线单测（行为可验证，不靠源码守卫）
 // v3.37.0（L1'）：导出 SOURCES / TIMEOUT_MS / BIG_SOURCE_TIMEOUT_MS，供 selftest T39 断言「大载荷源有独立超时预算」。
-module.exports = { save, load, todayStr, PRICING, usdFind, cnFind, looseFind, norm, median, AMBIG_WARNINGS, AMBIG_WARNINGS_LOCKED, AMBIG_WARNINGS_OFFICIAL, isFreeVariant, parseLlma, parseLlc, parseOr, parseLitellm, parsePortkey, mergeWithDisk, applyUsdCachedPrice, retiredLockWarnings, applyRetiredLocked, priceGate, restoreBlock, restoreCached, PRICE_SANITY, CACHE_RATIO, DEFAULT_RATE, SOURCES, TIMEOUT_MS, BIG_SOURCE_TIMEOUT_MS };
+module.exports = { save, load, todayStr, PRICING, usdFind, cnFind, looseFind, looseNormIndex, norm, median, medianAllowZero, AMBIG_WARNINGS, AMBIG_WARNINGS_LOCKED, AMBIG_WARNINGS_OFFICIAL, isFreeVariant, parseLlma, parseLlc, parseOr, parseLitellm, parsePortkey, mergeWithDisk, applyUsdCachedPrice, retiredLockWarnings, applyRetiredLocked, priceGate, restoreBlock, restoreCached, PRICE_SANITY, CACHE_RATIO, DEFAULT_RATE, SOURCES, TIMEOUT_MS, BIG_SOURCE_TIMEOUT_MS };

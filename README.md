@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.55.0-blue)
+![Version](https://img.shields.io/badge/version-v3.56.0-blue)
 
 > 在每次回答后显示 **Token 消耗 / 耗时 / 折算费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -137,7 +137,7 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 | 💰 **费用估算** | 内置主流模型**人民币官方价**（元/百万 tokens，来源见下「本地官方价格库」）；支持高峰/夜间时段倍率（见下「时段价格标注」）；不足 ¥0.01 显示 `¥<0.01` |
 | ⏰ **时段价格标注** | 行1 显示时段策略：DeepSeek 原厂系高峰 → **`高峰双倍`**；声明了 `night_discount` 的模型夜间 → **`夜间X折`**。**DeepSeek 原厂时段「自动跟随官方」**——`pricing.json` 顶层的 `deepseek_rules.peak_schedule` 由 `deepseek-official.js` 每日从官方定价页抓取，官方改时段/取消周末低峰本地自动同步；解析失败**保留旧值**并亮 `⚠时段`（绝不静默清空），无规则时回落内置默认（9:00–12:00 / 14:00–18:00，周末全天低峰）。**其他厂商**的峰谷/夜间折扣没有可程序化读取的数据源，仍需人工在 `pricing.json` 该模型条目上维护 `peak_multiplier`（高峰倍率）与 `night_discount`（夜间系数）+ 可选的 `night_hours=[起,止]`（覆盖默认夜间窗口 00:00–08:00）。⚠️ **没有 `peak_hours` 这个字段**——高峰时段只来自 `deepseek_rules.peak_schedule` 或内置默认，别去改一个不存在的键 |
 | 🆕 **新模型自动补录** | 检测到未收录模型**立即联网**补录：先查国内源 llmabacus（人民币价，`region=CN`），再回退 OpenRouter（USD×汇率，`region=US`）；查不到则提示用搜索技能人工核验官方定价页 |
-| 🔄 **每日价格自动刷新** | 每天首次运行自动拉 **5 个价格源**（国内 2：llmabacus / llm-prices-cn；国外 3：OpenRouter / LiteLLM / Portkey），按模型 `region` 区分国内外定价（CN 用国内人民币价、US 用三 USD 源中位数×汇率）；**当天已刷新则不再联网**；全源失败 toast 显示「价⚠️」并保留上次价格 |
+| 🔄 **每日价格自动刷新** | 每天首次运行自动拉 **7 个价格源**（国内 2：llmabacus / llm-prices-cn；国外 5：OpenRouter / LiteLLM / Portkey×3 provider——deepseek / openai / anthropic），按模型 `region` 区分国内外定价（CN 用国内人民币价、US 用 USD 源中位数×汇率）；**当天已刷新则不再联网**；全源失败 toast 显示「价⚠️」并保留上次价格。⚠️ llm-prices-cn 是 llmabacus 的每日镜像（同源，不构成独立互证）；Portkey 的 openrouter.json 与 OpenRouter 同源故不选——详见 `docs/pricing-refresh.md`「源的独立性口径」 |
 | 🔗 **官方价跨 key 接管**（v3.07） | 官方现行 API ID 与本地 key 不同名时（如本地 `deepseek-v4.1-flash` ↔ 官方 `deepseek-flash`），按官方页「模型版本」行自动对齐识别为同一模型：**官方价强制覆盖手动补录价**、解除 `manual`/`lock` 冻结、绑定 `alias_of` 并写 `_manual_audit` 留痕；聚合源刷新也不会再覆盖官方价 |
 | 🏪 **本地官方价格库优先**（v2.81） | 计费新增**本地官方库层**（各厂商官网直抓的人民币官方价），优先级：`pricing.json 的 lock` > **本地官方库** > 聚合源补录。**每天第一次对话后台强制刷新**（实测约 12s，非阻塞，刷新没跑完自动用前一天完整库）；本地没有的模型才走聚合源实时查价并永久记录 |
 | ⚠️ **刷新失败告警**（v2.81） | 本地库停留在昨天/缺失时，弹窗模型名后追加 **`⚠价库8/30`** / **`⚠价库缺失`**（正常时与原来一字不差）；失败**退避重试** 3→10→30→60 分钟、当日满 5 次熔断，次日自动恢复——不会再无限重拉，也不会让你蒙在鼓里 |
@@ -175,7 +175,7 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 | `ENABLE_HOLIDAY_REFRESH` | `true` | **分开关5（v3.32.0）**——法定假日表自适应自动刷新（`loadPricing` → `maybeRefreshHolidays` → detach spawn `refresh-holidays.js`）。四条件触发（缺今年 / 10-12 月缺明年 / 任一年陈旧 / >30 天未成功），不满足**完全不联网**，同日最多尝试一次。数据源为 2 个 GitHub 公开仓库（零密钥、不含本地数据）。关掉后峰谷判定遇到数据缺失年份按「非假日」降级并打 stderr 告警，修复用 `node refresh-holidays.js <年>` |
 | *(非开关项)* 本地价库 Python 流水线 | 只认总开关 | `fetch-cn-prices.py` → `parse_tokenhub.py` → `build_index.py`，由 `loadPricing()` **每日首次调用时自动后台调起**（`~12s`，非阻塞；每天成功一次即不再跑，失败按 3/10/30/60 分钟退避、当日满 5 次熔断）。`ENABLE_PRICE_REFRESH=false` **不会**关掉它 | `llmabacus` / 各厂商官网 / 腾讯云 TokenHub 文档页 | 否 |
 | `ENABLE_BALANCE_QUERY` | **`false`** | 余额查询 | 仅 `https://api.deepseek.com/user/balance` | ⚠️ **是**（DeepSeek API key） |
-| `ENABLE_PRICE_REFRESH` | `true` | 每日价格自动刷新 | **5 个公开价格源**：llmabacus（`llmabacus.com/api/prices`）、llm-prices-cn（GitHub raw）、OpenRouter（`openrouter.ai/api/v1/models`）、LiteLLM（GitHub raw）、Portkey（`configs.portkey.ai/pricing/<provider>.json`） | 否 |
+| `ENABLE_PRICE_REFRESH` | `true` | 每日价格自动刷新 | **7 个公开价格源**：llmabacus（`llmabacus.com/api/prices`）、llm-prices-cn（GitHub raw，llmabacus 每日镜像）、OpenRouter（`openrouter.ai/api/v1/models`）、LiteLLM（GitHub raw）、Portkey×3 provider（`configs.portkey.ai/pricing/deepseek.json` / `openai.json` / `anthropic.json`） | 否 |
 | `ENABLE_MODEL_LOOKUP` | `true` | 新模型价格自动补录 | 同上（llmabacus 优先，OpenRouter 兜底） | 否 |
 | `ENABLE_UPDATE_CHECK` | `true` | 版本更新检查（**每 7 天最多 1 次**） | 仅 `https://api.github.com/repos/abc1317679842-ui/workbuddy-token-tracker` 的 `releases/latest` 与 `git/matching-refs/tags/v`（两个端点取较大版本） | 否 |
 
@@ -234,11 +234,11 @@ const ENABLE_UPDATE_CHECK = loadLocalFlag('enable_update_check', true);    // �
 |---|---|---|
 | `api.deepseek.com` | DeepSeek 官方价（`/models`）；余额查询（`/user/balance`） | 价：无；余额：需你的 DeepSeek key（默认关闭） |
 | `api-docs.deepseek.com` | DeepSeek 官方定价页解析 | 无 |
-| `www.llmabacus.com` | 聚合价源（国内·人民币·主） | 无 |
+| `www.llmabacus.com` | 聚合价源（国内·人民币·主；llm-prices-cn 是其每日镜像，**同源不构成独立互证**） | 无 |
 | `raw.githubusercontent.com` | `szp2005/llm-prices-cn`（国内备）、`BerriAI/litellm`（USD）、`NateScarlet/holiday-cn` + `HankAviator/china-holiday-calendar`（法定假日表） | 无 |
 | `api.github.com` | 假日表 contents API（v3.32.0 起每日链路自适应触发）、版本更新检查（每 7 天） | **不要求**；若环境已设 `GH_TOKEN` / `GITHUB_TOKEN` 会自动带上（仅用于提高限流额度），不读任何本地凭据文件 |
 | `openrouter.ai` | 聚合价源（USD） | 无 |
-| `configs.portkey.ai` | 聚合价源（USD） | 无 |
+| `configs.portkey.ai` | 聚合价源（USD，3 个 provider：deepseek / openai / anthropic） | 无 |
 | `platform.minimaxi.com` · `platform.stepfun.com` · `docs.bigmodel.cn` · `platform.moonshot.cn` · `platform.kimi.com` | **国内厂商官方定价页**（Python 侧 `fetch-cn-prices.py` 解析，v3.33.0 补入本清单——此前只声明了上面 7 个，这 5 个漏声明） | 无 |
 | `cloud.tencent.com` | 腾讯云 TokenHub 定价页（Python 侧 `parse_tokenhub.py`） | 无 |
 
