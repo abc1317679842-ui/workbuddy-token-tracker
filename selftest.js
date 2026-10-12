@@ -5393,6 +5393,192 @@ else {
   }
 }
 
+
+// ===== T64：v3.54.0 冗余交叉校验 + CN/USD 一致性 + 峰谷 effective_from（审计批4）=====
+// 三条主线：
+//   ① **L5 冗余交叉**：索引此前是「单源无条件采信」—— 主候选按 first_party > channel 排序后取第一个，
+//      all_sources 只是存档、从不参与校验 → 多源价格差 1000×（元/千 tokens 被当元/百万）也静默通过。
+//      交叉校验**只留痕 + WARN，不改价**（改价 = 用一个猜测覆盖另一个猜测，与「不凭空造钱」冲突）。
+//   ② **CN/USD 一致性**：索引顶层写死 currency='CNY'、下游按人民币计。USD 价混进来 = 金额差一个汇率
+//      且完全静默 → 新条目由闸门拒收、已有条目挂 _manual_audit（**不折算**：折算 = 凭空造一个数）。
+//   ③ **峰谷 effective_from**：peak 倍率一变，recalc 出来的**历史**金额整体漂移；
+//      「金额=派生值」口径允许漂移，但生效日期必须落进索引（否则事后无从解释金额变动）。
+// 源码守卫证明不了「冲突之后索引里到底是哪个价、条目还在不在」，故 e 组真跑 build_index.py。
+{
+  const bi64 = fs.readFileSync(path.join(SRC, 'build_index.py'), 'utf-8').replace(/\r\n/g, '\n');
+
+  // ── a. L5 冗余交叉：多源互证 ──
+  //   ⚠️ 断言必须匹配**使用点**（`cc_conf, cc_note = cross_check(primary, cands)`）：
+  //   只匹配函数名会把 def 行算进去 → 定义存在即恒绿（v3.52.0 反向验证踩过同族坑）。
+  ok('T64-a1 ★必须有多源交叉校验函数，且在合并处被真正调用（定义了不用 = 没有第二意见）',
+    bi64.indexOf('def cross_check(primary, cands)') >= 0
+    && bi64.indexOf('cc_conf, cc_note = cross_check(primary, cands)') >= 0,
+    '红 = 交叉校验没接进合并链路；单源解析错（差 1000×）无人复核');
+  ok('T64-a2 ★阈值判定必须真的被用上（只查常量存在的话，把阈值改成 1e9 仍然恒绿）',
+    bi64.indexOf('CROSS_WARN = 3.0') >= 0 && bi64.indexOf('CROSS_TOL = 10.0') >= 0
+    && bi64.indexOf('if r >= CROSS_TOL:') >= 0 && bi64.indexOf('elif r >= CROSS_WARN:') >= 0);
+  ok('T64-a3 ★交叉校验只留痕不改价（写进 _cross_check + 记 cross_conflict）',
+    bi64.indexOf("entry['_cross_check'] = cc") >= 0 && bi64.indexOf("'kind': 'cross_conflict'") >= 0,
+    '红 = 交叉校验开始改价：用「另一源更像对的」覆盖本源，本质是用一个猜测覆盖另一个猜测');
+  // ── b. 条目内交叉（G2 收紧）──
+  ok('T64-b1 ★条目内交叉：缓存命中价 > 输入价必须判为冲突（缓存是折扣价，高了几乎总是列取串）',
+    bi64.indexOf('def intra_check(entry)') >= 0 && bi64.indexOf("'sub': 'cache_gt_input'") >= 0
+    && bi64.indexOf('c > i') >= 0);
+  ok('T64-b2 ★条目内交叉必须在合并处被调用（refresh-prices 已拦一次，索引侧必须再拦一次）',
+    bi64.indexOf('cc_intra = intra_check(entry)') >= 0);
+  // ── c. CN/USD 一致性 ──
+  ok('T64-c1 ★必须有币种一致性校验，且**缺失不算不一致**（老索引整批无 currency，判成不一致会整库挂起）',
+    bi64.indexOf('def currency_allowed(cur)') >= 0 && bi64.indexOf("ALLOWED_CURRENCY = ('CNY',)") >= 0
+    && bi64.indexOf('return (not cur) or (str(cur).upper() in ALLOWED_CURRENCY)') >= 0);
+  ok('T64-c2 ★非 CNY 的新条目必须被闸门拒收（混进 CNY 库 = 金额差一个汇率）',
+    bi64.indexOf("if not currency_allowed(e.get('currency')):\n        return False") >= 0
+    && bi64.indexOf('币种非 CNY') >= 0);
+  //   ⚠️ 锚点必须唯一到「已有条目」那一处：沿用段还另有一条同 kind 的记录，
+  //   只匹配 `'kind': 'currency_mismatch'` 的话，把已有条目这整段删掉仍然恒绿（反向验证 R7 实测）。
+  ok('T64-c3 ★非 CNY 的已有条目必须挂 _manual_audit 且**不折算**（折算 = 凭空造一个数）',
+    bi64.indexOf("if not currency_allowed(e.get('currency')) and not e.get('_manual_audit'):") >= 0
+    && bi64.indexOf('价格原样保留未折算') >= 0);
+  // ── d. 峰谷 effective_from ──
+  ok('T64-d1 ★峰谷规则变化必须被分级识别，且**两边都有值才判变化**（首次出现 peak 不是变化）',
+    bi64.indexOf("pk_o, pk_n = pe.get('peak'), ne.get('peak')") >= 0
+    && bi64.indexOf('if pk_o and pk_n and pk_o != pk_n:') >= 0
+    && bi64.indexOf("kinds.append('peak_rule')") >= 0);
+  ok('T64-d2 ★峰谷规则变化必须落 peak_effective_from（历史 recalc 会漂移，生效日期必须有据可查）',
+    bi64.indexOf("e['peak_effective_from'] = today_iso0") >= 0);
+  ok('T64-d3 ★索引顶层必须给出契约口径汇总（币种分布 / 非 CNY 清单 / 交叉阈值）',
+    bi64.indexOf("'_contract': {") >= 0 && bi64.indexOf("'currency_counts': cur_counts") >= 0
+    && bi64.indexOf("'non_cny': sorted(non_cny)") >= 0 && bi64.indexOf("'cross_tolerance'") >= 0);
+  //   ⚠️ 必须匹配 **stderr 文案形态**，不能只匹配关键词：源码注释里同样写着「峰谷规则变化」
+  //   → 删掉告警段后关键词仍在、断言恒绿（反向验证 R11 实测；与「扫源码先剥注释」同族坑）。
+  ok('T64-d4 ★三类新告警必须有 stderr 输出（留痕不外显 = 等于没留）',
+    ['%d 个条目交叉校验冲突', '%d 个条目币种非 CNY', '%d 个条目峰谷规则变化'].every((s) => bi64.indexOf(s) >= 0)
+    && bi64.indexOf('[build_index][WARN]') >= 0);
+
+  // ── e. 行为验证：真跑 build_index.py ──
+  {
+    const py64 = (() => {
+      if (process.env.CN_PYTHON) return process.env.CN_PYTHON;
+      try {
+        const root = path.join(os.homedir(), '.workbuddy', 'binaries', 'python', 'versions');
+        for (const v of fs.readdirSync(root).sort().reverse()) {
+          const p = path.join(root, v, 'python.exe');
+          if (fs.existsSync(p)) return p;
+        }
+      } catch (e) { /* 探测失败 → 回退裸 python */ }
+      return 'python';
+    })();
+    const probe64 = spawnSync(py64, ['-c', 'print(1)'], { timeout: 20000, windowsHide: true });
+    const pyOk64 = !!(probe64.status === 0);
+    if (!SPAWN_OK || !pyOk64) {
+      for (const n of ['T64-e1', 'T64-e2', 'T64-e3', 'T64-e4', 'T64-e5', 'T64-e6', 'T64-e7', 'T64-e8']) {
+        envSkip(n + ' ★build_index 行为验证（真跑 python）',
+          !SPAWN_OK ? SPAWN_SKIP_REASON : ('未找到可用 python（试探 ' + py64 + ' 失败）；CI 上应为 0'));
+      }
+    } else {
+      const d64 = path.join(tmp, 't64');
+      const p64 = path.join(d64, 'prices');
+      fs.mkdirSync(p64, { recursive: true });
+      fs.mkdirSync(path.join(d64, 'wbroot'), { recursive: true }); // 空 WB_ROOT → 跳过 pricing.json(lock) 覆盖层
+      const U64 = '元/百万 tokens';
+      // ⚠️ 用**本地日期**而非 toISOString()：py 侧是 datetime.date.today()（本地），
+      //    UTC 日期在 GMT+8 的凌晨会差一天 → 断言永远红（假失败）。
+      const nd = new Date();
+      const today64 = `${nd.getFullYear()}-${String(nd.getMonth() + 1).padStart(2, '0')}-${String(nd.getDate()).padStart(2, '0')}`;
+      const mk64 = (i, o, over) => Object.assign({
+        in_price: i, out_price: o, cache_hit: 0.1, currency: 'CNY', unit: U64,
+        region: 'CN', source_url: 'http://x', fetched_at: today64 + 'T00:00:00',
+      }, over || {});
+      const ent64 = (i, o, over) => Object.assign({
+        name: 'n', api_name: 'n', in_price: i, out_price: o, cache_hit: 0.1,
+        primary_source: 'src', primary_source_type: 'first_party', tier_note: '', all_sources: [],
+        currency: 'CNY', unit: U64, region: 'CN',
+      }, over || {});
+      const peakOf = (pi, po) => ({ idle: { in: 1.0, out: 2.0, cache: 0.1 },
+                                    peak: { in: pi, out: po, cache: 0.1 } });
+      fs.writeFileSync(path.join(p64, 'index.json'), JSON.stringify({
+        built_at: today64,
+        models: {
+          deepseekx: ent64(1.0, 2.0),                                 // 本版两源：官方 1.2 / 转售 1200（1000×）
+          ci: ent64(1.0, 2.0),                                        // 本版缓存价 1.5 > 输入价 1.0
+          pk: ent64(1.0, 2.0, { peak: peakOf(2.0, 4.0) }),            // 峰谷规则：高峰 2× → 4×
+          oldusd: ent64(1.0, 2.0, { currency: 'USD' }),               // 历史遗留非 CNY（本版抓不到 → 沿用）
+          oldusd2: ent64(1.0, 2.0, { currency: 'USD' }),              // 历史遗留非 CNY（**本版仍抓到** → 走已有条目路径）
+        },
+      }));
+      fs.writeFileSync(path.join(p64, 'latest.json'), JSON.stringify({
+        fetched_at: today64 + 'T00:00:00',
+        vendors: {
+          deepseek: { name: 'DeepSeek', models: [
+            Object.assign(mk64(1.2, 2.4), { name: 'x', api_name: 'deepseekx' }),              // first_party 1.2
+            Object.assign(mk64(1.0, 2.0, { cache_hit: 1.5 }), { name: 'ci', api_name: 'ci' }), // 缓存价 > 输入价
+          ] },
+          aliyun: { name: '阿里云', models: [
+            Object.assign(mk64(1200.0, 2400.0), { name: 'x', api_name: 'deepseekx' }),        // channel 1200（1000×）
+          ] },
+          minimax: { name: 'MiniMax', models: [
+            Object.assign(mk64(2.0, 4.0, { currency: 'USD' }), { name: 'newusd', api_name: 'newusd' }), // 非 CNY 新条目 → 拒收
+            Object.assign(mk64(2.0, 4.0, { currency: 'USD' }), { name: 'oldusd2', api_name: 'oldusd2' }), // 非 CNY **已有**条目 → 挂起
+          ] },
+        },
+      }));
+      // 峰谷规则走 TokenHub 路径（latest.json 的 vendor 路径不产 peak）
+      fs.writeFileSync(path.join(p64, 'tokenhub_lang.json'), JSON.stringify({
+        region: '广州',
+        models: [{ name: 'pk', api_name: 'pk', currency: 'CNY', unit: U64, region: 'CN',
+          source_url: 'http://x', fetched_at: today64 + 'T00:00:00', first_party: true, sku: 'sku1',
+          tiers: [{ type: 'peak', value: '空闲时段', in: 1.0, out: 2.0, cache: 0.1 },
+                  { type: 'peak', value: '高峰时段', in: 4.0, out: 8.0, cache: 0.4 }] }],
+      }));
+      const env64 = Object.assign({}, process.env, { CN_PRICES_DIR: p64, WB_ROOT: path.join(d64, 'wbroot') });
+      const r64 = spawnSync(py64, [path.join(SRC, 'build_index.py')],
+        { cwd: d64, env: env64, timeout: 120000, windowsHide: true, encoding: 'utf-8' });
+      let idx64 = null, ch64 = [];
+      try { idx64 = JSON.parse(fs.readFileSync(path.join(p64, 'index.json'), 'utf-8')); } catch (e) { /* 下方断言会红 */ }
+      try {
+        ch64 = fs.readFileSync(path.join(p64, 'changes.jsonl'), 'utf-8').split('\n')
+          .filter((l) => l.trim()).map((l) => JSON.parse(l));
+      } catch (e) { /* 同上 */ }
+      const M64 = (idx64 && idx64.models) || {};
+      const C64 = (idx64 && idx64._contract) || {};
+      const kinds64 = ch64.reduce((a, c) => { a[c.kind] = (a[c.kind] || 0) + 1; return a; }, {});
+      const log64 = String((r64 && (r64.stdout + r64.stderr)) || '');
+      const conf64 = ((M64.deepseekx || {})._cross_check || {}).conflicts || [];
+      ok('T64-e1 ★多源交叉冲突（官方 1.2 vs 转售 1200，1000×）必须留痕且**不改价**（仍用官方 1.2）',
+        M64.deepseekx && M64.deepseekx.in_price === 1.2 && conf64.length >= 1
+        && conf64[0].ratio >= 10, JSON.stringify(M64.deepseekx && M64.deepseekx._cross_check) + ' | ' + log64.slice(-200));
+      ok('T64-e2 ★条目内交叉：缓存价 1.5 > 输入价 1.0 → intra 留痕，价格原样保留（不删条目、不改价）',
+        M64.ci && M64.ci.cache_hit === 1.5
+        && (((M64.ci._cross_check || {}).intra || [])[0] || {}).sub === 'cache_gt_input',
+        JSON.stringify(M64.ci && M64.ci._cross_check));
+      ok('T64-e3 ★非 CNY 的新条目必须被闸门拒收（混进 CNY 库 = 金额差一个汇率）',
+        !M64.newusd
+        && ch64.some((c) => c.kind === 'rejected' && String(c.reason || '').indexOf('币种非 CNY') >= 0),
+        JSON.stringify(ch64.filter((c) => c.kind === 'rejected')));
+      ok('T64-e4 ★非 CNY 条目一律记 currency_mismatch：沿用条目（oldusd）+ 本版仍抓到的已有条目（oldusd2 挂 _manual_audit）',
+        !!M64.oldusd && !!M64.oldusd2
+        && ((M64.oldusd2 || {})._manual_audit || {}).kind === 'currency_mismatch'
+        && (kinds64.currency_mismatch || 0) >= 2
+        && Array.isArray(C64.non_cny) && C64.non_cny.indexOf('oldusd') >= 0
+        && C64.non_cny.indexOf('oldusd2') >= 0,
+        JSON.stringify({ kinds: kinds64, contract: C64, a2: (M64.oldusd2 || {})._manual_audit }));
+      ok('T64-e5 ★峰谷规则变化必须落 peak_effective_from=今天，且采用新倍率（不是语义变，价格照常更新）',
+        M64.pk && M64.pk.peak_effective_from === today64
+        && M64.pk.peak && M64.pk.peak.peak && M64.pk.peak.peak.in === 4.0
+        && (kinds64.peak_rule || 0) >= 1,
+        JSON.stringify({ pk: M64.pk, peak_rule: kinds64.peak_rule }));
+      ok('T64-e6 ★三类新告警必须有 stderr 输出（留痕不外显 = 等于没留）',
+        log64.indexOf('交叉校验冲突') >= 0 && log64.indexOf('币种非 CNY') >= 0
+        && log64.indexOf('峰谷规则变化') >= 0, log64.slice(-500));
+      ok('T64-e7 ★顶层契约口径汇总：币种分布 + 交叉阈值（人工一眼看清库里混没混币种）',
+        C64.currency_counts && C64.currency_counts.CNY >= 3
+        && C64.cross_tolerance && C64.cross_tolerance.conflict === 10 && C64.cross_tolerance.warn === 3,
+        JSON.stringify(C64));
+      ok('T64-e8 ★交叉冲突**只留痕不删条目**（deepseekx/ci/pk/oldusd 全部仍在索引里）',
+        ['deepseekx', 'ci', 'pk', 'oldusd', 'oldusd2'].every((k) => !!M64[k]), Object.keys(M64).join(','));
+    }
+  }
+}
+
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。
 //   为什么需要：主脚本在被 require 时会跑 loadPricing → maybeRefreshHolidays（每进程一次、四条件命中即
 //   **detach** spawn 一个 refresh-holidays.js 子进程并往 SNAP_DIR 写 `.holidays-refresh.json`）。该子进程

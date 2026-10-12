@@ -86,6 +86,22 @@ PRICE_MIN, PRICE_MAX = 0.0005, 5000.0        # 元/百万 tokens，与 fetch-cn-
 SEMANTIC_GUARDED = ('unit', 'currency')      # 这两个字段变了 = 计价基准变了
 BIG_JUMP = 5.0                               # 价格跳变阈值：>5× 或 <1/5 → 采纳但仍 WARN
 
+# ── v3.54.0（审计批4·L5 冗余交叉 / CN·USD 一致性 / 峰谷 effective_from）──────────────
+# 背景：至此索引产出环节仍是**单源无条件采信** —— 主候选按 first_party > channel 排序后取第一个，
+#   all_sources 只是存档、从不参与校验。三类事故因此无从发现：
+#     ① **单位/列取错**：「元/千 tokens」被当「元/百万 tokens」→ 与另一源差 1000×，
+#        单源视角下它长得完全正常（价格区间合法、契约齐全，闸门照放）；
+#     ② **币种混入**：索引顶层写死 currency='CNY'，下游（mergeLocalPriceDb）按人民币计。
+#        若某源给的是 USD，金额直接差一个汇率（≈7×）且完全静默；
+#     ③ **峰谷规则漂移**：peak（高峰/空闲倍率）变更会让 recalc 出来的**历史**金额整体漂移，
+#        而索引里看不出这套规则是哪天生效的（"金额=派生值"口径允许漂移，但必须有据可查）。
+# 口径（沿用批3）：**值变=自动，语义变=人工**；交叉校验**只留痕 + WARN，不改价** ——
+#   用"另一源更像对的"去改价，本质是用一个猜测覆盖另一个猜测，与「不凭空造钱」冲突；
+#   真冲突一律挂起等人看（见 _manual_audit / changes.jsonl）。
+CROSS_WARN = 3.0                             # 多源价格比 >3× → 提示（转售/渠道加价的常见区间）
+CROSS_TOL = 10.0                             # >10× 或 <1/10 → 疑似单位/列取错，记为冲突
+ALLOWED_CURRENCY = ('CNY',)                  # 索引口径币种；其它币种不许静默混入
+
 # aliyun 上挂的非阿里品牌 → 降为 channel（模型广场转售）
 FOREIGN_IN_ALIYUN = ('deepseek', 'glm', 'kimi', 'minimax', 'hunyuan', 'step-',
                      'yi-', 'ernie', 'qianfan', 'llama', 'claude', 'gpt',
@@ -137,6 +153,59 @@ def price_values(e):
     return [e.get(f) for f in ('in_price', 'out_price') if isinstance(e.get(f), (int, float))]
 
 
+def currency_allowed(cur):
+    """v3.54.0（批4）：CN/USD 一致性 —— 索引口径统一 CNY。
+
+    ⚠️ **缺失不算不一致**：契约海关（currency/unit 拒收）与逐模型沿用各自处理缺失形态，
+    此处若把缺失也算不一致，老索引里整批无 currency 的沿用条目会被整库挂起（比现状更糟）。
+    """
+    return (not cur) or (str(cur).upper() in ALLOWED_CURRENCY)
+
+
+def cross_check(primary, cands):
+    """v3.54.0（批4·L5）：冗余交叉 —— 同一归一模型在多个来源间的价格互证。返回 (conflicts, notes)。
+
+    为什么现在才需要：主候选排序后无条件取第一个，多源价格差 1000× 也静默通过 ——
+    单源解析出错时**没有任何第二意见**；而「两个独立源给出同一数量级」本身就是强证据，
+    「差 1000×」则几乎只可能是单位或列取错（元/千 vs 元/百万 的典型倍率）。
+    阈值：转售/渠道加价一般 ≤3×（>3× 只提示）；≥10× 记冲突。
+    """
+    conflicts, notes = [], []
+    for f in ('in', 'out'):
+        pv = primary.get(f)
+        if not isinstance(pv, (int, float)) or pv <= 0:
+            continue
+        for c in cands:
+            if c is primary:
+                continue
+            cv = c.get(f)
+            if not isinstance(cv, (int, float)) or cv <= 0:
+                continue
+            r = (pv / cv) if pv >= cv else (cv / pv)
+            item = {'field': f, 'primary': pv, 'other': cv, 'ratio': round(r, 3),
+                    'other_source': c.get('source'), 'other_source_type': c.get('source_type')}
+            if r >= CROSS_TOL:
+                conflicts.append(item)
+            elif r >= CROSS_WARN:
+                notes.append(item)
+    return conflicts, notes
+
+
+def intra_check(entry):
+    """v3.54.0（批4·G2 收紧）：条目内冗余交叉 —— 缓存命中价应 ≤ 输入价。
+
+    缓存是折扣价，`cache_hit > in_price` 几乎总是**列取串**（输入价与缓存价错位）。
+    refresh-prices.js 在 pricing.json 写入侧已拦一次；此处是索引侧的第二次 ——
+    两条链路都可能被各自绕过（lock 注入、TokenHub 分档、沿用条目），
+    重复校验的成本远低于漏检（缓存价错 = 影响 45%~86% 金额，见 A5）。
+    """
+    conflicts = []
+    i, c = entry.get('in_price'), entry.get('cache_hit')
+    if isinstance(i, (int, float)) and isinstance(c, (int, float)) and i > 0 and c > i:
+        conflicts.append({'sub': 'cache_gt_input', 'in_price': i, 'cache_hit': c})
+    return conflicts
+
+
 def gate_new_model(e, full):
     """新条目闸门：返回 (ok, reason)。
 
@@ -151,6 +220,9 @@ def gate_new_model(e, full):
     miss = [f for f in need if not e.get(f)]
     if miss:
         return False, '契约不全（缺 %s）' % ','.join(miss)
+    # v3.54.0（批4）：币种必须属索引口径。USD 价混进 CNY 库 = 金额差一个汇率且无告警。
+    if not currency_allowed(e.get('currency')):
+        return False, '币种非 CNY（%s；索引口径统一 CNY，混入会差一个汇率）' % e.get('currency')
     vals = price_values(e)
     if not vals:
         return False, '无可校验价格'
@@ -194,6 +266,13 @@ def classify_change(pe, ne):
     if to and tn and to != tn:
         kinds.append('source_downgrade' if to == 'first_party' else 'source_upgrade')
         detail['source'] = {'old': to, 'new': tn}
+    # v3.54.0（批4）：峰谷规则变化 —— 两边都有才判（首次出现 peak 不是"变化"）。
+    #   峰谷倍率一变，recalc 出来的**历史**金额会整体漂移；"金额=派生值"口径允许漂移，
+    #   但"这套规则哪天生效的"必须有据可查，否则事后无从解释金额变动（见 peak_effective_from）。
+    pk_o, pk_n = pe.get('peak'), ne.get('peak')
+    if pk_o and pk_n and pk_o != pk_n:
+        kinds.append('peak_rule')
+        detail['peak'] = {'old': pk_o, 'new': pk_n}
     return sorted(set(kinds)), detail
 
 
@@ -378,6 +457,19 @@ def main():
             entry['peak'] = peak_src['peak']
         if primary.get('sku'):
             entry['sku'] = primary['sku']
+        # v3.54.0（批4·L5）：多源交叉 + 条目内交叉 —— **只留痕，不改价**
+        #   （改价 = 用"另一源更像对的"覆盖本源，本质是用一个猜测覆盖另一个猜测）。
+        cc_conf, cc_note = cross_check(primary, cands)
+        cc_intra = intra_check(entry)
+        if cc_conf or cc_note or cc_intra:
+            cc = {}
+            if cc_conf:
+                cc['conflicts'] = cc_conf
+            if cc_note:
+                cc['notes'] = cc_note
+            if cc_intra:
+                cc['intra'] = cc_intra
+            entry['_cross_check'] = cc
         merged[key] = entry
 
     # 覆盖层：pricing.json 中 lock=True 的官方价 = 最高权威
@@ -477,6 +569,10 @@ def main():
                             'source': e.get('primary_source')})
             continue
         kinds, detail = classify_change(pe, e)
+        if 'peak_rule' in kinds:
+            # v3.54.0（批4）：峰谷规则自今天起生效 —— 历史 recalc 金额会随之漂移，
+            #   "金额=派生值"口径允许漂移，但生效日期必须落在索引里（否则事后无从解释金额变动）。
+            e['peak_effective_from'] = today_iso0
         if 'semantic' in kinds:
             # 语义变 = 计价基准变了 → 保留上一版价格与单位，本次新值挂 _manual_audit 供人工对照
             new_vals = {f: e.get(f) for f in ('in_price', 'out_price', 'cache_hit')}
@@ -500,6 +596,24 @@ def main():
                 'field_diff': detail.get('region'),
                 'since': today_iso0,
             }
+        # v3.54.0（批4）：交叉校验冲突（多源价格量级不一致 / 缓存价高于输入价）—— 只留痕，不改价
+        xc = e.get('_cross_check') or {}
+        if xc.get('conflicts') or xc.get('intra'):
+            changes.append({'ts': datetime.datetime.now().isoformat(timespec='seconds'),
+                            'built_at': today_iso0, 'model': key, 'kind': 'cross_conflict',
+                            'detail': {'conflicts': xc.get('conflicts') or [], 'intra': xc.get('intra') or []}})
+        # v3.54.0（批4）：CN/USD 一致性 —— 非 CNY 条目挂起（不折算：折算 = 凭空造一个数）
+        if not currency_allowed(e.get('currency')) and not e.get('_manual_audit'):
+            e['_manual_audit'] = {
+                'kind': 'currency_mismatch',
+                'reason': '币种 %s 与索引口径 CNY 不一致（下游按人民币计，混入会差一个汇率）；'
+                          '价格原样保留未折算，请人工确认或换算后重抓' % e.get('currency'),
+                'currency': e.get('currency'),
+                'since': today_iso0,
+            }
+            changes.append({'ts': datetime.datetime.now().isoformat(timespec='seconds'),
+                            'built_at': today_iso0, 'model': key, 'kind': 'currency_mismatch',
+                            'detail': {'currency': e.get('currency')}})
         for k in kinds:
             changes.append({'ts': datetime.datetime.now().isoformat(timespec='seconds'),
                             'built_at': today_iso0, 'model': key, 'kind': k, 'detail': detail})
@@ -563,6 +677,11 @@ def main():
                                       % (prev.get('built_at') or '上版', gap)})
             if tag_of(v.get('primary_source')) in today_tags:
                 vv['tier_note'] = '官网当日未返回该模型（可能改版/下架），沿用 %s 价' % (prev.get('built_at') or '上版')
+            # v3.54.0（批4）：沿用条目同样过币种一致性 —— 历史遗留的非 CNY 条目不能天天静默续命
+            if not currency_allowed(vv.get('currency')):
+                changes.append({'ts': datetime.datetime.now().isoformat(timespec='seconds'),
+                                'built_at': today_iso, 'model': k, 'kind': 'currency_mismatch',
+                                'detail': {'currency': vv.get('currency'), 'carried': True}})
             merged[k] = vv
             carried.append((tag_of(v.get('primary_source')) or '其他', k))
         if carried:
@@ -607,9 +726,35 @@ def main():
     if rg:
         sys.stderr.write('[build_index][WARN] %d 个条目地域变化（价格已采用新值，请确认是否为预期区域）：%s\n'
                          % (len(rg), ', '.join(str(x) for x in rg[:10])))
+    # ── v3.54.0（批4）：交叉校验 / 币种一致性 / 峰谷生效日 告警 ───────────────────────
+    xk = models_of('cross_conflict')
+    if xk:
+        sys.stderr.write('[build_index][WARN] %d 个条目交叉校验冲突（多源价格比 ≥%.0f×，或缓存价高于输入价）——'
+                         '多为单位/列取错；按「只留痕不改价」原样保留，请人工复核：%s\n'
+                         % (len(xk), CROSS_TOL, ', '.join(str(x) for x in xk[:10])))
+    cm = models_of('currency_mismatch')
+    if cm:
+        sys.stderr.write('[build_index][WARN] %d 个条目币种非 CNY（索引口径统一 CNY，下游按人民币计 → 差一个汇率；'
+                         '已挂 _manual_audit 未折算）：%s\n'
+                         % (len(cm), ', '.join(str(x) for x in cm[:10])))
+    pkl = models_of('peak_rule')
+    if pkl:
+        sys.stderr.write('[build_index][WARN] %d 个条目峰谷规则变化（peak_effective_from=%s）：'
+                         '历史 recalc 金额会随新规则漂移（「金额=派生值」口径允许，但生效日期必须有据可查）：%s\n'
+                         % (len(pkl), today_iso0, ', '.join(str(x) for x in pkl[:10])))
     if counts.get('new'):
         print('新增模型 %d 个（契约 + 价格闸门已过，自动采纳；明细见 %s）'
               % (counts['new'], os.path.basename(CHANGE_FILE)))
+
+    # v3.54.0（批4）：契约口径汇总 —— 币种分布 / 非 CNY 清单 / 交叉阈值，
+    #   供人工一眼看清「库里到底混没混币种、冲突判定用了什么阈值」（审计消费，计费侧不读）。
+    cur_counts = {}
+    non_cny = []
+    for k, e in merged.items():
+        c = e.get('currency') or '(缺失)'
+        cur_counts[c] = cur_counts.get(c, 0) + 1
+        if not currency_allowed(e.get('currency')):
+            non_cny.append(k)
 
     result = {
         'built_at': datetime.date.today().isoformat(),  # 每日刷新闸门：skill 读此字段判断是否需要重抓
@@ -623,6 +768,13 @@ def main():
             'counts': counts,
             'written': written,
             'gate_mode': 'full' if gate_full else 'min',
+        },
+        # v3.54.0（审计批4）：契约口径汇总 + 交叉阈值。**仅供审计消费** ——
+        #   mergeLocalPriceDb（token-tracker.js:2544-2571）按固定字段白名单读取，顶层新字段对计费零影响。
+        '_contract': {
+            'currency_counts': cur_counts,
+            'non_cny': sorted(non_cny),
+            'cross_tolerance': {'warn': CROSS_WARN, 'conflict': CROSS_TOL},
         },
         'conflict_resolved': conflicts,
         'authoritative_overrides': overlay,
