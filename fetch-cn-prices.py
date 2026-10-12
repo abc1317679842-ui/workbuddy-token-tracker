@@ -33,6 +33,7 @@ import sys
 import time
 import gzip
 import zlib
+import hashlib
 import datetime
 import urllib.request
 try:
@@ -41,7 +42,11 @@ except ImportError:
     requests = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT_DIR = os.path.join(HERE, 'prices')
+# v3.52.0（审计批2·S1）：输出目录可被调用方显式指定。原实现**恒写 HERE/prices**，而
+#   token-tracker.js 的价库目录 CN_PRICE_DIR 是自动发现的（可能是任意工作区下的 prices/），
+#   两者不同 → 流水线照跑、输出却落到技能目录 → **自定义价库目录永远不被填充**
+#   （built_at 卡在旧日期，价库静默失效）。调用方 spawn 时传 CN_PRICES_DIR=CN_PRICE_DIR 对齐两端。
+OUT_DIR = os.environ.get('CN_PRICES_DIR') or os.path.join(HERE, 'prices')
 # v3.23.4：抓到的价格会写进 pricing.json、直接决定每轮计费金额 —— 不再无条件关闭证书校验。
 # 实测四家官方页（智谱 / Kimi / 阶跃 / MiniMax）在严格校验下均 200 且字节数一致，
 # 关闭校验既无收益，又留下「中间人改一次价格、账本金额跟着错且无告警」的漏洞。
@@ -87,9 +92,98 @@ PRICING_PATH = os.path.join(WB_ROOT, 'skills', 'token-usage-tracker', 'pricing.j
 # 阿里云(通义千问)不抓本地库——计费统一走聚合源(llmabacus)人民币价；
 # 其官方价分地域/阶梯/思考模式/Batch半价，本地难以精确解析，故放弃本地存储。
 
-# 通用：丢弃历史快照版/区域版/预览别名(-2025-01-12 / -us / -latest / -preview)
-# 注意：腾讯混元只走 parse_tokenhub.py，不受此规则影响(Hy4 preview 含 preview 但必须保留)
-SNAP_RE = re.compile(r'-20\d\d-\d\d-\d\d|-us$|-latest$|-preview$|快照', re.I)
+# v3.52.0（审计批2·S4）：快照过滤**黑白名单分离**。
+#   旧实现 `-us$|-latest$|-preview$` 与日期快照同属一刀切硬丢，而 `-preview/-latest` 在
+#   Kimi / MiniMax / 智谱 / 阶跃路径上**也可能是真实在售型号**（hy4-preview、step-5-preview、
+#   MiniMax-M3.1-Flash-Preview 类）→ 新模型上线即被静默丢弃、按未收录计价，且无任何提示。
+#   只有「历史快照版」才是真垃圾：带日期后缀（-2025-01-12）或页面明写「快照」。
+#   分级：hard → 丢（真快照）；soft → **保留 + 进待确认清单**（宁可多收录同价，不可漏收真型号）。
+SNAP_HARD_RE = re.compile(r'-20\d\d-\d\d-\d\d|快照', re.I)
+SNAP_SOFT_RE = re.compile(r'-us$|-latest$|-preview$|-exp$|-beta$', re.I)
+# 待确认清单（进程内累计；main() 结尾统一 WARN 输出，供人工/自动化巡检消费）
+PENDING_CONFIRM = []
+
+
+def snap_verdict(name, keep_over_re=None):
+    """模型名快照判定（v3.52.0·S4）。返回 'keep'（正常收录）/ 'drop'（真快照，丢）/ 'soft'
+    （疑似快照但可能是真型号 → 收录并进待确认清单）。
+    keep_over_re：厂商白名单（如 step-5-preview 是官方正式名）→ 直接 keep，连 WARN 都不打。"""
+    if keep_over_re and keep_over_re.search(name or ''):
+        return 'keep'
+    if SNAP_HARD_RE.search(name or ''):
+        return 'drop'
+    if SNAP_SOFT_RE.search(name or ''):
+        PENDING_CONFIRM.append(name)
+        return 'soft'
+    return 'keep'
+
+
+def apply_snap_verdict(name, keep_over_re=None):
+    """返回 True = 收录。soft 命中也返回 True（不再静默丢弃，改为留痕）。"""
+    return snap_verdict(name, keep_over_re) != 'drop'
+
+
+# v3.52.0（审计批2·L2）：列语义同义词表 —— 厂商改写列名词面时**只补表、不动解析逻辑**。
+#   判定顺序（关键）：① 先看「缓存命中/未命中」修饰词 —— 「输入价格（缓存命中）」必须先被
+#     cache 认领，否则会被当成普通输入列（智谱表有「缓存存储」与「缓存命中」两列，
+#     只按主词「缓存」匹配会把存储价当成命中价）；② 再按主词认领 in/out；③ 每类只认领首列。
+#   ⚠️ 与 parse_tokenhub.py 的同名表需保持一致（两个 py 无共享模块，各自实现；selftest T62 校验）。
+COL_SYNONYMS = {
+    'name': ('模型名称', 'model id', 'model', '模型', '名称'),
+    'in': ('输入价格', '输入单价', '推理输入', '输入', 'input price', 'prompt', 'input'),
+    'out': ('输出价格', '输出单价', '推理输出', '输出', 'output price', 'completion', 'output'),
+    'cache': ('缓存命中', '缓存价格', '缓存读取', '缓存', 'cached', 'cache hit', 'cache'),
+}
+QUAL_HIT = ('缓存命中', '命中', 'cache hit', 'hit')
+QUAL_MISS = ('缓存未命中', '未命中', 'cache miss', 'miss')
+
+
+def _has(cell, words):
+    c = (cell or '').lower()
+    return any(w.lower() in c for w in words)
+
+
+def map_price_columns(hdr):
+    """表头单元格列表 -> {'name':i|None, 'in':i|None, 'out':i|None, 'cache':i|None}。
+    语义匹配，不按位置（v3.52.0·L2）。未认领的列 = None（调用方按契约不全处理，**不猜**）。"""
+    res = {'name': None, 'in': None, 'out': None, 'cache': None}
+    for i, c in enumerate(hdr or []):
+        if res['name'] is None and _has(c, COL_SYNONYMS['name']):
+            res['name'] = i
+            continue
+        # ⚠️「未命中」含子串「命中」—— 必须先判 miss 再判 hit，否则
+        #   「输入价格（缓存未命中）」会被 cache 抢走（阶跃表头正是这种写法，实测踩到）。
+        miss = _has(c, QUAL_MISS)
+        hit = (not miss) and _has(c, QUAL_HIT)
+        if hit and res['cache'] is None:
+            res['cache'] = i
+            continue
+        if res['in'] is None and _has(c, COL_SYNONYMS['in']) and not hit:
+            res['in'] = i
+            continue
+        if res['out'] is None and _has(c, COL_SYNONYMS['out']) and not hit:
+            res['out'] = i
+            continue
+    return res
+
+
+def scan_fingerprint(text):
+    """页面结构指纹（v3.52.0·L1）—— 解析出 0 个模型时，靠它区分「网络失败」与「官网改版」。
+    只描述结构（字节数/哈希/表数量/表头前几格），**不猜测价格**。"""
+    tbls = re.findall(r'<table[\s\S]*?</table>', text or '') or []
+    heads = []
+    for t in tbls[:3]:
+        r = re.search(r'<tr[^>]*>[\s\S]*?</tr>', t)
+        if r:
+            heads.append(strip_tags(r.group(0)).split()[:8])
+    md_rows = [ln for ln in (text or '').splitlines() if ln.lstrip().startswith('|')]
+    return {
+        'bytes': len(text or ''),
+        'sha1_8': hashlib.sha1((text or '').encode('utf-8', 'replace')).hexdigest()[:8],
+        'tables': len(tbls),
+        'md_table_rows': len(md_rows),
+        'headers': heads,
+    }
 
 # v3.51.0（审计批1·B/L2 活样例）：阶跃官方定价页 2026-10-12 当天改版（Mintlify 重构）——
 #   新页面价格数字不再内联「元」字（单位挪到正文「单位：元／百万 tokens。」段落），旧 parse_tr
@@ -248,9 +342,9 @@ def parse_tr(html, keep=None, keep_re=None, drop_re=None, require_re=None,
         name = tokens[0] if tokens else ''
         if not looks_like_model(name):
             continue
-        if keep_over_re and keep_over_re.search(name):
-            pass  # 白名单：真模型名含 -preview 等快照样式，放行
-        elif SNAP_RE.search(name):
+        # v3.52.0（审计批2·S4）：黑白名单分离 —— 只有真快照（日期后缀/「快照」）才丢；
+        #   -preview/-latest/-us 等 soft 命中**收录 + 进待确认清单**（漏收真型号 = 按未收录计价，更贵）。
+        if not apply_snap_verdict(name, keep_over_re):
             continue
         if drop_re and drop_re.search(name):
             continue
@@ -300,18 +394,28 @@ def parse_zhipu_docs(html):
     out = []
     seen = set()
     for table in re.findall(r'<table[\s\S]*?</table>', html):
-        if '输入单价' not in table:
+        rows = re.findall(r'<tr[^>]*>([\s\S]*?)</tr>', table)
+        if not rows:
             continue
-        for row in re.findall(r'<tr[^>]*>([\s\S]*?)</tr>', table):
+        # v3.52.0（审计批2·L2）：列索引由表头**语义映射**得出，不再写死 cells[2]/[3]/[5]。
+        #   旧实现「按位置取第 3/4/6 列」+「页面必须含『输入单价』」双重硬约束：厂商在价格列前
+        #   插入一列（如「计费模式」）→ 输入价取到上下文长度、缓存价取到缓存存储价，且**不报错**。
+        #   现改为：表头认领不到 in 或 out 列 → 整表跳过（fail-closed，宁缺勿错）。
+        hdr = [strip_tags(c) for c in re.findall(r'<t[dh][^>]*>([\s\S]*?)</t[dh]>', rows[0])]
+        cmap = map_price_columns(hdr)
+        if cmap['in'] is None or cmap['out'] is None:
+            continue
+        for row in rows[1:]:
             cells = [strip_tags(c) for c in re.findall(r'<td[^>]*>([\s\S]*?)</td>', row)]
-            if len(cells) < 6:
+            if not cells:
                 continue
-            name = cells[0].strip()
+            name = cells[cmap['name'] or 0].strip()
             if not re.match(r'^GLM[-A-Za-z0-9.]*$', name):
                 continue
-            inp = _znum(cells[2])
-            outp = _znum(cells[3])
-            cache = _znum(cells[5]) if len(cells) > 5 else None
+            inp = _znum(cells[cmap['in']]) if cmap['in'] < len(cells) else None
+            outp = _znum(cells[cmap['out']]) if cmap['out'] < len(cells) else None
+            cache = (_znum(cells[cmap['cache']])
+                     if cmap['cache'] is not None and cmap['cache'] < len(cells) else None)
             if inp is None and outp is None:
                 continue  # 免费/无法解析的行不进价库（build_index 同样拒收无价条目）
             if name in seen:
@@ -367,8 +471,14 @@ def parse_minimax(html):
         rows = re.findall(r'<tr[^>]*>([\s\S]*?)</tr>', tb)
         if not rows:
             continue
-        header = strip_tags(rows[0])
-        if '输入价格' not in header or '元/百万' not in header:
+        # v3.52.0（审计批2·L2）：表头判定改走语义同义词表（原 `if '输入价格' not in header` 是
+        #   字面量硬匹配：官方把「输入价格」改成「输入单价 / 输入计费」→ 整页判为非计价表 →
+        #   该厂商**静默 0 模型**）。单位声明（元/百万）保留字面量校验：币种/单位禁止猜。
+        hdr = [strip_tags(c) for c in re.findall(r'<t[dh][^>]*>([\s\S]*?)</t[dh]>', rows[0])]
+        cmap = map_price_columns(hdr)
+        if cmap['in'] is None or cmap['out'] is None:
+            continue
+        if '元/百万' not in strip_tags(rows[0]):
             continue  # 只处理 token 计价表（跳过 TTS/视频等按秒/万字符计费表）
         for row in rows[1:]:
             text = strip_tags(row)
@@ -470,28 +580,18 @@ def parse_stepfun_md(md, drop_re=None, keep_over_re=None):
             i += 1
         if len(tbl) < 3:
             continue
+        # v3.52.0（审计批2·L2）：列索引改走**共享语义同义词表** map_price_columns。
+        #   原实现在每家解析器里各写一份字面量判定（'输入价格' in c and '缓存未命中' in c …），
+        #   厂商把「输入价格」改成「输入单价 / Prompt 单价」就得改代码；且 cache/in 的区分
+        #   依赖「命中」修饰词顺序，复制多份必然走样。统一走同义词表：改词面只需补 COL_SYNONYMS。
         hdr = [c.strip() for c in tbl[0].strip('|').split('|')]
-        if not (any('输入价格' in c for c in hdr) and any('输出价格' in c for c in hdr)):
-            continue  # 非 token 计价表（单价表：元／万字符、元／小时…）
-        # 单位：向上找最近的「单位：X。」
-        unit = None
-        for j in range(i - len(tbl) - 1, -1, -1):
-            um = re.search(r'单位[：:]\s*([^。\n]+)。', lines[j])
-            if um:
-                unit = um.group(1).strip().replace('／', '/')
-                break
-        if not unit or '元' not in unit:
-            continue  # 契约不全（无单位声明）→ 不收
-        col_in = col_cache = col_out = None
-        for ci, c in enumerate(hdr):
-            if '输入价格' in c and '缓存未命中' in c:
-                col_in = ci
-            elif '输入价格' in c and '缓存命中' in c:
-                col_cache = ci
-            elif '输出价格' in c:
-                col_out = ci
+        cmap = map_price_columns(hdr)
+        col_in, col_out, col_cache = cmap['in'], cmap['out'], cmap['cache']
+        # 语义映射要求「同时认领到输入价列与输出价列」，否则不是 token 计价表
+        #   （单价表：元／万字符、元／小时… 无输入/输出列 → 自然被排除，无需再写字面量判定）
         if col_in is None or col_out is None:
             continue
+        # 单位：向上找最近的「单位：X。」
         for row in tbl[2:]:  # 跳过表头与分隔行
             cells = [c.strip().strip('`') for c in row.strip('|').split('|')]
             if len(cells) <= max(col_in, col_out):
@@ -499,9 +599,8 @@ def parse_stepfun_md(md, drop_re=None, keep_over_re=None):
             name = cells[0].strip()
             if not re.match(r'^step-[0-9a-z.\-]+$', name, re.I):
                 continue
-            if keep_over_re and keep_over_re.search(name):
-                pass  # 白名单：真模型名含 -preview 等快照样式，放行
-            elif SNAP_RE.search(name):
+            # v3.52.0（S4）：同 parse_tr —— soft 快照样式不再静默丢弃
+            if not apply_snap_verdict(name, keep_over_re):
                 continue
             if drop_re and drop_re.search(name):
                 continue
@@ -574,7 +673,8 @@ def parse_kimi():
             if not m:
                 continue
             name = m.group(1)
-            if SNAP_RE.search(name):
+            # v3.52.0（S4）：同其余解析器 —— 只丢真快照，soft 收录 + 待确认留痕
+            if not apply_snap_verdict(name):
                 continue
             prices = re.findall(r'"¥([\d.]+)"', m.group(2))
             if len(prices) >= 3:
@@ -673,7 +773,11 @@ def main():
                 # 不从网页抓，直接读用户已校对的 pricing.json
                 entry['models'] = parse_pricing_deepseek()
             else:
-                html = fetch(cfg['url'])
+                # v3.52.0（审计批2·G3）：非 kimi 分支原走裸 fetch()（urllib）→ **绕过了 http_get 里
+                #   的解压与 TLS 降级开关**：只装了 requests 的机器上，若某厂商开始返回压缩页
+                #   （urllib 不自动解压）→ 拿到二进制垃圾 → 0 模型且退出码 0（最坏的静默失败）。
+                #   统一走 http_get：requests 优先（自动解压/跟随 301）+ 无 requests 回退 urllib。
+                html = http_get(cfg['url'])
                 if cfg['mode'] == 'tr':
                     entry['models'] = parse_tr(html, cfg.get('keep'), cfg.get('keep_re'), cfg.get('drop_re'), cfg.get('require_re'),
                                                cfg.get('order', ('in', 'out', 'cache')), cfg.get('keep_over_re'))
@@ -685,6 +789,10 @@ def main():
                     entry['models'] = parse_kimi()
                 elif cfg['mode'] == 'stepfun_md':
                     entry['models'] = parse_stepfun_md(html, cfg.get('drop_re'), cfg.get('keep_over_re'))
+                # v3.52.0（审计批2·L1）：结构指纹 —— 页面「长什么样」的可审计证据。
+                #   0 模型时两类根因（网络失败 vs 官网改版）在旧版输出里**长得一模一样**
+                #   （都是「0 个模型」），只能靠人重跑肉眼比对；指纹把它变成可比对的结构数据。
+                entry['fingerprint'] = scan_fingerprint(html)
             # 补全 source 标注（解析器未设时回退到厂商名）
             # v3.51.0（审计批1·B）：补全契约字段 —— 本脚本只抓国内厂商官方人民币价页，
             #   unit/currency/region 由设计前提恒定（页面价格均以「X元」形式给出，见
@@ -729,6 +837,11 @@ def main():
         'models_total': total,
         'ok': ok_keys,
         'failed': failed,
+        # v3.52.0（审计批2·L1/L4）：0 模型厂商的结构指纹（区分「网络失败」vs「官网改版」）；
+        #   S4 待确认清单（soft 快照样式被收录的型号，供人工确认是否为真型号）。
+        'fingerprints': {k: v.get('fingerprint') for k, v in result['vendors'].items()
+                         if k in failed and v.get('fingerprint')},
+        'pending_confirm': sorted(set(PENDING_CONFIRM)),
         'note': 'failed 非空表示当日这些厂商源未产出数据，价格可能沿用上版；需下游配合读取',
     }
     if failed:
@@ -736,6 +849,14 @@ def main():
                          % (len(failed), len(result['vendors']), len(ok_keys), total))
         for key, err in failed.items():
             sys.stderr.write('  - %s(%s): %s\n' % (result['vendors'][key]['name'], key, err))
+            fp = result['vendors'][key].get('fingerprint')
+            if fp:
+                sys.stderr.write('      结构指纹: %s\n' % json.dumps(fp, ensure_ascii=False))
+    # v3.52.0（审计批2·S4）：待确认清单 WARN —— 这些模型带 preview/latest/us 后缀但**已收录**
+    #   （旧版会静默丢弃它们）。人工确认是真型号即可把后缀加进 keep_over_re 消掉告警。
+    if PENDING_CONFIRM:
+        sys.stderr.write('[WARN] %d 个「疑似快照别名」型号已收录（旧版会静默丢弃，漏收真型号 = 按未收录计价）：%s\n'
+                         % (len(set(PENDING_CONFIRM)), ', '.join(sorted(set(PENDING_CONFIRM))[:20])))
     stamp = datetime.datetime.now().strftime('%Y-%m-%d')
     path = os.path.join(OUT_DIR, 'cn-prices-%s.json' % stamp)
     # v2.82：原子写（唯一 tmp + os.replace）。多会话并发刷新时另一进程的 build_index.py

@@ -20,9 +20,14 @@ import json
 import os
 import re
 import sys
+import shutil
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LATEST = os.path.join(HERE, 'prices', 'latest.json')
+# v3.52.0（审计批2·S1）：价库目录可用 CN_PRICES_DIR 显式指定（同另两个流水线脚本）。
+#   原实现恒读写 HERE/prices，而调用方（token-tracker.js）读的是自动发现的 CN_PRICE_DIR ——
+#   两者不同 → 流水线跑完 index.json 落在技能目录、调用方那份永远停在旧日期（价库静默失效）。
+PRICES_DIR = os.environ.get('CN_PRICES_DIR') or os.path.join(HERE, 'prices')
+LATEST = os.path.join(PRICES_DIR, 'latest.json')
 
 
 def detect_workbuddy_root():
@@ -53,8 +58,8 @@ def detect_workbuddy_root():
 
 WB_ROOT = detect_workbuddy_root()
 PRICING = os.path.join(WB_ROOT, 'skills', 'token-usage-tracker', 'pricing.json')
-OUT = os.path.join(HERE, 'prices', 'index.json')
-TOKENHUB = os.path.join(HERE, 'prices', 'tokenhub_lang.json')
+OUT = os.path.join(PRICES_DIR, 'index.json')
+TOKENHUB = os.path.join(PRICES_DIR, 'tokenhub_lang.json')
 
 # v2.82（2026-09-01）：「逐模型沿用」的保留天数上限。
 # 上一版有、本次抓取缺失的模型会沿用旧价（防官网改版/软404导致价格凭空消失、按 0 元计）；
@@ -394,6 +399,15 @@ def main():
         'authoritative_overrides': overlay,
         'models': merged,
     }
+    # v3.52.0（审计批2·G7）：写盘前**滚动备份上一版**。原实现只有 tmp + os.replace 的原子写
+    #   （防读到半截 JSON），但**新索引内容出错时无法回滚**：一旦抓取/合并逻辑把价格算错并落盘，
+    #   上一版正确索引已被覆盖、连人工恢复的材料都没有（只留 ≤7 天逐模型沿用，救不回整份错价）。
+    #   备份失败只 WARN —— 备份是保险，不能因为备份不了就拒绝产出今日索引。
+    if os.path.exists(OUT):
+        try:
+            shutil.copyfile(OUT, OUT + '.bak')
+        except Exception as e:
+            sys.stderr.write('[build_index][WARN] index.json 滚动备份失败（%r）；本次不回滚保护\n' % (e,))
     # 原子写：先写临时文件再替换，保证读取方(技能)在刷新中途读到的要么是旧完整版要么是新完整版
     # v2.82：tmp 按 PID 唯一化——固定名 .tmp 在多会话并发时两个进程互写同一文件 → PermissionError(exit 1)
     tmp = '%s.tmp-%d' % (OUT, os.getpid())

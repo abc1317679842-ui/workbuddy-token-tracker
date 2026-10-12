@@ -599,3 +599,40 @@ DeepSeek 官方页「旧模型名」正文段（`deepseek-v4-flash` 等旧名「
 - T59-c3/c4 的端到端夹具拷贝清单 `['token-tracker.js', ...RUNTIME_COMPANIONS]` **漏了 `backfill.js`**（它是入口脚本、不在那份"主脚本 require 的兄弟模块"清单里）→ spawn 报 `MODULE_NOT_FOUND`、退出码 1 → 假失败。
 - T59-c4 读 `skillDir/pricing.json` 取期望值，但该文件**在中途被别的用例（如 T11）改写成夹具价（只有 `m-x`）且从不还原** → `findModel` 返回 null → `.m` 抛错。改用 `subSkill/pricing.json`（c3/c4 setup 刚从 SRC 拷贝、正是 backfill 实跑时消费的那份）。
 - 两者仅在 `SPAWN_OK=true` 的环境/CI 暴露；本沙箱此前恒跳过 → 从未真正跑到。
+
+## KI-19 抓取链路四处静默失效（spawn 耦合 / 快照一刀切 / 裸 fetch / 无备份）+ 列判据各自硬编码（2026-10-13）—— **v3.52.0 已修**
+
+> 来源：待做计划台账 `.workbuddy/memory/PLAN-price-pipeline-2026-10.md` 第二节（fresh 审计 S1/S4/G3/G7）+ 批2 本体。
+> 共性：**跑完不报错、结果悄悄错** —— 都不是崩溃型缺陷，而是"看起来每天刷新成功、价库其实没动/少了模型"。
+
+### 现场与定位
+
+- **S1**：`spawn(exe, ['fetch-cn-prices.py'], { cwd: CN_PRICE_PIPELINE_DIR })` 是**相对脚本名**，定位完全依赖 cwd。
+  `CN_PRICE_DIR` 由 `autoDiscoverCnPriceDir()` 自动发现（`~/WorkBuddy/*/prices` 扫描或 `CN_PRICE_DB_DIR` 覆盖），
+  命中**只有 index.json、没有 py 脚本**的目录 → 流水线三个脚本全部 ENOENT（stderr 一行，看不出根因）。
+  第二层：三个 py 脚本恒写「脚本自身目录/prices」，调用方读 `CN_PRICE_DIR` → **自定义价库目录永不被填充**。
+- **S4**：`SNAP_RE` 把 `-preview/-latest/-us` 与日期快照同等硬丢；只有阶跃有 `keep_over_re` 白名单
+  → `hy4-preview`、`MiniMax-*-Preview` 类真型号在其余厂商路径**静默丢弃**、按未收录计价。
+- **G3**：`main()` 非 kimi 分支走裸 `fetch()`（urllib），绕过 `http_get()` 的解压 + TLS 降级开关
+  → 厂商返回压缩页时二进制垃圾 → 0 模型且**退出码 0**。
+- **G7**：`build_index.py` 只有 tmp+`os.replace` 原子写，**无 `.bak`** → 新索引算错时无上一版可回滚。
+- **判据硬编码**：阶跃写死列名词面、智谱按位置取 `cells[2]/[3]/[5]`、MiniMax 靠 `'输入价格' in header`、
+  TokenHub 靠 `col(['推理输入'])`、DeepSeek 六处硬正则 —— 厂商改一个列名词面即**整家 0 模型**。
+
+### 修法（v3.52.0）
+
+- S1：脚本**绝对路径**（`[CN_PRICE_PIPELINE_DIR, __dirname]` 依次 `existsSync`），`cwd` 不再参与定位；
+  另以 **`CN_PRICES_DIR`** 环境变量把价库目录传给 py 侧，三脚本输出目录以它为准（未设回退脚本目录）。
+- S4：`SNAP_HARD_RE`（日期后缀/「快照」）硬丢、`SNAP_SOFT_RE`（`-us/-latest/-preview/-exp/-beta`）**收录 + 待确认清单 WARN**。
+- G3：统一 `http_get()`；G7：写盘前 `shutil.copyfile(OUT, OUT + '.bak')`（备份失败只 WARN，不阻断产出）。
+- 判据：`COL_SYNONYMS` + `map_price_columns/map_columns`（py 两侧各一份，selftest 校验形状一致）、
+  `ROW_TERMS`（deepseek-official.js）；**「未命中」含子串「命中」** → 必须先判 miss 再判 hit（阶跃表头实测踩到）。
+- 结构指纹 `scan_fingerprint()`：0 模型/fail-closed 时输出 bytes/sha1_8/tables/headers，**只描述结构不猜价格**。
+
+### 复发条件与排查入口
+
+- 价库 `built_at` 连续多天不更新 → 先看 `.refresh.error`：若是 spawn/ENOENT，检查 `CN_PRICE_DIR` 下有没有三个 py 脚本；
+  脚本在而目录没产物 → 检查调用方是否传了 `CN_PRICES_DIR`。
+- 某厂商突然 0 模型 → 看 stderr 的 `[FINGERPRINT]` / `_fetch_summary.fingerprints`：
+  字节数与昨天**相同**多为解析逻辑问题，**骤变**（页面改版/挑战页）多为源侧变化。
+- 索引里出现带 `-preview` 的新条目 → 看 `pending_confirm`：确认是真型号后把后缀加进对应厂商的 `keep_over_re` 消告警。

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.51.0 (2026-10-12)
+// token-usage-tracker v3.52.0 (2026-10-13)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -2684,6 +2684,26 @@ function maybeRefreshLocalDb() {
       // v3.19.0（P9）：改数组形式 spawn（exe 直传 + 脚本名作独立参数），去掉 shell: true 的字符串拼接——
       // 旧实现只对空格加引号，路径含 & / | 等 cmd 元字符时可被解释执行（纵深防御缺口）。
       const scripts = ['fetch-cn-prices.py', 'parse_tokenhub.py', 'build_index.py'];
+      // v3.52.0（审计批2·S1）：脚本名 → **绝对路径**，并让输出目录与价库目录对齐。
+      //   旧实现 spawn(exe, ['fetch-cn-prices.py'], { cwd: CN_PRICE_PIPELINE_DIR })：
+      //     ① 相对脚本名 + cwd 强耦合 —— CN_PRICE_DIR 自动发现到某个**只有 index.json、没有脚本**
+      //        的目录时（~/WorkBuddy/*/prices 自动扫描命中），流水线**三个脚本全部 ENOENT**
+      //        → 刷新整体失败、价库 built_at 永久卡住，且 stderr 只留一行 spawn 错误；
+      //     ② 即便脚本存在，三个 py 脚本恒写「脚本自身目录/prices」，而调用方读的是 CN_PRICE_DIR
+      //        → **自定义价库目录永远不被填充**（C1 混合部署场景，S1 报告实测）。
+      //   修法：脚本路径按 [流水线目录, 技能目录] 依次 existsSync 取真存在的那个（cwd 不再参与定位）；
+      //   同时把 CN_PRICE_DIR 以 env CN_PRICES_DIR 传给 py 侧，两端目录从此唯一。
+      const resolveScript = (name) => {
+        const cands = [CN_PRICE_PIPELINE_DIR, __dirname];
+        for (const base of cands) {
+          if (!base) continue;
+          const p = path.join(base, name);
+          try { if (fs.existsSync(p)) return p; } catch (e) { /* 单个候选不可读 → 试下一个 */ }
+        }
+        return path.join(__dirname, name); // 都不存在 → 走技能目录（保持原失败形态，便于定位）
+      };
+      const spawnEnv = Object.assign({}, process.env);
+      if (CN_PRICE_DIR) spawnEnv.CN_PRICES_DIR = CN_PRICE_DIR;
       const runAll = (idx) => new Promise((resolve) => {
         if (idx >= scripts.length) return resolve({ code: 0, timedOut: false });
         let c;
@@ -2698,8 +2718,10 @@ function maybeRefreshLocalDb() {
           //   `unref()` 也必须一起去掉：它会让子进程不再 keep-alive 事件循环 → node 可能在第 1 个脚本
           //   跑完就退出 → 第 2、3 个脚本根本不启动 → 刷新残缺。**两个是成对加的，必须成对回退。**
           //   代价：触发刷新那轮 Stop 弹窗晚 ~12s（每天第一次）。若日后在意，走「换触发时机」而不是换进程属性。
-          c = require('child_process').spawn(exe, [scripts[idx]], {
-            cwd: CN_PRICE_PIPELINE_DIR, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+          const scriptPath = resolveScript(scripts[idx]);
+          c = require('child_process').spawn(exe, [scriptPath], {
+            cwd: path.dirname(scriptPath), windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+            env: spawnEnv,
           });
           // 注意：**不要**在这里加 detached / unref —— 理由见上方 KI-14 注释（守卫 T56-b1）。
         } catch (e) { return resolve({ code: -1, timedOut: false, err: 'spawn 失败: ' + String(e.message).slice(0, 200) }); }
@@ -6024,7 +6046,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.51.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.52.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

@@ -115,6 +115,21 @@ async function fetchHtml(url) {
   }
 }
 
+// v3.52.0（审计批2·L2）：行语义同义词表 —— 官方页改措辞时**只补表、不动判定逻辑**。
+//   旧实现把词面硬编码进 6 条正则（/百万tokens输入/、/缓存命中/、/空闲/ …），改一个词就得
+//   改代码，且词面散落六处、改一处漏一处 = 某项价格静默取不到 → 整页「解析不完整」不写库。
+//   ⚠️ 词表只做**等价扩展**（官方可能的同义改写），**不加裸「输入」「输出」这类过宽词** ——
+//     那会误命中「模型版本」等行，比原实现更差（宁可漏，不可错）。
+const ROW_TERMS = {
+  input: ['百万tokens输入', '百万tokens 输入', '输入价格'],
+  output: ['百万tokens输出', '百万tokens 输出', '输出价格'],
+  hit: ['缓存命中'],
+  miss: ['缓存未命中', '未命中'],
+  off: ['空闲'],
+  peak: ['高峰时段', '高峰'],
+};
+const hasTerm = (s, arr) => arr.some((w) => String(s).includes(w));
+
 // 提取 <table> 里表头模型名 + 三组价格（缓存命中/未命中/输出，各 空闲/高峰）
 // 返回 { models:[...], prices: { cached:{off,peak}, uncached:{off,peak}, output:{off,peak} } }
 // prices 每个值是与 models 同序的数组。
@@ -182,12 +197,13 @@ function parseOfficial(html) {
   for (const t of trs) {
     const c = cellText(t);
     const joined = c.join(' ');
-    if (/百万tokens输入/.test(joined) && /缓存命中/.test(joined) && /空闲/.test(joined)) prices.cached.off = grab(t, 0);
-    if (/高峰时段/.test(joined) && /缓存命中/.test(cellText(trs[trs.indexOf(t) - 1] || '').join(' '))) prices.cached.peak = grab(t, 0);
-    if (/百万tokens输入/.test(joined) && /缓存未命中/.test(joined) && /空闲/.test(joined)) prices.uncached.off = grab(t, 0);
-    if (/高峰时段/.test(joined) && /缓存未命中/.test(cellText(trs[trs.indexOf(t) - 1] || '').join(' '))) prices.uncached.peak = grab(t, 0);
-    if (/百万tokens输出/.test(joined) && /空闲/.test(joined)) prices.output.off = grab(t, 0);
-    if (/高峰时段/.test(joined) && /百万tokens输出/.test(cellText(trs[trs.indexOf(t) - 1] || '').join(' '))) prices.output.peak = grab(t, 0);
+    // v3.52.0：判定改走 ROW_TERMS 词表（语义等价，词面集中可维护）
+    if (hasTerm(joined, ROW_TERMS.input) && hasTerm(joined, ROW_TERMS.hit) && hasTerm(joined, ROW_TERMS.off)) prices.cached.off = grab(t, 0);
+    if (hasTerm(joined, ROW_TERMS.peak) && hasTerm(cellText(trs[trs.indexOf(t) - 1] || '').join(' '), ROW_TERMS.hit)) prices.cached.peak = grab(t, 0);
+    if (hasTerm(joined, ROW_TERMS.input) && hasTerm(joined, ROW_TERMS.miss) && hasTerm(joined, ROW_TERMS.off)) prices.uncached.off = grab(t, 0);
+    if (hasTerm(joined, ROW_TERMS.peak) && hasTerm(cellText(trs[trs.indexOf(t) - 1] || '').join(' '), ROW_TERMS.miss)) prices.uncached.peak = grab(t, 0);
+    if (hasTerm(joined, ROW_TERMS.output) && hasTerm(joined, ROW_TERMS.off)) prices.output.off = grab(t, 0);
+    if (hasTerm(joined, ROW_TERMS.peak) && hasTerm(cellText(trs[trs.indexOf(t) - 1] || '').join(' '), ROW_TERMS.output)) prices.output.peak = grab(t, 0);
   }
 
   if (!prices.cached.off || !prices.cached.peak || !prices.uncached.off || !prices.uncached.peak || !prices.output.off || !prices.output.peak) {
@@ -685,7 +701,10 @@ async function main() {
 
 // v3.19.1：导出纯函数供 selftest 直接单测（句式解析是 N1 的核心，必须能离线验证六个文案变体）
 // v3.29.0（A-4a）：补导出 peakMultiplierOf —— 真实峰谷倍率推导是 A-4a 的核心，同样必须能离线单测
-module.exports = { parseRules, extractPeakSchedule, extractRanges, applyRules, PEAK_PATTERNS, peakMultiplierOf };
+// v3.52.0（审计批2）：parseOfficial / ROW_TERMS 一并导出 —— 供 selftest 用**固定页样 HTML**
+//   做行为验证（源码字符串守卫证明不了「改词面后仍解析正确」，只有行为测试能）。
+module.exports = { parseRules, extractPeakSchedule, extractRanges, applyRules, PEAK_PATTERNS, peakMultiplierOf,
+  parseOfficial, ROW_TERMS };
 
 if (require.main === module) {
   main().catch((e) => {

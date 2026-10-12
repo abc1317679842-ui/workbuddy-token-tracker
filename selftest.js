@@ -4638,8 +4638,12 @@ else {
   const srcTT56 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8'));
   // b1：以 spawn 调用为锚点，**窗口必须窄**（v3.46.0 教训：宽窗口会把别处的同名写法框进来 → 假绿）。
   //   这里只取 spawn(...) 之后 220 字符 = 恰好一个 options 对象，且不含下一处 spawn。
-  const iSpawn56 = srcTT56.indexOf('spawn(exe, [scripts[idx]]');
-  const segSpin56 = iSpawn56 < 0 ? '' : srcTT56.slice(iSpawn56, iSpawn56 + 220);
+  // v3.52.0（S1）：spawn 参数从相对脚本名改为**绝对路径变量** scriptPath。锚点取**最后一处**
+  //   `require('child_process').spawn(exe,`（抓价流水线在文件更靠后；前面那处是 resolvePython 的版本探测），
+  //   这样锚点不依赖参数名 —— 否则 v3.52.0 的回退验证里 T56 会跟着误红（实测踩到）。
+  //   守卫语义不变：抓价流水线这个 spawn 的 options 里不得出现 detached / unref。
+  const iSpawn56 = srcTT56.lastIndexOf("require('child_process').spawn(exe,");
+  const segSpin56 = iSpawn56 < 0 ? '' : srcTT56.slice(iSpawn56, iSpawn56 + 300);
   ok('T56-b1 ★★KI-14 抓价流水线 spawn 选项内不得出现 detached（KI-13 实证：detached 挡不住 Job Object；'
     + 'A/B/C/D 实测：它既不继承也不新建控制台 → 零收益。真正修到功能的是 T56-b2 的 unref）',
     iSpawn56 >= 0 && !/detached/.test(segSpin56), segSpin56.slice(0, 160));
@@ -5067,9 +5071,11 @@ else {
     pt61.indexOf("'region': region_label") >= 0 && pt61.indexOf("'currency': currency") >= 0
     && pt61.indexOf("'unit': unit") >= 0 && pt61.indexOf("'region': '广州'") < 0,
     '红 = 回归硬编码（错区块价格会被盖上正确戳，无从审计）');
+  // v3.52.0（S1）：默认值仍必须 HERE 锚定，另允许调用方用 CN_PRICES_DIR 显式覆盖
+  //   （恒写脚本目录 = 与调用方读的价库目录不一致 → 自定义价库目录永不填充）。语义未变，断言随实现更新。
   ok('T61-a5 ★输出目录必须 HERE 锚定（cwd 相对的 makedirs(\'prices\') 写错地方且 build_index 静默找不到）',
     !/os\.makedirs\('prices'/.test(pt61code)
-    && pt61.indexOf("out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prices')") >= 0);
+    && pt61.indexOf("out_dir = os.environ.get('CN_PRICES_DIR') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prices')") >= 0);
 
   // ── b. build_index：契约海关 + latest.json 不裸崩 + 静默 skip 转 WARN ──
   ok('T61-b1 ★latest.json 读取必须 try 保护（裸崩 = 今日抓取数据全丢且无任何告警）',
@@ -5091,10 +5097,13 @@ else {
   ok('T61-c2 ★阶跃必须走 .md 语义解析（HTML 改版后价格不带「元」，tr 模式实测 0 模型）',
     fc61.indexOf("STEPFUN_MD_URL = 'https://platform.stepfun.com/docs/zh/guides/pricing/details.md'") >= 0
     && fc61.indexOf("'mode': 'stepfun_md'") >= 0 && fc61.indexOf('def parse_stepfun_md') >= 0);
-  ok('T61-c3 ★阶跃表头必须按列名语义映射（缓存未命中→in/缓存命中→cache/输出→out），不按位置',
-    fc61.indexOf("'输入价格' in c and '缓存未命中' in c") >= 0
-    && fc61.indexOf("'输入价格' in c and '缓存命中' in c") >= 0
-    && fc61.indexOf("'输出价格' in c") >= 0);
+  // v3.52.0（审计批2·L2）：实现从「每家各写一份字面量判定」升级为**共享语义同义词表**
+  //   map_price_columns（改列名词面只需补表）。断言随实现更新 —— 语义要求本身没变：
+  //   缓存未命中→in / 缓存命中→cache / 输出→out，且**不按位置**；新增 T62-e 行为守卫兜底。
+  ok('T61-c3 ★阶跃表头必须按语义映射（缓存未命中→in/缓存命中→cache/输出→out），不按位置',
+    fc61.indexOf('cmap = map_price_columns(hdr)') >= 0
+    && fc61.indexOf("col_in, col_out, col_cache = cmap['in'], cmap['out'], cmap['cache']") >= 0
+    && !/cells\[2\]|cells\[3\]|cells\[5\]/.test(fc61.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n')));
   ok('T61-c4 ★调价公告必须按生效日期取当日有效值（未来生效按旧值 + tier_note 留痕，不静默采用未来价）',
     fc61.indexOf('STEP_ADJ_RE = re.compile') >= 0 && fc61.indexOf("adj['effective'] > now_iso") >= 0);
 
@@ -5112,6 +5121,115 @@ else {
   const bfNeed61 = "'back" + "fill.js', ...RUNTIME_COMPANIONS]";
   ok('T61-e1 ★backfill 端到端夹具必须随行 backfill.js（入口脚本不在 RUNTIME_COMPANIONS → 漏拷即 MODULE_NOT_FOUND 假失败）',
     st61.indexOf(bfNeed61) >= 0);
+}
+
+// ===== T62：v3.52.0 抓取链路 P0/P1 + 语义/指纹防御（审计批2）=====
+// 四条主线，全部是「静默失效」类（跑完不报错、结果悄悄错）：
+//   S1 spawn 相对脚本名 + cwd 强耦合 → 混合部署下流水线整体 ENOENT，且自定义价库目录永不填充；
+//   S4 SNAP_RE 一刀切 → 真型号（hy4-preview / MiniMax-*-Preview 类）被静默丢弃、按未收录计价；
+//   G3 非 kimi 分支裸 fetch() 绕过 http_get（解压 + TLS 降级）→ 压缩页 = 二进制垃圾 = 0 模型退出码 0；
+//   L2 列语义硬编码在各解析器里 → 厂商改列名词面即整家 0 模型；L1 无结构指纹 → 改版与网络失败不可区分。
+// 负向断言一律**先剥注释**（v3.49.0/3.51.0 两次踩到：注释里引用反例形态会被数进去 → 假红）。
+{
+  const tt62 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const fc62 = fs.readFileSync(path.join(SRC, 'fetch-cn-prices.py'), 'utf-8').replace(/\r\n/g, '\n');
+  const pt62 = fs.readFileSync(path.join(SRC, 'parse_tokenhub.py'), 'utf-8').replace(/\r\n/g, '\n');
+  const bi62 = fs.readFileSync(path.join(SRC, 'build_index.py'), 'utf-8').replace(/\r\n/g, '\n');
+  const ds62 = fs.readFileSync(path.join(SRC, 'deepseek-official.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const pyCode = (s) => s.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
+  const jsCode = (s) => s.split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+  const fc62c = pyCode(fc62), pt62c = pyCode(pt62), bi62c = pyCode(bi62), ds62c = jsCode(ds62), tt62c = jsCode(tt62);
+
+  // ── a. S1：spawn 解耦（脚本绝对路径 + 输出目录与价库目录对齐）──
+  ok('T62-a1 ★流水线必须按绝对路径 spawn 脚本（相对脚本名 + cwd 强耦合 = 混合部署下整体 ENOENT）',
+    tt62.indexOf('const resolveScript = (name)') >= 0
+    && tt62.indexOf('spawn(exe, [scriptPath]') >= 0
+    && tt62.indexOf("const p = path.join(base, name)") >= 0 && tt62.indexOf('fs.existsSync(p)') >= 0,
+    '红 = 回到「相对脚本名 + cwd=流水线目录」：目录里没有脚本（只有 index.json）时三个脚本全 ENOENT，价库 built_at 永久卡住');
+  ok('T62-a2 ★spawn 必须把价库目录以 CN_PRICES_DIR 传给 py 侧（否则自定义价库目录永远不被填充）',
+    tt62.indexOf('spawnEnv.CN_PRICES_DIR = CN_PRICE_DIR') >= 0 && tt62.indexOf('env: spawnEnv') >= 0);
+  ok('T62-a3 ★三个 py 脚本的输出目录必须支持 CN_PRICES_DIR 覆盖（恒写脚本目录 = 与调用方读的目录不一致）',
+    fc62.indexOf("OUT_DIR = os.environ.get('CN_PRICES_DIR')") >= 0
+    && pt62.indexOf("out_dir = os.environ.get('CN_PRICES_DIR')") >= 0
+    && bi62.indexOf("PRICES_DIR = os.environ.get('CN_PRICES_DIR')") >= 0
+    && bi62.indexOf("OUT = os.path.join(PRICES_DIR, 'index.json')") >= 0
+    && bi62.indexOf("TOKENHUB = os.path.join(PRICES_DIR, 'tokenhub_lang.json')") >= 0);
+
+  // ── b. S4：快照过滤黑白名单分离（只丢真快照，soft 收录 + 留痕）──
+  ok('T62-b1 ★硬黑名单只含真快照（日期后缀 /「快照」字样），不得再含 -preview/-latest/-us',
+    fc62.indexOf('SNAP_HARD_RE = re.compile') >= 0 && fc62.indexOf('SNAP_SOFT_RE = re.compile') >= 0
+    && !/-preview\$|-latest\$|-us\$/.test(fc62c.split('SNAP_HARD_RE')[1] ? fc62c.split('SNAP_HARD_RE')[1].split('\n')[0] : ''));
+  ok('T62-b2 ★soft 命中必须**收录**（漏收真型号 = 按未收录计价），仅进待确认清单',
+    fc62.indexOf("return snap_verdict(name, keep_over_re) != 'drop'") >= 0
+    && fc62.indexOf('PENDING_CONFIRM.append(name)') >= 0
+    && fc62.indexOf("SNAP_SOFT_RE.search(name or '')") >= 0);
+  ok('T62-b3 ★三个使用点必须统一走 apply_snap_verdict（不得残留 SNAP_RE.search 直接丢弃）',
+    (fc62c.match(/apply_snap_verdict\(/g) || []).length >= 4 && !/SNAP_RE\.search\(name/.test(fc62c));
+  ok('T62-b4 ★待确认清单必须 WARN 输出（静默收录/静默丢弃都不可接受）',
+    fc62.indexOf("'[WARN] %d 个「疑似快照别名」型号已收录") >= 0
+    && fc62.indexOf("'pending_confirm': sorted(set(PENDING_CONFIRM))") >= 0);
+
+  // ── c. G3 / G7 ──
+  ok('T62-c1 ★非 kimi 分支必须走 http_get（裸 fetch 绕过解压与 TLS 降级 → 压缩页 = 0 模型退出码 0）',
+    fc62.indexOf('html = http_get(cfg[\'url\'])') >= 0 && !/html = fetch\(cfg\['url'\)\)/.test(fc62c));
+  ok('T62-c2 ★index.json 写盘前必须滚动备份 .bak（新索引算错时无上一版可回滚）',
+    bi62.indexOf("shutil.copyfile(OUT, OUT + '.bak')") >= 0 && bi62.indexOf('import shutil') >= 0);
+
+  // ── d. L2：语义同义词表（改列名词面只补表，不动解析逻辑）──
+  //   ⚠️ 计数必须匹配**使用点**（`cmap = map_price_columns(hdr)`）而不是 `map_price_columns(hdr)`
+  //   —— 后者会连函数定义行一起数进来 → 定义存在就恒绿（v3.52.0 反向验证实测：把阶跃那处
+  //   回退成写死列索引后断言仍绿，守卫等于没设）。
+  ok('T62-d1 ★fetch-cn-prices 必须有共享列语义同义词表，且三个解析器都走它（不再各写一份字面量）',
+    fc62.indexOf('COL_SYNONYMS = {') >= 0 && fc62.indexOf('def map_price_columns(hdr)') >= 0
+    && (fc62c.match(/cmap = map_price_columns\(hdr\)/g) || []).length >= 3);
+  ok('T62-d2 ★「未命中」必须先于「命中」判定（「输入价格（缓存未命中）」会被 cache 抢走 —— 阶跃表头正是此写法）',
+    fc62.indexOf('miss = _has(c, QUAL_MISS)') >= 0 && fc62.indexOf('hit = (not miss) and _has(c, QUAL_HIT)') >= 0);
+  ok('T62-d3 ★parse_tokenhub 列定位必须走语义表（原 col([\'推理输入\']) 字面量 = 改列名即整条源 exit(2)）',
+    pt62.indexOf('COL_SYNONYMS = {') >= 0 && pt62.indexOf('def map_columns(hdr)') >= 0
+    && !/col\(\['推理输入'\]\)/.test(pt62c) && !/'模型名称' in t and '推理输入' in t/.test(pt62c));
+  ok('T62-d4 ★deepseek 行判定必须走 ROW_TERMS 词表（六处硬正则散落 = 改一处漏一处，某价格静默取不到）',
+    ds62.indexOf('const ROW_TERMS = {') >= 0 && ds62.indexOf('const hasTerm =') >= 0
+    && (ds62c.match(/hasTerm\(joined, ROW_TERMS\./g) || []).length >= 4
+    && !/\/百万tokens输入\/\.test/.test(ds62c));
+  // 行为验证：官方页改词面（「输入价格 / 输出价格 / 缓存未命中」）后仍必须解析出同一组价
+  //   —— 源码守卫证明不了这一点（旧实现的硬正则在这种页面上会**整页取不到价**）。
+  {
+    const dso62 = require(path.join(SRC, 'deepseek-official.js'));
+    const mk = (inWord, outWord, missWord) => `<table>
+<tr><td>模型</td><td>deepseek-flash</td><td>deepseek-v4-pro</td></tr>
+<tr><td>${inWord}（缓存命中）</td><td>空闲时段</td><td>0.02元</td><td>0.15元</td></tr>
+<tr><td>高峰时段</td><td>0.04元</td><td>0.30元</td></tr>
+<tr><td>${inWord}（${missWord}）</td><td>空闲时段</td><td>1元</td><td>4.5元</td></tr>
+<tr><td>高峰时段</td><td>2元</td><td>9元</td></tr>
+<tr><td>${outWord}</td><td>空闲时段</td><td>4元</td><td>13.5元</td></tr>
+<tr><td>高峰时段</td><td>8元</td><td>27元</td></tr>
+</table>`;
+    let r62a = null, r62b = null, e62 = '';
+    try {
+      r62a = dso62.parseOfficial(mk('百万tokens输入', '百万tokens输出', '缓存未命中'));
+      r62b = dso62.parseOfficial(mk('输入价格', '输出价格', '未命中'));
+    } catch (e) { e62 = String(e.message).slice(0, 120); }
+    ok('T62-d5 ★deepseek 官方价解析：原词面页必须解析出 6 组价（行为基准）',
+      !!r62a && !!r62a.prices && JSON.stringify(r62a.prices.cached.off) === '[0.02,0.15]'
+      && JSON.stringify(r62a.prices.uncached.peak) === '[2,9]', e62 || JSON.stringify(r62a && r62a.prices));
+    ok('T62-d6 ★deepseek 官方价解析：列名词面改写后仍解析出同一组价（语义词表生效，旧硬正则会整页取不到）',
+      !!r62b && !!r62b.prices && JSON.stringify(r62b.prices) === JSON.stringify(r62a.prices),
+      e62 || ('旧词面=' + JSON.stringify(r62a && r62a.prices) + ' 新词面=' + JSON.stringify(r62b && r62b.prices)));
+  }
+
+  // ── e. L1：结构指纹（0 模型时区分「网络失败」vs「官网改版」）──
+  ok('T62-e1 ★两个抓取脚本必须有结构指纹函数，且 0 模型/失败时输出它',
+    fc62.indexOf('def scan_fingerprint(text)') >= 0
+    && fc62.indexOf("'fingerprints': {k: v.get('fingerprint')") >= 0
+    && pt62.indexOf('def scan_fingerprint(html)') >= 0
+    && pt62.indexOf('[parse_tokenhub][FINGERPRINT]') >= 0);
+  //   ⚠️ 窗口必须覆盖整个 scan_fingerprint 函数体（v3.52.0 反向验证实测：窗口 200 时
+  //      「指纹里塞价格字段」的回退**检测不到** —— 价格字段距 `fingerprint` 字样远超 200 字符）。
+  const iFp62 = fc62c.indexOf('def scan_fingerprint');
+  const segFp62 = iFp62 < 0 ? '' : fc62c.slice(iFp62, iFp62 + 1600);
+  ok('T62-e2 ★指纹只描述结构不猜价格（含 bytes/sha1_8/tables/headers，不含价格字段）',
+    fc62.indexOf("'sha1_8': hashlib.sha1(") >= 0 && fc62.indexOf("'headers': heads") >= 0
+    && !/in_price|out_price|cache_hit/.test(segFp62), segFp62.slice(-160));
 }
 
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。

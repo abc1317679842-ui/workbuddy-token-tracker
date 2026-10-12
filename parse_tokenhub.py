@@ -107,6 +107,33 @@ def fetch():
     return decode_body(resp.read(), resp.headers.get('Content-Encoding'))
 
 
+# v3.52.0（审计批2·L2）：列语义同义词表 —— 腾讯改列表头词面时**只补表、不动解析逻辑**。
+#   认领顺序至关重要（见 map_columns）：特殊列（条件/峰谷/缓存命中）必须先于 in/out 认领，
+#   否则「输入长度」这类条件列会被含「输入」的 in 抢走。
+#   ⚠️ 与 fetch-cn-prices.py 的 COL_SYNONYMS 需保持一致（两个 py 无共享模块，各自实现）。
+COL_SYNONYMS = {
+    'name': ('模型名称', 'model', '模型', '名称'),
+    'cond': ('条件', 'token', '输入长度'),
+    'peak': ('峰谷', '时段'),
+    'cache': ('缓存命中', '缓存价格', '缓存'),
+    'in': ('推理输入', '输入价格', '输入单价', '输入'),
+    'out': ('推理输出', '输出价格', '输出单价', '输出'),
+}
+# 认领顺序：先特殊列，再 in/out（含裸「输入/输出」的同义词最宽，必须最后认领）
+CLAIM_ORDER = ('name', 'cond', 'peak', 'cache', 'in', 'out')
+
+
+def map_columns(hdr):
+    """表头单元格 -> 各语义列索引（未认领为 None）。v3.52.0 取代原 col(['字面量']) 位置式写法。"""
+    res = {k: None for k in COL_SYNONYMS}
+    for i, c in enumerate(hdr or []):
+        for k in CLAIM_ORDER:
+            if res[k] is None and any(w in c for w in COL_SYNONYMS[k]):
+                res[k] = i
+                break
+    return res
+
+
 def cells_of_row(seg):
     """一个 <tr> 片段 -> 各 <td>/<th> 的文本（多行合并为一格）"""
     out = []
@@ -137,25 +164,20 @@ def parse_lang_table(block):
     """解析广州语言模型价表（含峰谷/分档）。返回模型列表。"""
     rows = rows_of_block(block)
     # 表头：定位各列索引
+    # v3.52.0（审计批2·L2）：表头定位与列映射均改走语义同义词表（原 `any('模型名称' in c)` +
+    #   `col(['推理输入'])` 是字面量硬匹配：腾讯把「推理输入」改成「输入单价」→ 找不到表头 →
+    #   解析 0 模型 → 触发 exit(2)，混元价从索引消失）。
     hidx = None
     for i, r in enumerate(rows):
-        if any('模型名称' in c for c in r) and any('推理输入' in c for c in r):
+        cm = map_columns(r)
+        if cm['name'] is not None and cm['in'] is not None:
             hidx = i
             break
     if hidx is None:
         return []
-    hdr = rows[hidx]
-    def col(keywords):
-        for j, c in enumerate(hdr):
-            if any(k in c for k in keywords):
-                return j
-        return None
-    i_name = col(['模型名称'])
-    i_cond = col(['条件', 'token'])
-    i_peak = col(['峰谷'])
-    i_in = col(['推理输入'])
-    i_out = col(['推理输出'])
-    i_cache = col(['缓存命中'])
+    cm = map_columns(rows[hidx])
+    i_name, i_cond, i_peak = cm['name'], cm['cond'], cm['peak']
+    i_in, i_out, i_cache = cm['in'], cm['out'], cm['cache']
     if None in (i_name, i_in, i_out):
         return []
 
@@ -287,6 +309,34 @@ def parse_unit_currency(tbl):
     return None, None
 
 
+def scan_fingerprint(html):
+    """页面结构指纹（v3.52.0·L1）—— 与 fetch-cn-prices.py 同口径。
+    0 模型/结构异常时把它打进 stderr：让「网络失败」与「官网改版」在日志里可区分
+    （旧版两者都只表现为「解析到模型数: 0」）。"""
+    import hashlib
+    tbls = re.findall(r'<table[\s\S]*?</table>', html or '') or []
+    heads = []
+    for t in tbls[:3]:
+        r = re.search(r'<tr[^>]*>[\s\S]*?</tr>', t)
+        if r:
+            heads.append(re.sub(r'<[^>]+>', ' ', r.group(0)).split()[:8])
+    return {
+        'bytes': len(html or ''),
+        'sha1_8': hashlib.sha1((html or '').encode('utf-8', 'replace')).hexdigest()[:8],
+        'tables': len(tbls),
+        'headers': heads,
+    }
+
+
+def dump_fingerprint(html):
+    """把结构指纹打进 stderr（各 fail-closed 分支共用，避免四处复制）。"""
+    try:
+        sys.stderr.write('[parse_tokenhub][FINGERPRINT] %s\n'
+                         % json.dumps(scan_fingerprint(html), ensure_ascii=False))
+    except Exception:
+        pass
+
+
 def main():
     html = fetch()
     # v3.51.0（审计批1·A）：显式区域绑定 —— 按页面 tse-tabs 结构找「广州」面板，再取面板内
@@ -295,6 +345,7 @@ def main():
     panels = find_region_panels(html)
     if not panels:
         sys.stderr.write('[parse_tokenhub][ERROR] 页面未找到 tse-tabs 地域选项卡结构（可能改版/被拦/结构变化），不写入；保留上一版本\n')
+        dump_fingerprint(html)
         print('解析到模型数: 0 | 页面无地域选项卡结构，已保留上一版 tokenhub_lang.json')
         sys.exit(2)
     hits = [(lb, p) for lb, p in panels if TARGET_REGION in lb]
@@ -304,10 +355,20 @@ def main():
         print('解析到模型数: 0 | 地域面板匹配异常，已保留上一版 tokenhub_lang.json')
         sys.exit(2)
     region_label, panel = hits[0]
-    # 面板内取语言模型价表（表头含 模型名称 + 推理输入 + 峰谷计费）
+    # v3.52.0（审计批2·L2）：价表定位改走语义列映射（原 `'模型名称' in t and '推理输入' in t and
+    #   '峰谷计费' in t` 是字面量判定 —— 腾讯把「推理输入」改名即整条源 exit(2)、混元价静默消失）。
+    #   判据：表头必须同时认领到「模型名称 / 输入价 / 峰谷」三类列（缺一即不是语言模型价表）。
     tbl = None
     for t in re.split(r'<table', panel)[1:]:
-        if '模型名称' in t and '推理输入' in t and '峰谷计费' in t:
+        hrow = re.search(r'<tr[^>]*>[\s\S]*?</tr>', t)
+        if not hrow:
+            continue
+        hc = cells_of_row(hrow.group(0))
+        if not any(hc):
+            hc = [re.sub(r'<[^>]+>', ' ', x).strip()
+                  for x in re.findall(r'<t[dh][^>]*>([\s\S]*?)</t[dh]>', hrow.group(0))]
+        cm = map_columns(hc)
+        if cm['name'] is not None and cm['in'] is not None and cm['peak'] is not None:
             tbl = t
             break
     if tbl is None:
@@ -333,6 +394,7 @@ def main():
         #   而 0 模型文件会让 build_index 的"逐模型沿用 ≤7 天"失效 → Hunyuan 从索引消失 →
         #   该模型按 0/未收录计费。宁可这次没数据，也不能用空数据覆盖好数据。
         sys.stderr.write('[parse_tokenhub][ERROR] 解析到 0 个混元模型（页面可能改版/被拦/列序变化），不写入；保留上一版本\n')
+        dump_fingerprint(html)
         print('解析到模型数: 0 | 未解析到混元模型，已保留上一版 tokenhub_lang.json')
         sys.exit(2)
     peak_rule = parse_peak_rule(html)
@@ -364,7 +426,10 @@ def main():
     #   **cwd 相对路径**——换个工作目录跑就写到别处，而 build_index.py 只读
     #   HERE/prices/tokenhub_lang.json → 混元价从索引静默消失（靠 ≤7 天逐模型沿用兜底，
     #   无人察觉）。与 fetch-cn-prices.py 的 HERE/OUT_DIR 模式对齐。
-    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prices')
+    # v3.52.0（审计批2·S1）：输出目录可用 CN_PRICES_DIR 显式指定（同 fetch-cn-prices.py）。
+    #   原实现恒写脚本自身目录的 prices/，与调用方（token-tracker.js）自动发现的价库目录
+    #   CN_PRICE_DIR 不一致时 → 混元价写到技能目录、**价库目录里的 tokenhub_lang.json 永不更新**。
+    out_dir = os.environ.get('CN_PRICES_DIR') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prices')
     os.makedirs(out_dir, exist_ok=True)
     # v2.82：原子写（唯一 tmp + os.replace），防多会话并发时读方拿到半截 JSON
     tmp = os.path.join(out_dir, 'tokenhub_lang.json.tmp-%d' % os.getpid())
