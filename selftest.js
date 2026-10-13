@@ -1206,8 +1206,10 @@ else {
     /Math\.max\(n, o\.subs\[sf\] \|\| 0\)/.test(bfSrc) && !/v\.subs\[sf\]\) \|\| n \|\| 0/.test(bfSrc));
   const rcSrc = fs.readFileSync(path.join(SRC, 'recalc-day.js'), 'utf8').replace(/\r\n/g, '\n')
     .split('\n').map((l) => l.replace(/(^|\s)\/\/.*$/, '$1')).join('\n');
+  // v3.58.0（批8-①）：形态同步为 `safeCost(stat.cost)` —— 裸 `dayTotal += stat.cost` 对字符串型 cost
+  //   是**字符串拼接**（0 + "0.5" → "00.5"），整日合计会落盘 NaN 且不自愈。守的就是这个「必须数值化」。
   ok('T15-c3 ★recalc 峰谷占比未知时不得改写已有金额（原账>0 → 保留原额）',
-    /dayTotal \+= stat\.cost; continue;/.test(rcSrc));
+    /dayTotal \+= safeCost\(stat\.cost\); continue;/.test(rcSrc));
   // d：行为验证（直接调主脚本导出函数）
   if (!tt2) ok('T15-d 行为验证（fmtCost/hitRate/dbStaleTag）', false, 'token-tracker.js require 失败 —— CI 正常环境下这必是代码回归，不允许静默跳过');
   else {
@@ -6069,8 +6071,10 @@ else {
     && /split\.pOut \+ split\.oOut !== st\.out/.test(bf68)
     && /split\.pCached \+ split\.oCached !== st\.cached/.test(bf68)
     && /split\.pIn \+ split\.oIn === stIn/.test(rc68));
+  // v3.58.0（批8-①）：同上 —— 降级路径仍必须保留（不许因为加了全覆盖校验就把非全覆盖静默采用），
+  //   且累加必须走 safeCost（防字符串拼接把当日合计打成 NaN）。
   ok('T68-a3 ★非全覆盖必须保留 v3.24.0 降级路径（原账>0 保留 / =0 按空闲补记），不许静默采用',
-    /if \(Number\(stat\.cost \|\| 0\) > 0\) \{ dayTotal \+= stat\.cost; continue; \}/.test(rc68));
+    /if \(Number\(stat\.cost \|\| 0\) > 0\) \{ dayTotal \+= safeCost\(stat\.cost\); continue; \}/.test(rc68));
 
   if (!SPAWN_OK) {
     envSkip('T68-e1 半套明细→保留原额（spawn）', SPAWN_SKIP_REASON);
@@ -6260,6 +6264,110 @@ else {
       ok('T69 行为夹具异常', false, (e && e.message) || String(e));
     }
   }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// T70 —— v3.58.0（批8）：2026-10-14 外部审计报告「实证属实」项的修复守卫
+//   取证过程：报告原件 `2026-10-14-02-19-31/.workbuddy/audit/`；逐条验证后**证伪/降级**的已剔除
+//   （DeepSeek 官方只有峰/谷两档、无夜间档；调休按自然星期；holidayYearUnknown 亦非死代码 ——
+//    主脚本 token-tracker.js isPeakHour 早已消费，审计那条是误判）。本组只守实证属实的九条。
+//   ★ 头号：recalc-day 脏 cost → `dayTotal += stat.cost` 是**字符串拼接** → 当日合计 NaN 落盘且不自愈。
+//   **反向验证要求**：把任一条修复改回修复前形态，对应断言必须变红；其余断言不得误伤。
+// ═════════════════════════════════════════════════════════════════════════════════════════
+{
+  // 剥行注释后再匹配：守卫自身的注释里常引用目标形态，不剥会把自己数进去（v3.54.0 教训）。
+  const strip70 = (s) => String(s || '').replace(/\r\n/g, '\n')
+    .split('\n').map((l) => l.replace(/(^|\s)\/\/.*$/, '$1')).join('\n');
+  const rc70 = strip70(fs.readFileSync(path.join(SRC, 'recalc-day.js'), 'utf-8'));
+  const bf70 = strip70(fs.readFileSync(path.join(SRC, 'backfill.js'), 'utf-8'));
+  const pr70src = strip70(fs.readFileSync(path.join(SRC, 'peak-rules.js'), 'utf-8'));
+  const wr70 = strip70(fs.readFileSync(path.join(SRC, 'wb-root.js'), 'utf-8'));
+  const rp70 = strip70(fs.readFileSync(path.join(SRC, 'refresh-prices.js'), 'utf-8'));
+
+  // ── ① recalc-day 脏 cost → 字符串拼接 → 当日合计 NaN（本批头号，唯一污染持久账本的） ──
+  ok('T70-a1 ★recalc 定义 safeCost，且「当日合计」的两处累加**都**走数值化（裸 `+= stat.cost` = 拼接）',
+    /function safeCost\(v\)/.test(rc70)
+    && (rc70.match(/dayTotal \+= safeCost\(stat\.cost\)/g) || []).length === 2
+    && !/dayTotal \+= stat\.cost;/.test(rc70));
+  ok('T70-a2 ★recalc 落盘前对 dayTotal 再兜一次 safeCost（NaN 落盘即不自愈 → 必须拦在写入前）',
+    /dayObj\.total\.cost = Math\.round\(safeCost\(dayTotal\) \* 1e6\) \/ 1e6;/.test(rc70));
+  const rd70 = (() => { try { return require(path.join(SRC, 'recalc-day.js')); } catch (e) { return null; } })();
+  ok('T70-b1 ★safeCost 行为：脏串/NaN/undefined/null 归一为 0，数值与数字串原值保留',
+    !!rd70 && typeof rd70.safeCost === 'function'
+    && rd70.safeCost('abc') === 0 && rd70.safeCost(NaN) === 0
+    && rd70.safeCost(undefined) === 0 && rd70.safeCost(null) === 0
+    && rd70.safeCost('0.5') === 0.5 && rd70.safeCost(1.23) === 1.23);
+  // 反例自证：末尾那半条断言的是「裸拼接确实产生非数」，防止有人把判据写成恒真。
+  ok('T70-b2 ★两笔字符串型 cost 累加 = 数值相加 1.7（改前 0+"0.5"+"1.2" → "00.51.2" → NaN）',
+    !!rd70 && Math.abs((0 + rd70.safeCost('0.5') + rd70.safeCost('1.2')) - 1.7) < 1e-9
+    && Number.isNaN(Number('00.51.2')));
+
+  // ── ② backfill 命中率是「未钳制的复制」（P2-2 真身：不是累加侧，是显示层口径分裂） ──
+  ok('T70-a3 ★backfill 的 hitRate 收敛到主脚本单点 tt.hitRate（本地无钳制副本 = 与增量记账命中率打架）',
+    /const hitRate = \(inTok, cachedTok\) => tt\.hitRate\(inTok, cachedTok\);/.test(bf70)
+    && !/function hitRate\(/.test(bf70));
+  // ⚠️ 反向不能修成「累加时钳制 cached ≤ in」：主链路累加侧同样不钳，钳了 = 两条路径 token 硬账不等，
+  //    直接违反本项目最高口径（token 量必须三路相等）。故这里**正向断言累加侧保持裸累加**。
+  ok('T70-a4 ★backfill 累加侧保持 `m.cached += u.cached`（与主链路一致，禁在硬账侧钳制）',
+    /m\.cached \+= u\.cached;/.test(bf70));
+
+  // ── ③ backfill 水位线回滚文案两态 → 三态（首次回填时必谎报「回滚失败」） ──
+  ok('T70-a5 ★backfill 回滚文案区分「无需回滚（水位线本次新建）」与「回滚失败」',
+    /无需回滚（水位线文件是本次新建的，原本不存在）/.test(bf70)
+    && /const rollbackState = restored \?/.test(bf70)
+    && /const wmExisted = preLock\.result\.wmExists === true;/.test(bf70)
+    && /return \{ aborted: false, stat: st, wmExists \};/.test(bf70));
+
+  // ── ④⑤ peak-rules 周末语义分叉 + 跨午夜区间 ──
+  ok('T70-a6 ★peak-rules 周末判据两分支同构（回落分支改前是无条件周末低峰，与 weekend_off_peak 开关矛盾）',
+    (pr70src.match(/if \(weekendOff && \(dow === 0 \|\| dow === 6\)\) return false;/g) || []).length === 2);
+  ok('T70-a7 ★peak-rules 支持跨午夜时段区间（改前 `r.e <= r.s` 直接 continue = 官方若加该档静默漏判）',
+    /if \(r\.e <= r\.s\) \{ if \(hm >= r\.s \|\| hm < r\.e\) return true; continue; \}/.test(pr70src));
+  const pr70 = (() => { try { return require(path.join(SRC, 'peak-rules.js')); } catch (e) { return null; } })();
+  const bjTs70 = (s) => new Date(s + 'Z').getTime() - 8 * 3600e3; // 传入按北京时间写的串 → 对应 epoch ms
+  ok('T70-b3 ★weekend_off_peak=false 时回落分支与开关语义一致（周六 10:00 应为高峰；改前给低峰）',
+    !!pr70 && pr70.isPeakAt(bjTs70('2026-10-10T10:00'),
+      { deepseek_rules: { weekend_off_peak: false, peak_schedule: 'garbage' } }, null) === true);
+  ok('T70-b4 ★跨午夜区间按两段并集判定（22:00-02:00：23:00 与 01:00 高峰，10:00 低峰）',
+    !!pr70
+    && pr70.isPeakAt(bjTs70('2026-10-07T23:00'),
+      { deepseek_rules: { weekend_off_peak: true, peak_schedule: '22:00-02:00' } }, null) === true
+    && pr70.isPeakAt(bjTs70('2026-10-07T01:00'),
+      { deepseek_rules: { weekend_off_peak: true, peak_schedule: '22:00-02:00' } }, null) === true
+    && pr70.isPeakAt(bjTs70('2026-10-07T10:00'),
+      { deepseek_rules: { weekend_off_peak: true, peak_schedule: '22:00-02:00' } }, null) === false);
+
+  // ── ⑥ 假日表解析失败静默（降级不可见，与 holidayYearUnknown 同类） ──
+  // ⚠️ 守卫自身教训（本批 R8 反向验证实测）：`_lastHolidaysError =` 在**成功分支也写了一份**（置 null），
+  //   只匹配这个形态的话「删掉 catch 里那份（= 退回全静默）」仍恒绿 —— 断言必须**唯一到那一处**，
+  //   故这里同时要求：① catch 分支的模板串形态；② 成功分支的置 null（清残留，否则错误态永不解除）。
+  ok('T70-a8 ★peak-rules 解析失败必须留痕（导出 holidaysLoadError + catch 分支写入错误 + 成功分支清空）',
+    /function holidaysLoadError\(\)/.test(pr70src) && /holidaysLoadError,/.test(pr70src)
+    && /_lastHolidaysError = `\$\{holidaysPath\}/.test(pr70src)
+    // ⚠️ 再踩同一类坑（本批 R8a 实测两次）：① 光写 `_lastHolidaysError = null;` 会命中**模块级声明行**
+    //   `let _lastHolidaysError = null;`；② 收紧成 `[ \t]_lastHolidaysError` 仍命中（let 后那个空格也是 [ \t]）。
+    //   最终锚到**唯一上下文**：紧跟「解析成功」那行 JSON.parse 之后（语义 = 解析成功必须清空错误态）。
+    && /JSON\.parse\(fs\.readFileSync\(holidaysPath, 'utf-8'\)\);\s*_lastHolidaysError = null;/.test(pr70src));
+  ok('T70-a9 文件不存在属正常部署场景 → 不打告警（只对「存在但解析失败」告警，防测试/首刷屏）',
+    /mtime >= 0 && !_holidaysErrWarned/.test(pr70src));
+  const bad70 = path.join(tmp, 'holidays-bad.json');
+  fs.writeFileSync(bad70, '{ 这不是 JSON');
+  ok('T70-b5 ★假日表损坏时 holidaysLoadError() 非 null（改前 catch 里直接吞掉 = 降级完全不可见）',
+    !!pr70 && (() => { pr70.isPeakAt(bjTs70('2026-10-07T10:00'), {}, bad70); return pr70.holidaysLoadError(); })() !== null);
+
+  // ── ⑦ wb-root 兜底前无二次筛选（两套根并存时整套路径会错位到另一个根） ──
+  ok('T70-a10 ★wb-root 兜底前先用目录存在性再选一轮（且顺序在 marker 判定之后、硬兜底之前）',
+    /if \(fs\.existsSync\(c\)\) return c;/.test(wr70)
+    && wr70.indexOf('traces') < wr70.indexOf('if (fs.existsSync(c)) return c;')
+    && wr70.indexOf('if (fs.existsSync(c)) return c;') < wr70.lastIndexOf('return path.join(h,'));
+
+  // ── ⑧ refresh-prices 官方抓取 timeout 与子进程重试预算不匹配 ──
+  ok('T70-a11 ★refresh-prices 官方抓取 timeout = 180000（120s 会在子进程重试退避中途把它掐死）',
+    /timeout: 180000,/.test(rp70));
+
+  // ── ⑨ recalc-day 是独立路径，主脚本那条 holidayYearUnknown 告警对它无效 ──
+  ok('T70-a12 ★recalc-day 也消费 holidayYearUnknown（进程内按年去重，热路径不刷屏）',
+    /peakRules\.holidayYearUnknown\(tMs, HOLIDAYS\)/.test(rc70) && /_holidayWarnedYears/.test(rc70));
 }
 
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。

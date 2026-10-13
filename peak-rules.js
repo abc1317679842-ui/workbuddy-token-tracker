@@ -18,6 +18,15 @@ const DEFAULT_RANGES = [{ s: 9, e: 12 }, { s: 14, e: 18 }]; // 官方当前口�
 let _holidaysCache = null;
 let _holidaysPathCache = null;
 let _holidaysMtimeCache = -1;
+// v3.58.0（批8-⑥）：假日表「读取失败」此前完全静默（catch 里直接吞掉）。
+//   后果与已修好的 holidayYearUnknown 是同一类——**降级不可见**：表损坏/被写坏时全年法定假日都按
+//   「非假日」判，真假日按高峰 ×2 多算，零报错零告警。本模块是纯判定模块（无返回值通道给上层），
+//   故：① 导出 holidaysLoadError() 供上层/测试探针；② 首次解析失败时往 stderr 打一条（按路径幂等，
+//   isPeakAt 是计费热路径，绝不能每次都打）。
+//   ⚠️ 只对「文件存在但解析失败」告警：文件不存在是正常部署场景（首次运行 / 测试用例），不该刷屏。
+let _lastHolidaysError = null;
+const _holidaysErrWarned = new Set();
+function holidaysLoadError() { return _lastHolidaysError; }
 
 function loadHolidays(holidaysPath) {
   // v3.19.1（N4）：缓存加 mtime 校验。原先只在「路径变化」时失效 → 同一进程内（watcher 最长活 3 小时）
@@ -26,7 +35,19 @@ function loadHolidays(holidaysPath) {
   try { mtime = fs.statSync(holidaysPath).mtimeMs; } catch (e) { mtime = -1; } // 缺失/不可 stat → 不判假
   if (_holidaysCache !== null && _holidaysPathCache === holidaysPath && _holidaysMtimeCache === mtime) return _holidaysCache;
   let h = { years: {} };
-  try { h = JSON.parse(fs.readFileSync(holidaysPath, 'utf-8')); } catch (e) { h = { years: {} }; } // 缺失→不判假，绝不抛错
+  try {
+    h = JSON.parse(fs.readFileSync(holidaysPath, 'utf-8'));
+    _lastHolidaysError = null;
+  } catch (e) {
+    h = { years: {} }; // 缺失→不判假，绝不抛错
+    _lastHolidaysError = `${holidaysPath}: ${(e && e.message) || e}`;
+    if (mtime >= 0 && !_holidaysErrWarned.has(holidaysPath)) {
+      _holidaysErrWarned.add(holidaysPath);
+      try {
+        process.stderr.write(`[peak-rules] ⚠ 法定假日表解析失败（${_lastHolidaysError}）→ 峰谷判定按「非假日」降级：真假日会被按高峰 ×2 多算；请跑 node refresh-holidays.js 重建该表\n`);
+      } catch (e2) { /* 告警绝不影响判定本身 */ }
+    }
+  }
   _holidaysCache = h;
   _holidaysPathCache = holidaysPath;
   _holidaysMtimeCache = mtime;
@@ -100,13 +121,18 @@ function isPeakAt(tsMs, pricing, holidaysPath) {
     const ranges = parsePeakSchedule(rules.peak_schedule);
     if (ranges.length) {
       for (const r of ranges) {
-        if (r.e <= r.s) continue; // 跨午夜区间暂不处理（官方当前无此档）
+        // v3.58.0（批8-⑤）：跨午夜区间（如 22:00-02:00）改前被 `continue` 直接跳过 ——
+        //   官方当前无此档所以没炸，但一旦加了就是**静默漏判**：整档按低峰计，金额差一倍且零报错。
+        //   跨午夜 = 两段并集：hm >= r.s 或 hm < r.e。
+        if (r.e <= r.s) { if (hm >= r.s || hm < r.e) return true; continue; }
         if (hm >= r.s && hm < r.e) return true;
       }
       return false;
     }
     // rules 存在但时段解析不出 → 回落默认（保留周末开关语义）
-    if (dow === 0 || dow === 6) return false;
+    // v3.58.0（批8-④）：改前这里是**无条件**周末低峰，与上方 `weekendOff && …` 判据分叉 ——
+    //   weekend_off_peak 显式为 false 时，两条路径对同一个周末给出相反结论（同一模块内的口径分裂）。
+    if (weekendOff && (dow === 0 || dow === 6)) return false;
     return DEFAULT_RANGES.some((r) => hm >= r.s && hm < r.e);
   }
   // ② 无 rules → 周末低峰 + 默认时段
@@ -114,4 +140,4 @@ function isPeakAt(tsMs, pricing, holidaysPath) {
   return DEFAULT_RANGES.some((r) => hm >= r.s && hm < r.e);
 }
 
-module.exports = { isPeakAt, isHolidayBeijing, holidayYearUnknown, parsePeakSchedule, DEFAULT_RANGES };
+module.exports = { isPeakAt, isHolidayBeijing, holidayYearUnknown, holidaysLoadError, parsePeakSchedule, DEFAULT_RANGES };

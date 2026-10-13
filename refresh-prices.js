@@ -741,7 +741,12 @@ async function main() {
       } else {
         sp = spawnSync(process.execPath, [DS_OFFICIAL], {
           encoding: 'utf-8',
-          timeout: 120000, // 含重试（2 次 × 60s）
+          // v3.58.0（批8-⑧）：timeout 由 120000 提到 180000，注释同步改对。
+          //   改前写「含重试（2 次 × 60s）」但实参是 DS_RETRIES:'0'（单次尝试）——注释与实参自相矛盾：
+          //   120s 只够覆盖单次（15s 超时），若哪天放开子进程重试（默认 DS_RETRIES=2 → 3 次尝试 +
+          //   2 段 60s 退避 ≈ 165s），120s 会在第 2 段退避中途**把子进程掐死**，官方价抓取静默失败。
+          //   现在 timeout 按最坏情形（165s）留 15s 余量；当前 DS_RETRIES='0' 的行为不受任何影响。
+          timeout: 180000,
           env: { ...process.env, DS_RETRIES: '0' }, // 本次外部已整体由 refresh 控制节奏，子进程不再追加重试，避免重复 60s
         });
       }

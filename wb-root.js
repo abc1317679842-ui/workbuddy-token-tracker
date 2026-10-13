@@ -16,6 +16,17 @@ function detectWorkBuddyRoot() {
       if (fs.existsSync(path.join(c, 'traces')) || fs.existsSync(path.join(c, 'settings.json'))) return c;
     } catch (e) { /* 单个候选探测失败不影响下一个 */ }
   }
+  // v3.58.0（批8-⑦）：marker 全不命中时，先用「目录本身是否存在」再选一轮，最后才兜底。
+  //   改前两个候选都没 marker（如 traces/ 尚未首次创建、settings.json 被清空/改名）就**直接**返回
+  //   `.workbuddy` —— 若实际用的是 `.workbuddy-ai`，则账本 / toast 日志 / 价库**整套路径错位到另一个根**，
+  //   表现为「记账了但报表为空 / 报表读到别人的旧账」，且全程零报错。目录存在性比 marker 弱，但比硬兜底强。
+  for (const c of cands) {
+    try {
+      if (fs.existsSync(c)) return c;
+    } catch (e) { /* 单个候选探测失败不影响下一个 */ }
+  }
+  // 两个候选都不存在：仍须返回一个可用路径（调用方全部依赖非空返回值，返回 null 会让它们全线抛错）。
+  // 此处是**真正的兜底**，保持原行为。
   return path.join(h, '.workbuddy');
 }
 

@@ -37,8 +37,34 @@ if (!process.env.WB_ROOT) process.env.WB_ROOT = WB;
 const tt = require(path.join(__dirname, 'token-tracker.js'));
 
 
+// v3.58.0（批8-⑨）：峰谷**降级可见性** —— 与主脚本 token-tracker.js isPeakHour（v3.32.0 H4）同款告警。
+//   recalc 是**独立路径**，从不经过主脚本的 isPeakHour，所以主脚本那条告警对回溯重算完全无效：
+//   假日数据未知/陈旧的年份在这里照样按「非假日」判定，双向错（真假日按高峰 ×2 多算、
+//   调休上班日按周末低峰少算）且零提示。进程内每年至多 1 条 stderr（Set 去重，本函数是热路径）。
+const _holidayWarnedYears = new Set();
 function isPeakBeijing(iso, pricing) {
-  return peakRules.isPeakAt(new Date(iso).getTime(), pricing, HOLIDAYS);
+  const tMs = new Date(iso).getTime();
+  try {
+    const yNow = new Date(tMs + 8 * 3600e3).getUTCFullYear();
+    if (!_holidayWarnedYears.has(yNow) && peakRules.holidayYearUnknown(tMs, HOLIDAYS)) {
+      _holidayWarnedYears.add(yNow);
+      process.stderr.write(`[recalc-day] ⚠ ${yNow} 年法定假日数据未知或已陈旧 → 该年峰谷判定按「非假日」降级：真假日按高峰 ×2 多算、调休上班日按周末低峰少算；联网后跑 node refresh-holidays.js ${yNow} 可修复\n`);
+    }
+  } catch (e) { /* 告警失败绝不影响判定本身 */ }
+  return peakRules.isPeakAt(tMs, pricing, HOLIDAYS);
+}
+
+// v3.58.0（批8-①）：账本 cost 的**安全取值**——非有限数（NaN / "abc" / undefined / null）一律归一为 0。
+//   病根：`dayTotal += stat.cost` 用的是 `+` 而不是「数值累加」——只要账本里某条 cost 是**字符串**
+//   （旧版本写入 / 外部手改 / 导入脏数据），就变成字符串拼接：
+//       0 + "0.5"        → "00.5"（字符串）
+//       "00.5" + "1.2"   → "00.51.2"（字符串，数值上已完全错误）
+//       Math.round("00.51.2" * 1e6) → NaN → 当日合计落盘 NaN，**不抛错、不自愈**（下轮读到仍是 NaN）。
+//   归一为 0 后：脏条目被判成「原账 0」→ 由上游补出正确金额并回写（L323）→ 账本**自愈**。
+//   与 v3.24.0「原账 > 0 保留原额」的语义不冲突：脏值不是"原额"，它根本不是一个金额。
+function safeCost(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
 }
 
 // toast 行1 形如「<模型名>[ 时段标注][｜⚠无公开价][（子代理 X）]」——模型名永远在最前
@@ -305,7 +331,10 @@ function main() {
         // 是口径改写：任何一次 recalc 都会把历史金额悄悄改小。现在分两种情况：
         //   原账 > 0 → 保留原额不动（只在报告标注"时段未知"）；
         //   原账 = 0 → 是"当时未收录"的历史欠账，按空闲价补上（低估可接受，且这正是本工具存在的目的）。
-        if (Number(stat.cost || 0) > 0) { dayTotal += stat.cost; continue; }
+        // v3.58.0（批8-①）：此处 `dayTotal += stat.cost` 必须走 safeCost —— 上面的判据是
+        //   `Number(stat.cost || 0) > 0`（只对**数值**成立），但累加用的却是未归一化的 stat.cost：
+        //   字符串型 cost（如 "0.5"）判据为真 → 走本分支 → 字符串拼接 → 整日合计变字符串 → 落盘 NaN。
+        if (Number(stat.cost || 0) > 0) { dayTotal += safeCost(stat.cost); continue; }
         cost = base; // ¥0 欠账 → 按空闲价补记
       } else {
         // v3.23.5：缺省值与主脚本 calcCost（token-tracker.js L2599）对齐——DeepSeek 系缺省 2，其余缺省 1。
@@ -318,7 +347,10 @@ function main() {
         cost = costOf(m, stat.in, stat.cached, stat.out, 1 + (peakMult - 1) * ratio);
       }
 
-      const old = Number(stat.cost || 0);
+      // v3.58.0（批8-①）：`Number(stat.cost || 0)` 对脏值（"abc" / NaN）得到 NaN，
+      //   于是 `Math.abs(cost - NaN)` = NaN → `NaN > 0.0005` = false → **不回写**，脏值永久留在账本。
+      //   归一为 0 后判据成立 → 用正确金额覆盖脏值 → 自愈（同一条数据第二轮即变正确数值）。
+      const old = safeCost(stat.cost);
       if (Math.abs(cost - old) > 0.0005) {
         stat.cost = cost;
         report.push({
@@ -336,13 +368,16 @@ function main() {
         delete stat.no_price; delete stat.no_price_note;
         report.push({ model, note: '已补公开价并回算，清除 no_price 标记' });
       }
-      dayTotal += stat.cost;
+      // v3.58.0（批8-①）：同上 —— 累加侧再兜一次（未回写的原值仍是脏值时也不能污染合计）。
+      dayTotal += safeCost(stat.cost);
     }
 
     // v3.46.0（审计 S-10）：`dayObj.total` 缺失时补空对象再写 cost。
     //   改前 `dayObj.total.cost = ...` 对没有 total 键的旧/坏账本直接抛（锁内抛出 → 同上，只留异常栈）。
     if (!dayObj.total || typeof dayObj.total !== 'object') dayObj.total = {};
-    dayObj.total.cost = Math.round(dayTotal * 1e6) / 1e6;
+    // v3.58.0（批8-①）：最后一关兜底 —— 即便上面某条漏网把 dayTotal 变成非有限数，
+    //   也只让当日合计降级为 0（可重跑修复），绝不让 NaN 落进账本（NaN 一旦落盘即不自愈）。
+    dayObj.total.cost = Math.round(safeCost(dayTotal) * 1e6) / 1e6;
     return { total: dayObj.total.cost, report };
   }
 
@@ -402,4 +437,5 @@ function main() {
 //   仍然照常跑（行为零变化），被 require 时只暴露纯函数。
 if (require.main === module) main();
 
-module.exports = { peakSplitOf, costOf, readToastRounds, groupToastLines };
+// v3.58.0（批8-①）：safeCost 一并导出 —— 供 selftest 做**行为级**验证（只靠源码形态守不住「数值化」语义）。
+module.exports = { peakSplitOf, costOf, readToastRounds, groupToastLines, safeCost };

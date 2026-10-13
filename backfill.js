@@ -140,11 +140,12 @@ function rowCost(pricing, modelName, u, tsMs) {
   // v3.42.0（plan-B B1）：收敛到 token-tracker.js 单点实现 triPriceRounded（带 1e-6 四舍五入）
   return tt.triPriceRounded(inT, cached, outT, m, mult);
 }
-function hitRate(inTok, cachedTok) {
-  const denom = inTok || 0;
-  if (!(denom > 0)) return 0;
-  return Math.round((cachedTok / denom) * 10000) / 100;
-}
+// v3.58.0（批8-②）：缓存命中率收敛到主脚本单点 tt.hitRate —— 本函数此前是**未钳制的复制**：
+//   主脚本 v3.24.0 已把 hit 钳制到 [0,100]（脏数据 cached>in 会显示「>100%」的假报表），backfill 这份
+//   没跟上 → 同一账本、同一批数据，重建出来的命中率与增量记账的不一致（A3「复制实现靠注释同步」的又一标本）。
+//   ⚠️ 绝不能改成「累加时把 cached 钳到 ≤ in」：主链路累加侧同样不钳制，钳了会让两条路径的 cached
+//   **token 硬账**不相等，违反本项目最高口径（token 量必须三路相等且可复算）。钳在**显示层**才是对的。
+const hitRate = (inTok, cachedTok) => tt.hitRate(inTok, cachedTok);
 function dayTotalOf(models) {
   const t = { in: 0, out: 0, cached: 0, total: 0, cost: 0 };
   for (const m of Object.values(models || {})) {
@@ -444,9 +445,12 @@ function main() {
     } else if (st === null || st.size !== preStat.size || st.mtimeMs !== preStat.mtimeMs) {
       return { aborted: true }; // size 或 mtimeMs 任一不同 → 扫描期间有进程写过账本（Windows 上 mtimeMs 精度足够直接 !== 比较）
     }
+    // v3.58.0（批8-③）：顺带记录「写入前水位线是否存在」——步骤 C 失败回滚时要靠它区分
+    //   「无需回滚」与「回滚失败」，否则文案只能二选一，必然对一半（见 rollbackWatermark）。
+    const wmExists = fs.existsSync(WATERMARK);
     try { if (fs.existsSync(DAILY)) fs.copyFileSync(DAILY, bak1); } catch (e) {} // silent-ok:清理 — 备份失败不阻断回填（备份是尽力而为）
-    try { if (fs.existsSync(WATERMARK)) fs.copyFileSync(WATERMARK, bak2); } catch (e) {} // silent-ok:清理 — 同上
-    return { aborted: false, stat: st };
+    try { if (wmExists) fs.copyFileSync(WATERMARK, bak2); } catch (e) {} // silent-ok:清理 — 同上
+    return { aborted: false, stat: st, wmExists };
   }, { ttl: 600000, retries: 50 }); // ttl/retries 放宽：回填扫描长、持锁久，给足重试等待
   if (!preLock || !preLock.ok) {
     // 抢锁失败：绝不无锁续写，否则又退回「整体覆盖丢增量」老问题
@@ -459,6 +463,7 @@ function main() {
     process.exit(1);
   }
   const baseStat = preLock.result.stat; // 步骤 C 的指纹基线：A→C 之间无人改动才算数
+  const wmExisted = preLock.result.wmExists === true; // v3.58.0（批8-③）：回滚文案的判据之一
 
   // 步骤 B（WATERMARK 锁）：**先**写水位线 —— 与主链路 incrementalRecord 共用**同一把锁**
   //   （WATERMARK + '.lock' 即 token-tracker.js 的 LEDGER_WATERMARK_FILE + '.lock'），
@@ -505,9 +510,20 @@ function main() {
   //   "账本已写、要撤销"的分支，现在不存在这种情形）。
   const rollbackWatermark = (why) => {
     let restored = false;
-    try { if (fs.existsSync(bak2)) restored = saveLedgerRawAtomic(WATERMARK, fs.readFileSync(bak2)); } catch (e) {} // silent-ok:降级 — 回滚是尽力而为，失败由下方告警兜底
+    // v3.58.0（批8-③）：水位线是本次新建（写入前不存在）时 bak2 必然不存在 —— 那是「无需回滚」，不是失败。
+    let needless = false;
+    try {
+      if (fs.existsSync(bak2)) restored = saveLedgerRawAtomic(WATERMARK, fs.readFileSync(bak2));
+      else if (!wmExisted) needless = true;
+    } catch (e) {} // silent-ok:降级 — 回滚是尽力而为，失败由下方告警兜底
+    // v3.58.0（批8-③）：改前只有「已回滚 / 回滚失败」两态 → 首次回填（原本无水位线）时 bak2 必不存在，
+    //   于是**必定**落到「回滚失败！请手动用 .bak-backfill-* 还原」= 谎报故障：其实没有任何东西要还原，
+    //   用户照着做反而可能把别处的备份盖进来。现在三态，把「无需回滚」讲清楚。
+    const rollbackState = restored ? '已回滚到写入前状态'
+      : (needless ? '无需回滚（水位线文件是本次新建的，原本不存在）'
+        : '回滚失败！请手动用 .bak-backfill-* 还原');
     console.error('[backfill] ' + why + '，本次回填已作废；水位线'
-      + (restored ? '已回滚到写入前状态' : '回滚失败！请手动用 .bak-backfill-* 还原')
+      + rollbackState
       + '（放任水位线与账本不一致的后果是**少记**而非多收：主链路会按推高的水位线跳过这些行，重跑 backfill 即恢复）；请退出 WorkBuddy 后重试');
   };
 
