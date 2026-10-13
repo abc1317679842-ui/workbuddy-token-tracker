@@ -256,13 +256,18 @@ function main() {
       // v3.31.0（P1-15）：并发新出现的模型不在 allModels 里 → 补进候选表，否则它自己的轮次会被仲裁给别的模型
       const cands = allModels.includes(model) ? allModels : allModels.concat([model]);
       const hours = hoursCache.has(model) ? hoursCache.get(model) : roundHoursOf(date, model, cands);
+      // v3.57.0（K1）：无峰谷模型结构性退出峰谷时段判定——只有 peakMultOf>1 才算高峰占比。
+      //   改前无条件算占比（无峰谷模型靠倍率 1 打平）；deepseek 名+显式 mult≤1 组合生产不存在，
+      //   且「显式 peak_multiplier 优先」本就是 peakMultOf 既定口径（v3.46.0 S-9）。
+      const pm = tt.peakMultOf(m, model);
       let peakRatio = null;
-      if (hours) {
-        peakRatio = hours.filter((iso) => isPeakBeijing(iso, pricing)).length / hours.length;
-      } else if ((typeof m.peak_multiplier === 'number' && m.peak_multiplier > 1) || /(^|[\/\-_])deepseek/i.test(String(model || ''))) {
-        peakRatio = null; // 有峰谷价但拿不到轮次时间 → 占比未知
+      if (pm > 1) {
+        if (hours) {
+          peakRatio = hours.filter((iso) => isPeakBeijing(iso, pricing)).length / hours.length;
+        }
+        // 有峰谷但拿不到轮次时间 → peakRatio 保持 null（占比未知 → 走降级路径）
       } else {
-        peakRatio = 0;
+        peakRatio = 0; // 无峰谷 → 不判时段
       }
 
       const base = costOf(m, stat.in, stat.cached, stat.out, 1);
@@ -274,7 +279,17 @@ function main() {
       //   "实时链路算的"与"recalc 回算的"不再可能给出两个金额（A3 的验收标准）。
       const split = peakSplitOf(date, model);
       let splitUsed = false;
-      if (split && (split.pIn + split.pCached + split.pOut + split.oIn + split.oCached + split.oOut) > 0) {
+      // v3.57.0（H5 收口 / 逻辑审计 R1）：at-time 切分**必须全覆盖**才采用 —— 三对桶加总与账本
+      //   条目三值完全相等，证明明细覆盖了当天全部轮次。修前此处只要求「六桶和 > 0」：
+      //   hook-fallback 轮不落明细（A22，已知不修）、明细被 prune、跨版本残留都会让桶和 < 条目值，
+      //   此时按 split 计价 = 只给明细轮次定价、**漏掉其余轮次的全部用量**（把账本金额改小），
+      //   且与 backfill.js v3.57.0 的全覆盖口径分叉。对不上 → 落到下面的轮次占比折算 /
+      //   「未知按空闲」降级路径（v3.24.0 既定语义：原账 >0 保留、=0 按空闲补记）。
+      const stIn = Number(stat.in) || 0, stOut = Number(stat.out) || 0, stCached = Number(stat.cached) || 0;
+      if (split && (split.pIn + split.pCached + split.pOut + split.oIn + split.oCached + split.oOut) > 0
+       && split.pIn + split.oIn === stIn
+       && split.pOut + split.oOut === stOut
+       && split.pCached + split.oCached === stCached) {
         // v3.46.0（审计 S-9）：峰谷倍率与分桶展开式**都改为调用主脚本单点实现**。
         //   改前这里手写了一份 6 项展开式 + 一份倍率三元式，注释还写「与主链路 calcCost 同款钳制」
         //   ——只对分桶支成立、对回退支不成立（两份注释各自对一半 = 病根标本）。

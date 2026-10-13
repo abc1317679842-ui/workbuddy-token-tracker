@@ -39,8 +39,8 @@ type: skill
 
 ## 当前功能总览（版本以 manifest.yaml 为准）
 
+> **v3.57.0 要点（2026-10-13）：H5+R1 修复——backfill/recalc 历史日按当时规则计价**（厂商调整峰谷时段后，拿当前规则重算全部历史行会与 recalc 回算系统性分叉，六批审计实证同一历史日差 2 倍；修法：组装账本时对主链路落有 at-time `peakSplit` 明细且三对桶全覆盖的 (日期, 模型) 按**当时**切分计价，对不上保持行级现值；「当时规则」切分全项目只此一处实现——backfill 直接 require `recalc-day.js` 的 `peakSplitOf`。**R1 同根收口**：recalc 的 split 分支原先只要求「六桶和>0」就采用，明细部分覆盖时会把明细轮次之外的全部用量漏掉、金额改小——追加三对桶与条目三值相等的全覆盖校验，对不上落 v3.24.0 既定降级；生产实证 9 对部分覆盖旧版全部漏价（最狠 10-11 hy3 少算 81%），新版 token 三值与生产逐项相等）。**K1 峰谷时段表不再全局共享**（用户定性为重大口径问题）：新增 `peakAppliesToAgg` 单点闸门（`peakMultOf>1` 才判时段），弹窗/账本两侧分桶 + `calcCost` 倍率 + recalc `peakRatio` + backfill `rowCost` 五处结构性退出——无峰谷模型不再读 DeepSeek 时段表、不落 peakSplit 明细（改前只靠倍率 1 碰巧打平）；金额零影响、`--report` 全历史逐字节零差异，病根由夹具 O2 实证（旧版无峰谷模型也落明细）。守卫 **T67(8)+T68(6)+T69(6)**（源码 20 + 行为 8，行为为 spawn 真跑 dry-run；K1 端到端 11/11 + 反向验证恰好 N2 一条红零误伤）。
 > **v3.56.0 要点（2026-10-13）：Portkey USD 源 3→5**（补 openai / anthropic 两个 provider；**不选 openrouter**——Portkey 的 openrouter.json 就是 OpenRouter 的镜像，加了就是假独立源；zhipu/moonshot 暂不加：对现价库零收益还新增歧义告警）+ **文档写明源的独立性口径**（llm-prices-cn 是 llmabacus 每日镜像，同源不构成互证）+ **G4 查找缓存**（looseFind 全索引归一化 + usdFind 结果 memo，A1 扩源后 255 次全索引遍历降到每索引一次）+ **G6 toast 单次读入**（recalc 预热从 N 个模型各整份读一遍改成一次读入分组，纯函数 `groupToastLines` 可单测）。守卫 **T66(20)**（源码 12 + 行为 8，全 require 真跑）。
-> **v3.55.0 要点（2026-10-13）：`parse_tokenhub` 未映射模型不再静默丢弃（三路分流 + `_unmapped` 留痕，**不猜品牌**）+ `backfill --write` 改**模型级 merge**（重放权威覆盖、抓不到的保留并打 `stale_carried`，无人工确认）+ 缓存价/输入价比值校验（正常带 0.5%~50%，只告警不阻断）；**A5 缓存价缺失按 0 计判 Won't fix**（= 厂商未公布价，合法常态）**
 > **逐版细节、动机、取舍一律查 `CHANGELOG.md`** —— 本文件不再堆版本要点；上面若与旧说法冲突，**以本条为准**。
 
 > **⚠️ 强制（查询触发总纲）：所有统计查询必须调用 `--report` 命令并原样贴出脚本输出，禁止自行解析 JSON。** 无论用户问「今日消耗」「今天用了多少」「账本」「报告」「统计」「花费」还是历史某天，一律先跑 `node token-tracker.js --report`（或 `--report <日期>`），再把脚本打印的 Markdown 表格原文贴给用户；不得自行读取 `daily-usage.json`、不得自行汇总、不得转成列表/纯文本/代码块。详细规则见下方「查询触发规则（强制）」与「展示格式约束（强制）」。

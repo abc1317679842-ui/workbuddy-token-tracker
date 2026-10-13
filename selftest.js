@@ -3605,39 +3605,44 @@ else {
       deepseek_rules: { peak_schedule: '9:00 - 12:00、14:00 - 18:00', weekend_off_peak: true },
     };
     const M = 'deepseek-v4.1-flash'; // 本机价：in 1 / cached 0.02 / out 4，peak_multiplier 2
+    // v3.57.0（K1 收尾顺手修）：本组用例原先**不传 tsMs** → calcCost 回退 `new Date()`（运行时刻），
+    //   于是断言结果依赖"跑测试时是不是高峰段"——09:00-12:00/14:00-18:00 跑就红、其余时段绿
+    //   （实测 08:29 绿、09:01 红，同一份代码）。现显式传一个**固定空闲时刻**（2026-10-13 周二 12:30 +0800，
+    //   午休段）消除时刻依赖：c1/c6 走分桶路径不受影响；c2/c3/c4/c5 的"回退整批"一律按空闲 ×1 判。
+    const OFFPEAK_TS = 1791865800000; // 2026-10-13 12:30 +0800（周二，非高峰）
     // c1：**有分桶**时高峰段必须乘 peakMult —— 与调用时刻无关（这是 A3 的核心行为）
     //   半峰半闲：100万高峰 + 100万空闲 → 1×2 + 1×1 = ¥3
     const half = tt44.calcCost({ model: M, in: 2000000, out: 0, cached: 0,
-      pIn: 1000000, pCached: 0, pOut: 0, oIn: 1000000, oCached: 0, oOut: 0 }, pricing44);
+      pIn: 1000000, pCached: 0, pOut: 0, oIn: 1000000, oCached: 0, oOut: 0 }, pricing44, OFFPEAK_TS);
     ok('T44-c1 ★有行级分桶时高峰段乘 peakMult（半峰半闲 200万 in → ¥3，不是整批的 ¥2 或 ¥4）',
       Math.abs(half - 3) < 1e-9, `实测 ${half}`);
     const allPeak = tt44.calcCost({ model: M, in: 1000000, out: 0, cached: 0,
-      pIn: 1000000, pCached: 0, pOut: 0, oIn: 0, oCached: 0, oOut: 0 }, pricing44);
+      pIn: 1000000, pCached: 0, pOut: 0, oIn: 0, oCached: 0, oOut: 0 }, pricing44, OFFPEAK_TS);
     const allOff = tt44.calcCost({ model: M, in: 1000000, out: 0, cached: 0,
-      pIn: 0, pCached: 0, pOut: 0, oIn: 1000000, oCached: 0, oOut: 0 }, pricing44);
+      pIn: 0, pCached: 0, pOut: 0, oIn: 1000000, oCached: 0, oOut: 0 }, pricing44, OFFPEAK_TS);
     ok('T44-c2 ★全高峰 → ×2（¥2）；全空闲 → ×1（¥1）—— 分桶自身的倍率是对的',
       Math.abs(allPeak - 2) < 1e-9 && Math.abs(allOff - 1) < 1e-9,
       `全高峰 ${allPeak} / 全空闲 ${allOff}`);
     // c3：**回退路径**——无分桶时行为必须与 v3.39.0 逐字节一致（靠 tsMs 判整批）
-    const noBuck = tt44.calcCost({ model: M, in: 2000000, out: 0, cached: 0 }, pricing44);
+    const noBuck = tt44.calcCost({ model: M, in: 2000000, out: 0, cached: 0 }, pricing44, OFFPEAK_TS);
     ok('T44-c3 ★无分桶 → 回退整批口径（不因 A3 改动而变），且结果为有限数',
       Number.isFinite(noBuck) && noBuck > 0, `实测 ${noBuck}`);
     // c4：**分桶不完整时必须回退**（真实行有分桶 + 估算段无分桶 → 三项和 ≠ 总量）
     //   → 不得用残缺分桶算钱（否则静默少算/多算）。这里模拟"in 分桶只覆盖一半"。
     const partial = tt44.calcCost({ model: M, in: 2000000, out: 0, cached: 0,
-      pIn: 500000, pCached: 0, pOut: 0, oIn: 500000, oCached: 0, oOut: 0 }, pricing44);
+      pIn: 500000, pCached: 0, pOut: 0, oIn: 500000, oCached: 0, oOut: 0 }, pricing44, OFFPEAK_TS);
     ok('T44-c4 ★分桶三项和 ≠ 总量 → 拒绝使用分桶、回退整批（残缺分桶绝不静默参与计价）',
       Math.abs(partial - noBuck) < 1e-9, `残缺分桶 ${partial} vs 整批 ${noBuck}`);
     // c5：分桶三项**全为 0** → 视为无分桶（不得把全部 token 当免费）
     const zeroBuck = tt44.calcCost({ model: M, in: 1000000, out: 0, cached: 0,
-      pIn: 0, pCached: 0, pOut: 0, oIn: 0, oCached: 0, oOut: 0 }, pricing44);
+      pIn: 0, pCached: 0, pOut: 0, oIn: 0, oCached: 0, oOut: 0 }, pricing44, OFFPEAK_TS);
     ok('T44-c5 ★分桶全 0（= 一行都没落进可见时段）→ 视为无分桶、回退整批（不得算成免费）',
-      Math.abs(zeroBuck - tt44.calcCost({ model: M, in: 1000000, out: 0, cached: 0 }, pricing44)) < 1e-9,
+      Math.abs(zeroBuck - tt44.calcCost({ model: M, in: 1000000, out: 0, cached: 0 }, pricing44, OFFPEAK_TS)) < 1e-9,
       `实测 ${zeroBuck}`);
     // c6：cached 也随峰谷（A13 结论）——高峰段的 cached 乘 peakMult
     //   100万 peak in（其中 100万 cached）→ 1×0.02×2 = ¥0.04
     const peakCached = tt44.calcCost({ model: M, in: 1000000, out: 0, cached: 1000000,
-      pIn: 1000000, pCached: 1000000, pOut: 0, oIn: 0, oCached: 0, oOut: 0 }, pricing44);
+      pIn: 1000000, pCached: 1000000, pOut: 0, oIn: 0, oCached: 0, oOut: 0 }, pricing44, OFFPEAK_TS);
     ok('T44-c6 ★分桶路径里高峰段 cached 同样 ×peakMult（A13 三项同乘在分桶路径同样成立）',
       Math.abs(peakCached - 0.04) < 1e-9, `实测 ${peakCached}（应 0.04）`);
   }
@@ -5937,6 +5942,323 @@ else {
         const f = rp66m.looseFind(idx, rp66m.norm('kimi-k3'), 'USD源', 'kimi-k3-9', false);
         return f && f.usdIn === 3;
       })());
+  }
+}
+
+// ===== T67：v3.57.0 H5 修复——backfill 历史日按当时规则计价（审计批7）=====
+// 病根：rowCost 逐行用 isPeakBeijingTs(ts) 判峰谷 = **当前** deepseek_rules 口径；厂商调整峰谷
+//   时段后，拿它重算全部历史行，同一历史日金额与 recalc-day（读 rounds 明细里主链路**当时**落下的
+//   peakSplit 六桶）系统性分叉（审计实证差 2 倍：¥0.0024 vs ¥0.0048）。用户定夺：历史日按当时规则。
+// 修法：组装循环内对每个 (date, model) 读回 at-time 切分，**三对桶全覆盖才采用**（防"只给部分
+//   轮次按当时规则定价"），否则保持行级现值；无公开价模型不动（与 rowCost null 语义一致）。
+// 守卫两层：
+//   ① 源码：require 关系 / peakSplitOf 使用点 / 全覆盖三项 / 单点计价 / 覆盖必须先于 dayTotalOf；
+//   ② 行为（spawn dry-run，WB_ROOT 全隔离 tmp）：全覆盖→当时规则、半套→行级现值、无明细→行级现值。
+// ⚠️ 反向验证口径：整段删掉覆盖 pass → a2/a3/a4/a5 与 e1 必须变红；e2/e3 不得误伤
+//   （修复前后同为行级现值 ¥2.00）。
+{
+  const bf67 = fs.readFileSync(path.join(SRC, 'backfill.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const s67 = stripComments(bf67);
+  ok('T67-a1 ★backfill 必须 require recalc-day.js（当时规则切分只许一处实现，不得另抄一份）',
+    /const recalcDay = require\(path\.join\(__dirname, 'recalc-day\.js'\)\);/.test(s67));
+  ok('T67-a2 ★组装循环内必须调 recalcDay.peakSplitOf（导入了不调用 = 白修）',
+    s67.indexOf('recalcDay.peakSplitOf(date, name)') >= 0);
+  ok('T67-a3 ★必须做三对桶全覆盖校验（缺一项 = 半套明细也能按当时规则定价）',
+    /split\.pIn \+ split\.oIn !== st\.in/.test(s67)
+    && /split\.pOut \+ split\.oOut !== st\.out/.test(s67)
+    && /split\.pCached \+ split\.oCached !== st\.cached/.test(s67));
+  ok('T67-a4 ★成本改写必须走单点 tt.costFromPeakSplit + tt.peakMultOf（不得手写六项展开式）',
+    s67.indexOf('tt.costFromPeakSplit(hit.m, split, tt.peakMultOf(hit.m, name))') >= 0);
+  ok('T67-a5 ★覆盖 pass 必须早于 dayTotalOf 使用点（日合计后置 = 当天 total.cost 仍是旧值）',
+    (() => {
+      const w = s67.indexOf('st.cost = Math.round(c * 1e6) / 1e6');
+      const d = s67.indexOf('total: dayTotalOf(models)');
+      return w >= 0 && d >= 0 && w < d;
+    })());
+
+  if (!SPAWN_OK) {
+    envSkip('T67-e1 全覆盖→当时规则（spawn）', SPAWN_SKIP_REASON);
+    envSkip('T67-e2 半套明细→行级现值（spawn）', SPAWN_SKIP_REASON);
+    envSkip('T67-e3 无明细→行级现值（spawn）', SPAWN_SKIP_REASON);
+  } else {
+    // 夹具：当前规则 18-22 高峰；历史日 2026-10-15（周四）20:00 当时空闲、按当前规则高峰。
+    //   行级现值 = ¥2.00（高峰 ×2）；at-time 明细（全空闲桶）= ¥1.00。全部落 tmp 隔离目录。
+    const D67 = '2026-10-15';
+    const M67 = 'h5-fixture-model';
+    const TS67 = 1792065600000; // 2026-10-15 20:00 +0800（周四）
+    const PRICING67 = {
+      models: {
+        [M67]: { input_price: 1.0, output_price: 2.0, cached_price: 0.5, currency: 'CNY',
+                 unit: 'per_1m_tokens', region: 'CN', peak_multiplier: 2,
+                 source_url: 'fixture', fetched_at: '2026-10-14T00:00:00Z' },
+      },
+      deepseek_rules: { peak_schedule: '18:00 - 22:00', weekend_off_peak: true,
+                        effective_at: null, updated_at: '2026-10-14' },
+      usd_cny_rate: 7.2,
+    };
+    const mkTrans = () => JSON.stringify({
+      timestamp: TS67, type: 'message',
+      providerData: { model: M67, messageId: 'm-1',
+        usage: { inputTokens: 1000000, outputTokens: 0, inputTokensDetails: [{ cached_tokens: 0 }] } },
+    }) + '\n';
+    const mkDaily = () => JSON.stringify({
+      [D67]: {
+        models: { [M67]: { in: 1000000, out: 0, cached: 0, total: 1000000, cost: 2.0, hit: 0 } },
+        total: { in: 1000000, out: 0, cached: 0, total: 1000000, cost: 2.0, hit: 0 },
+      },
+    });
+    const mkRounds = (oIn) => (oIn == null ? null : JSON.stringify({
+      date: D67, ts: TS67, toastText: M67,
+      peakSplit: { [M67]: { pIn: 0, pCached: 0, pOut: 0, oIn, oCached: 0, oOut: 0 } },
+    }) + '\n');
+    const wj = (p, o) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, o); };
+    const costOf = (out) => {
+      for (const line of String(out || '').split('\n')) {
+        if (line.startsWith(D67 + ' ')) return parseFloat(line.split('¥')[1].split(' ')[0].split('（')[0]);
+      }
+      return null;
+    };
+    const runBf = (oIn) => {
+      wj(path.join(skillDir, 'pricing.json'), JSON.stringify(PRICING67));
+      wj(path.join(skillDir, 'holidays.json'), '{}');
+      wj(path.join(skillDir, 'daily-usage.json'), mkDaily());
+      wj(path.join(tmp, 'projects', 'proj1', 'sess-a.jsonl'), mkTrans());
+      // rounds 明细一律覆写同一路径：oIn=null 时写空文件（peakSplitOf 读不到记录 → null），
+      //   既模拟"旧日期无明细"，也不用删目录（删失败会残留上一态文件 → 假绿）。
+      wj(path.join(skillDir, 'rounds', 'rounds-2026-10.jsonl'), oIn == null ? '' : mkRounds(oIn));
+      const r = spawnSync(NODE, [path.join(skillDir, 'backfill.js')],
+        Object.assign({}, env, { WB_LEDGER_MAINT: '1' }), // 夹具账本（tmp 隔离），非生产
+        { timeout: 120000, windowsHide: true, encoding: 'utf8' });
+      return { v: costOf(r.stdout), rc: r.status, out: String(r.stdout || '') + String(r.stderr || '') };
+    };
+    try {
+      const c1 = runBf(1000000); // 全覆盖：按当时规则（空闲）计价
+      ok('T67-e1 ★at-time 明细全覆盖 → backfill 按当时规则 = ¥1.00（旧实现给 ¥2.00，即 H5 分叉）',
+        c1.v === 1.0, `got ${c1.v} rc=${c1.rc}`);
+      if (c1.v !== 1.0) console.log(c1.out.slice(-1500));
+      const c2 = runBf(500000); // 半套明细：非全覆盖 → 行级现值
+      ok('T67-e2 半套明细 → 保持行级现值 ¥2.00（不得被半套切分带偏）',
+        c2.v === 2.0, `got ${c2.v} rc=${c2.rc}`);
+      if (c2.v !== 2.0) console.log(c2.out.slice(-1500));
+      const c3 = runBf(null); // 无明细：行级现值（旧日期行为不回归）
+      ok('T67-e3 无 rounds 明细 → 保持行级现值 ¥2.00',
+        c3.v === 2.0, `got ${c3.v} rc=${c3.rc}`);
+      if (c3.v !== 2.0) console.log(c3.out.slice(-1500));
+    } catch (e) {
+      ok('T67 行为夹具异常', false, (e && e.message) || String(e));
+    }
+  }
+}
+
+// ===== T68：v3.57.0 R1 收口——recalc 的 at-time 切分必须全覆盖（与 backfill 同构）=====
+// 病根（逻辑审查发现，H5 修复的半边）：backfill.js v3.57.0 已对 peakSplit 加「三对桶全覆盖」
+//   校验，但 recalc-day.js 的同一条切分路径仍只要求「六桶和 > 0」——hook-fallback 轮不落明细
+//   （A22）/ 明细被 prune / 跨版本残留时，recalc 会把账本金额改成只覆盖明细轮次的值（漏价），
+//   且与修好的 backfill 结果分叉。修法：两侧判据同构（三对桶 === 条目三值），非全覆盖 →
+//   回落 v3.24.0 既定降级（原账>0 保留 / =0 按空闲补记 / 轮次占比折算）。
+// ⚠️ 反向验证口径：删掉 recalc 的全覆盖条件 → a1 红、行为 e1 红；e2/e3 不误伤。
+{
+  const rc68 = stripComments(fs.readFileSync(path.join(SRC, 'recalc-day.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  const bf68 = stripComments(fs.readFileSync(path.join(SRC, 'backfill.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  ok('T68-a1 ★recalc 的 split 分支必须含三对桶全覆盖校验（缺一项 = 明细缺轮次时漏价改账）',
+    /split\.pIn \+ split\.oIn === stIn/.test(rc68)
+    && /split\.pOut \+ split\.oOut === stOut/.test(rc68)
+    && /split\.pCached \+ split\.oCached === stCached/.test(rc68));
+  ok('T68-a2 ★backfill 与 recalc 的全覆盖判据必须同构（两侧漂移 = 同一批数据两个金额）',
+    /split\.pIn \+ split\.oIn !== st\.in/.test(bf68)
+    && /split\.pOut \+ split\.oOut !== st\.out/.test(bf68)
+    && /split\.pCached \+ split\.oCached !== st\.cached/.test(bf68)
+    && /split\.pIn \+ split\.oIn === stIn/.test(rc68));
+  ok('T68-a3 ★非全覆盖必须保留 v3.24.0 降级路径（原账>0 保留 / =0 按空闲补记），不许静默采用',
+    /if \(Number\(stat\.cost \|\| 0\) > 0\) \{ dayTotal \+= stat\.cost; continue; \}/.test(rc68));
+
+  if (!SPAWN_OK) {
+    envSkip('T68-e1 半套明细→保留原额（spawn）', SPAWN_SKIP_REASON);
+    envSkip('T68-e2 全覆盖→采用（spawn）', SPAWN_SKIP_REASON);
+    envSkip('T68-e3 无明细→保留原额（spawn）', SPAWN_SKIP_REASON);
+  } else {
+    // 行为夹具与 b7-h5/r1.py 同参：账本 in=1e6 cost=2.0；明细半套 oIn=500000。
+    //   修前 recalc 采用半套 split → 0.50（漏价）；修后非全覆盖 → 原账>0 保留 2.00。
+    const D68 = '2026-10-15';
+    const M68 = 'r1-fixture-model';
+    const TS68 = 1792065600000;
+    const wb68 = path.join(tmp, 'r1-wb');
+    const sk68 = path.join(wb68, 'skills', 'token-usage-tracker');
+    const wj = (p, o) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, o); };
+    const mkAll = (oIn) => {
+      wj(path.join(sk68, 'pricing.json'), JSON.stringify({
+        models: { [M68]: { input_price: 1.0, output_price: 2.0, cached_price: 0.5, currency: 'CNY',
+                           unit: 'per_1m_tokens', region: 'CN', peak_multiplier: 2,
+                           source_url: 'fixture', fetched_at: '2026-10-14T00:00:00Z' } },
+        deepseek_rules: { peak_schedule: '18:00 - 22:00', weekend_off_peak: true,
+                          effective_at: null, updated_at: '2026-10-14' },
+        usd_cny_rate: 7.2,
+      }));
+      wj(path.join(sk68, 'holidays.json'), '{}');
+      wj(path.join(sk68, 'daily-usage.json'), JSON.stringify({
+        [D68]: {
+          models: { [M68]: { in: 1000000, out: 0, cached: 0, total: 1000000, cost: 2.0, hit: 0 } },
+          total: { in: 1000000, out: 0, cached: 0, total: 1000000, cost: 2.0, hit: 0 },
+        },
+      }));
+      wj(path.join(sk68, 'rounds', 'rounds-2026-10.jsonl'), oIn == null ? '' : JSON.stringify({
+        date: D68, ts: TS68, toastText: M68,
+        peakSplit: { [M68]: { pIn: 0, pCached: 0, pOut: 0, oIn, oCached: 0, oOut: 0 } },
+      }) + '\n');
+    };
+    const runRecalc = () => {
+      // 脚本本体跑 selftest tmp 副本（skillDir），数据根指向 fixture（wb68）——与 T67 同模式
+      const r = spawnSync(NODE, [path.join(skillDir, 'recalc-day.js'), D68, M68],
+        Object.assign({}, env, { WB_ROOT: wb68, WB_LEDGER_MAINT: '1' }),
+        { timeout: 120000, windowsHide: true, encoding: 'utf8' });
+      let cost = null;
+      try {
+        const d = JSON.parse(fs.readFileSync(path.join(sk68, 'daily-usage.json'), 'utf8'));
+        cost = d[D68].models[M68].cost;
+      } catch (e) { /* 读不到按 null */ }
+      return { rc: r.status, cost, out: String(r.stdout || '') + String(r.stderr || '') };
+    };
+    try {
+      mkAll(500000); // 半套明细：非全覆盖
+      const c1 = runRecalc();
+      ok('T68-e1 ★明细半套（oIn=500000 < 条目 1e6）→ 保留原额 ¥2.00（修前给 0.50 = 漏价）',
+        c1.cost === 2.0, `got ${c1.cost} rc=${c1.rc}`);
+      if (c1.cost !== 2.0) console.log(c1.out.slice(-1200));
+      mkAll(1000000); // 全覆盖：采用
+      const c2 = runRecalc();
+      ok('T68-e2 明细全覆盖 → 采用 at-time = ¥1.00（口径不回归）',
+        c2.cost === 1.0, `got ${c2.cost} rc=${c2.rc}`);
+      if (c2.cost !== 1.0) console.log(c2.out.slice(-1200));
+      mkAll(null); // 无明细
+      const c3 = runRecalc();
+      ok('T68-e3 无明细 → 保留原额 ¥2.00（v3.24.0 降级语义不回归）',
+        c3.cost === 2.0, `got ${c3.cost} rc=${c3.rc}`);
+      if (c3.cost !== 2.0) console.log(c3.out.slice(-1200));
+    } catch (e) {
+      ok('T68 行为夹具异常', false, (e && e.message) || String(e));
+    }
+  }
+}
+
+// ===== T69：v3.57.0 K1 收口——无峰谷模型结构性退出峰谷时段判定（用户定夺「只修 K1」）=====
+// 病根（用户定性为重大口径问题）：峰谷时段表（pricing.deepseek_rules，DeepSeek 官方动态时段）
+//   被全局共享——aggregateTranscLines / perModelFromRows 对**所有模型**逐行 isPeakHour 分桶，
+//   calcCost 对所有模型判 isPeakHour，recalc 对所有模型算 peakRatio，backfill rowCost 对所有
+//   模型判 isPeakBeijingTs。无峰谷模型只靠「peakMult===1 时倍率恒 1」碰巧打平，结构上零隔离——
+//   「别的模型没有峰谷，肯定不能共享这个时段表；共享高峰时段的话，价格又会有变化的」。
+// 修法（四处同收）：只有 peakMultOf>1（有峰谷）的模型才判时段——
+//   ① calcCost：peakMult > 1 && isPeakHour(...) ? peakMult : 1；
+//   ② 两个分桶落点：peakRulesAgg && peakAppliesToAgg(name) 才分桶（无峰谷模型不落 peakSplit 明细）；
+//   ③ recalc：pm>1 才算 peakRatio；④ backfill rowCost：pm>1 && isPeakBeijingTs ? pm : 1；
+//   ⑤ periodPeakNote 收敛到 peakMultOf（与计价同一判据）。
+// 金额影响：无峰谷模型倍率恒 1 → 改前改后金额逐字节一致；变的是「不再落 peakSplit 明细」。
+// ⚠️ 反向验证口径：任一处删守卫 → 对应 a 条红 + 行为 e1 红（无峰谷模型又落明细）；e2 不误伤。
+{
+  const tt69 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  const rc69 = stripComments(fs.readFileSync(path.join(SRC, 'recalc-day.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  const bf69 = stripComments(fs.readFileSync(path.join(SRC, 'backfill.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  ok('T69-a1 ★calcCost 的 isPeakHour 必须被 peakMult>1 守卫（无峰谷模型不判时段）',
+    /const mult = peakMult > 1 && isPeakHour\(pricing\.deepseek_rules/.test(tt69));
+  ok('T69-a2 ★peakAppliesToAgg 必须存在且判据是 peakMultOf>1（分桶闸门的单点实现）',
+    /function peakAppliesToAgg\(modelName\)/.test(tt69)
+    && /peakMultOf\(hit\.m, modelName\) > 1/.test(tt69));
+  ok('T69-a3 ★弹窗侧分桶必须过 peakAppliesToAgg(mkName)（无峰谷模型不落明细）',
+    tt69.indexOf('peakRulesAgg && peakAppliesToAgg(mkName)') >= 0);
+  ok('T69-a4 ★账本侧分桶必须过 peakAppliesToAgg(name)（漏一侧 = 弹窗与账本口径分叉）',
+    tt69.indexOf('peakRulesAgg && peakAppliesToAgg(name)') >= 0);
+  ok('T69-a5 ★recalc 的 peakRatio 必须有 pm>1 前置（无峰谷模型不算高峰占比）',
+    /const pm = tt\.peakMultOf\(m, model\);/.test(rc69) && /if \(pm > 1\) \{/.test(rc69));
+  ok('T69-a6 ★backfill rowCost 必须被 pm>1 守卫（无峰谷模型不判峰谷）',
+    /const mult = pm > 1 && isPeakBeijingTs\(tsMs\) \? pm : 1;/.test(bf69));
+
+  if (!SPAWN_OK) {
+    envSkip('T69-e1 无峰谷模型不落明细（spawn）', SPAWN_SKIP_REASON);
+    envSkip('T69-e2 有峰谷模型照常分桶计价（spawn）', SPAWN_SKIP_REASON);
+  } else {
+    // 端到端夹具（**--stop 模式**：只有 Stop 端 transcript 路径才跑 incrementalRecord 记账主链，
+    //   --hook 在无 trace 时会走「暂无 trace 数据」早退 → 不记账、断言恒失败 = 假红）。
+    //   WB_ROOT 与脚本目录用**生产布局**（脚本在 wb/skills/token-usage-tracker/）——因为
+    //   ROUNDS_DIR = __dirname/rounds、recalc 的 SKILL_DIR = WB_ROOT/skills/...，两者必须同一处才读得到明细。
+    //   当前规则 9-12/14-18 高峰；transcript = 1 条 user（轮起点）+ 两行同刻 usage
+    //   （2026-10-13 周二 10:00 +0800 = 高峰）：A 无峰谷（不翻倍、不落 peakSplit 明细）/
+    //   B 有峰谷 ×2（照常落明细）。改前 A 也落明细（靠倍率 1 打平）。
+    const D69 = '2026-10-13';
+    const TS69 = 1791856800000; // 2026-10-13 10:00 +0800（周二）= 高峰段内
+    const TS69_USER = TS69 - 60000; // 09:59，轮起点须早于 usage 行
+    const MA = 'k1-nopeak-fixture', MB = 'k1-peak-fixture';
+    const SID69 = 'selftest-k1';
+    const wb69 = path.join(tmp, 'k1-wb');
+    const sk69 = path.join(wb69, 'skills', 'token-usage-tracker');
+    const wj = (p, o) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, o); };
+    const mkAll = () => {
+      wj(path.join(sk69, 'pricing.json'), JSON.stringify({
+        date: D69,
+        models: {
+          [MA]: { input_price: 1.0, output_price: 2.0, cached_price: 0.5, currency: 'CNY',
+                  unit: 'per_1m_tokens', region: 'CN', source_url: 'fixture', fetched_at: '2026-10-13T00:00:00Z' },
+          [MB]: { input_price: 1.0, output_price: 2.0, cached_price: 0.5, currency: 'CNY',
+                  unit: 'per_1m_tokens', region: 'CN', peak_multiplier: 2,
+                  source_url: 'fixture', fetched_at: '2026-10-13T00:00:00Z' },
+        },
+        deepseek_rules: { peak_schedule: '9:00 - 12:00、14:00 - 18:00', weekend_off_peak: true,
+                          effective_at: null, updated_at: '2026-10-13' },
+        usd_cny_rate: 7.2,
+      }));
+      wj(path.join(sk69, 'holidays.json'), '{}');
+      // 生产布局：把技能脚本拷进 wb69/skills/token-usage-tracker（__dirname == SKILL_DIR）
+      for (const f of fs.readdirSync(skillDir).filter((x) => x.endsWith('.js'))) {
+        fs.copyFileSync(path.join(skillDir, f), path.join(sk69, f));
+      }
+      wj(path.join(sk69, '.update-check.json'),
+        JSON.stringify({ lastCheckAt: Date.now(), latestVersion: '0.0.0', failCount: 0, nextRetryAt: 0 }));
+      const user = JSON.stringify({
+        timestamp: TS69_USER, type: 'message', role: 'user',
+        content: [{ type: 'text', text: 'hi' }],
+      }) + '\n';
+      const line = (id, model) => JSON.stringify({
+        timestamp: TS69, type: 'message', role: 'assistant',
+        providerData: { model, messageId: id,
+          usage: { inputTokens: 1000000, outputTokens: 0, inputTokensDetails: [{ cached_tokens: 0 }] } },
+      }) + '\n';
+      wj(path.join(wb69, 'projects', 'proj1', SID69 + '.jsonl'), user + line('m-a', MA) + line('m-b', MB));
+    };
+    const runStop = () => {
+      mkAll();
+      const payload = JSON.stringify({ session_id: SID69,
+        transcript_path: path.join(wb69, 'projects', 'proj1', SID69 + '.jsonl'), cwd: wb69 });
+      const r = spawnSync(NODE, [path.join(sk69, 'token-tracker.js'), '--stop'],
+        Object.assign({}, env, { WB_ROOT: wb69, WB_LEDGER_MAINT: '1', WB_NO_NET: '1' }),
+        { input: payload, timeout: 120000, windowsHide: true, encoding: 'utf8' });
+      let daily = null;
+      const splitModels = [];
+      try {
+        daily = JSON.parse(fs.readFileSync(path.join(sk69, 'daily-usage.json'), 'utf8'));
+      } catch (e) { /* 读不到按 null */ }
+      // 明细写在 ROUNDS_DIR = __dirname/rounds（= sk69/rounds，生产布局下与 SKILL_DIR 同处）
+      try {
+        const raw = fs.readFileSync(path.join(sk69, 'rounds', 'rounds-2026-10.jsonl'), 'utf8');
+        for (const l of raw.split('\n')) {
+          if (!l.trim()) continue;
+          try { const rec = JSON.parse(l); for (const k of Object.keys(rec.peakSplit || {})) splitModels.push(k); } catch (e2) { /* 跳过坏行 */ }
+        }
+      } catch (e3) { /* 无明细文件 */ }
+      return { rc: r.status, daily, splitModels, out: String(r.stdout || '') + String(r.stderr || '') };
+    };
+    try {
+      const c = runStop();
+      const costA = c.daily && c.daily[D69] && c.daily[D69].models[MA] ? c.daily[D69].models[MA].cost : null;
+      const costB = c.daily && c.daily[D69] && c.daily[D69].models[MB] ? c.daily[D69].models[MB].cost : null;
+      ok('T69-e1 ★无峰谷模型：金额=原价 ¥1.00（高峰不翻倍）且不落 peakSplit 明细',
+        costA === 1.0 && c.splitModels.indexOf(MA) < 0,
+        `cost=${costA} splitModels=${JSON.stringify(c.splitModels)} rc=${c.rc}`);
+      if (!(costA === 1.0 && c.splitModels.indexOf(MA) < 0)) console.log(c.out.slice(-1500));
+      ok('T69-e2 ★有峰谷模型：高峰×2 = ¥2.00 且落 peakSplit 明细（口径不回归）',
+        costB === 2.0 && c.splitModels.indexOf(MB) >= 0,
+        `cost=${costB} splitModels=${JSON.stringify(c.splitModels)} rc=${c.rc}`);
+      if (!(costB === 2.0 && c.splitModels.indexOf(MB) >= 0)) console.log(c.out.slice(-1500));
+    } catch (e) {
+      ok('T69 行为夹具异常', false, (e && e.message) || String(e));
+    }
   }
 }
 

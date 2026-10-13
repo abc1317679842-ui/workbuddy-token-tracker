@@ -3,6 +3,59 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.57.0（2026-10-13）—— 历史日按当时规则计价：backfill/recalc at-time 峰谷切分全覆盖（H5+R1，审计批7）
+
+> 触发：六批累积审计（2026-10-13）H5（P1）+ 用户定夺「历史日肯定按当时的规则来」；
+> 逻辑层复审追加 R1（P1，recalc 侧同根缺口——backfill 收了口，recalc 还在漏）。
+> 定位：**只修 backfill.js 的回填口径**。主链路（token-tracker.js 实时记账）本就是按当时规则
+> 逐行记的——分叉只发生在「拿今天的规则重算昨天」的回填/重算工具之间。
+
+### 修复
+
+- **H5 backfill 历史日按当时规则计价**（`backfill.js`）
+  - 病根：`rowCost` 逐行用 `isPeakBeijingTs(ts)` 判峰谷——读的是**当前** `pricing.deepseek_rules`。厂商调整峰谷时段后，拿当前规则重算全部历史行，同一历史日的金额与 `recalc-day.js`（读 rounds 明细里主链路**当时**落下的 `peakSplit` 六桶）系统性分叉（六批审计实证：某历史日 ¥0.0024 vs ¥0.0048，**差 2 倍**；token 量不受影响，纯金额口径）。
+  - 修法：组装新账本循环内、`dayTotalOf` **之前**，对每个 (日期, 模型) 调 `recalcDay.peakSplitOf(date, name)` 读回主链路当时落下的六桶切分（pIn/pCached/pOut/oIn/oCached/oOut）；**三对桶加总与行级累加完全相等（全覆盖）才采用**，按 `tt.costFromPeakSplit + tt.peakMultOf` 计价；对不上即保持行级现值。
+  - 为什么必须「全覆盖」：明细只覆盖部分轮次时按当时规则定价 = 同一天两套规则混算，比纯当前规则更糟。旧日期无明细 / 中断补偿估算段无明细 / 明细被 prune → 自动回退行级现值，行为与 v3.56.0 及以前一致。
+  - 切分实现只此一处：backfill 直接 require `recalc-day.js` 的 `peakSplitOf`（同一函数、同一数据文件 `rounds/rounds-YYYY-MM.jsonl`），全项目不再有第二套「当时规则」近似。
+- **R1 recalc 的 split 分支同样必须全覆盖**（`recalc-day.js`，逻辑层复审发现）
+  - 病根：`recalc-day.js` 的 split 分支（v3.40.0 引入）只要求「六桶和 > 0」就采用 at-time 切分——**没有全覆盖校验**。hook-fallback 轮不落明细（A22，已知不修）、明细被 prune、跨版本残留都会让桶和 < 账本条目值，此时按 split 计价 = **只给明细轮次定价、漏掉其余轮次全部用量**（把账本金额改小），且与修好的 backfill 再次分叉。
+  - 修法：三对桶加总与条目三值（`stat.in/out/cached`）**完全相等才采用**；对不上落到既有的轮次占比折算 / 「未知按空闲」降级路径（v3.24.0 既定语义：原账 >0 保留、=0 按空闲补记）。判据与 backfill 侧逐字同构（T68-a2 守卫防漂移）。
+
+### 验证
+
+- selftest 新增守卫组 **T67（8 条）**：源码 5 条（require 关系 / peakSplitOf 使用点 / 全覆盖三项校验 / 单点 `costFromPeakSplit`+`peakMultOf` / 覆盖必须先于 `dayTotalOf`）+ 行为 3 条（spawn 真跑 dry-run，WB_ROOT 全隔离 tmp：全覆盖→当时规则、半套明细→行级现值、无明细→行级现值）。
+- 行为夹具 6/6（四态：全覆盖采用且与 recalc 回算一致 / 部分覆盖回退 / 无明细回退 / 无公开价模型不记钱）。
+- 反向验证 18/18：回退 backfill.js 后 fixture 态①精确变红（¥2.00，H5 分叉重现）+ T67-a1~a5 恰好五条红、零误伤（态②③④与 recalc 断言不误伤）；恢复后 fixture 6/6 + selftest 693/0/45。
+- 生产零影响实证：修复版 vs 回退版 dry-run 逐日对比——**token 量零差、金额零差**（¥1604.64 = ¥1604.64）。生产当前峰谷时段与 at-time 明细期间一致，故修复对现价零改动；规则一旦变更，夹具态①证明新口径立即生效。`--report` 四组 exit 0（本批未触主链路）。
+- R1 验证：selftest 新增守卫组 **T68（6 条）**——源码 3 条（recalc split 分支三对桶校验 / 与 backfill 判据同构 / 非全覆盖保留 v3.24.0 降级）+ 行为 3 条（spawn 真跑，沙箱内 node 子进程受限按环境跳过、CI 真跑）；行为夹具 r1.py 3/3（半套→保留原额 / 全覆盖→采用 / 无明细→保留）；反向验证：回退 recalc-day.js 后 R1-a 精确变红（¥2.00→¥0.50，漏价重现）+ T68-a1/a2 恰好两条红、T68-a3 与其余 694 条零误伤；恢复后 3/3 + selftest 696/0/48。
+- **R1 生产影响面实证**（隔离 fixture 跑旧版 vs 新版，生产只读拷贝）：测试期 10-08~10-13 共 21 个 (日期, 模型) 对——**全覆盖 8 对、部分覆盖 9 对、无明细 4 对**。9 对部分覆盖**全部命中 R1 场景**（10-09 起明细确有缺口）：旧版把 9 对金额**全部改小**（漏价，最狠 10-11 hy3 ¥1.659→¥0.311，**少算 81%**）；新版全覆盖计价、token 三值与生产逐项相等（硬账不动）；8 对全覆盖与 4 对无明细两版行为一致（at-time 口径无分叉、降级路径无回归）。
+
+### 修复（K1，用户定夺「只修 K1」）
+
+- **K1 峰谷时段表不再全局共享：无峰谷模型结构性退出峰谷时段判定**（`token-tracker.js` + `recalc-day.js` + `backfill.js`，逻辑层审计发现、用户定性为重大口径问题）
+  - 病根：峰谷时段表 `pricing.deepseek_rules`（DeepSeek 官方动态时段）被**所有模型共享**——`aggregateTranscLines`（弹窗侧）/ `perModelFromRows`（账本侧）对**每一个模型**逐行调 `isPeakHour(deepseek_rules)` 分桶，`calcCost` 也一律读时段表算倍率。无峰谷模型（`peak_multiplier` 缺省=1）只靠「倍率算出来恰好是 1」在金额上打平，**结构上零隔离**——一旦某无峰谷模型被误配 `peak_multiplier`、或倍率算错，立刻按 DeepSeek 时段多算，且明细里还会落下不该有的 peakSplit 桶。用户定性：「别的模型没有峰谷，肯定不能共享这个时段表，只有有高峰的特定模型才能用」。
+  - 修法（结构性退出，不是靠倍率碰巧打平）：
+    - 新增 `peakAppliesToAgg(modelName)` 单点闸门——`findModel` 命中且 `peakMultOf(m, name) > 1`（显式 `peak_multiplier>1` 或 deepseek 系缺省 2）才返回 true；`peakRulesForAgg` 缓存同步带上 `models`（同一份 pricing.json 读取，零额外 I/O）。
+    - `aggregateTranscLines` / `perModelFromRows` 的分桶条件由 `if (peakRulesAgg)` 改为 `if (peakRulesAgg && peakAppliesToAgg(...))` → **无峰谷模型不判时段、不落 peakSplit 明细**。
+    - `calcCost` 的倍率表达式由 `const mult = isPeakHour(...) ? peakMult : 1` 改为 `peakMult > 1 && isPeakHour(...) ? peakMult : 1` → **无峰谷模型彻底不读时段表**（`isPeakHour` 连短路求值都不进）。
+    - `recalc-day.js` 的 `peakRatio` 加 `pm > 1` 前置（无峰谷 → 0）；`backfill.js` 的 `rowCost` 倍率加 `pm > 1` 守卫。
+    - `periodPeakNote` 的倍率由内联 `typeof m.peak_multiplier === 'number' ? … : 1` 收敛到 `peakMultOf(m, model)`（deepseek 系缺省 2 的时段标注不再漏显）。
+  - **金额零影响**：无峰谷模型倍率恒 1，改前改后金额逐字节一致；变的只是**不再落不该有的 peakSplit 明细**（旧明细天然兼容：recalc 读旧桶 ×倍数 1 不变）。
+
+### 验证（K1）
+
+- selftest 新增守卫组 **T69（源码 6 条 a1~a6 + 行为 2 条 e1/e2）**：a1 `calcCost` 的 `isPeakHour` 必须被 `peakMult>1` 守卫 / a2 `peakAppliesToAgg` 定义且判据 `peakMultOf>1` / a3 弹窗侧分桶过闸 / a4 账本侧分桶过闸（漏一侧 = 弹窗与账本口径分叉）/ a5 recalc `peakRatio` 有 `pm>1` 前置 / a6 backfill `rowCost` 被 `pm>1` 守卫；e1/e2 端到端 `--stop` 行为（沙箱内 node 子进程受限按环境跳过、CI 真跑）。
+- 行为夹具 `k1-fixture.py` **11/11**（生产布局、`--stop` 模式）：N1 无峰谷模型 ¥1.00 不翻倍 / **N2 不落 peakSplit 明细** / N3 有峰谷模型 ¥2.00 / N4 落明细 / O1~O3 旧版对照 / C1~C3 旧明细喂新版 recalc 兼容。**O2 是病根实证**：旧版 `splitModels=['k1-nopeak-fixture','k1-peak-fixture']`（无峰谷模型也被拉进时段分桶），新版 `splitModels=['k1-peak-fixture']`。
+- 反向验证：'k1-fixture.py' 加 `K1_FORCE_OLD=1` 让"新版"也加载改前文件 → **恰好 N2 一条变红**（`splitModels` 又含 `k1-nopeak-fixture`），其余 10 条全绿 = 零误伤；N1 仍绿证明金额不受影响（正是 K1 的结构性所在）。
+- 生产零影响实证：修复版 vs HEAD 版 `--report`（今日 + `--all` 全历史）**逐字节零差异**。
+- **顺手修既有脆弱测试**：T44-c2（分桶倍率用例）原先不传 tsMs → `calcCost` 回退 `new Date()`（运行时刻），断言结果依赖"跑测试时是不是高峰段"（实测 08:29 绿、09:01 红，同一份代码）。现 T44-c1~c6 统一显式传固定空闲时刻 `OFFPEAK_TS`（2026-10-13 周二 12:30 +0800）。
+
+### 文档 / 口径
+
+- `KNOWN-ISSUES.md`：KI-25（峰谷时段表全局共享）从「P3 当前零影响，待定夺」更新为「**已修（v3.57.0）**」，含病根与结构性修法。
+- H5 从「P1 待用户定夺」更新为「已修（v3.57.0）」，修法与验收口径入库。
+- backfill.js 头部「语义与口径」同步 at-time 覆盖说明。
+
 ## v3.56.0（2026-10-13）—— Portkey 补源（USD 3→5）+ 查找缓存 + toast 单次读入 + 源独立性口径（审计批6）
 
 > 触发：待做计划台账（`.workbuddy/memory/PLAN-price-pipeline-2026-10.md`）批 6（A1 + G4/G6）。

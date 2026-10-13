@@ -782,3 +782,81 @@ new / rejected / carried / retired / rollback）+ `changes.jsonl` 审计流水�
   而是去核对该厂商页面的单位/币种解析，确认后再让它生效。
 - 新条目被闸门拒收（`kind='rejected'`）时该模型按未收录计价 —— 若确认是真型号且价格合理，
   问题多半在抓取侧缺契约字段（currency/unit/region/source_url/fetched_at），补抓取侧而不是放宽闸门。
+
+## KI-24 backfill 用当前峰谷规则重算全部历史行 → 与 recalc 回算系统性分叉（2026-10-13）—— **v3.57.0 已修（H5）**
+
+> 来源：六批累积审计（v3.51.0~v3.56.0）H5（P1）+ 用户定夺「历史日肯定按当时的规则来」。
+
+### 一、现象与定位
+
+- **分叉只在回填/重算工具之间**：主链路（`token-tracker.js` 实时记账）逐行按**当时**峰谷规则落账，
+  从来是对的；错的是「拿今天的规则重算昨天」的两个工具互相不一致：
+  - `backfill.js` 的 `rowCost` 逐行调 `isPeakBeijingTs(ts)` —— 读**当前** `pricing.deepseek_rules`；
+  - `recalc-day.js` 走 `peakSplitOf` —— 读 rounds 明细里主链路**当时**落下的 `peakSplit` 六桶。
+- 厂商一调峰谷时段（`deepseek_rules.peak_schedule` / `weekend_off_peak`），同一历史日两工具金额即分叉
+  （审计实证：**差 2 倍**，¥0.0024 vs ¥0.0048；token 量不受影响，纯金额口径）。
+- 触发条件收得很窄：**只有时段规则变更才分叉**（峰谷倍率变更两工具都用当前值，无分叉）。
+
+### 二、修法（v3.57.0，`backfill.js`）
+
+- 组装新账本循环内、`dayTotalOf` **之前**，对每个 (日期, 模型) 调 `recalcDay.peakSplitOf(date, name)`
+  读回当时切分；**三对桶加总与行级累加完全相等（全覆盖）才采用**，按
+  `tt.costFromPeakSplit + tt.peakMultOf` 计价；对不上即保持行级现值。
+- **全覆盖是硬闸**：明细只覆盖部分轮次时按当时规则定价 = 同一天两套规则混算，比纯当前规则更糟。
+  旧日期无明细 / 中断补偿估算段无明细 / 明细被 prune → 自动回退行级现值，行为与 v3.56.0 及以前一致。
+- 「当时规则」切分全项目只此一处实现：backfill 直接 require `recalc-day.js` 的 `peakSplitOf`
+  （同一函数、同一数据文件 `rounds/rounds-YYYY-MM.jsonl`）。
+
+### 二·补、recalc 侧同根收口（v3.57.0，R1）
+
+- 逻辑层复审发现：`recalc-day.js` 的 split 分支（v3.40.0 引入）只要求「六桶和 > 0」即采用——
+  **没有全覆盖校验**。明细只覆盖部分轮次时（hook-fallback 轮不落明细 A22 / prune / 跨版本残留），
+  按 split 计价 = 只给明细轮次定价、**漏掉其余轮次全部用量**（金额被改小），且与修好的 backfill 分叉。
+- 修法：三对桶加总与条目 `stat.in/out/cached` 完全相等才采用；对不上落轮次占比折算 /
+  「未知按空闲」降级（v3.24.0 既定语义）。判据与 backfill 侧逐字同构（T68-a2 防漂移）。
+- 生产实证（隔离 fixture 旧版 vs 新版，2026-10-08~10-13 共 21 对）：**部分覆盖 9 对全部命中**，
+  旧版 9 对金额全部改小（最狠 10-11 hy3 少算 81%）；新版 token 三值与生产逐项相等。
+  → 复发条件：任何时候明细不全覆盖（hook-fallback 轮 / prune / 跨版本）都曾触发，现已收口。
+
+### 三、数据实况（影响面）
+
+- 生产 `rounds-2026-10.jsonl` 632 条，仅 169 条带 `peakSplit`；**10-01~10-08 零 split**（旧代码写的），
+  **10-09 起几乎每条都有**（39/39、39/39、30/32、43/43、18/18）→ at-time 数据只覆盖 10-09+。
+- 按 (日期, 模型) 对聚合（10-08~10-13 共 21 对）：**全覆盖 8 / 部分覆盖 9 / 无明细 4**——
+  「30/32」那两轮缺口确实造成了 9 个部分覆盖对（R1 场景在生产真实存在，非理论推演）。
+- 10-09 之前的日期任何工具都只能当前规则近似 —— 属历史数据，用户明确不管。
+- `changes.jsonl` 生产不存在（价库目录只有 index.json）→ 峰谷规则变更无机器记录，
+  只能靠明细与当前规则的逐日对比发现分叉。
+
+### 四、复发条件与排查入口
+
+- 若某天 backfill 与 recalc 金额又对不上：先看该 (日期, 模型) 的 rounds 明细有没有 `peakSplit`、
+  六桶是否与行级累加相等（全覆盖）——非全覆盖时刻意保持行级现值，这是设计不是 bug。
+- 想验证本修复：跑 `node backfill.js`（dry-run）与 `node recalc-day.js <日期>` 对比同一历史日金额；
+  正常应一致（都有 at-time 明细时）或都回退行级现值（都无明细时）。
+
+## KI-25 峰谷时段表全局共享：非 deepseek 模型会静默套用 DeepSeek 时段（✅ 已修 v3.57.0，2026-10-13）
+
+- 现象（改前）：`peak-rules.js` 的高峰时段判定对**所有**模型读同一份 `pricing.deepseek_rules.peak_schedule`（内置默认 9:00–12:00 / 14:00–18:00、周末低峰）——任何配了 `peak_multiplier>1` 的模型都用这份表。
+- 审计初判：生产 17 个模型中 `peak_multiplier>1` 的共 5 个（deepseek-v4-flash / deepseek-v4.1-flash / deepseek-v4-flash-vision-exp / deepseek-flash / deepseek-v4-pro），**全部是 deepseek 系** → 当时判定「当前零影响」。
+- **用户定性（2026-10-13）**：这不是「当前零影响」而是**重大口径问题**——「别的模型没有峰谷，肯定不能共享这个时段表，只有有高峰的特定模型才能用」。共享时段表给无峰谷模型，金额上只靠「倍率算出来恰好是 1」碰巧打平，**结构上零隔离**；且明细里会落下本不该有的 peakSplit 桶。
+- **修法（v3.57.0，结构性退出，不靠倍率碰巧打平）**：
+  - 新增 `peakAppliesToAgg(modelName)` 单点闸门——`findModel` 命中且 `peakMultOf(m, name) > 1` 才返回 true；`peakRulesForAgg` 缓存带 `models`（同一份 pricing.json 读取，零额外 I/O）。
+  - `aggregateTranscLines` / `perModelFromRows` 分桶条件加 `&& peakAppliesToAgg(...)` → 无峰谷模型不判时段、不落 peakSplit 明细。
+  - `calcCost` 倍率表达式加 `peakMult > 1 &&` 前置 → 无峰谷模型彻底不读时段表。
+  - `recalc-day.js` 的 `peakRatio` 加 `pm > 1` 前置；`backfill.js` 的 `rowCost` 倍率加 `pm > 1` 守卫；`periodPeakNote` 收敛到 `peakMultOf`。
+- 验收：金额零影响（无峰谷模型倍率恒 1，改前改后逐字节一致）；行为夹具 O2 实证病根（旧版无峰谷模型也落明细）、N2 实证修复（新版不落）；`--report` 今日 + 全历史零差异。
+
+## KI-26 `usd_cny_rate=7.2` 是粘性值、无 live 源（2026-10-13 逻辑层审计记录，P3 当前零影响，待定夺）
+
+- 现象：汇率不是抓来的——`refresh-prices.js:822` 只保留 pricing.json 里的现值（`Number(usd_cny_rate)>0 ? 现值 : DEFAULT_RATE`），兜底常量 `DEFAULT_RATE=7.2`（v3.32.0 收敛的单一真源）。整条链路没有任何 live 汇率源，也不会陈旧告警。
+- 现状实证：17 个模型中 region=US 的只有 space-bunny 且标价 $0 → 美元折算路径当前零影响。
+- 潜在风险：第一个真实美元价模型上线时，折算用一个可能已过时的 7.2，无感知无告警。
+- 处置建议（待用户定夺）：① 记录，等首个 US 价模型出现时一并处理（那时美元中位数也需 ≥3 源才有统计意义）；② 或加「汇率 >90 天未人工确认」stderr 提醒。
+
+## KI-27 `weekend_off_peak_fallback` 标记写了没有消费端（2026-10-13 逻辑层审计记录，P3 当前零影响，待定夺）
+
+- 现象：`deepseek-official.js` 解析官方定价页时，周末低峰信息拿不到会写 `deepseek_rules.weekend_off_peak_fallback=true` 并**自己**打 stderr 告警；但 `peak-rules.js` 的峰谷判定**不读**这个标记——「低置信度时改变判定行为」的设计意图未闭环。
+- 现状实证：生产该标记为 false → 零影响。
+- 潜在风险：官方页结构变更导致周末信息丢失时，峰谷判定仍按 `weekend_off_peak` 原值走，只有 deepseek-official.js 一条 stderr；没人看 stderr 则周末判定静默失真。
+- 处置建议（待用户定夺）：① 现状可接受（告警通道已存在；让 peak-rules 读它反而有把历史金额判定改保守的风险）；② 或让 toast / `--report` 在该标记为 true 时标注「周末时段低置信」。

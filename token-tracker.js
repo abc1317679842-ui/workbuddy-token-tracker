@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.56.0 (2026-10-13)
+// token-usage-tracker v3.57.0 (2026-10-13)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -1207,7 +1207,7 @@ function numTs(v) {
 //   deepseek_rules 并缓存。为什么要缓存：本函数每行都会被调用一次，若不缓存等于**每行读一次磁盘**。
 //   mtime 失效：价库被 refresh-prices.js / 用户手工改动后，下一次聚合就用上新规则（不需要重启进程）。
 //   失败一律返回 null（不抛）——调用方据此退化为「不分桶」，由 calcCost 走旧的整批单倍率路径。
-let _aggPeakRulesCache = null;   // { rules, mtimeMs, at }
+let _aggPeakRulesCache = null;   // { rules, models, mtimeMs, at }
 function peakRulesForAgg() {
   try {
     const st = fs.statSync(PRICING);
@@ -1215,12 +1215,29 @@ function peakRulesForAgg() {
     if (c && c.mtimeMs === st.mtimeMs) return c.rules;
     const pr = JSON.parse(fs.readFileSync(PRICING, 'utf-8').replace(/^\uFEFF/, ''));
     const rules = (pr && pr.deepseek_rules) || null;
-    _aggPeakRulesCache = { rules, mtimeMs: st.mtimeMs, at: Date.now() };
+    _aggPeakRulesCache = { rules, models: (pr && pr.models) || null, mtimeMs: st.mtimeMs, at: Date.now() };
     return rules;
   } catch (e) {
     // 价库缺失 / 损坏 / 无 deepseek_rules → 不分桶（调用方 `if (peakRulesAgg)` 已是守卫）
     return null;
   }
+}
+
+// v3.57.0（K1，用户定夺「只修 K1」）：该模型是否参与峰谷时段判定——**只有有峰谷的模型才判**
+//   （peakMultOf > 1：显式 peak_multiplier>1，或 deepseek 系缺省 2）。
+//   病根（用户定性为重大口径问题）：改前 aggregateTranscLines / perModelFromRows 对**所有模型**
+//   逐行调 isPeakHour 分桶——时段表（pricing.deepseek_rules，DeepSeek 官方动态时段）事实上被
+//   全局共享，无峰谷模型只靠 calcCost 里 peakMult===1 时倍率恒 1「碰巧」打平，结构上零隔离。
+//   「别的模型没有峰谷，肯定不能共享这个时段表」——现在分桶前先过这道闸：无峰谷模型不判时段、
+//   不落 peakSplit 明细；有峰谷模型行为与改前逐字节一致。
+//   取不到价库（peakRulesForAgg 走完 catch）→ 调用方本就不分桶；这里保守返回 false。
+function peakAppliesToAgg(modelName) {
+  try {
+    const c = _aggPeakRulesCache;
+    if (!c || !c.models) return false;
+    const hit = findModel({ models: c.models }, modelName, 'price');
+    return !!hit && peakMultOf(hit.m, modelName) > 1;
+  } catch (e) { return false; }
 }
 
 // 聚合 transcript 中 timestamp > fromTs 的全部调用（按 messageId/conversationRequestId 去重）
@@ -1279,7 +1296,9 @@ function aggregateTranscLines(rows, fromTs) {
     //   「整批单倍率」旧路径 → 金额退化到 v3.39.0 行为，绝不因取不到规则而算错或抛异常。
     //   成本：pricing.json 每轮读**一次**并缓存（见 peakRulesForAgg 的 mtime 失效），不是每行一次。
     const peakRulesAgg = peakRulesForAgg();
-    if (peakRulesAgg) {
+    // v3.57.0（K1）：只有有峰谷的模型才分桶——无峰谷模型结构性退出峰谷时段判定
+    //   （改前所有模型都按 deepseek_rules 逐行分桶，靠倍率 1 打平 = 时段表全局共享）。
+    if (peakRulesAgg && peakAppliesToAgg(mkName)) {
       const peekRow = isPeakHour(peakRulesAgg, new Date(ts));
       if (peekRow) { mb.pIn = (mb.pIn || 0) + u.in; mb.pCached = (mb.pCached || 0) + u.cached; mb.pOut = (mb.pOut || 0) + u.out; }
       else { mb.oIn = (mb.oIn || 0) + u.in; mb.oCached = (mb.oCached || 0) + u.cached; mb.oOut = (mb.oOut || 0) + u.out; }
@@ -1442,7 +1461,8 @@ function perModelFromRows(rows, fromTs) {
     const b = byModel[name] || (byModel[name] = { in: 0, out: 0, cached: 0, total: 0 });
     b.in += u.in; b.out += u.out; b.cached += u.cached; b.total += u.in + u.out;
     // v3.40.0（plan-B A3）：行级峰谷分桶（形状/语义与 aggregateTranscLines 内那份**完全一致**）。
-    if (peakRulesAgg) {
+    // v3.57.0（K1）：与 aggregateTranscLines 同闸——只有有峰谷的模型才分桶（账本侧落点）
+    if (peakRulesAgg && peakAppliesToAgg(name)) {
       if (isPeakHour(peakRulesAgg, new Date(ts))) {
         b.pIn = (b.pIn || 0) + u.in; b.pCached = (b.pCached || 0) + u.cached; b.pOut = (b.pOut || 0) + u.out;
       } else {
@@ -3287,7 +3307,12 @@ function calcCost(stat, pricing, tsMs) {
   const effTs = (typeof tsMs === 'number' && tsMs > 0)
     ? tsMs
     : (Number(stat && stat.lastTs) > 0 ? Number(stat.lastTs) : 0);
-  const mult = isPeakHour(pricing.deepseek_rules, effTs > 0 ? new Date(effTs) : undefined) ? peakMult : 1;
+  // v3.57.0（K1，用户定夺「只修 K1」）：**无峰谷模型结构性退出峰谷时段判定**。
+  //   病根：改前所有模型都调 isPeakHour 判峰谷（时段表 = pricing.deepseek_rules，DeepSeek 官方
+  //   动态时段），无峰谷模型只靠 peakMult===1 时 mult 恒 1「碰巧」打平——时段表事实上被全局
+  //   共享，结构上没有任何隔离（用户定性：重大口径问题——「别的模型没有峰谷，肯定不能共享」）。
+  //   修法：只有 peakMult>1（有峰谷）的模型才判时段；无峰谷模型倍率恒 1，不读时段表。
+  const mult = peakMult > 1 && isPeakHour(pricing.deepseek_rules, effTs > 0 ? new Date(effTs) : undefined) ? peakMult : 1;
   // v2.99（测试发现的防御性加固）：cached / out 补非负钳制。
   //   原实现 in 侧已有 Math.max(0,...)，但 cached 与 out 仅用 (v || 0)——负数会直接参与计算：
   //   · 负 out → 总价变负，污染当日账本合计；
@@ -5051,7 +5076,10 @@ function periodPeakNote(stat, pricing) {
   const hit = findModel(pricing, stat.model, 'price'); // v2.71：计费模式（时段标注与计价口径一致）
   if (!hit) return '';
   const m = hit.m;
-  const mult = typeof m.peak_multiplier === 'number' ? m.peak_multiplier : 1;
+  // v3.57.0（K1）：收敛到 peakMultOf 单点（与 calcCost 计价同一判据）。改前这里内联「未配→1」，
+  //   deepseek 名未配 peak_multiplier 的模型标注会漏「高峰双倍」（生产中 5 个 deepseek 全配了
+  //   2 → 零行为变化）；注释自称「时段标注与计价口径一致」，现在由调用关系保证。
+  const mult = peakMultOf(m, stat.model);
   if (isPeakHour(pricing.deepseek_rules) && mult > 1) {
     // 高峰标注写清倍数：2 倍显示「高峰双倍」，其他倍数显示「高峰×N」
     return mult === 2 ? '高峰双倍' : `高峰×${mult}`;
@@ -6057,7 +6085,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.56.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.57.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

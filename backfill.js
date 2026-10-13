@@ -14,8 +14,10 @@
 // - usage 提取：extractUsage 同口径（usage / rawUsage / message.usage 三处落点 + 数值钳制取整）
 // - 去重：同文件内按 messageId/conversationRequestId/id 去重（perModelFromRows 同口径）
 // - 日期归属：行 timestamp + 8h 的北京时间日期（与 v2.39「本地时间日界」一致）
-// - 费用：pricing.json 精确匹配模型名；峰谷按**行时间**判定（工作日 9-12/14-18 北京时间 ×
-//   peak_multiplier；周末与法定假日全天低峰——v3.15 同口径）。匹配不到价的模型只记 token 不记钱
+// - 费用：pricing.json 精确匹配模型名；行级按**行时间**判峰谷（工作日 9-12/14-18 北京时间 ×
+//   peak_multiplier；周末与法定假日全天低峰——v3.15 同口径）。v3.57.0（H5）起：对主链路落有
+//   at-time peakSplit 明细且六桶全覆盖的 (日期,模型)，改按**当时规则**的切分计价（详见组装循环
+//   处注释）；明细缺失/部分覆盖 → 保持行级现值。匹配不到价的模型只记 token 不记钱
 //   （与 addModelUsage 的 cost=null 行为一致）。
 // - 水位线：写完后把每个扫描到的会话推满到当前行数（键=session_id，与 ledgerKey 一致），
 //   并与旧水位线逐键取 max——未来的 Stop 增量记账从满水位继续，**不会重复计数**。
@@ -61,6 +63,10 @@ if (!process.env.CN_PRICE_DB_DIR) {
 const tt = require(path.join(__dirname, 'token-tracker.js'));
 const normalizeModelName = tt.normalizeModelName;
 const findModel = tt.findModel;
+// v3.57.0（审计批7·H5 修复）：复用 recalc-day.js 的 peakSplitOf —— 与 recalc 回算**同一函数、
+//   同一数据文件**（rounds/rounds-YYYY-MM.jsonl），保证"当时规则"的切分全项目只有一处实现。
+//   recalc-day.js 被 require 时不跑 main（:388 `require.main === module` 守卫），可安全 import。
+const recalcDay = require(path.join(__dirname, 'recalc-day.js'));
 // v3.45.0（审计 F-2 / P-20）：账本/水位线的**原子写单点**直接复用主脚本实现。
 //   原回滚路径自带 fs.copyFileSync / fs.writeFileSync（非 tmp+rename）→ 回滚中途失败会留下半截账本，
 //   且这是"写盘最容易失败的场景"（磁盘满/占用），半截概率不低。改成调用后，写盘方式全项目只有一处。
@@ -125,7 +131,10 @@ function rowCost(pricing, modelName, u, tsMs) {
   //   改前这里是内联手抄（DeepSeek 缺省 2、其余缺省 1）——语义虽与单点等价，但"等价"只靠注释维护，
   //   peakMultOf 一侧改动（如新增厂商峰谷规则）不会传导到这里 → 回填与增量记账系统性分歧且零报错。
   //   收敛后口径由**调用关系**保证，不再有"复制实现靠注释同步"这最后一处。
-  const mult = isPeakBeijingTs(tsMs) ? tt.peakMultOf(m, modelName) : 1;
+  // v3.57.0（K1）：无峰谷模型结构性退出峰谷时段判定（只有 peakMultOf>1 才判时段）。
+  //   改前所有模型都判 isPeakBeijingTs，无峰谷模型靠倍率 1 打平 = 时段表全局共享。
+  const pm = tt.peakMultOf(m, modelName);
+  const mult = pm > 1 && isPeakBeijingTs(tsMs) ? pm : 1;
   const inT = u.in || 0, cached = Math.min(u.cached || 0, inT), outT = u.out || 0;
   const uncached = Math.max(0, inT - cached);
   // v3.42.0（plan-B B1）：收敛到 token-tracker.js 单点实现 triPriceRounded（带 1e-6 四舍五入）
@@ -350,9 +359,30 @@ function main() {
   try { oldDaily = JSON.parse(fs.readFileSync(DAILY, 'utf-8')); } catch (e) {} // silent-ok:降级 — 旧账本读取失败即视为空（上面已确认存在才进这里）
   const newDaily = {};
   const dates = Object.keys(acc).sort();
+  // v3.57.0（审计批7·H5 修复）：**历史日按当时规则计价**（at-time peak split）
+  //   病根：rowCost 逐行用 isPeakBeijingTs(ts) 判峰谷——那是**当前** pricing.deepseek_rules 的
+  //   口径。厂商调整峰谷时段后，拿它重算全部历史行，同一历史日的金额会与 recalc-day.js（读 rounds
+  //   明细里主链路**当时**落下的 peakSplit 六桶）系统性分叉（审计实证差 2 倍：¥0.0024 vs ¥0.0048）。
+  //   修法：主链路 appendRoundDetail 已按每行当时的峰谷切好六桶（pIn/pCached/pOut/oIn/oCached/oOut）。
+  //   这里对每个 (date, model) 读回该切分，**全覆盖才采用**——三对桶加总与行级累加完全相等，
+  //   证明明细覆盖了当天全部用量，不存在"只给部分轮次按当时规则定价"的半吊子状态；对不上即保持
+  //   行级现值（旧日期无明细 / 中断补偿估算段无明细 / 明细被 prune），与 v3.56.0 及以前行为一致。
+  //   无公开价模型同样不动（findModel 失败即跳过）——与 rowCost 返回 null 的语义一致。
   for (const date of dates) {
     const models = acc[date];
     for (const m of Object.values(models)) m.hit = hitRate(m.in, m.cached);
+    for (const [name, st] of Object.entries(models)) {
+      if (!(st.in || st.out)) continue; // 零用量行（防御；cached ≤ in 钳制下 cached 不可能独存）
+      const split = recalcDay.peakSplitOf(date, name);
+      if (!split) continue; // 无 at-time 明细 → 行级现值
+      if (split.pIn + split.oIn !== st.in
+       || split.pOut + split.oOut !== st.out
+       || split.pCached + split.oCached !== st.cached) continue; // 非全覆盖 → 行级现值
+      const hit = findModel(_pricing, name, 'price');
+      if (!hit || typeof hit.m.input_price !== 'number') continue; // 无价模型只记 token 不记钱
+      const c = tt.costFromPeakSplit(hit.m, split, tt.peakMultOf(hit.m, name));
+      if (c != null) st.cost = Math.round(c * 1e6) / 1e6;
+    }
     newDaily[date] = { models, total: dayTotalOf(models) };
   }
 
