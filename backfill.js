@@ -160,11 +160,24 @@ function rowCost(pricing, modelName, u, tsMs) {
 //   ⚠️ 绝不能改成「累加时把 cached 钳到 ≤ in」：主链路累加侧同样不钳制，钳了会让两条路径的 cached
 //   **token 硬账**不相等，违反本项目最高口径（token 量必须三路相等且可复算）。钳在**显示层**才是对的。
 const hitRate = (inTok, cachedTok) => tt.hitRate(inTok, cachedTok);
+// v3.59.1（审计批17·高危）：与 token-tracker.js:3403 dayTotalOf **逐字同构**。
+//   改前本函数是 `t.cost += m.cost || 0` 且**无 null 守卫** —— 与批10（v3.58.0）在 recalc-day 里
+//   干掉的四处完全同族，而后果更重：本函数的返回值经 ledger-merge.js `mergeDailyLedger` 的
+//   `total: dayTotalOf(m)` **直接写进 daily-usage.json**：
+//     ① 旧账本某 (日期,模型) 的 cost 是脏字符串 → 重放抓不到 → 保留并打 stale_carried →
+//        `0 + "0.51.2"` 字符串拼接 → total.cost 以字符串形态落盘 → 报表 `(total.cost > 0)`
+//        是 NaN 比较恒 false → **该日金额整天显示 ¥0.00（钱静默消失）**；
+//     ② 账本一条 `"某模型": null` → `m.in` 抛 TypeError → **崩在 backfill 的文件锁内**。
+//   token-tracker.js 那份 v3.24.0（级联⑪）就有 null 守卫、本份一直没有 —— A3「复制实现靠注释
+//   同步」的又一标本，本次连同数值归一一次对齐。
+//   ⚠️ 五字段的数值归一统一走 `tt.numOr0`（token-tracker.js:3403 导出），**不许本地再抄一份**：
+//     抄了就会再次漂移（同类漂移已记 KI-29）。
 function dayTotalOf(models) {
   const t = { in: 0, out: 0, cached: 0, total: 0, cost: 0 };
   for (const m of Object.values(models || {})) {
-    t.in += m.in || 0; t.out += m.out || 0; t.cached += m.cached || 0; t.total += m.total || 0;
-    t.cost += m.cost || 0;
+    if (!m || typeof m !== 'object') continue; // v3.59.1：与 token-tracker.js:3405 同构（null 条目曾让主脚本报表全线 TypeError）
+    t.in += tt.numOr0(m.in); t.out += tt.numOr0(m.out); t.cached += tt.numOr0(m.cached); t.total += tt.numOr0(m.total);
+    t.cost += tt.numOr0(m.cost);
   }
   t.hit = hitRate(t.in, t.cached);
   return t;
@@ -602,4 +615,9 @@ function main() {
   console.log(`备份：${bak2}`);
 }
 
-main();
+// v3.59.1（审计批17）：`main()` 加 require.main 守卫 + 导出 dayTotalOf。
+//   改前是无条件 `main()` → 被 require 就会真跑一遍全盘扫描（可能写盘）→ selftest 只能靠 spawn
+//   做行为验证，而 spawn 型用例在 CI/受限环境里会 envSkip（覆盖缺口）。加上守卫后可安全 import，
+//   与 recalc-day.js:388 同一模式（backfill.js:68 的注释早就这么写了，实现没跟上）。
+if (require.main === module) main();
+module.exports = { dayTotalOf };

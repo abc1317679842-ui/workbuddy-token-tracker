@@ -3,6 +3,78 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.59.1（2026-10-15）—— v3.59.0 整体复审补修（批17 · 1 高危 + 5 中危）
+
+> 触发：v3.59.0 发版后应用户要求做「整体性审查，特别是代码判断、逻辑判断……重点是你这些修改的整体性判断」——
+> 7 批 / 13 个代码文件 / 471 行净改动逐段复审，另三路并行审 py 侧 / CI / 假日表。主体逻辑判定站得住，
+> 但查出 1 高危 + 4 中危（假日表审查又追加 1 中危）。
+
+### 修复
+
+- **高危：backfill 的 dayTotalOf 漏修（与批10 S1 同族，跨文件版）**
+  - 病根：批10 把 recalc-day 的四个累加点都收了口（`safeCost`），但 **`backfill.js` 的 `dayTotalOf` 没跟上**，
+    仍是 `t.cost += m.cost || 0`。而它的结果经 `mergeDailyLedger(cur, newDaily, dayTotalOf)`
+    → **写进 `daily-usage.json`**（recalc 的合计只影响 stdout，backfill 的合计落盘）。
+  - 触发链：旧账本某 `(日期, 模型)` 的 per-model cost 是脏字符串（半截 JSON 修复残留 / 手工编辑 / 第三方工具写入）
+    → 跑 `backfill --write` → 该 `(日期,模型)` 重放抓不到 → `mergeDailyLedger` 保留旧条目并打 `stale_carried`
+    → `dayTotalOf` 把它 concat 成字符串 → **`total.cost` 以字符串形态落盘** → 报表里 `(total.cost > 0)`
+    是 NaN 比较恒 false → **该日金额整天显示 ¥0.00，钱静默消失**。
+  - 同族第二洞：这份 `dayTotalOf` 还缺 null 守卫（`token-tracker.js` 那份 v3.24.0 级联⑪就有）——
+    账本一条 `"某模型": null` 会让 `m.in` 抛 TypeError，**崩在文件锁内**。
+  - 修法：`numOr0()` 数值归一（数值串→数、非有限数→0）+ null 守卫，**导出复用**
+    （backfill 调 `tt.numOr0`，不许本地再抄一份——抄了就会再漂移，A3 / KI-29 同类）；
+    backfill 加 `require.main` 守卫并导出 `dayTotalOf`（无条件 `main()` → 被 require 就真跑一遍扫描）。
+  - 生产现状取证：62 天 / 189 个模型条目，per-model cost 与 total.cost **全是 number、零脏值**——
+    当前无实际污染，但洞是真的，一旦被触发正是 KI-5 想避免的那类丢失。
+- **中危 1：CI 探针探错端点**（`.github/workflows/selftest.yml`）
+  - 病根：探测 `api.github.com`，但联网那一遍真正依赖的是 `configs.portkey.ai` 等四家价库源。
+    GitHub 可达 + portkey 挂 → 探针放行 → selftest 因抓不到价而红 → **又是一个没有解释的红**，正是 M39 想消灭的。
+  - 修法：探针改遍历四个真实源 URL（portkey / openrouter / raw.githubusercontent / llmabacus），任一可达即放行；
+    并留 `::notice::` 覆盖痕迹——「绿」与「绿但没覆盖」必须可区分。
+- **中危 2：holidays.json 的 tmp 名不带 pid**
+  - 病根：同一文件里状态文件的 tmp 早带了 pid，唯独 holidays.json 这处是 v3.19 旧写法 `OUT + '.tmp'`
+    → 两个刷新进程并发共用同一 tmp → 第二个 truncate 第一个的半写文件 → rename 出损坏 JSON。
+  - 修法：补 pid，与 `DAILY + '.tmp-' + process.pid` 同款。
+- **中危 3：`--years 0000` 绕过区间校验**
+  - 病根：`if (argY && (argY < 1990 || …))`——`argY===0` 时 `if (0 && …)` 为假 → 区间校验被整个跳过
+    → 拿 year 0 拼 URL → 两次 404 → 静默 exit 2 = **参数错被说成源故障**（M33 想消灭的正是这个）。
+  - 修法：判 `arg` 真假。
+- **中危 4：stale_years / stale_detail 子集重跑抹掉未覆盖年份**（审查中新发现，原审计报告未列）
+  - 病根：两处都是整块重建、只遍历本次 `missingYears`。而 `stale_years` 是 `holidayRefreshNeeded`
+    条件③ 'stale' 的**唯一触发源**——`--years 2026` 跑一轮，旧文件里 2025 的 stale 标记被无声抹掉
+    → 若 2025 仍缺，自动链路再也记不起它 → 那一年**永久不再自动重试**（只剩 30 天 'aged' 兜底）
+    → 峰谷判定对 2025 长期按「非假日」降级（真假日多算 / 调休日少算）且零提示。
+  - 修法：以旧值为基线，只动「本次查过的年份」——查了且缺 → 进（连续缺失沿用旧 since）；
+    查了且不缺 → 出（M31「恢复即清理」语义不变）；**本次没查 → 原样保留**（未知 ≠ 恢复）。
+  - ⚠ 自查抓到一个自造回归：`.map(String)` 把 stale_years 元素从 number 变成 string
+    （T74-b5 的数字断言当场红）——比较走 `String()`，**元素保留原类型**。
+- **中危 5：刷新看门狗罩不住「各阶段预算之和」**
+  - 病根：官方抓取最坏 3×15s + 2×60s 退避 = **165s**；国内源最坏 30s×3 + 1.2s ≈ **91s**（批14 M1 引入重试后）；
+    合计 256s > 看门狗 **180s** → 官方一慢，国内源只剩十几秒必被掐死 → 整轮刷新失败，且失败原因被记成
+    「超时 180000ms 被杀」，排查时指向错误方向。（v3.58.0 把 spawn 从 120s 提到 180s 时就已埋下，M1 把它放大。）
+  - 修法：`REFRESH_TIMEOUT_MS` 180000 → **300000**；新增 T81-a14 把「上限 > 官方最坏 + 国内源最坏」
+    钉成不变量——两侧常量都从**源码实读**，任何人改任一侧预算，守卫跟着重算，不会变成谎话。
+- **附带（低危）**：secret-scan 补裸 `token` 赋值规则、`.env/.sh/.toml/.ini/.cfg` 等藏密扩展名、
+  二进制（NUL 字节判据）+ >1MB 体积防护。
+
+### 守卫
+
+- **T81**（16 源码 + 4 行为）：
+  - a1~a6 两份 `dayTotalOf` 同构（⚠ 锚点必须先切**函数体**再判：守卫串 `if (!m || typeof m !== 'object') continue;`
+    在 `token-tracker.js` 里有**三处**，全文件搜会空转——批17 G2 回退实测正是这个假绿，与 v3.58.0 硬教训同类）；
+  - a7/a8 CI 探针四源 + 覆盖痕迹；a9/a10/a16 假日表三处；a11~a13 secret-scan 三条；a14/a15 看门狗不变量（源码实算）；
+  - 行为组直接 require 两个实现喂脏数据（`"123"`→133 数值相加而非 `"0123"` 拼接、脏串归 0、null 条目不抛、
+    两份逐字段一致）+ `mergeDailyLedger` 生产路径（注入 backfill 的 dayTotalOf，遇脏 carried 条目不抛且 total.cost 是 number）。
+
+### 验证
+
+- selftest **908 过 / 0 败 / 0 跳过**（EXIT=0）。
+- 反向验证 **11/11 达标零误伤**；初轮 3 组 EXTRA 全是**合法连带**（T24-a2/b2 守「dayTotalOf 守卫同口径 + 不抛」、
+  T65-b2 守 `mergeDailyLedger(cur, newDaily, dayTotalOf)` 同一处），期望漏列而已。
+- 审查中拦回自己一次：T81-b3 的 detail 模板字符串**无条件**调 `n('5')`，导出被拔时算 detail 就抛 TypeError
+  → `ok()` 从未被调用 → selftest 崩而非干净变红；改成先安全求值再交 ok()。
+- 零账本影响：同一数据快照新旧双跑 `--report all`，**25167B 逐字节一致**，数据文件零改写。
+
 ## v3.59.0（2026-10-14）—— 外部审计批次修复（批10~批16 · 7 批全部完成，统一发版）
 
 > 触发：2026-10-14 16:37 第二份外部审计报告（v3.58.0 全仓 33 文件 / 25,869 行）。

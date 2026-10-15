@@ -160,7 +160,10 @@ if (require.main === module) (async () => {
     process.exit(2);
   }
   const argY = arg ? Number(arg) : 0;
-  if (argY && (argY < 1990 || argY > 2100)) {
+  // v3.59.1（审计批17·中危）：判据从 `argY &&` 改成 `arg &&`。改前 `--years 0000` 时
+  //   argY===0 → `if (0 && ...)` 为假 → **区间校验被整个跳过** → 拿 year 0 去拼 URL → 两次 404
+  //   → 静默 exit 2 —— 正是 M33 想消灭的"参数错被说成源故障"。（'0000' 能过上面的正则。）
+  if (arg && (argY < 1990 || argY > 2100)) {
     console.error(`[refresh-holidays] ✗ 年份超出合理区间（1990-2100）：${argY}（国务院假日安排不在此范围内）`);
     process.exit(2);
   }
@@ -268,19 +271,45 @@ if (require.main === module) (async () => {
   // v3.19.0（P5）：原子写（tmp + rename），与其它写盘路径同口径（原先裸 writeFileSync，中断留半截 JSON）
   // v3.32.0（方案 H1）：stale_detail —— 每个缺数据年份的 since/reason 明细（--check 与人工排查消费；
   //   `stale_years` 保持既有字符串数组形态不破坏旧读者，明细另开一字段）。
-  // v3.59.0（审计 M31）：**写前按当前缺年集合清理** —— 原实现从 old 继承后只对 missingYears 增补、
-  //   从不删除 → 某年数据恢复后它的陈旧明细永留文件里，`--check` 与人工排查把它当"仍缺数据"读，
-  //   误判一年。（`stale_years` 是每次整体重算的，本就正确；只有 stale_detail 会累积。）
-  const staleDetail = {};
+  // v3.59.0（审计 M31）：**恢复即清理** —— 原实现从 old 继承后只对 missingYears 增补、从不删除 →
+  //   某年数据恢复后它的陈旧明细永留文件里，`--check` 与人工排查把它当"仍缺数据"读，误判一年。
+  // v3.59.1（审计批17·中危）再收窄：清理范围从"当前缺年集合"精确到"**本次查过的年份**"——
+  //   子集重跑（--years 单年）时未覆盖的年份不许被抹（详见下方 staleDetail 段）。
+  // v3.59.1（审计批17·中危）：**子集重跑（--years <单年>）不得抹掉未覆盖年份的陈旧标记**。
+  //   改前两处都是"整块重建、只遍历本次 missingYears"：
+  //     · `stale_years: missingYears` —— 它是 holidayRefreshNeeded 条件③ 'stale' 的**唯一触发源**
+  //       （:353/:356）。`--years 2026` 跑一轮，旧文件里 2025 的 stale 标记被无声抹掉 →
+  //       若 2025 仍缺，自动链路再也记不起它 → 那一年**永久不再自动重试**（只剩 30 天 'aged' 兜底），
+  //       峰谷判定对 2025 长期按「非假日」降级（真假日多算 / 调休日少算）且零提示。
+  //     · `const staleDetail = {}` 同病（--check 与人工排查的明细一起丢）。
+  //   修法：以旧值为基线，只动「本次查过的年份」——
+  //     查了且缺 → 进（连续缺失沿用旧 since）；查了且不缺 → 出（M31 的"恢复即清理"语义不变）；
+  //     本次没查 → 原样保留（未知 ≠ 恢复；保守保留才不丢触发源）。
+  const checkedSet = new Set(years.map(String));
+  const missingSet = new Set(missingYears.map(String));
+  // ⚠ 比较一律走 String()，但**元素保留原类型**：missingYears 是数字数组，旧实现写盘的就是
+  //   数字（T74-b5/b7 用 indexOf(2027) 数字断言）。.map(String) 会把 [2027] 变成 ["2027"] ——
+  //   类型回归，实测当场红（v3.59.1 自查抓到的）。
+  const staleYears = (old.stale_years || []).filter((y) => !checkedSet.has(String(y)));
   for (const y of missingYears) {
-    const yy = String(y);
+    if (!staleYears.some((s) => String(s) === String(y))) staleYears.push(y);
+  }
+  const staleDetail = Object.assign({}, old.stale_detail || {});
+  for (const yy of checkedSet) {
     const failsY = fails.filter((f) => f.includes('/' + yy + ':'));
-    // 已缺过的年份沿用旧 since（缺数据的起始日不该被"今天又缺一次"刷新）
-    const prev = (old.stale_detail || {})[yy];
-    staleDetail[yy] = {
-      since: (prev && prev.since) || new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10),
-      reason: failsY.length ? '获取失败: ' + failsY.join('; ') : '源返回 0 天（真实世界不可能，判定为源异常）',
-    };
+    if (missingSet.has(yy)) {
+      // 连续缺失的年份沿用旧 since（缺数据的起始日不该被"今天又缺一次"刷新）。
+      // v3.59.1（审计批17·注释澄清）：反之，某年**恢复过又重新缺失**时旧条目早已在"查了且不缺"那轮
+      //   被删掉 → prev 为 undefined → since 从今天重新起算。这是**正确语义**：旧那一轮缺失已经结束，
+      //   since 记的应是当前这一轮的起始日。
+      const prev = (old.stale_detail || {})[yy];
+      staleDetail[yy] = {
+        since: (prev && prev.since) || new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10),
+        reason: failsY.length ? '获取失败: ' + failsY.join('; ') : '源返回 0 天（真实世界不可能，判定为源异常）',
+      };
+    } else {
+      delete staleDetail[yy];
+    }
   }
   const payload = JSON.stringify({
     updated_at: new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 19).replace('T', ' '),
@@ -288,8 +317,8 @@ if (require.main === module) (async () => {
     sources: { primary: SRC_A, verify: SRC_B },
     // v3.31.0（P0-6）：缺数据的年份标记——文件自身必须能说明「哪些年不可信」，
     //   供人工排查与后续下游（弹窗/报表）消费；`_stale:true` 时本表不代表真实法定假日全集。
-    _stale: missingYears.length > 0,
-    stale_years: missingYears,
+    _stale: staleYears.length > 0,
+    stale_years: staleYears,
     stale_detail: staleDetail,
     years: yearsMap,
     cross_check: cross,
@@ -297,7 +326,12 @@ if (require.main === module) (async () => {
     cross_check_diff: crossDiff,
   }, null, 1);
   {
-    const tmp = OUT + '.tmp';
+    // v3.59.1（审计批17·中危）：tmp 名补 pid。改前是固定的 `OUT + '.tmp'`（v3.19 旧写法）——
+    //   **同一个文件里** :318 的状态文件早就带了 pid，唯独这里没有 → 两个刷新进程并发
+    //   （手动并行 / 自动链路与手动撞车）会共用同一个 tmp 名：第二个进程 truncate 第一个的半写文件
+    //   → rename 出损坏 JSON → holidays.json 整体不可用 → 峰谷判定整天按非假日（多算/少算）。
+    //   M32 的注释称"与账本/价库同一套写法"，实际正是这一处没照抄（DAILY + '.tmp-' + process.pid）。
+    const tmp = OUT + '.tmp-' + process.pid;
     fs.writeFileSync(tmp, payload, 'utf-8');
     fs.renameSync(tmp, OUT);
   }

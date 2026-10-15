@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.59.0 (2026-10-14)
+// token-usage-tracker v3.59.1 (2026-10-15)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -2789,7 +2789,17 @@ function maybeRefreshLocalDb() {
         });
       });
       let out = '';
-      const REFRESH_TIMEOUT_MS = 180000; // 实测约 12s，给足 3 分钟（单脚本上限）
+      // v3.59.1（审计批17·中危）：180000 → 300000。**这条上限必须大于各阶段预算之和**，
+      //   而改前（180s）连"官方抓取跑满重试阶梯"这一种情况都罩不住：
+      //     · deepseek-official.js 自身最坏 = 3 次抓取 × 15s + 2 次退避 × 60s = **165s**
+      //       （v3.58.0 批8-⑧ 正因此把 spawn timeout 从 120s 提到 180s，见守卫 T70-a11）；
+      //     · refresh-prices.js 国内源最坏 = 30s × 3 次重试 + 1.2s 退避 ≈ **91s**（v3.59.0 批14·M1）；
+      //     · 合计 256s > 180s → 官方一慢，国内源只剩十几秒 → 必被掐死 → **整轮刷新失败**
+      //       （沿用旧库 + ⚠价库），且失败原因被记成"超时 180000ms 被杀"，排查时指向错误的方向。
+      //   ⚠️ 这不是"多等等"：刷新是 spawn 出去的**非阻塞**链路（带退避重试 + 锁防并发），
+      //      上限放大不会拖慢任何一次 hook；真正被拖到的只有"源全挂"时的放弃时机。
+      //   ⚠️ 与 T39-a5 联动：那条守卫断言"最大单源预算 < 本上限"，改这里必须同步复核它仍成立。
+      const REFRESH_TIMEOUT_MS = 300000; // 各阶段预算之和（165s 官方 + 91s 国内源 = 256s）+ 余量
       runAll(0).then((r) => {
         if (r.code === 0) {
           try { fs.unlinkSync(CN_PRICE_REFRESH_LOCK); } catch (e) {} // silent-ok:清理 — 清残留锁文件
@@ -3400,12 +3410,24 @@ function hitRate(inTok, cachedTok) {
   const v = Math.round((cachedTok / denom) * 10000) / 100;
   return Math.min(100, Math.max(0, v));
 }
+// v3.59.1（审计批17·高危）：数值归一。改前五字段全是 `t.x += m.x || 0` —— `|| 0` 只挡 falsy、
+//   **不挡字符串**：账本里一个 "123"（半截 JSON 修复残留 / 手工编辑 / 第三方工具写入）会让
+//   `0 + "123"` = "0123"，此后每加一个数都是**字符串拼接**，in/out/cached/total/cost 五兄弟一起腐化。
+//   本函数的返回值在 :3752 是**直接落盘**的（day.total = dayTotalOf(day.models)）→ 腐化值写进
+//   daily-usage.json → 之后报表里 `(total.cost > 0)` 是 NaN 比较恒 false → 该日金额整天显示 ¥0.00
+//   （钱静默消失，与 recalc-day v3.58.0 批8-① 的 safeCost 同一病根，这里是五字段全量版）。
+//   ⚠️ 绝不改成"累加时钳 cached ≤ in"之类的业务钳制 —— 本项目最高口径是 token 硬账三路相等，
+//      这里只做**类型归一**（非有限数 → 0），不改变任何合法数值的语义。
+function numOr0(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
 function dayTotalOf(models) {
   const t = { in: 0, out: 0, cached: 0, total: 0, cost: 0 };
   for (const m of Object.values(models || {})) {
     if (!m || typeof m !== 'object') continue; // v3.24.0（级联⑪）：账本一条 null 条目曾让 --report/区间/CSV/外推全线 TypeError
-    t.in += m.in || 0; t.out += m.out || 0; t.cached += m.cached || 0; t.total += m.total || 0;
-    t.cost += m.cost || 0;
+    t.in += numOr0(m.in); t.out += numOr0(m.out); t.cached += numOr0(m.cached); t.total += numOr0(m.total);
+    t.cost += numOr0(m.cost);
   }
   t.hit = hitRate(t.in, t.cached);
   return t;
@@ -6100,7 +6122,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.59.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.59.1'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -7226,6 +7248,10 @@ function main() {
 if (require.main === module) main();
 module.exports = {
   todayStr, dateStrOfTs, loadDailyUsage, saveDailyUsage, recordUsage, dayTotalOf, hitRate,
+  // v3.59.1（审计批17·高危）：dayTotalOf 的数值归一根。**必须导出** —— backfill.js 的
+  //   dayTotalOf 复用同一实现（`tt.numOr0`），不许在本地再抄一份：抄了就会再次漂移，
+  //   而本项目已因"复制实现靠注释同步"记了 A3 / KI-29 两条。
+  numOr0,
   calcCost, triPrice, triPriceRounded, costFromPeakSplit, peakMultOf, classifyWatchLock, findModel, isLocalModel, fmtCost, cleanModelName,
   readTranscLines, parseTranscChunk, readTranscLinesFrom, extractUsage, perModelFromRows, aggregatePerModel,
   aggregateMainOnly, aggregateSubsOnly, aggregateTranscript,

@@ -6787,8 +6787,12 @@ globalThis.fetch = async (url, opts) => {
     /if \(b && Array\.isArray\(b\.offDays\) && b\.offDays\.length === 0\) b = null;/.test(rh74));
   ok('T74-a3 ★S4 归一发生在「两源都取不到」判断**之前**（顺序颠倒则归一无效，仍走交集）',
     rh74.indexOf('a.length === 0') >= 0 && rh74.indexOf('if (!a && !b)') > rh74.indexOf('a.length === 0'));
-  ok('T74-a4 ★M31 stale_detail 每次全新构造（不从 old 继承 → 按当前缺年集合整体重算）',
-    /const staleDetail = \{\};/.test(rh74));
+  // v3.59.1（审计批17·中危）：M31 的"整体重算"演进为"**差量更新**" —— "恢复即清理"的语义没有丢
+  //   （由 delete 保证），只是未覆盖年份不再被抹（子集重跑不丢触发源，见 T81-a16）。
+  //   这里同步演进断言形态，且**检出力不降反升**：差量基线 + delete 两个形态都钉。
+  ok('T74-a4 ★M31 stale_detail 差量更新（以 old 为基线保留未覆盖年份；恢复即清理仍在 —— 缺 delete = 旧累积 bug 复发）',
+    /const staleDetail = Object\.assign\(\{\}, old\.stale_detail \|\| \{\}\)/.test(rh74)
+    && /delete staleDetail\[yy\]/.test(rh74));
   ok('T74-a5 ★M31 连续缺失沿用旧 since（缺数据的起始日不该被"今天又缺一次"刷新成今天）',
     /const prev = \(old\.stale_detail \|\| \{\}\)\[yy\];/.test(rh74)
     && /since: \(prev && prev\.since\) \|\| new Date\(/.test(rh74));
@@ -7246,7 +7250,171 @@ function finish() { try { clearTimeout(t); } catch (e) { /* silent-ok:清理 —
   }
 }
 
-// 隔离目录清理（v3.33.0 加固）：**有界重试**。
+// ===== T81（v3.59.1 审计批17）：dayTotalOf 脏值/null 同构 + CI 探针 + 假日表两处 =====
+//   背景：v3.59.0 整体复查（7 批 / 13 个代码文件逐段复审 + 三路并行审 py 侧 / CI / 假日表）
+//   查出 1 高危 + 4 中危。**高危这条正是批10 自己写在注释里的那个错误形态** ——
+//   "修复不完整比没修复更危险"，只是当时漏的不是分支、是文件：
+//   recalc-day 的四个累加点都收了口，backfill 的 dayTotalOf 没跟上，而它的结果**会落盘**。
+//   本组把"两份实现必须同构"钉成守卫，并直接 require 做行为验证（不靠 spawn）。
+{
+  const tt81 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8');
+  const bf81 = fs.readFileSync(path.join(SRC, 'backfill.js'), 'utf-8');
+  const rh81 = fs.readFileSync(path.join(SRC, 'refresh-holidays.js'), 'utf-8');
+  const ci81 = fs.readFileSync(path.join(SRC, '.github/workflows/selftest.yml'), 'utf-8');
+  const ss81 = fs.readFileSync(path.join(SRC, '.github/workflows/secret-scan.js'), 'utf-8');
+  // ⚠️ CRLF：工作区文件是 CRLF，所有锚点**不用 `$` 行尾断言**（改用 indexOf / 行内正则），
+  //    否则归一化漏一处就整条恒绿（v3.59.0 批16 反向验证踩过）。
+
+  // ── a. 高危：两份 dayTotalOf 必须同构 ──
+  ok('T81-a1 ★token-tracker.js dayTotalOf 五字段必须走 numOr0（`|| 0` 只挡 falsy、**不挡字符串**：'
+    + '"123" 会让 0+"123"="0123"，之后每加一个数都是字符串拼接，五字段一起腐化并落盘）',
+    tt81.indexOf('t.in += numOr0(m.in); t.out += numOr0(m.out); t.cached += numOr0(m.cached); t.total += numOr0(m.total);') >= 0
+    && tt81.indexOf('t.cost += numOr0(m.cost);') >= 0);
+  // ⚠️ 锚点必须唯一到那一处（v3.58.0 硬教训，批17 G2 实测又踩一次）：
+  //   `if (!m || typeof m !== 'object') continue;` 在 token-tracker.js 里有**三处**
+  //   （dayTotalOf / aggregateRangeModels / 区间汇总）—— 全文件搜这一串，把 dayTotalOf 里那处
+  //   删掉仍恒绿。正确做法：先把 dayTotalOf 函数体切出来，再在函数体内判。
+  const dtFn81 = (tt81.match(/function dayTotalOf\(models\) \{[\s\S]*?\n\}/) || [''])[0];
+  ok('T81-a2 ★token-tracker.js dayTotalOf 必须保留 null 守卫（v3.24.0 级联⑪：账本一条 null 条目曾让报表全线 TypeError）',
+    dtFn81.length > 0 && dtFn81.indexOf("if (!m || typeof m !== 'object') continue;") >= 0,
+    dtFn81.length ? 'dayTotalOf 函数内无 null 守卫' : '未取到 dayTotalOf 函数体（函数签名被改？）');
+  ok('T81-a3 ★numOr0 必须导出（backfill 复用同一实现；在本地再抄一份 = 等着再漂移，KI-29 同类）',
+    tt81.indexOf('dayTotalOf, hitRate,') >= 0 && tt81.indexOf('numOr0,') >= 0);
+  // 同样先切函数体再判（与 a2 同一理由：守卫串若在别处再出现一次，全文件搜就会空转）
+  const bfDt81 = (bf81.match(/function dayTotalOf\(models\) \{[\s\S]*?\n\}/) || [''])[0];
+  ok('T81-a4 ★backfill.js dayTotalOf 必须与主脚本同构：null 守卫 + 五字段 tt.numOr0'
+    + '（改前 `t.cost += m.cost || 0` 且无守卫 —— 脏串经 stale_carried 保留后拼成字符串**落盘** → 该日金额整天 ¥0.00；'
+    + '一条 null 条目更会让 m.in 抛 TypeError，崩在文件锁内）',
+    bfDt81.length > 0 && bfDt81.indexOf("if (!m || typeof m !== 'object') continue;") >= 0
+    && bfDt81.indexOf('t.in += tt.numOr0(m.in); t.out += tt.numOr0(m.out); t.cached += tt.numOr0(m.cached); t.total += tt.numOr0(m.total);') >= 0
+    && bfDt81.indexOf('t.cost += tt.numOr0(m.cost);') >= 0,
+    bfDt81.length ? '函数体内缺守卫或缺 numOr0 归一' : '未取到 backfill 的 dayTotalOf 函数体');
+  ok('T81-a5 ★backfill.js 必须加 require.main 守卫并导出 dayTotalOf（无条件 main() → 被 require 就真跑一遍扫描）',
+    bf81.indexOf('if (require.main === module) main();') >= 0
+    && bf81.indexOf('module.exports = { dayTotalOf };') >= 0);
+  ok('T81-a6 ★backfill 必须把自己的 dayTotalOf 注入 mergeDailyLedger（合并后重算 total 的那一份；'
+    + '传别的实现 = 又一处会漂移的副本）',
+    bf81.indexOf('mergeDailyLedger(cur, newDaily, dayTotalOf)') >= 0);
+
+  // ── b. 中危：CI 探针必须探价库源 ──
+  ok('T81-a7 ★CI 探针必须覆盖价库源（portkey / openrouter / raw.githubusercontent / llmabacus）'
+    + '且不得只探 api.github.com（GitHub 通、价库挂 → 放行 → selftest 因抓不到价而红 = 没有解释的红，正是 M39 要消灭的）',
+    ci81.indexOf('configs.portkey.ai') >= 0 && ci81.indexOf('openrouter.ai') >= 0
+    && ci81.indexOf('llmabacus.com') >= 0
+    && ci81.indexOf("fetch('https://api.github.com'") < 0);
+  ok('T81-a8 ★联网那一遍必须留覆盖痕迹（跳过时 job 仍绿是有意的——runner 网络抖动不该判红，'
+    + '但"绿"与"绿但没覆盖"必须可区分）',
+    ci81.indexOf('Online coverage marker') >= 0 && ci81.indexOf('::notice::') >= 0);
+
+  // ── c. 中危：假日表两处 ──
+  ok('T81-a9 ★holidays.json 的 tmp 必须带 pid（固定名 `.tmp` → 两个刷新进程并发共用同一 tmp → rename 出损坏 JSON）',
+    rh81.indexOf("const tmp = OUT + '.tmp-' + process.pid;") >= 0
+    && rh81.indexOf("const tmp = OUT + '.tmp';") < 0);
+  ok('T81-a10 ★年份区间校验必须判 `arg` 真假而非 `argY`（argY===0 时 `if(0 && …)` 为假 → `--years 0000` 整个跳过校验'
+    + ' → 拿 year 0 抓两次 404 后静默 exit 2 = 参数错被说成源故障）',
+    rh81.indexOf('if (arg && (argY < 1990 || argY > 2100))') >= 0
+    && rh81.indexOf('if (argY && (argY < 1990') < 0);
+  // v3.59.1（审计批17·中危，holiday-reviewer Q2）：子集重跑不得抹掉未覆盖年份的陈旧标记。
+  //   这是本批唯一一条"审查中新发现、原报告未列"的问题：`stale_years: missingYears` 是整块写，
+  //   而 stale_years 正是 holidayRefreshNeeded 条件③ 'stale' 的**唯一触发源**（:374 消费它）。
+  ok('T81-a16 ★stale_years/stale_detail 必须按「本次查过的年份」差量更新、未覆盖年份原样保留'
+    + '（整块写 missingYears → `--years 2026` 子集跑抹掉 2025 的 stale 标记 → 若 2025 仍缺，'
+    + '自动链路再也记不起它 → 那一年永久不再自动重试，峰谷长期按「非假日」降级且零提示）',
+    rh81.indexOf('stale_years: missingYears,') < 0
+    && rh81.indexOf('const staleDetail = {};') < 0
+    && rh81.indexOf('const checkedSet = new Set(years.map(String));') >= 0
+    && rh81.indexOf('stale_years: staleYears,') >= 0
+    && rh81.indexOf('old.stale_years') >= 0);
+
+  // ── d. 中危：secret-scan 补裸 token / 藏密扩展名 / 二进制防护 ──
+  ok('T81-a11 ★secret-scan 必须认裸 token 赋值（只认 access_token 时 `token = "长串"` 这种最常见形态漏报）',
+    ss81.indexOf('疑似 token 赋值') >= 0 && ss81.indexOf('(?:^|[^a-zA-Z])token') >= 0);
+  ok('T81-a12 ★secret-scan 必须扫 .env/.sh/.toml（凭据最常躺在 .env 里；改前只扫代码/文档扩展名，正好漏掉最常见的藏密处）',
+    ss81.indexOf('txt|env|sh|toml|ini|cfg') >= 0);
+  ok('T81-a13 ★secret-scan 必须有二进制 + 体积防护（二进制当文本扫 = 乱码误报/漏报；>1MB 整体 split 全部行会随文件涨内存）',
+    ss81.indexOf('includes(0)) continue') >= 0 && ss81.indexOf('MAX_BYTES') >= 0);
+
+  // ── e. 行为组：直接 require 两个实现喂脏数据（不靠 spawn） ──
+  //    ⚠️ 假绿防护：期望值与"什么都没做"必须可区分 —— 改前 "0.51.2" 会拼成字符串、null 条目会抛 TypeError；
+  //      改后归 0 / 跳过。两条判据都不等于夹具预置值。
+  const bfMod = (() => { try { return require(path.join(SRC, 'backfill.js')); } catch (e) { return null; } })();
+  const ttMod = (() => { try { return require(path.join(SRC, 'token-tracker.js')); } catch (e) { return null; } })();
+  const DIRTY = {
+    m_dirty: { in: '123', out: 5, cached: null, total: 'abc', cost: '0.51.2' },
+    m_null: null,
+    m_ok: { in: 10, out: 2, cached: 1, total: 12, cost: 0.5 },
+  };
+  if (!bfMod || !ttMod || typeof bfMod.dayTotalOf !== 'function' || typeof ttMod.dayTotalOf !== 'function') {
+    ok('T81-b1 两个 dayTotalOf 均可 require（红 = 导出被改坏 / require 有副作用）', false,
+      `bfMod=${!!bfMod} ttMod=${!!ttMod}`);
+  } else {
+    let bt = null, berr = null;
+    try { bt = bfMod.dayTotalOf(DIRTY); } catch (e) { berr = e; }
+    ok('T81-b1 ★backfill dayTotalOf 喂脏数据：不抛 + 五字段全 number + 脏串归 0'
+      + '（"123"→133 数值相加而非 "0123" 拼接；"abc"/"0.51.2"→0；null 条目跳过）',
+      !berr && bt && ['in', 'out', 'cached', 'total', 'cost'].every((k) => typeof bt[k] === 'number')
+      && bt.in === 133 && bt.out === 7 && bt.cached === 1 && bt.total === 12 && bt.cost === 0.5,
+      berr ? '抛出: ' + berr.message : JSON.stringify(bt));
+    let t2 = null;
+    try { t2 = ttMod.dayTotalOf(DIRTY); } catch (e) { /* 由 b2 的等值判断暴露 */ }
+    ok('T81-b2 ★两份 dayTotalOf 行为逐字节一致（同构不只是长得像——喂同一份脏数据结果必须相同）',
+      !!t2 && JSON.stringify(t2) === JSON.stringify(bt),
+      `tt=${JSON.stringify(t2)} bf=${JSON.stringify(bt)}`);
+    const n = ttMod.numOr0;
+    // ⚠ detail 必须**先安全求值**再交给 ok()：模板字符串里的 n('5') 是无条件执行的 ——
+    //   导出被拔时（批17 G3 回退实测）它在**算 detail 时**就抛 TypeError，ok() 从未被调用、
+    //   selftest 直接崩（exit 1 且无汇总行），把"干净变红"退化成"崩掉"。
+    let nProbe;
+    try { nProbe = [n('5'), n(NaN), n(Infinity), n(null), n(undefined), n('abc'), n({}), n(''), n(7)].join(','); }
+    catch (e) { nProbe = '求值抛: ' + ((e && e.message) || e); }
+    ok('T81-b3 ★numOr0 边界：数值串→数、NaN/Infinity/null/undefined/"abc"/{}→0、`Number.isFinite` 语义',
+      typeof n === 'function' && n('5') === 5 && n(NaN) === 0 && n(Infinity) === 0 && n(-Infinity) === 0
+      && n(null) === 0 && n(undefined) === 0 && n('abc') === 0 && n({}) === 0 && n('') === 0 && n(7) === 7,
+      `got ${nProbe}`);
+    // 生产路径：backfill 就是用这个函数当 mergeDailyLedger 的第三参 —— 脏 carried 条目合并不抛、
+    // total.cost 必须是 number（字符串会顺着一路写进 daily-usage.json）。
+    let mg = null, mgerr = null;
+    try {
+      const { mergeDailyLedger } = require(path.join(SRC, 'ledger-merge.js'));
+      mg = mergeDailyLedger(
+        { '2026-10-01': { models: { 'm_dirty': { in: '123', out: 5, cached: 0, total: 'abc', cost: '0.51.2' } } } },
+        { '2026-10-01': { models: { 'm_ok': { in: 10, out: 2, cached: 1, total: 12, cost: 0.5 } } } },
+        bfMod.dayTotalOf);
+    } catch (e) { mgerr = e; }
+    ok('T81-b4 ★mergeDailyLedger(注入 backfill 的 dayTotalOf) 遇脏 carried 条目：不抛 + total.cost 是 number'
+      + '（这就是生产路径：旧账本脏 cost 被 stale_carried 保留后重算 total 并落盘）',
+      !mgerr && mg && typeof mg.merged['2026-10-01'].total.cost === 'number'
+      && mg.merged['2026-10-01'].models.m_dirty.stale_carried === true,
+      mgerr ? '抛出: ' + mgerr.message : JSON.stringify(mg && mg.merged['2026-10-01'].total));
+  }
+
+  // ── f. 中危：看门狗必须大于「各阶段预算之和」（v3.59.1 把 180000 抬到 300000 的那条算术） ──
+  //   不变量：官方抓取最坏 + 国内源最坏 < 整进程上限。改前 180s < 256.2s —— 官方一跑满重试阶梯
+  //   （165s），国内源只剩十几秒必被掐死 → 整轮刷新失败（沿用旧库 + ⚠价库），且失败原因被记成
+  //   "超时 180000ms 被杀"，排查时指向错误方向。
+  //   ⚠️ 两侧常量都从**源码实读**（不硬编码）：任何人改任一侧预算，这里跟着重算，不会变成谎话。
+  const ds81 = fs.readFileSync(path.join(SRC, 'deepseek-official.js'), 'utf-8');
+  const rp81src = fs.readFileSync(path.join(SRC, 'refresh-prices.js'), 'utf-8');
+  const capM81 = tt81.match(/REFRESH_TIMEOUT_MS\s*=\s*(\d+)/);
+  const cap81 = capM81 ? Number(capM81[1]) : 0;
+  const oTo = (ds81.match(/const TIMEOUT_MS = (\d+);/) || [])[1];
+  const oRt = (ds81.match(/const RETRIES = Number\(process\.env\.DS_RETRIES \|\| (\d+)\)/) || [])[1];
+  const oDl = (ds81.match(/const RETRY_DELAY_MS = Number\(process\.env\.DS_RETRY_DELAY_MS \|\| (\d+)\)/) || [])[1];
+  const dRt = (rp81src.match(/Math\.floor\(n\) : (\d+)/) || [])[1];
+  const dsSpawn = (rp81src.match(/timeout: (\d+),/) || [])[1];
+  const rpMod81 = (() => { try { return require(path.join(SRC, 'refresh-prices.js')); } catch (e) { return null; } })();
+  const BIG81 = rpMod81 ? rpMod81.BIG_SOURCE_TIMEOUT_MS : 0;
+  const officialWorst = (oTo && oRt != null && oDl) ? (Number(oRt) + 1) * Number(oTo) + Number(oRt) * Number(oDl) : -1;
+  const domesticWorst = (BIG81 && dRt) ? BIG81 * (Number(dRt) + 1) + 400 * (Math.pow(2, Number(dRt)) - 1) : -1;
+  ok('T81-a14 ★看门狗 REFRESH_TIMEOUT_MS 必须大于「官方抓取最坏 + 国内源最坏」之和'
+    + '（官方 3×15s+2×60s=165s；国内源 30s×3+1.2s≈91.2s；和 256.2s —— 改前 180s 罩不住）',
+    cap81 > 0 && officialWorst > 0 && domesticWorst > 0 && cap81 > officialWorst + domesticWorst,
+    `上限=${cap81} 官方最坏=${officialWorst} 国内源最坏=${domesticWorst} 和=${officialWorst + domesticWorst}`);
+  ok('T81-a15 ★官方脚本 spawn 预算必须覆盖它自己的最坏耗时（否则在重试退避中途被掐死 —— v3.58.0 批8-⑧ 的既有不变量）',
+    !!dsSpawn && officialWorst > 0 && Number(dsSpawn) >= officialWorst,
+    `spawn=${dsSpawn} 官方最坏=${officialWorst}`);
+}
+
 //   为什么需要：主脚本在被 require 时会跑 loadPricing → maybeRefreshHolidays（每进程一次、四条件命中即
 //   **detach** spawn 一个 refresh-holidays.js 子进程并往 SNAP_DIR 写 `.holidays-refresh.json`）。该子进程
 //   存活到测试结束之后，恰好与这里的 rmSync 抢同一批文件 → Windows 上 rimraf 报

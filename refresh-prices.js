@@ -60,7 +60,9 @@ const TIMEOUT_MS = 12000;
 // 历史 6 次真实刷新里 litellm 有 4 次失败，其中 3 次错误是 `This operation was aborted`
 // （= 我们自己的 12s 超时器触发，不是源不可达）。晚间拥塞时段 12s 会被轻松突破。
 // 30s 相对实测最慢值留约 5× 余量；总耗时仍远低于 token-tracker.js 侧
-// REFRESH_TIMEOUT_MS=180000 的整进程上限（五源是 Promise.all 并行，只取最慢那个）。
+// REFRESH_TIMEOUT_MS=300000 的整进程上限（v3.59.1 从 180000 抬到 300000：官方抓取最坏 165s
+// + 本脚本最坏 91s = 256s，改前的 180s 罩不住这个和，见 token-tracker.js 该常量处注释；
+// 五源是 Promise.all 并行，只取最慢那个）。
 const BIG_SOURCE_TIMEOUT_MS = 30000;
 const DEFAULT_RATE = 7.2; // v3.32.0（P1-3）：USD→CNY 兜底汇率的**单一真源**，token-tracker.js 新模型补录兜底处引用本导出（selftest T21-d 断言两侧一致）
 const FORCE = process.argv.includes('--force');
@@ -301,7 +303,8 @@ function isFreeVariant(id) {
 // 与 Python 侧（M21：fetch-cn-prices / parse_tokenhub）**同一口径**：默认额外 2 次、延迟 400ms→800ms，
 //   env `CN_PRICE_HTTP_RETRIES` 可调（0=关），两边共用一个开关名便于统一调。
 // 只重试**瞬时故障**（超时 / 5xx / 429 / 网络层错误）；404 这类确定性失败不重试（重试只是白等）。
-// 耗时上界：单源最坏 30s×3 + 1.2s ≈ 91s，仍低于 token-tracker.js 的 REFRESH_TIMEOUT_MS=180000 整进程上限。
+// 耗时上界：单源最坏 30s×3 + 1.2s ≈ 91s，仍低于 token-tracker.js 的 REFRESH_TIMEOUT_MS=300000
+// 整进程上限（v3.59.1：180000 → 300000，因为官方抓取阶段最坏还要 165s，两者相加 256s 必须罩住）。
 const HTTP_RETRIES = (() => {
   const n = Number(process.env.CN_PRICE_HTTP_RETRIES);
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 2;

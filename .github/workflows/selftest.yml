@@ -56,15 +56,42 @@ jobs:
       #   一并吞掉（网络一抖，这一遍等于没跑，且绿灯照给）。改为**先探测网络可达性**：
       #     可达 → 这一遍必须红（真回归拦得住）；不可达 → 整步跳过（不假红，也不假装跑过）。
       #   这样"没跑"是显式的（job 日志里看得到 skip 原因），不再是静默放过。
+      # v3.59.1（审计批17·中危）：**探针目标改成型库源本身**。改前探 api.github.com，但联网这一遍
+      #   的真实依赖是价库七源（T3 要靠重建 pricing.json，走 refresh-prices.js 的 SOURCES）——
+      #   GitHub 通、portkey/llmabacus 挂 → 探针放行 → selftest 因抓不到价而红 → 又是一个没有解释的
+      #   红，正是 M39 想消灭的东西。判据与重建逻辑对齐：**任一源可达即放行**（重建只需"至少一个
+      #   USD 源可用"，见 refresh-prices.js 的 usdOk 判定）。逐源打印结果，便于区分"全挂"与"只挂一个"。
       - name: Probe network reachability (gate for the online run)
         id: net
         shell: bash
         run: |
-          if node -e "fetch('https://api.github.com',{signal:AbortSignal.timeout(8000)}).then(function(r){process.exit(r.ok?0:1)}).catch(function(){process.exit(1)})"; then
+          ok=0
+          for u in https://configs.portkey.ai/pricing/deepseek.json \
+                   https://openrouter.ai/api/v1/models \
+                   https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json \
+                   https://www.llmabacus.com/api/prices; do
+            if node -e "fetch(process.argv[1],{signal:AbortSignal.timeout(8000)}).then(function(r){process.exit(r.ok?0:1)}).catch(function(){process.exit(1)})" "$u"; then
+              echo "  可达: $u"; ok=1
+            else
+              echo "  不可达: $u"
+            fi
+          done
+          if [ "$ok" = "1" ]; then
             echo "reachable=true" >> "$GITHUB_OUTPUT"
           else
             echo "reachable=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::外网不可达 → 跳过联网那一遍 selftest（T3-R4 本轮无覆盖，属环境问题不是通过）"
+            echo "::warning::价库源均不可达 → 跳过联网那一遍 selftest（T3-R4 本轮无覆盖，属环境问题不是通过）"
+          fi
+      # v3.59.1（审计批17·中危）：把"这一遍到底跑没跑"变成**显式注解**。跳过时 job 仍是绿的
+      #   （这是有意的：runner 网络抖动不该判红），但绿与"绿但没覆盖"必须可区分 —— 以前只能去
+      #   翻步骤列表，现在 job summary 里直接有一行 notice。
+      - name: Online coverage marker
+        if: always()
+        run: |
+          if [ "${{ steps.net.outputs.reachable }}" = "true" ]; then
+            echo "::notice::联网那一遍已执行（T3-R4 价库告警路径有覆盖）"
+          else
+            echo "::notice::联网那一遍被跳过（T3-R4 本轮无覆盖，属环境问题；见上方 warning）"
           fi
       - name: Run selftest (online, covers T3-R4 price-library warning)
         if: steps.net.outputs.reachable == 'true'

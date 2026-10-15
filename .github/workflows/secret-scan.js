@@ -24,11 +24,18 @@ const RULES = [
   ['私钥 PEM 块', /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
   ['Slack token', /xox[baprs]-[A-Za-z0-9-]{10,}/],
   ['硬编码凭据赋值', /(api[_-]?key|secret|passwd|password|access[_-]?token)\s*[:=]\s*['"][A-Za-z0-9_\-]{16,}['"]/i],
+  // v3.59.1（审计批17·中危）：补裸 `token` 赋值。改前只认 access[_-]?token —— `token = "长串"`
+  //   这种最常见形态漏报（本仓库自己的 PAT 在 mcp.json 里就叫 GITHUB_PERSONAL_ACCESS_TOKEN，
+  //   但别人误粘的往往是裸 token）。20+ 字符 + 引号包裹，避免命中普通英文句子里的 token 一词。
+  ['疑似 token 赋值', /(?:^|[^a-zA-Z])token\s*[:=]\s*['"][A-Za-z0-9_\-.]{20,}['"]/i],
 ];
 // 白名单：形似但确属正常的长串（本仓库实测零命中，故留空；新增规则后若出现已知安全项在此登记并写理由）
 const ALLOW = [];
 const SKIP_DIRS = new Set(['node_modules', '.git', '__pycache__', 'rounds']);
-const SCAN_EXT = /\.(js|mjs|cjs|json|md|py|yml|yaml|txt)$/i;
+// v3.59.1（审计批17·中危）：补 .env/.sh/.toml/.ini/.cfg —— 凭据最常躺在这些文件里
+//   （.env 尤其是），改前只扫代码/文档扩展名，正好把最常见的藏密处整个漏掉。
+const SCAN_EXT = /\.(js|mjs|cjs|json|md|py|yml|yaml|txt|env|sh|toml|ini|cfg|pem|key)$/i;
+const MAX_BYTES = 1024 * 1024; // v3.59.1：>1MB 跳过（大日志类文本整体读入 split 全部行，内存随文件涨）
 
 const hits = [];
 const walk = (dir) => {
@@ -39,8 +46,17 @@ const walk = (dir) => {
     const p = path.join(dir, e.name);
     if (e.isDirectory()) { walk(p); continue; }
     if (!SCAN_EXT.test(e.name)) continue;
+    // v3.59.1：体积 + 二进制防护。二进制文件（.pem 之外的密钥材料、编译产物）若扩展名命中会被
+    //   当文本扫 → 读出来是乱码、既可能误报也可能漏报；NUL 字节是可靠的二进制判据。
+    let sz = 0;
+    try { sz = fs.statSync(p).size; } catch (err) { continue; }
+    if (sz > MAX_BYTES) continue;
     let txt;
-    try { txt = fs.readFileSync(p, 'utf8'); } catch (err) { continue; }
+    try {
+      const buf = fs.readFileSync(p);
+      if (buf.subarray(0, 4096).includes(0)) continue; // 二进制：跳过
+      txt = buf.toString('utf8');
+    } catch (err) { continue; }
     txt.split(/\r?\n/).forEach((ln, i) => {
       if (ALLOW.some((re) => re.test(ln))) return;
       for (const [name, re] of RULES) {
