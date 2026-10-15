@@ -116,6 +116,12 @@ function isPeakAt(tsMs, pricing, holidaysPath) {
   if (isHolidayBeijing(tsMs, holidaysPath)) return false; // ① 法定假日全天低峰
   const rules = pricing && pricing.deepseek_rules;
   if (rules && typeof rules === 'object') {
+    // v3.59.0（审计 M30，只补语义说明、不改行为）：**缺省 = false 是刻意的**，且与下方「无 rules」分支
+    //   （周末一律低峰）**口径不同**，这是有意为之而不是漏写：
+    //   · 有 rules = 官方时段是**抓来的**（deepseek-official.js 三级判定）→ `weekend_off_peak` 必须由
+    //     官方文案显式声明才认；**缺失 = 官方没说 → 不替官方假设「周末也低峰」**（猜错就是系统性少算）。
+    //   · 无 rules（抓不到 / 未配置）→ 走 DEFAULT_RANGES 历史默认值，其既有语义本就含「周末低峰」。
+    //   当前 pricing.json 显式写了 `weekend_off_peak: true` → 两条分支结果一致、**零实际差异**。
     const weekendOff = rules.weekend_off_peak === true || rules.weekend_off_peak === 'true';
     if (weekendOff && (dow === 0 || dow === 6)) return false;
     const ranges = parsePeakSchedule(rules.peak_schedule);

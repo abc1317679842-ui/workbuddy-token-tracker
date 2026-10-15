@@ -17,7 +17,7 @@ v3.51.0（2026-10-12，审计批1·A）：地域与币种改为**显式解析**�
   静默入账。现改为解析页面 tse-tabs 组件的「地域标签 → 面板」结构（见 find_region_panels），
   单位/币种从价表表头声明读取（见 parse_unit_currency），任何一环不符即 exit(2) 保留旧文件。
 """
-import os, re, json, ssl, gzip, zlib, urllib.request, sys
+import os, re, json, ssl, gzip, zlib, urllib.request, sys, time
 try:
     import requests  # 可选依赖：缺失时 fetch() 自动回退 urllib（本页服务端渲染，不需要 requests 的任何特性）
 except ImportError:
@@ -91,20 +91,35 @@ def decode_body(raw, encoding):
     return raw.decode('utf-8', 'replace')
 
 
+# v3.59.0（审计 M21）：抓取重试（指数退避），同 fetch-cn-prices.http_get 的口径。
+#   腾讯文档页瞬时抖动/Cloudflare 挑战一次失败 → 整条源 exit(2) 保留旧版，本可不必。
+TOKENHUB_RETRIES = int(os.environ.get('CN_PRICE_HTTP_RETRIES') or '2')
+TOKENHUB_RETRY_BASE_MS = 400
+
+
 def fetch():
-    if requests is not None:
-        # v3.48.0（审计 S6）：原实现 `requests.get(URL,...).text` **不校验 HTTP 状态**——腾讯文档页临时
-        #   5xx / Cloudflare 挑战页会被 .text 原样吃下：页面里恰有含"峰谷计费"的块时，错误价表直接写进
-        #   tokenhub_lang.json；没切出块则 0 模型"假成功"。而 urllib 分支非 2xx 直接抛 → 同一故障两条
-        #   分支给出两种结局。raise_for_status 让 requests 分支与 urllib 分支对齐（fail-closed）。
-        #   另：requests 分支的 verify 与 urllib 分支同受 CN_PRICES_INSECURE_TLS 控制（见 ssl_context
-        #   上方注释），无需在此重复处理。
-        resp = requests.get(URL, headers={'User-Agent': UA}, timeout=30)
-        resp.raise_for_status()
-        return resp.text
-    req = urllib.request.Request(URL, headers={'User-Agent': UA})
-    resp = urllib.request.urlopen(req, timeout=30, context=ssl_context())
-    return decode_body(resp.read(), resp.headers.get('Content-Encoding'))
+    last = None
+    for attempt in range(TOKENHUB_RETRIES + 1):
+        try:
+            if requests is not None:
+                # v3.48.0（审计 S6）：原实现 `requests.get(URL,...).text` **不校验 HTTP 状态**——腾讯文档页临时
+                #   5xx / Cloudflare 挑战页会被 .text 原样吃下：页面里恰有含"峰谷计费"的块时，错误价表直接写进
+                #   tokenhub_lang.json；没切出块则 0 模型"假成功"。而 urllib 分支非 2xx 直接抛 → 同一故障两条
+                #   分支给出两种结局。raise_for_status 让 requests 分支与 urllib 分支对齐（fail-closed）。
+                #   另：requests 分支的 verify 与 urllib 分支同受 CN_PRICES_INSECURE_TLS 控制（见 ssl_context
+                #   上方注释），无需在此重复处理。
+                resp = requests.get(URL, headers={'User-Agent': UA}, timeout=30)
+                resp.raise_for_status()
+                return resp.text
+            req = urllib.request.Request(URL, headers={'User-Agent': UA})
+            resp = urllib.request.urlopen(req, timeout=30, context=ssl_context())
+            return decode_body(resp.read(), resp.headers.get('Content-Encoding'))
+        except Exception as e:
+            last = e
+            if attempt >= TOKENHUB_RETRIES:
+                break
+            time.sleep(TOKENHUB_RETRY_BASE_MS * (2 ** attempt) / 1000.0)
+    raise last
 
 
 # v3.52.0（审计批2·L2）：列语义同义词表 —— 腾讯改列表头词面时**只补表、不动解析逻辑**。
@@ -465,7 +480,8 @@ def main():
     # v2.82：原子写（唯一 tmp + os.replace），防多会话并发时读方拿到半截 JSON
     tmp = os.path.join(out_dir, 'tokenhub_lang.json.tmp-%d' % os.getpid())
     with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(out, f, ensure_ascii=False, indent=1)
+        # v3.59.0（批10·M17）：allow_nan=False —— 写出 `NaN` 会让 Node 侧 JSON.parse 抛错致计费崩溃
+        json.dump(out, f, ensure_ascii=False, indent=1, allow_nan=False)
     os.replace(tmp, os.path.join(out_dir, 'tokenhub_lang.json'))
     print('解析到模型数:', len(models), '| 峰谷规则:', len(peak_rule))
     print('已写入 prices/tokenhub_lang.json')

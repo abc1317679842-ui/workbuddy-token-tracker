@@ -151,7 +151,20 @@ if (require.main === module) (async () => {
     process.exit(0);
   }
   const nowY = new Date(Date.now() + 8 * 3600e3).getUTCFullYear();
-  const years = arg ? [Number(arg)] : [nowY - 1, nowY, nowY + 1];
+  // v3.59.0（审计 M33）：参数校验。改前 `Number(arg)` 不加任何判断 → `node refresh-holidays.js abc`
+  //   = `years = [NaN]` → 拿 NaN 去拼 URL 抓两次 404 → 静默 exit 2。用户只看到"没反应"，
+  //   **与"源挂了 / 没网 / 被限流"完全无法区分** → 排查方向整个错掉（其实是自己参数打错了）。
+  if (arg && !/^\d{4}$/.test(String(arg))) {
+    console.error(`[refresh-holidays] ✗ 参数不是合法年份：${JSON.stringify(String(arg))}`
+      + `（应为 4 位年份数字，如 ${nowY}；不传参数则默认刷新 ${nowY - 1} / ${nowY} / ${nowY + 1} 三年）`);
+    process.exit(2);
+  }
+  const argY = arg ? Number(arg) : 0;
+  if (argY && (argY < 1990 || argY > 2100)) {
+    console.error(`[refresh-holidays] ✗ 年份超出合理区间（1990-2100）：${argY}（国务院假日安排不在此范围内）`);
+    process.exit(2);
+  }
+  const years = arg ? [argY] : [nowY - 1, nowY, nowY + 1];
   const tok = ghToken();
   let old = { years: {} };
   try { old = JSON.parse(fs.readFileSync(OUT, 'utf-8')); } catch (e) {} // silent-ok:降级 — 旧年表读取失败即视为空（随后会按新表写）
@@ -174,6 +187,14 @@ if (require.main === module) (async () => {
       const oldV = yearsMap[String(y)];
       if (!Array.isArray(oldV) || oldV.length === 0) yearsMap[String(y)] = null;
     };
+    // v3.59.0（审计 S4）：**空数组源 = 本次不可用**，不是"该年 0 天假日"。
+    //   中国每年法定假日 ≥11 天（另有调休上班日），全年 0 天只可能是源异常
+    //   （页面改版 / API 空响应 / 字段改名）。原实现里 `a=[]` 是 truthy → 照样进
+    //   两源交集 → 交集为空 → 空年守卫保留旧数据 → **另一源的有效数据被白丢**
+    //   （少一天更新，且只有 stdout 一行提示、不落 stale 明细）。
+    //   归一为 null 后走下方「单源可用 → 采用」分支：一个源坏不影响另一个源落地。
+    if (Array.isArray(a) && a.length === 0) a = null;
+    if (b && Array.isArray(b.offDays) && b.offDays.length === 0) b = null;
     if (!a && !b) { keepOldOrMarkUnknown(); console.log(`  ⚠ ${y}: 两源都取不到 → 保留旧数据`); continue; }
     // 两源比对（v3.29.0/C-5：计算抽为纯函数 crossCheck，逻辑与原先内联实现逐字等价）
     let adopt, agree = null, onlyA = [], onlyB = [];
@@ -247,12 +268,17 @@ if (require.main === module) (async () => {
   // v3.19.0（P5）：原子写（tmp + rename），与其它写盘路径同口径（原先裸 writeFileSync，中断留半截 JSON）
   // v3.32.0（方案 H1）：stale_detail —— 每个缺数据年份的 since/reason 明细（--check 与人工排查消费；
   //   `stale_years` 保持既有字符串数组形态不破坏旧读者，明细另开一字段）。
-  const staleDetail = Object.assign({}, old.stale_detail || {});
+  // v3.59.0（审计 M31）：**写前按当前缺年集合清理** —— 原实现从 old 继承后只对 missingYears 增补、
+  //   从不删除 → 某年数据恢复后它的陈旧明细永留文件里，`--check` 与人工排查把它当"仍缺数据"读，
+  //   误判一年。（`stale_years` 是每次整体重算的，本就正确；只有 stale_detail 会累积。）
+  const staleDetail = {};
   for (const y of missingYears) {
     const yy = String(y);
     const failsY = fails.filter((f) => f.includes('/' + yy + ':'));
+    // 已缺过的年份沿用旧 since（缺数据的起始日不该被"今天又缺一次"刷新）
+    const prev = (old.stale_detail || {})[yy];
     staleDetail[yy] = {
-      since: new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10),
+      since: (prev && prev.since) || new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10),
       reason: failsY.length ? '获取失败: ' + failsY.join('; ') : '源返回 0 天（真实世界不可能，判定为源异常）',
     };
   }
@@ -284,7 +310,14 @@ if (require.main === module) (async () => {
     try { st = JSON.parse(fs.readFileSync(stPath, 'utf-8')); } catch (e) { st = {}; }
     st.lastSuccessAt = Date.now();
     st.confirmedYears = Object.keys(yearsMap).filter((y) => Array.isArray(yearsMap[y]) && yearsMap[y].length > 0);
-    fs.writeFileSync(stPath, JSON.stringify(st), 'utf-8');
+    // v3.59.0（审计 M32）：改 tmp + rename **原子写**。改前是直接 writeFileSync 覆盖 →
+    //   ① 并发两个刷新进程（手动并行 / 自动链路与手动撞车）会互相覆盖 lastSuccessAt；
+    //   ② 更糟的是写到一半被中断 → 留下**半截 JSON** → 下轮 JSON.parse 失败 → 状态被当成空
+    //      → 条件④「距上次成功 >30 天」永久失效 → **每天重复联网**。
+    //   tmp + rename 在同一分区是原子的，与账本/价库同一套写法（全项目写盘方式只有一处）。
+    const stTmp = stPath + '.tmp-' + process.pid;
+    fs.writeFileSync(stTmp, JSON.stringify(st), 'utf-8');
+    fs.renameSync(stTmp, stPath);
   } catch (e) { /* 状态文件写失败不影响数据落盘成果，下轮按"陈旧"重试 */ }
   console.log(`  已写入 ${OUT}`);
   console.log(`  覆盖年份: ${Object.keys(yearsMap).sort().join(', ')}`);

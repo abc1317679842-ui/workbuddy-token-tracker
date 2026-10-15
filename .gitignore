@@ -73,3 +73,7 @@ prices/
 *.corrupt-*
 # v3.32.0（方案 H3）：假日自动刷新的节流状态（lastAttemptAt / lastSuccessAt）
 .holidays-refresh.json
+__pycache__/
+*.pyc
+# v3.59.0：提前弹窗专题调查报表（本地留档，不随技能发布）
+PREMATURE-POPUP.md

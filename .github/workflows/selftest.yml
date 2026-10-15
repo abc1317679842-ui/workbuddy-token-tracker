@@ -23,11 +23,18 @@ on:
 jobs:
   selftest:
     runs-on: windows-latest
+    # v3.59.0（审计批15 · M40）：Node 版本矩阵 —— 改前只跑 20，而本机实际是 22；
+    #   语法/API 差异（如 AbortSignal.timeout、fs.rmSync 行为）只在对应版本上才暴露。
+    #   fail-fast:false —— 一个版本红也要看另一个版本的结果，避免"修好 20 又炸 22"来回试错。
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: ${{ matrix.node-version }}
       - name: Verify runner can spawn node subprocesses (selftest 前提)
         run: node -e "const r=require('child_process').spawnSync(process.execPath,['-e','console.log(1)']); if(r.status!==0){console.error('spawn 探测失败：本 runner 上 selftest 的端到端用例会静默跳过');process.exit(1)} console.log('spawn OK')"
       # v3.49.0（审计 G12）：Python 三脚本语法守卫 —— selftest 的 T0 只做 JS 的 `node --check`，
@@ -35,13 +42,30 @@ jobs:
       #   不设 continue-on-error：语法错误是确定性回归，该红就红。
       - name: Syntax check Python price-pipeline scripts
         run: python -m py_compile fetch-cn-prices.py parse_tokenhub.py build_index.py
+      # v3.59.0（审计批15 · M40）：凭据扫描。零依赖自研脚本（理由见脚本头注释：
+      #   不引第三方 action，是为了保住"零依赖单文件"这个卖点、也不把 CI 可信度押在别人仓库上）。
+      - name: Secret & credential scan (zero-dependency)
+        run: node .github/workflows/secret-scan.js
       - name: Run selftest (offline, isolated)
         run: node selftest.js
         env:
           WB_NO_NET: '1'
       # v3.48.0（审计 S3）：联网再跑一遍，专门覆盖 T3-R4「⚠价库告警」（离线跑会 envSkip 掉它）。
       #   两者是**不同模式**而非重复：离线跑锁"断网自愈"路径，联网跑锁"价库告警"路径。
-      #   continue-on-error：GitHub runner 的外网偶发抖动属环境问题，不该把 CI 变成常红噪音。
+      # v3.59.0（审计批15 · M39）：**去掉 continue-on-error** —— 原写法把"真回归"与"runner 网络抖动"
+      #   一并吞掉（网络一抖，这一遍等于没跑，且绿灯照给）。改为**先探测网络可达性**：
+      #     可达 → 这一遍必须红（真回归拦得住）；不可达 → 整步跳过（不假红，也不假装跑过）。
+      #   这样"没跑"是显式的（job 日志里看得到 skip 原因），不再是静默放过。
+      - name: Probe network reachability (gate for the online run)
+        id: net
+        shell: bash
+        run: |
+          if node -e "fetch('https://api.github.com',{signal:AbortSignal.timeout(8000)}).then(function(r){process.exit(r.ok?0:1)}).catch(function(){process.exit(1)})"; then
+            echo "reachable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "reachable=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::外网不可达 → 跳过联网那一遍 selftest（T3-R4 本轮无覆盖，属环境问题不是通过）"
+          fi
       - name: Run selftest (online, covers T3-R4 price-library warning)
-        continue-on-error: true
+        if: steps.net.outputs.reachable == 'true'
         run: node selftest.js

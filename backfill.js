@@ -75,7 +75,21 @@ const saveLedgerRawAtomic = tt.saveLedgerRawAtomic;
 const WRITE = process.argv.includes('--write');
 
 
+// v3.59.0（审计 M25）：峰谷**降级可见性** —— 与 recalc-day.js（v3.58.0 批8-⑨）/ 主脚本
+//   token-tracker.js isPeakHour（v3.32.0 H4）同款告警。backfill 是**第三条**独立计价路径
+//   （主链路增量 / recalc 回溯 / backfill 重建），前两条都已有这条告警，唯独 backfill 没有：
+//   假日数据未知/陈旧的年份在这里照样按「非假日」判定 → 真假日按高峰 ×2 多算、调休上班日按周末
+//   低峰少算，**双向错且零提示**，而 backfill 恰恰是最常被拿去"重建整个账本"的那一把刀。
+//   进程内每年至多 1 条 stderr（Set 去重，本函数在扫描循环里是热路径）。
+const _holidayWarnedYears = new Set();
 function isPeakBeijingTs(tsMs) {
+  try {
+    const yNow = new Date(tsMs + 8 * 3600e3).getUTCFullYear();
+    if (!_holidayWarnedYears.has(yNow) && peakRules.holidayYearUnknown(tsMs, HOLIDAYS)) {
+      _holidayWarnedYears.add(yNow);
+      process.stderr.write(`[backfill] ⚠ ${yNow} 年法定假日数据未知或已陈旧 → 该年峰谷判定按「非假日」降级：真假日按高峰 ×2 多算、调休上班日按周末低峰少算；联网后跑 node refresh-holidays.js ${yNow} 可修复\n`);
+    }
+  } catch (e) { /* 告警失败绝不影响判定本身 */ }
   return peakRules.isPeakAt(tsMs, _pricing, HOLIDAYS);
 }
 function beijingDate(tsMs) {

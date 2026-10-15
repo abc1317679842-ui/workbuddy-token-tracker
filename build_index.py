@@ -223,6 +223,14 @@ def gate_new_model(e, full):
     # v3.54.0（批4）：币种必须属索引口径。USD 价混进 CNY 库 = 金额差一个汇率且无告警。
     if not currency_allowed(e.get('currency')):
         return False, '币种非 CNY（%s；索引口径统一 CNY，混入会差一个汇率）' % e.get('currency')
+    # v3.59.0（批10·M12）：主价双价必须齐全。改前 price_values 只收「非 None 的数字」，
+    #   in/out 缺一半时 vals 剩一个且区间合法 → 照样进索引 → JS 侧 None*tokens=0 →
+    #   该模型**计费静默归 0（少收）且不告警**。
+    #   ⚠️ cache_hit 缺失**不在本闸门范围**：厂商未公布缓存命中价是 A5 已定常态（按 0 计合法），
+    #   把它也卡了会把大批正常模型误杀。
+    for f in ('in_price', 'out_price'):
+        if not isinstance(e.get(f), (int, float)):
+            return False, '主价缺失（%s=%r 非数值；缺一半会让该模型计费静默归 0）' % (f, e.get(f))
     vals = price_values(e)
     if not vals:
         return False, '无可校验价格'
@@ -290,7 +298,10 @@ def append_changes(records):
     try:
         with open(CHANGE_FILE, 'a', encoding='utf-8') as f:
             for r in records:
-                f.write(json.dumps(r, ensure_ascii=False) + '\n')
+                # v3.59.0（批10·M17）：allow_nan=False —— 默认 True 会把 NaN/Infinity 写成 JSON 字面量
+                #   `NaN`，而 JSON 标准不认它 → Node 侧 JSON.parse 直接抛错致计费崩溃。
+                #   宁可在这里抛 ValueError（有栈、定位到这条记录），也不要写出脏文件。
+                f.write(json.dumps(r, ensure_ascii=False, allow_nan=False) + '\n')
                 n += 1
     except Exception as e:
         sys.stderr.write('[build_index][WARN] changes.jsonl 写入失败（%r）；本次无审计流水，索引照常产出\n' % (e,))
@@ -299,6 +310,11 @@ def append_changes(records):
 
 
 def main():
+    # v3.59.0（审计 M18）：确保价库目录存在再干活。原实现直接往 PRICES_DIR 写
+    #   index.json / changes.jsonl —— 单独运行（或全新部署、目录被清理）时
+    #   FileNotFoundError 裸崩。链上另两个脚本都有 makedirs，唯独本脚本没有
+    #   （正常跑链时靠前两个脚本顺带建目录，单独跑/首日部署就崩）。
+    os.makedirs(PRICES_DIR, exist_ok=True)
     # v3.51.0（审计批1·C）：latest.json 缺失/损坏不再裸崩。原实现 json.load 直接抛异常 →
     #   build_index 非零退出、index.json 停留在上一版（表面无事，实则今日抓取数据全丢且无告警）。
     #   改为 WARN + 按「今日无抓取数据」处理：下方逐模型沿用逻辑整体继承上一版索引
@@ -487,23 +503,42 @@ def main():
             if not v.get('lock'):
                 continue
             k = norm(key)
+            # v3.59.0（批10·M16）：lock 条目价格必须数值化后再用。改前直接 `v.get('input_price') * mult`：
+            #   ① 字符串价（手写编辑 / 导入）→ `'1'*2='11'` 错峰价，静默错 11 倍；
+            #   ② `"cached_price": null`（JSON 显式 null）→ `v.get('cached_price', 0)` 返回 **None**（键存在）
+            #      → `None*mult` 抛 TypeError **崩掉整段 build_index**（无 try 保护，当日价库全停产）。
+            # 非数值一律归一 None + WARN 留痕；peak 计算要求 in/out 齐全，缺一半则放弃 peak 段
+            # （宁可少一个峰谷档，也不能崩或给出错价）。
+            def _num(x):
+                return x if isinstance(x, (int, float)) and not isinstance(x, bool) else None
+            in_p, out_p, cache_p = _num(v.get('input_price')), _num(v.get('output_price')), _num(v.get('cached_price'))
+            for _f, _raw in (('input_price', v.get('input_price')), ('output_price', v.get('output_price')),
+                             ('cached_price', v.get('cached_price'))):
+                if _raw is not None and _num(_raw) is None:
+                    sys.stderr.write('[build_index][WARN] lock 条目 %s 的 %s=%r 非数值，已按缺失处理'
+                                     '（字符串价会乘出错价、null 价会崩 peak 计算）\n' % (key, _f, _raw))
             # 峰谷：peak_multiplier 表示高峰价倍数（DeepSeek 原厂系）
             peak = None
             if v.get('peak_multiplier') and v['peak_multiplier'] != 1:
                 mult = v['peak_multiplier']
-                peak = {
-                    'idle': {'in': v.get('input_price'), 'out': v.get('output_price'),
-                             'cache': v.get('cached_price', 0)},
-                    'peak': {'in': v.get('input_price') * mult,
-                             'out': v.get('output_price') * mult,
-                             'cache': v.get('cached_price', 0) * mult},
-                }
+                if _num(mult) is None:
+                    sys.stderr.write('[build_index][WARN] lock 条目 %s 的 peak_multiplier=%r 非数值，跳过 peak 段\n' % (key, mult))
+                elif in_p is None or out_p is None:
+                    sys.stderr.write('[build_index][WARN] lock 条目 %s 主价不齐（in=%r/out=%r），跳过 peak 段\n' % (key, in_p, out_p))
+                else:
+                    peak = {
+                        'idle': {'in': in_p, 'out': out_p,
+                                 'cache': cache_p if cache_p is not None else 0},
+                        'peak': {'in': in_p * mult,
+                                 'out': out_p * mult,
+                                 'cache': (cache_p if cache_p is not None else 0) * mult},
+                    }
             contract = {'currency': p_currency, 'unit': p_unit, 'region': v.get('region') or 'CN'}
             if k in merged:
                 upd = {
-                    'in_price': v.get('input_price'),
-                    'out_price': v.get('output_price'),
-                    'cache_hit': v.get('cached_price'),
+                    'in_price': in_p,
+                    'out_price': out_p,
+                    'cache_hit': cache_p,
                     'primary_source': 'pricing.json(用户已校对官方价,lock)',
                     'primary_source_type': 'first_party',
                     'tier_note': v.get('tier_note', merged[k].get('tier_note', '')),
@@ -516,21 +551,22 @@ def main():
                 overlay += 1
             else:
                 # 未被抓取覆盖（如 Hy4 官方研究页是 SPA）→ 直接注入为官方权威项
+                # v3.59.0（批10·M16）：同步用数值化后的 in_p/out_p/cache_p，与上方 overlay 分支同口径
                 rec = {
                     'name': v.get('name', key),
                     'api_name': key,
-                    'in_price': v.get('input_price'),
-                    'out_price': v.get('output_price'),
-                    'cache_hit': v.get('cached_price'),
+                    'in_price': in_p,
+                    'out_price': out_p,
+                    'cache_hit': cache_p,
                     'primary_source': v.get('price_source', 'pricing.json(用户已校对官方价,lock)'),
                     'primary_source_type': 'first_party',
                     'tier_note': v.get('tier_note', ''),
                     'authoritative': True,
                     'all_sources': [{
                         'name': v.get('name', key),
-                        'in': v.get('input_price'),
-                        'out': v.get('output_price'),
-                        'cache': v.get('cached_price'),
+                        'in': in_p,
+                        'out': out_p,
+                        'cache': cache_p,
                         'source': v.get('price_source', 'pricing.json(lock)'),
                         'source_type': 'first_party',
                     }],
@@ -793,7 +829,8 @@ def main():
     # v2.82：tmp 按 PID 唯一化——固定名 .tmp 在多会话并发时两个进程互写同一文件 → PermissionError(exit 1)
     tmp = '%s.tmp-%d' % (OUT, os.getpid())
     with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+        # v3.59.0（批10·M17）：allow_nan=False，理由同 changes.jsonl —— 写出 `NaN` 会让 Node 侧 JSON.parse 崩
+        json.dump(result, f, ensure_ascii=False, indent=2, allow_nan=False)
     os.replace(tmp, OUT)
     print('合并完成：%d 个归一化模型，解决 %d 处来源冲突，%d 个被 pricing.json(lock) 权威覆盖（其中 %d 个为新注入的官方项）；跳过 %d 条契约不全/无价条目（详见 stderr）'
           % (len(merged), conflicts, overlay, injected, len(skipped)))

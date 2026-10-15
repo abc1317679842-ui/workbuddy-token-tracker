@@ -231,6 +231,23 @@ function main() {
   const _n = new Date();
   const date = argv[0] || `${_n.getFullYear()}-${String(_n.getMonth() + 1).padStart(2, '0')}-${String(_n.getDate()).padStart(2, '0')}`;
   const onlyModel = argv[1] || '';
+  // v3.59.0（审计 M24）：日期合法性校验。改前 `argv[0]` 原样拿去查字典 →
+  //   `node recalc-day.js 2026-13-45` 报「账本中无 2026-13-45 记录」——**把"参数非法"说成"数据缺失"**：
+  //   用户会以为账本坏了、或那天真的没有用量，转头去查账本、甚至跑去跑 backfill（正是 KI-5 警告的
+  //   危险操作）。校验要在**查字典之前**做，否则两个失败原因永远混在一条信息里。
+  if (argv[0]) {
+    const bad = (msg) => {
+      console.error(`✗ 日期参数非法：${JSON.stringify(argv[0])} —— ${msg}`
+        + `（应为 YYYY-MM-DD，如 ${date}；不传参数默认重算今天）`);
+      process.exit(2);
+    };
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(argv[0])) bad('格式不是 YYYY-MM-DD');
+    const p = argv[0].split('-').map(Number);
+    // 日历校验（不是只看形状）：`2026-13-45` / `2026-02-30` 形状合法但不是真实日期 →
+    // `new Date(2026,12,45)` 会静默滚到下一年，必须靠回读年/月/日识别。
+    const dt = new Date(Date.UTC(p[0], p[1] - 1, p[2]));
+    if (dt.getUTCFullYear() !== p[0] || dt.getUTCMonth() !== p[1] - 1 || dt.getUTCDate() !== p[2]) bad('不是真实存在的日期');
+  }
 
   const daily = loadJsonSafe(DAILY);
   if (!daily) { console.error('账本读取失败（已备份为 .corrupt-*）；请检查 daily-usage.json'); process.exit(1); }
@@ -264,19 +281,28 @@ function main() {
   function recalcDay(dayObj) {
     let dayTotal = 0;
     const report = [];
+    // v3.59.0（批16）：**可观测性补漏** —— recalc 此前没有任何"到底处理了几个模型"的输出信号：
+    //   早退路径（无价 / 被 onlyModel 过滤 / 条目损坏）与"真处理了但金额没变"在 stdout 上**完全一致**
+    //   → 端到端测试只能断言"没崩"（T68-e3 的弱断言），分不清"重算成功"与"压根没走到重算"。
+    let modelsSeen = 0;     // 遍历到的账本条目数（含被跳过的）
+    let modelsRecalced = 0; // 真正走到计价重算的（有价 + 未被 onlyModel 过滤）
 
     for (const [model, stat] of Object.entries(dayObj.models || {})) {
+      modelsSeen += 1;
       // v3.46.0（审计 S-10）：账本条目可能是 null / 非对象（手写编辑、第三方工具写坏、半截 JSON 修复后残留）。
       //   改前 `stat.cost` 直接抛 TypeError → 整个 recalc 崩在**锁内**、账本已备份但未写回 →
       //   用户只看到一段异常栈。跳过坏条目（不动它的金额），其余模型照常重算。
       if (!stat || typeof stat !== 'object') continue;
-      if (onlyModel && model !== onlyModel) { dayTotal += stat.cost || 0; continue; }
+      // v3.59.0（批10·S1）：两处早退累加原先用 `stat.cost || 0` —— 脏字符串 cost 会把 dayTotal
+      //   腐化成字符串（"0.5"+12.3 → "0.5012.3"），末行 safeCost 兜底解析失败 → 当日合计静默归 0，
+      //   后续模型的金额全部丢失。与 :337/:372 同口径走 safeCost（非有限数归一为 0，由上游补正）。
+      if (onlyModel && model !== onlyModel) { dayTotal += safeCost(stat.cost); continue; }
       // v3.23.5：查价改走主脚本的 findModel（归一化 + 边界匹配 + 别名），与 backfill / 主链路同口径。
       // 原先裸查字典 `(pricing.models || {})[model]` —— 账本里的模型名与价库键差一个后缀/别名就取不到价，
       // 表现为「同一天 backfill 算得出金额、recalc 算不出」，且没有任何报错。
       const hit = tt.findModel(pricing, model, 'price');
       const m = hit ? hit.m : null;
-      if (!m || typeof m.input_price !== 'number') { dayTotal += stat.cost || 0; continue; }
+      if (!m || typeof m.input_price !== 'number') { dayTotal += safeCost(stat.cost); continue; }
 
       // v3.29.0（S-2 补漏）：优先用锁外预热缓存；并发新出现的模型（不在缓存里）才现场读 toast。
       // v3.31.0（P1-15）：并发新出现的模型不在 allModels 里 → 补进候选表，否则它自己的轮次会被仲裁给别的模型
@@ -296,6 +322,7 @@ function main() {
         peakRatio = 0; // 无峰谷 → 不判时段
       }
 
+      modelsRecalced += 1; // 走到这里 = 有价且未被 onlyModel 过滤，真的要重算金额
       const base = costOf(m, stat.in, stat.cached, stat.out, 1);
       let cost;
       // v3.40.0（plan-B A3）：**优先级① —— 行级精确切分**（明细里落下的 peakSplit）。
@@ -378,7 +405,7 @@ function main() {
     // v3.58.0（批8-①）：最后一关兜底 —— 即便上面某条漏网把 dayTotal 变成非有限数，
     //   也只让当日合计降级为 0（可重跑修复），绝不让 NaN 落进账本（NaN 一旦落盘即不自愈）。
     dayObj.total.cost = Math.round(safeCost(dayTotal) * 1e6) / 1e6;
-    return { total: dayObj.total.cost, report };
+    return { total: dayObj.total.cost, report, modelsSeen, modelsRecalced };
   }
 
   // v3.19.0（P2）：先备份，再走主脚本的原子写（tmp+rename）。原先直接 writeFileSync 覆盖，
@@ -429,6 +456,9 @@ function main() {
     console.log(`    原 ¥${r.old.toFixed(4)} → 现 ¥${r.neu.toFixed(4)}  （轮次 ${r.rounds}，高峰占比 ${r.peakRatio}）`);
   }
   console.log(`  当日合计 ¥${recalc.total.toFixed(2)}`);
+  // v3.59.0（批16）：处理模型数的**显式信号**（见 recalcDay 内计数器注释）。
+  //   `重算/总计` 的差额 = 未收录价 / 被 onlyModel 过滤 / 条目损坏 —— 差额大时一眼看出"没算全"。
+  console.log(`  处理模型 ${recalc.modelsRecalced}/${recalc.modelsSeen} 个（重算 / 总计）`);
 }
 
 // v3.40.0（plan-B A3）：被 require 时**不自动跑 main**（供 selftest 单测 peakSplitOf/精确切分）。

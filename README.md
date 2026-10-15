@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.58.0-blue)
+![Version](https://img.shields.io/badge/version-v3.59.0-blue)
 
 > 在每次回答后显示 **Token 消耗 / 耗时 / 折算费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -91,7 +91,7 @@ node recalc-day.js 2026-10-02   # 指定某天
 node recalc-day.js              # 不带参数即当天；历史多天需逐日执行
 ```
 
-> 注意：`backfill --write` 是**全量重建替换**，不是 merge——用它回填会抹掉压缩窗口外的历史账，**不要为回填目的跑它**（详见 `TROUBLESHOOTING.md` 与 KNOWN-ISSUES KI-5）。
+> 注意：⚠ `backfill --write` **不是**整份替换（v3.55.0 / KI-22 起是**模型级合并**：重放抓不到的 `(日期,模型)` 保留并标 `stale_carried`），但**抓得到的 (日期,模型) 一律用重放值覆盖、不取 max** → 用它回填时，transcript 被压缩掉的行对应的量照样会**减少**，**不要为回填目的跑它**（详见 `TROUBLESHOOTING.md` 与 KNOWN-ISSUES KI-5）。
 
 ### ⚠️ 弹窗标注速查：`⚠未计价` / `⚠账缺` / `⚠缓存价未知` / `⚠价核验`
 
@@ -99,7 +99,7 @@ node recalc-day.js              # 不带参数即当天；历史多天需逐日�
 
 | 标注 | 出现位置 | 含义（触发条件） | 你该怎么办 |
 |---|---|---|---|
-| `｜⚠未计价` | 行2 末尾 | **本轮有 token 消耗、但金额算不出来**：该模型在 `pricing.json` 里查不到匹配（未收录 / `findModel` 未命中），或混合轮里**部分模型无价** → 金额位显示 `未收录`（混合轮为有价部分的**部分和**） | 「这轮金额缺了一块」。补 `pricing.json` 该条目价 → `node recalc-day.js <日期>` 回算历史；**不要用 `backfill --write`**（会抹历史账）。无输入/输出的空轮不会标 |
+| `｜⚠未计价` | 行2 末尾 | **本轮有 token 消耗、但金额算不出来**：该模型在 `pricing.json` 里查不到匹配（未收录 / `findModel` 未命中），或混合轮里**部分模型无价** → 金额位显示 `未收录`（混合轮为有价部分的**部分和**） | 「这轮金额缺了一块」。补 `pricing.json` 该条目价 → `node recalc-day.js <日期>` 回算历史；**不要用 `backfill --write`**（模型级合并但重放值覆盖同 key 且不取 max → 压缩掉的行对应的量会减少，见 KI-5）。无输入/输出的空轮不会标 |
 | `｜⚠账缺` | 行2 末尾 | 平台**压缩 / 重写过 transcript**，文件完整行数少于水位线 → 压缩窗口之后**可能静默少计**。v3.25.0 起新消耗已自动恢复记账，但**被压缩掉的历史行本地不可恢复**（见 `KNOWN-ISSUES.md` KI-5） | 对账时这段历史缺口**以服务商账单为准**；旗标（`.transcript-truncated.json`）7 天自动过期，**不要用 `backfill --write`** |
 | `｜⚠缓存价未知` | 行2 末尾 | **v3.31.0 起**（此前无任何提示）。该模型**有输入/输出单价、金额算得出来**，但**厂商没公布"缓存命中"的单价** → 缓存 token 只能按 **0 元**计。本技能场景下缓存占比常达 ~97%，故金额是**系统性低估**（实测低估区间 45%~86%），而弹窗看上去完全正常 | 不是故障、是**口径偏低的可见化**。金额位**照常显示、不隐藏**；要精确对账请以服务商账单为准。若厂商后续公布缓存价，跑 `node refresh-prices.js` 补录后 `node recalc-day.js <日期>` 回算 |
 | `价⚠️` / `官价⚠️` | 行2 末尾 | 价格多源刷新**全源失败** / DeepSeek **官方价抓取失败** → 本轮金额按上一次的价格估算 | 属刷新失败的可见化；看 `pricing.json` 的 `last_refresh_error` / `deepseek_refresh_error`，稍后重刷即可 |

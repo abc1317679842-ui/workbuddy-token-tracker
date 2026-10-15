@@ -271,6 +271,13 @@ def fetch(url, timeout=TIMEOUT):
     return decode_body(resp.read(), resp.headers.get('Content-Encoding'))
 
 
+# v3.59.0（审计 M21）：抓取重试（指数退避）。原实现单次失败即让该厂商当日停更——
+#   main 循环按厂商 try/except，一次瞬时抖动就 entry status=error，且次日之前不会自愈。
+#   默认额外重试 2 次（共 3 次尝试），退避 0.4s/0.8s；可用 CN_PRICE_HTTP_RETRIES 调（0=关）。
+HTTP_RETRIES = int(os.environ.get('CN_PRICE_HTTP_RETRIES') or '2')
+HTTP_RETRY_BASE_MS = 400
+
+
 def http_get(url, timeout=TIMEOUT):
     """GET 取回文本：有 requests 就用它（自动跟随 301），没有就回退上面的 urllib 实现。
     v3.23.4：requests 从「硬依赖」降级为「可选」——没有它的机器上整条流水线不再因 ImportError 崩掉。
@@ -282,12 +289,22 @@ def http_get(url, timeout=TIMEOUT):
       （实测 verify=<CERT_NONE 的 SSLContext> 仍得到 cert_reqs=CERT_REQUIRED），故不能靠传 CTX 生效。
       正确做法：按 CTX 的校验模式显式翻译 ——
         降级（CTX.verify_mode == CERT_NONE）→ verify=False（同时关链校验与 hostname 校验，与 urllib 分支对齐）
-        否则 → verify=True（requests 默认严格校验，与修复前行为一致）"""
-    if requests is not None:
-        verify = False if CTX.verify_mode == ssl.CERT_NONE else True
-        return requests.get(url, headers={'User-Agent': UA}, timeout=timeout,
-                            verify=verify).text
-    return fetch(url, timeout)
+        否则 → verify=True（requests 默认严格校验，与修复前行为一致）
+    v3.59.0（M21）：瞬时抖动重试——第 N 次失败睡 0.4s×2^(N-1) 再试；仍失败才抛（调用方按厂商 error 处理）。"""
+    last = None
+    for attempt in range(HTTP_RETRIES + 1):
+        try:
+            if requests is not None:
+                verify = False if CTX.verify_mode == ssl.CERT_NONE else True
+                return requests.get(url, headers={'User-Agent': UA}, timeout=timeout,
+                                    verify=verify).text
+            return fetch(url, timeout)
+        except Exception as e:
+            last = e
+            if attempt >= HTTP_RETRIES:
+                break
+            time.sleep(HTTP_RETRY_BASE_MS * (2 ** attempt) / 1000.0)
+    raise last
 
 
 def strip_tags(s):
@@ -384,6 +401,34 @@ def _znum(s):
     return float(m.group(1)) if m else None
 
 
+# ── v3.59.0（审计 S5）：页面单位声明校验（公共）──────────────────────────────
+# 背景：各家解析器只抓数字，unit 全靠 main 里 setdefault('元/百万 tokens') 兜底 →
+#   厂商把计价单位从「元/百万 tokens」改成「元/千 tokens」时价格照抓、单位照盖，
+#   1000× 错价**静默**入账（setdefault 把语义闸门架空了）。
+# 口径（2026-10-14 逐家抓真实页面实证）：
+#   智谱  —— 表头每列带「（元/百万 Tokens）」+ 全局「除特别说明外统一按元/百万 Tokens 展示」
+#   阶跃  —— 表格上方正文「单位：元／百万 tokens。」（全角／）；非 token 计价表无此声明
+#   MiniMax —— 表头含「元/百万」字样（:481 已有字面量校验）
+#   Kimi  —— 行首 "1M tokens" 字面量（原为隐式，本批提为显式断言）
+UNIT_TOKEN_MILLION_RE = re.compile(r'元\s*[／/]\s*百万\s*tokens?', re.I)
+
+
+def unit_is_token_million(text):
+    """该文本是否声明「元/百万 tokens」计价（全角／半角／大小写／空格均归一）。"""
+    return bool(UNIT_TOKEN_MILLION_RE.search(text or ''))
+
+
+def read_unit_decl(lines, before_idx, window=40):
+    """在 lines[:before_idx] 里向上找最近的「单位：X。」声明（阶跃 .md 形态）。
+    返回声明文本（不含「单位：」前缀），找不到返回 None。"""
+    lo = max(0, before_idx - window)
+    for j in range(before_idx - 1, lo - 1, -1):
+        m = re.search(r'单位[:：]\s*([^。\n]+)', lines[j])
+        if m:
+            return m.group(1).strip()
+    return None
+
+
 def parse_zhipu_docs(html):
     """智谱官方文档站定价页（v0.2，2026-09-28）——服务端渲染语义表格，无需 bundle 解析。
     列：模型名称 | 上下文 | 输入单价 | 输出单价 | 缓存存储 | 缓存命中 | 输入模态。
@@ -404,6 +449,17 @@ def parse_zhipu_docs(html):
         hdr = [strip_tags(c) for c in re.findall(r'<t[dh][^>]*>([\s\S]*?)</t[dh]>', rows[0])]
         cmap = map_price_columns(hdr)
         if cmap['in'] is None or cmap['out'] is None:
+            continue
+        # v3.59.0（审计 S5）：单位声明校验——智谱表头每列都带「（元/百万 Tokens）」
+        #   （2026-10-14 抓真实页面实证），认领不到元/百万单位的表整表跳过。
+        #   没有这道校验时：厂商把 token 计价单位改成「元/千 Tokens」而列名不变 →
+        #   价格照抓、unit 被 main 的 setdefault 盖回「元/百万 tokens」→ 1000× 错价静默入账。
+        #   ⚠️ 必须锚到 **in/out 认领到的那两列**，不能整表头扫：真实页面还有
+        #   「缓存存储（元/百万 Tokens/小时）」这种**不同量纲**列，整表头扫会被它带恒真
+        #   （夹具实测：只改输入/输出列为元/千、缓存存储列仍元/百万 → 校验形同虚设）。
+        #   微调表（元/千 Tokens）/ 语音表（元/万字符）无 in/out 列已被列语义排除，
+        #   走到这里仍不是元/百万的 = 真单位漂移，宁缺勿错。
+        if not (unit_is_token_million(hdr[cmap['in']]) and unit_is_token_million(hdr[cmap['out']])):
             continue
         for row in rows[1:]:
             cells = [strip_tags(c) for c in re.findall(r'<td[^>]*>([\s\S]*?)</td>', row)]
@@ -426,6 +482,7 @@ def parse_zhipu_docs(html):
                 'brand': 'zhipu',
                 'api_name': None,
                 'source_type': 'first_party',
+                'unit': '元/百万 tokens',  # v3.59.0（S5）：表头单位校验通过后显式回传
                 'in_price': ['%s元' % inp] if inp is not None else [],
                 'out_price': ['%s元' % outp] if outp is not None else [],
                 'cache_hit': ['%s元' % cache] if cache is not None else [],
@@ -459,6 +516,7 @@ def parse_minimax(html):
             'brand': 'minimax',
             'api_name': api,
             'source_type': 'first_party',
+            'unit': '元/百万 tokens',  # v3.59.0（S5）：表头「元/百万」字面量校验通过后显式回传
             'in_price': ['%s元' % in_v] if in_v is not None else [],
             'out_price': ['%s元' % out_v] if out_v is not None else [],
             'cache_hit': ['%s元' % cache_v] if cache_v is not None else [],
@@ -591,7 +649,18 @@ def parse_stepfun_md(md, drop_re=None, keep_over_re=None):
         #   （单价表：元／万字符、元／小时… 无输入/输出列 → 自然被排除，无需再写字面量判定）
         if col_in is None or col_out is None:
             continue
-        # 单位：向上找最近的「单位：X。」
+        # v3.59.0（审计 S5）：单位：向上找最近的「单位：X。」——此前只停在注释层、**未实现**，
+        #   单位全靠 main 的 setdefault 兜底。真实页面（2026-10-14 抓取）形态：
+        #   每个 token 计价表上方都有「单位：元／百万 tokens。」；万字符/小时/音色等
+        #   非 token 表没有该声明（且已被列语义排除）→ 找不到声明 = 不是 token 计价表。
+        #   声明存在但不是元/百万 = 真单位漂移 → WARN + 跳过（宁缺勿错）。
+        tbl_start = i - len(tbl)
+        unit_decl = read_unit_decl(lines, tbl_start)
+        if unit_decl is None:
+            continue
+        if not unit_is_token_million(unit_decl):
+            print('[WARN] stepfun: 表单位非元/百万 tokens（%s）→ 跳过该表' % unit_decl)
+            continue
         for row in tbl[2:]:  # 跳过表头与分隔行
             cells = [c.strip().strip('`') for c in row.strip('|').split('|')]
             if len(cells) <= max(col_in, col_out):
@@ -638,6 +707,7 @@ def parse_stepfun_md(md, drop_re=None, keep_over_re=None):
                 'brand': 'stepfun',
                 'api_name': name.lower(),
                 'source_type': 'first_party',
+                'unit': '元/百万 tokens',  # v3.59.0（S5）：表格上方单位声明校验通过后显式回传
                 'in_price': ['%s元' % in_v] if in_v is not None else [],
                 'out_price': ['%s元' % out_v] if out_v is not None else [],
                 'cache_hit': ['%s元' % cache_v] if cache_v is not None else [],
@@ -669,8 +739,15 @@ def parse_kimi():
         for line in t.splitlines():
             if not line.strip().startswith('['):
                 continue
-            m = re.match(r'\["([^"]+)",\s*"1M tokens",\s*(.*?),\s*"([\d,]+) tokens"\]', line)
+            m = re.match(r'\["([^"]+)",\s*"([\d.,]+[MK])\s*tokens",\s*(.*?),\s*"([\d,]+) tokens"\]', line)
             if not m:
+                continue
+            # v3.59.0（审计 S5）：单位显式断言。原正则把 "1M tokens" 写死成字面量 →
+            #   页面改用「1K tokens」计价时整行不匹配 → 静默 0 模型（连 WARN 都没有）。
+            #   现放宽量纲匹配再显式校验：非 1M tokens 计价 → WARN + 跳过（可见的失败）。
+            if m.group(2).upper() != '1M':
+                print('[WARN] kimi %s: 计价单位非 1M tokens（%s tokens）→ 跳过该行'
+                      % (pg, m.group(2)))
                 continue
             name = m.group(1)
             # v3.52.0（S4）：同其余解析器 —— 只丢真快照，soft 收录 + 待确认留痕
@@ -688,6 +765,7 @@ def parse_kimi():
                 'brand': 'kimi',
                 'api_name': name,
                 'source_type': 'first_party',
+                'unit': '元/百万 tokens',  # v3.59.0（S5）：行首 "1M tokens" 单位断言通过后显式回传
                 'in_price': ['%s元' % inp],
                 'out_price': ['%s元' % outp],
                 'cache_hit': ['%s元' % cache] if cache else [],
@@ -800,7 +878,15 @@ def main():
             #   供 build_index 契约海关校验（缺字段的条目会被拒收+告警，不会静默入账）。
             for mm in entry['models']:
                 mm.setdefault('source', cfg['name'])
-                mm.setdefault('unit', '元/百万 tokens')
+                # v3.59.0（审计 S5）：unit 不再静默兜底。各家解析器已在**页面单位声明校验
+                #   通过后**显式回传 unit（智谱表头/阶跃正文/MiniMax 表头/Kimi 行首 1M tokens）；
+                #   走到 setdefault 说明该厂商解析器没有单位校验 = 页面改单位会 1000× 错价
+                #   静默入账的那条路 → WARN 留痕（可见的失败），同时仍按设计前提兜底
+                #   （缺 unit 会被 build_index 契约海关拒收 → 整厂商停更，比错价更糟）。
+                if 'unit' not in mm:
+                    print('[WARN] %s: 解析器未回传 unit（无页面单位校验）→ 按设计前提兜底 元/百万 tokens'
+                          % cfg['name'])
+                    mm['unit'] = '元/百万 tokens'
                 mm.setdefault('currency', 'CNY')
                 mm.setdefault('region', 'CN')
                 mm.setdefault('source_url', cfg['url'])
@@ -863,12 +949,13 @@ def main():
     # 可能正在读 latest.json，裸 open('w') 会写出半截 JSON，对方 json.load 直接崩。
     tmp = path + '.tmp-%d' % os.getpid()
     with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+        # v3.59.0（批10·M17）：allow_nan=False —— 默认会写出 `NaN` 字面量，Node 侧 JSON.parse 抛错致计费崩
+        json.dump(result, f, ensure_ascii=False, indent=2, allow_nan=False)
     os.replace(tmp, path)
     latest = os.path.join(OUT_DIR, 'latest.json')
     tmp2 = latest + '.tmp-%d' % os.getpid()
     with open(tmp2, 'w', encoding='utf-8') as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+        json.dump(result, f, ensure_ascii=False, indent=2, allow_nan=False)
     os.replace(tmp2, latest)
     print('\n共 %d 个模型，已写入：\n  %s\n  %s'
           % (total, path, latest))

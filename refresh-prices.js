@@ -295,6 +295,33 @@ function isFreeVariant(id) {
   return s.endsWith(':free') || s.endsWith('-free');
 }
 
+// v3.59.0（审计 M1）：抓取重试（指数退避）—— 改前**一次失败 = 该源当日整体缺席**，后果被两处放大：
+//   ① 七源是 `Promise.all` 并行，任一源失败 = 中位数少一票（源越少越容易偏）；
+//   ② 刷新成功后 `pricing.date = today` → **当天不再重试** → 抖动一次 = 该源缺席满 24h。
+// 与 Python 侧（M21：fetch-cn-prices / parse_tokenhub）**同一口径**：默认额外 2 次、延迟 400ms→800ms，
+//   env `CN_PRICE_HTTP_RETRIES` 可调（0=关），两边共用一个开关名便于统一调。
+// 只重试**瞬时故障**（超时 / 5xx / 429 / 网络层错误）；404 这类确定性失败不重试（重试只是白等）。
+// 耗时上界：单源最坏 30s×3 + 1.2s ≈ 91s，仍低于 token-tracker.js 的 REFRESH_TIMEOUT_MS=180000 整进程上限。
+const HTTP_RETRIES = (() => {
+  const n = Number(process.env.CN_PRICE_HTTP_RETRIES);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 2;
+})();
+function isRetryableFetchErr(msg) {
+  return /abort|timeout|HTTP 5\d\d|HTTP 429|fetch failed|ENOTFOUND|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN/i.test(String(msg || ''));
+}
+async function fetchJsonWithRetry(url, timeoutMs = TIMEOUT_MS) {
+  let lastErr;
+  for (let i = 0; i <= HTTP_RETRIES; i++) {
+    try { return await fetchJson(url, timeoutMs); }
+    catch (e) {
+      lastErr = e;
+      if (i === HTTP_RETRIES || !isRetryableFetchErr(e && e.message)) break;
+      await new Promise((r) => setTimeout(r, 400 * Math.pow(2, i)));
+    }
+  }
+  throw lastErr;
+}
+
 // v3.37.0（L1'）：`timeoutMs` 参数——默认沿用全局 TIMEOUT_MS，大载荷源由 SOURCES 显式指定更大的值。
 async function fetchJson(url, timeoutMs = TIMEOUT_MS) {
   const ctrl = new AbortController();
@@ -666,7 +693,17 @@ function priceGate(key, now, pre, warnSink) {
       return true;
     }
     const ov = pre[field];
-    if (typeof ov === 'number' && isFinite(ov) && ov > 0) {
+    // v3.59.0（审计 M3）：**旧值自己必须可信，才配当骤变基线**。
+    //   改前只看"旧值是正数"就拿它做分母 → 一旦某次把错价写进价库（典型：上游单位改成「元/千 token」
+    //   后，1000× 错价通过 min/max 之外的路径落盘；或人工手改错），之后抓到的**正确价**相对它是
+    //   1/1000 → 被 abortAt 拦下并保留错价 → **错价永久自我锁定**：刷新每天跑、每天被拦，
+    //   人工不删价就永远修不回来（且告警说的是"新值骤变"，方向反了，越看越像新值有问题）。
+    //   修法：旧值若已超出合理区间（它自己就是那类错价）→ **不做骤变拦截**，新值只要过 min/max
+    //   校验即可写入 → 错价自愈。旧值在区间内（正常情况）→ 骤变校验逐字照旧，**零行为变化**。
+    //   安全方向：宁可让"疑似错价"被覆盖（有告警留痕），也不让错价靠闸门自我续命。
+    const ovUsable = typeof ov === 'number' && isFinite(ov) && ov > 0;
+    const ovTrusted = ovUsable && ov >= PRICE_SANITY.min && ov <= PRICE_SANITY.max;
+    if (ovTrusted) {
       const r = nv / ov;
       if (r >= PRICE_SANITY.abortAt || r <= 1 / PRICE_SANITY.abortAt) {
         warnSink.push(`${key}: ${label}由 ${ov} 骤变至 ${nv}（×${r.toFixed(2)}，超 ${PRICE_SANITY.abortAt}× 阈值），已保留旧值待人工核验`);
@@ -675,6 +712,9 @@ function priceGate(key, now, pre, warnSink) {
       if (r >= PRICE_SANITY.warnAt || r <= 1 / PRICE_SANITY.warnAt) {
         warnSink.push(`${key}: ${label}由 ${ov} 变动至 ${nv}（×${r.toFixed(2)}，变动超 50%），请人工核验`);
       }
+    } else if (ovUsable) {
+      // 旧值不可信 → 不拦，但**必须留痕**：否则"错价被覆盖"这件事完全不可见（与静默改价无区别）
+      warnSink.push(`${key}: ${label}旧值 ${ov} 已超出合理区间[${PRICE_SANITY.min}, ${PRICE_SANITY.max}]（疑似历史错价）→ 不再以它为骤变基线，本次采用抓取值 ${nv}，请人工确认`);
     }
     return false;
   };
@@ -727,6 +767,11 @@ async function main() {
   // 失败不中断：官方抓不到 → 回落聚合源，仅记 deepseek_refresh_error。
   let officialOk = false;
   let official = null; // { official: {模型:{input_price,cached_price,output_price,peak_multiplier}}, weekend_off_peak }
+  // v3.59.0（批11·S3）：DeepSeek 官方峰谷倍率变更告警。deepseek-official.js:685 会把
+  //   `peak_multiplier_note` 写进 JSON 输出并打自己的 stderr，但改前这里只取 j.ok/j.official，
+  //   note **零消费**、成功路径又整段丢弃 sp.stderr → 官方把倍率从 ×2 改成 ×1.5/×3 时
+  //   「价格会改、提示不出现」（deepseek-official.js:394-397 自认那是系统性少算/多算且零告警）。
+  let officialPeakNote = null;
   if (!NO_NET) {
     try {
       // v3.36.0（测试钩子）：DS_OFFICIAL_JSON 指向一份已抓好的官方价 JSON 时直接读取，
@@ -755,6 +800,14 @@ async function main() {
         if (j.ok && j.official) {
           official = j;
           officialOk = true;
+          // v3.59.0（批11·S3）：倍率变更告警透传 —— 见上方 officialPeakNote 声明处注释。
+          //   两件事一起做：① note 收进变量（下方并入 _price_audit.warnings 与 last_refresh_note）；
+          //   ② 成功路径也转发子进程 stderr（改前只有失败分支读 sp.stderr，成功路径整段丢弃）。
+          if (j.peak_multiplier_note) {
+            officialPeakNote = String(j.peak_multiplier_note);
+            process.stderr.write(`[refresh-prices] ⚠ ${officialPeakNote}\n`);
+          }
+          if (sp.stderr && String(sp.stderr).trim()) process.stderr.write(String(sp.stderr));
         }
       } else {
         // v3.18：sp.stderr 可能为 null（spawn 本身失败，如 EBUSY/ENOENT），先兜底空串
@@ -781,7 +834,7 @@ async function main() {
     ? Object.fromEntries(Object.keys(SOURCES).map((k) => [k, { ok: false, err: 'WB_NO_NET=1' }]))
     : await Promise.all(Object.entries(SOURCES).map(async ([k, s]) => {
         try {
-          const j = await fetchJson(s.url, s.timeoutMs);
+          const j = await fetchJsonWithRetry(s.url, s.timeoutMs); // v3.59.0（M1）：瞬时抖动不再让整源缺席 24h
           const parsed = PARSERS[k](j);
           const n = Object.keys(parsed || {}).length;
           if (!n) throw new Error('解析出 0 个模型（上游 schema 可能已变更）');
@@ -1005,6 +1058,10 @@ async function main() {
         };
         lockKeptMain++;
       } else if (officialBlk) {
+        // v3.59.0（批11·M5）：官方价分支也要走 bigDiff。改前只有 cnHit（国内源）分支检测
+        //   峰谷模型价差>60%，官方分支一律不检测 → 官方大幅改价或解析出错价时**静默入账**，
+        //   last_refresh_note 里只有一行不点名模型的通用文案。
+        const oldInOff = m.input_price, oldOutOff = m.output_price;
         m.input_price = officialBlk.input_price;
         m.cached_price = officialBlk.cached_price;
         m.output_price = officialBlk.output_price;
@@ -1014,6 +1071,11 @@ async function main() {
         delete m.retired;
         delete m.cached_price_estimated; // v3.24（F2·A-4c）：官方真实缓存价到位 → 清估算标记（只清标记，不动价格）
         updatedMain++;
+        if (typeof m.peak_multiplier === 'number' && m.peak_multiplier > 1) {
+          const dIn = oldInOff ? Math.abs(m.input_price - oldInOff) / oldInOff : 0;
+          const dOut = oldOutOff ? Math.abs(m.output_price - oldOutOff) / oldOutOff : 0;
+          if (dIn > 0.6 || dOut > 0.6) bigDiff.push(`${key}(官方价,±${Math.max(dIn, dOut).toFixed(0)}%)`);
+        }
       } else if (m.lock === true) {
         // 跳过人民币主价覆盖，保留本地价 + peak_multiplier
       } else if (cnHit) {
@@ -1108,6 +1170,8 @@ async function main() {
     if (beforeSnap.get(key) !== nowSnap) changedKeys.add(key);
   }
 
+  // v3.59.0（审计 S7）：写回前先取旧汇率——下一行就会把它覆盖掉，取晚了就永远等于新值。
+  const prevRateBefore = Number(pricing.usd_cny_rate);
   pricing.date = today;
   pricing.usd_cny_rate = rate;
   pricing.last_source = 'multi-source';
@@ -1135,6 +1199,25 @@ async function main() {
   // v3.31.0（P0-5 / P1-7）：价格体检告警并入同一出口（形状同样是 `<key>: 说明`，
   // 才能被 token-tracker.js 的 warnMentionsModel 点名命中、挂到对应模型的弹窗上）。
   for (const w of sanityWarnings) auditWarnings.push(w);
+  // v3.59.0（批11·S3）：DeepSeek 官方峰谷倍率变更 → 必须进可消费出口（弹窗挂载依赖
+  //   `_price_audit.warnings` 里 `<key>: 说明` 形状被 warnMentionsModel 点名，故带上 key 前缀）。
+  if (officialPeakNote) auditWarnings.push(`deepseek-official: ${officialPeakNote}`);
+  // v3.59.0（审计 S7）：汇率**陈旧度告警**。
+  //   KI-26 已定 Won't fix：`usd_cny_rate` 没有 live 刷新源（接汇率 API = 新外部依赖 + 新失败模式，
+  //   而实际参与换算的只有 USD 模型，偏差方向可控）。但"没有源"不等于"不该提醒"——
+  //   `rate` 一旦写入就永久沿用（只有 `rate<=0` 时才回退 DEFAULT_RATE），时间越久越可能与真实汇率脱节，
+  //   而**全程零提示**（用户根本不知道这份 7.2 是哪天来的）。
+  //   这里落 `usd_cny_rate_updated_at`（只在 rate 真的变化时更新）→ 超过阈值即在 stderr 与
+  //   `_price_audit.warnings` 留一条。**不需要任何外部源**，只陈述"这份汇率已经用了多久"。
+  //   形状 `usd_cny_rate: …` 不会被 warnMentionsModel 匹配到任何模型 → 不污染弹窗。
+  const RATE_STALE_DAYS = 30;
+  if (!(prevRateBefore > 0) || Math.abs(prevRateBefore - rate) > 1e-9) pricing.usd_cny_rate_updated_at = today;
+  const rateSince = String(pricing.usd_cny_rate_updated_at || '');
+  const rateDays = rateSince ? Math.round((Date.parse(today) - Date.parse(rateSince)) / 86400000) : -1;
+  if (rateDays < 0 || rateDays > RATE_STALE_DAYS) {
+    auditWarnings.push(`usd_cny_rate: 汇率 ${rate} ${rateDays < 0 ? '沿用起始日未知（本次起记录）' : `已沿用 ${rateDays} 天`}`
+      + `（> ${RATE_STALE_DAYS} 天）→ 无 live 刷新源（KI-26 Won't fix）；如已明显偏离请手工改 pricing.usd_cny_rate`);
+  }
 
   if (auditWarnings.length) pricing._price_audit = { at: new Date().toISOString(), warnings: auditWarnings };
   else delete pricing._price_audit;
@@ -1198,7 +1281,7 @@ async function main() {
     pricing.deepseek_refresh_error = `DeepSeek 官方定价抓取失败（${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}），DeepSeek 系价格沿用本地/聚合源价`;
     // 失败不阻塞整体刷新：其余模型照常更新
   }
-  pricing.last_refresh_note = `${new Date().toISOString()} 多源刷新：${noteParts.join(' | ')}；人民币主价更新 ${updatedMain} 个${autoConverted ? `，USD换算 ${autoConverted} 个` : ''}，USD参考 ${usdUpdated} 个，region 设定 ${regionSet} 个${(lockKept + lockKeptMain) ? `，lock 价保留 ${lockKept + lockKeptMain} 个${lockKeptMain ? `（含被官方价拦下 ${lockKeptMain} 个）` : ''}` : ''}（汇率 ${rate}）${bigDiff.length ? `；⚠️峰谷模型价差>60%需核验：${bigDiff.join('、')}` : ''}${officialOk ? '；DeepSeek官方价✓' : '；DeepSeek官方价✗(回落聚合源)'}${AMBIG_WARNINGS.size ? `；⚠️模糊匹配歧义: ${[...AMBIG_WARNINGS].join('；')}` : ''}${AMBIG_WARNINGS_LOCKED.size ? `；已 lock 条目的歧义 ${AMBIG_WARNINGS_LOCKED.size} 条（不挂弹窗，见 _ambig_warnings_locked）` : ''}${AMBIG_WARNINGS_OFFICIAL.size ? `；官方价已命中模型的备用源歧义 ${AMBIG_WARNINGS_OFFICIAL.size} 条（备用源结果不被采用 → 不挂弹窗，见 _ambig_warnings_official）` : ''}${auditWarnings.length ? `；⚠️价格一致性自检: ${auditWarnings.join('；')}` : ''}`;
+  pricing.last_refresh_note = `${new Date().toISOString()} 多源刷新：${noteParts.join(' | ')}；人民币主价更新 ${updatedMain} 个${autoConverted ? `，USD换算 ${autoConverted} 个` : ''}，USD参考 ${usdUpdated} 个，region 设定 ${regionSet} 个${(lockKept + lockKeptMain) ? `，lock 价保留 ${lockKept + lockKeptMain} 个${lockKeptMain ? `（含被官方价拦下 ${lockKeptMain} 个）` : ''}` : ''}（汇率 ${rate}）${bigDiff.length ? `；⚠️峰谷模型价差>60%需核验：${bigDiff.join('、')}` : ''}${officialPeakNote ? `；⚠️${officialPeakNote}` : ''}${officialOk ? '；DeepSeek官方价✓' : '；DeepSeek官方价✗(回落聚合源)'}${AMBIG_WARNINGS.size ? `；⚠️模糊匹配歧义: ${[...AMBIG_WARNINGS].join('；')}` : ''}${AMBIG_WARNINGS_LOCKED.size ? `；已 lock 条目的歧义 ${AMBIG_WARNINGS_LOCKED.size} 条（不挂弹窗，见 _ambig_warnings_locked）` : ''}${AMBIG_WARNINGS_OFFICIAL.size ? `；官方价已命中模型的备用源歧义 ${AMBIG_WARNINGS_OFFICIAL.size} 条（备用源结果不被采用 → 不挂弹窗，见 _ambig_warnings_official）` : ''}${auditWarnings.length ? `；⚠️价格一致性自检: ${auditWarnings.join('；')}` : ''}`;
 
   // v3.24（F2·缺陷3）：接收 save() 返回值。false = 抢锁超时、本次未落盘（date/价格都没更新）。
   // 用 process.exitCode=1 而非 process.exit(1)：不中断后续汇总输出与 atexit 清理，

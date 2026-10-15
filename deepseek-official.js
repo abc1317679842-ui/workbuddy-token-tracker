@@ -493,6 +493,31 @@ async function main() {
             else pricing._manual_audit.push({ model: mkey, manual_at: existing.manual_at || null, source: existing.price_source || null, ...patch });
             process.stderr.write(`[deepseek-official] ${mkey} 官方价已收录，手动补录价交接到官方价：${manual.input_price}/${manual.cached_price}/${manual.output_price} → ${official.input_price}/${official.cached_price}/${official.output_price}\n`);
           }
+          // v3.59.0（批11·S2）：lock 冻结优先于官方价（README 声明优先级 lock > 本地官方库 > 聚合源）。
+          //   改前这里直接重建条目对象，只把 existing.lock 原样透传（下方 spread）——**标志留了、
+          //   价格却被官方现价覆写** → 用户手工核对价这一最终防线对最权威厂商静默失效；
+          //   且 `retired + lock` 组合同样不冻结（官方回归时 delete retired）。
+          //   现在 lock=true 只留痕、不覆写。
+          //   ⚠️ 只堵**这一处**（官方 ID 精确匹配的主路径）。下方 1.5 跨 key 接管与 1.6 旧模型名绑定里的
+          //      `delete m.lock` 是 v3.07 / v3.51.0 的**有意设计**——那两处的动机恰是「lock 会把旧名
+          //      永久冻结在过期价」（deepseek-v4-flash 冻在 1.5/4.5/0.05，而官方现行 Flash 为 1/0.02/4），
+          //      动了它们等于把刚修好的回归请回来。审计报告把三处混为一谈，此处按代码意图分开处置。
+          if (existing.lock === true) {
+            const official = { input_price: blk.input_price, cached_price: blk.cached_price, output_price: blk.output_price };
+            if (!Array.isArray(pricing._official_ref)) pricing._official_ref = [];
+            const refRec = pricing._official_ref.find((r) => r && r.model === mkey);
+            const refPatch = {
+              model: mkey, official,
+              frozen: { input_price: existing.input_price, cached_price: existing.cached_price, output_price: existing.output_price },
+              ref_at: new Date().toISOString(),
+            };
+            if (refRec) Object.assign(refRec, refPatch);
+            else pricing._official_ref.push(refPatch);
+            const same = existing.input_price === official.input_price && existing.cached_price === official.cached_price && existing.output_price === official.output_price;
+            process.stderr.write(`[deepseek-official] ${mkey} 已设 lock 冻结 → 保留用户核对价 ${existing.input_price}/${existing.cached_price}/${existing.output_price}`
+              + (same ? '（与官方现价一致）\n' : `；官方现价 ${official.input_price}/${official.cached_price}/${official.output_price} 未覆写（如确认采用请手动解除 lock）\n`));
+            return; // forEach 回调内 return = 跳过该模型的价格覆写
+          }
           pricing.models[mkey] = {
             name: existing.name || mkey,
             input_price: blk.input_price,

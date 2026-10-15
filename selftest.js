@@ -13,6 +13,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
+// v3.59.0（批15 · M38）：并发集成测试需要**真并行**的两个子进程（spawnSync 是串行的，测不出竞态），
+//   故这里再取一份异步 spawn；配套的同步等待用 Atomics.wait 忙等（本文件清理重试处已用同款写法）。
+const { spawn: spawnAsync } = require('child_process');
 
 const SRC = __dirname;
 const NODE = process.execPath;
@@ -88,6 +91,13 @@ const RUNTIME_COMPANIONS = ['refresh-prices.js', 'deepseek-official.js', 'refres
   'pricing.json', 'holidays.json', 'peak-rules.js', 'recalc-day.js', 'stop-handler.js', 'wb-root.js',
   'ledger-merge.js']; // v3.55.0（S3）：账本合并抽成独立模块，backfill 顶层 require → 必须随行
 for (const f of ['token-tracker.js', ...RUNTIME_COMPANIONS]) {
+  fs.copyFileSync(path.join(SRC, f), path.join(skillDir, f));
+}
+// v3.59.0（批15 · 测试网床）：**入口脚本**也要随行——backfill.js 不被主脚本 require（不在上面那份
+//   「require 的兄弟模块」清单里），但 T67 会直接 spawn 它 → 隔离目录缺它 = MODULE_NOT_FOUND、
+//   三组端到端**从未真跑过**（T59 夹具 v3.51.0 就踩过同一个坑、当时只在那一处单独拷了一份，
+//   T61-e1 守的正是那一处；T67 是后来加的，漏了这一步）。这里统一补上，避免第四次踩。
+for (const f of ['backfill.js']) {
   fs.copyFileSync(path.join(SRC, f), path.join(skillDir, f));
 }
 // v3.18.4（G2）：隔离本地官方价库——autoDiscoverCnPriceDir 第②级会扫 ~/WorkBuddy/*/prices/index.json
@@ -1057,6 +1067,14 @@ else {
     const r = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'],
       { input: HOOK_PAYLOAD, env: envNet, timeout: 30000, windowsHide: true, encoding: 'utf8' });
     const ac = (() => { try { return JSON.parse(r.stdout).hookSpecificOutput.additionalContext; } catch (e) { return ''; } })();
+    // j0（v3.59.0 批15「新①」）：**先证明这次 spawn 真的成功产出输出**。
+    //   实测踩坑：机器负载高时 30s 超时 → `r.status = null`、stdout 空 → JSON.parse 拿 '' →
+    //   j1/j2 **假红**，而 j3「不含提示」反而**假绿**（空输出自然不含提示）。同一份代码两次跑
+    //   831/8 与 833/6 → 属测试自身脆弱性，不是产品回归。故所有「不含某字符串」型断言
+    //   必须先过这一条，否则空输出恒绿、守卫等于没有。
+    ok('T12-j0 ★spawn 未超时且 stdout 非空（超时会让 j1/j2 假红、j3 假绿）',
+      r.status === 0 && String(r.stdout || '').length > 0,
+      `status=${r.status} err=${r.error && (r.error.code || r.error.message)} stdoutLen=${String(r.stdout || '').length}`);
     ok('T12-j1 ★有新版时 --hook 的 additionalContext 末尾带更新提示',
       String(ac).indexOf('[技能更新]') >= 0, String(ac).slice(0, 160));
     ok('T12-j2 提示位于注入内容最后一行（不插入到用量行中间）',
@@ -1068,8 +1086,9 @@ else {
     put({ lastCheckAt: nowJ, latestVersion: ttNet.SKILL_VERSION, notifyCount: 0, failCount: 0, nextRetryAt: 0 });
     const r2 = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'],
       { input: HOOK_PAYLOAD, env: envNet, timeout: 30000, windowsHide: true, encoding: 'utf8' });
-    ok('T12-j3 已是最新时 --hook 注入不含任何更新提示（旧行为不变）',
-      String(r2.stdout || '').indexOf('[技能更新]') < 0, String(r2.stdout).slice(0, 160));
+    ok('T12-j3 已是最新时 --hook 注入不含任何更新提示（旧行为不变；前置 j0 式状态断言防空输出假绿）',
+      r2.status === 0 && String(r2.stdout || '').length > 0 && String(r2.stdout || '').indexOf('[技能更新]') < 0,
+      `status=${r2.status} stdoutLen=${String(r2.stdout || '').length} ${String(r2.stdout).slice(0, 160)}`);
     // j4：子进程侧零联网证明 —— 闸门闭合（lastCheckAt=nowJ、nextRetryAt=0）时若真发起过查询，
     //   maybeFetchLatest 必然改写 lastCheckAt 或把 failCount 加 1；两者都没变 = 一次都没查。
     const stJ = ttMod.loadUpdateState();
@@ -2871,10 +2890,15 @@ else {
 
   // a2：**必须真被消费**——fetchJson 要接 timeoutMs 参数，调用点要传 s.timeoutMs。
   //     只改常量不传参 = 改了个没人用的常量（最常见的假修复）。
-  ok('T39-a2 ★fetchJson 接收 timeoutMs 且调用点传入 s.timeoutMs（不是改了没人用的常量）',
+  // v3.59.0（批14·M1）：调用点改走 `fetchJsonWithRetry`（重试封装）后，本条改为验**整条链路贯通**：
+  //   调用点 → 重试封装 → fetchJson 三处都必须带着同一个 timeoutMs，任何一环漏传 = 超时预算失效。
+  //   （改前只验"调用点直接调 fetchJson"，封装一加就红 —— 守卫正确工作，适配而非放宽。）
+  ok('T39-a2 ★timeoutMs 三处贯通：调用点 → 重试封装 → fetchJson（不是改了没人用的常量）',
     /async function fetchJson\(url, timeoutMs = TIMEOUT_MS\)/.test(srcR39)
-    && /await fetchJson\(s\.url, s\.timeoutMs\)/.test(srcR39),
-    '常量没接到调用点 → 假修复');
+    && /await fetchJsonWithRetry\(s\.url, s\.timeoutMs\)/.test(srcR39)
+    && /async function fetchJsonWithRetry\(url, timeoutMs = TIMEOUT_MS\)/.test(srcR39)
+    && /await fetchJson\(url, timeoutMs\)/.test(srcR39),
+    'timeoutMs 没贯通到调用点 → 假修复');
 
   // a3：定时器必须用的是**传入的** timeoutMs，不是写死的 TIMEOUT_MS
   ok('T39-a3 ★setTimeout 用的是参数 timeoutMs（不是写死 TIMEOUT_MS）',
@@ -5119,8 +5143,11 @@ else {
     bi61.indexOf("for f in ('currency', 'unit', 'region', 'source_url', 'fetched_at')") >= 0);
 
   // ── c. fetch-cn-prices：契约字段 + 阶跃 .md 语义解析（2026-10-12 页面改版活样例）──
+  // v3.59.0（批12·S5）：unit 兜底从 setdefault 改为「WARN 留痕 + 仍兜底」——
+  //   各家解析器已在页面单位声明校验通过后显式回传 unit；走到兜底 = 该厂商没有单位校验
+  //   （= 页面改单位会 1000× 错价静默入账的那条路）→ 必须可见，不能再静默。
   ok('T61-c1 ★每条模型记录必须补契约字段（unit/currency/region/source_url/fetched_at）',
-    fc61.indexOf("mm.setdefault('unit', '元/百万 tokens')") >= 0
+    fc61.indexOf("mm['unit'] = '元/百万 tokens'") >= 0
     && fc61.indexOf("mm.setdefault('currency', 'CNY')") >= 0
     && fc61.indexOf("mm.setdefault('region', 'CN')") >= 0);
   ok('T61-c2 ★阶跃必须走 .md 语义解析（HTML 改版后价格不带「元」，tr 模式实测 0 模型）',
@@ -6028,9 +6055,15 @@ else {
       // rounds 明细一律覆写同一路径：oIn=null 时写空文件（peakSplitOf 读不到记录 → null），
       //   既模拟"旧日期无明细"，也不用删目录（删失败会残留上一态文件 → 假绿）。
       wj(path.join(skillDir, 'rounds', 'rounds-2026-10.jsonl'), oIn == null ? '' : mkRounds(oIn));
-      const r = spawnSync(NODE, [path.join(skillDir, 'backfill.js')],
-        Object.assign({}, env, { WB_LEDGER_MAINT: '1' }), // 夹具账本（tmp 隔离），非生产
-        { timeout: 120000, windowsHide: true, encoding: 'utf8' });
+      // ⚠ v3.59.0（批15 · 测试网床）：`spawnSync(cmd, args, options)` 只有三个参数——
+      //   原先把 env 当第三个、**真正的 options 当第四个**（被静默忽略）→ 子进程既没拿到
+      //   timeout/encoding，也**根本没拿到 env**（WB_ROOT 等全部失效）。
+      //   后果：这三组端到端"看起来在跑"（rc 有值、stdout 有输出），实则前提全丢 → 恒失败。
+      //   这正是 T67/T68/T69 六个存量红的根因（v3.57.0 时它们因 SPAWN_OK=false 被 SKIP，从未真跑）。
+      const r = spawnSync(NODE, [path.join(skillDir, 'backfill.js')], {
+        env: Object.assign({}, env, { WB_LEDGER_MAINT: '1' }), // 夹具账本（tmp 隔离），非生产
+        timeout: 120000, windowsHide: true, encoding: 'utf8',
+      });
       return { v: costOf(r.stdout), rc: r.status, out: String(r.stdout || '') + String(r.stderr || '') };
     };
     try {
@@ -6085,6 +6118,7 @@ else {
     //   修前 recalc 采用半套 split → 0.50（漏价）；修后非全覆盖 → 原账>0 保留 2.00。
     const D68 = '2026-10-15';
     const M68 = 'r1-fixture-model';
+    // 哨兵值定义在夹具里（total.cost = 9999），此处不再需要哨兵模型常量
     const TS68 = 1792065600000;
     const wb68 = path.join(tmp, 'r1-wb');
     const sk68 = path.join(wb68, 'skills', 'token-usage-tracker');
@@ -6099,10 +6133,16 @@ else {
         usd_cny_rate: 7.2,
       }));
       wj(path.join(sk68, 'holidays.json'), '{}');
+      // v3.59.0（批15 · 测试网床）：**当日合计 total.cost 预置哨兵值 9999** ——
+      //   e1/e3 的期望值（2.00）与夹具预置值**相同**，于是"recalc 根本没处理这一天"和
+      //   "处理了并保留原额"**不可区分**（实测：recacl-day 在目标模型不存在时 stdout 与正常时逐字相同
+      //   → 反向验证回退 env 那次 e1/e3 稳绿 = 假绿）。recacl 每次运行都会重算当日合计，
+      //   故 total.cost 是否被改写 = 它到底跑没跑。
+      //   ⚠ 别用"第二个模型"当哨兵：recalc-day 只重算命令行指定的那一个模型，哨兵不会被碰（实测踩到）。
       wj(path.join(sk68, 'daily-usage.json'), JSON.stringify({
         [D68]: {
           models: { [M68]: { in: 1000000, out: 0, cached: 0, total: 1000000, cost: 2.0, hit: 0 } },
-          total: { in: 1000000, out: 0, cached: 0, total: 1000000, cost: 2.0, hit: 0 },
+          total: { in: 1000000, out: 0, cached: 0, total: 1000000, cost: 9999, hit: 0 },
         },
       }));
       wj(path.join(sk68, 'rounds', 'rounds-2026-10.jsonl'), oIn == null ? '' : JSON.stringify({
@@ -6112,19 +6152,23 @@ else {
     };
     const runRecalc = () => {
       // 脚本本体跑 selftest tmp 副本（skillDir），数据根指向 fixture（wb68）——与 T67 同模式
-      const r = spawnSync(NODE, [path.join(skillDir, 'recalc-day.js'), D68, M68],
-        Object.assign({}, env, { WB_ROOT: wb68, WB_LEDGER_MAINT: '1' }),
-        { timeout: 120000, windowsHide: true, encoding: 'utf8' });
-      let cost = null;
+      const r = spawnSync(NODE, [path.join(skillDir, 'recalc-day.js'), D68, M68], {
+        env: Object.assign({}, env, { WB_ROOT: wb68, WB_LEDGER_MAINT: '1' }),
+        timeout: 120000, windowsHide: true, encoding: 'utf8',
+      });
+      let cost = null, totalCost = null;
       try {
         const d = JSON.parse(fs.readFileSync(path.join(sk68, 'daily-usage.json'), 'utf8'));
         cost = d[D68].models[M68].cost;
+        totalCost = d[D68].total.cost;
       } catch (e) { /* 读不到按 null */ }
-      return { rc: r.status, cost, out: String(r.stdout || '') + String(r.stderr || '') };
+      return { rc: r.status, cost, totalCost, out: String(r.stdout || '') + String(r.stderr || '') };
     };
     try {
       mkAll(500000); // 半套明细：非全覆盖
       const c1 = runRecalc();
+      ok('T68-e0 ★当日合计被重算（≠预置哨兵 9999）= recalc 真的处理了这一天（否则 e1 恒绿）',
+        c1.totalCost !== 9999 && c1.totalCost !== null, `total=${c1.totalCost} rc=${c1.rc}`);
       ok('T68-e1 ★明细半套（oIn=500000 < 条目 1e6）→ 保留原额 ¥2.00（修前给 0.50 = 漏价）',
         c1.cost === 2.0, `got ${c1.cost} rc=${c1.rc}`);
       if (c1.cost !== 2.0) console.log(c1.out.slice(-1200));
@@ -6135,9 +6179,17 @@ else {
       if (c2.cost !== 1.0) console.log(c2.out.slice(-1200));
       mkAll(null); // 无明细
       const c3 = runRecalc();
+      // v3.59.0（批16）：e3 的弱断言**已彻底修好** —— recalc-day.js 现在会打印「处理模型 重算/总计」，
+      //   「真的走到计价重算」与「早退 / 压根没跑」由此可分（下面 e3b 是强断言）。
       ok('T68-e3 无明细 → 保留原额 ¥2.00（v3.24.0 降级语义不回归）',
         c3.cost === 2.0, `got ${c3.cost} rc=${c3.rc}`);
       if (c3.cost !== 2.0) console.log(c3.out.slice(-1200));
+      // ⚠ e3b 是 e3 的**检出力来源**：夹具只有 1 个有价模型且命令行指定它 → 必须是 1/1。
+      //   若为 0/1 说明在计价前就早退了（无价 / 被 onlyModel 过滤 / 条目损坏）→ 上面 e3 的 2.00
+      //   就是"原封未动"，而不是"重算后保留"。
+      ok('T68-e3b ★「处理模型 1/1 个」= recalc 真的走到了计价重算（批16 新增输出信号；'
+        + '改前 e3 只能断言"没崩"，与"压根没跑"不可区分 = 弱断言）',
+        /处理模型 1\/1 个/.test(c3.out), `out=${c3.out.slice(-400)}`);
     } catch (e) {
       ok('T68 行为夹具异常', false, (e && e.message) || String(e));
     }
@@ -6230,9 +6282,10 @@ else {
       mkAll();
       const payload = JSON.stringify({ session_id: SID69,
         transcript_path: path.join(wb69, 'projects', 'proj1', SID69 + '.jsonl'), cwd: wb69 });
-      const r = spawnSync(NODE, [path.join(sk69, 'token-tracker.js'), '--stop'],
-        Object.assign({}, env, { WB_ROOT: wb69, WB_LEDGER_MAINT: '1', WB_NO_NET: '1' }),
-        { input: payload, timeout: 120000, windowsHide: true, encoding: 'utf8' });
+      const r = spawnSync(NODE, [path.join(sk69, 'token-tracker.js'), '--stop'], {
+        input: payload, env: Object.assign({}, env, { WB_ROOT: wb69, WB_LEDGER_MAINT: '1', WB_NO_NET: '1' }),
+        timeout: 120000, windowsHide: true, encoding: 'utf8',
+      });
       let daily = null;
       const splitModels = [];
       try {
@@ -6285,10 +6338,15 @@ else {
   const rp70 = strip70(fs.readFileSync(path.join(SRC, 'refresh-prices.js'), 'utf-8'));
 
   // ── ① recalc-day 脏 cost → 字符串拼接 → 当日合计 NaN（本批头号，唯一污染持久账本的） ──
-  ok('T70-a1 ★recalc 定义 safeCost，且「当日合计」的两处累加**都**走数值化（裸 `+= stat.cost` = 拼接）',
+  // v3.59.0（批10·S1）：2 → 4。批8-① 只修了 :337/:372 两个**主**累加点，漏了 :273/:279 两个
+  //   early-continue 分支（`stat.cost || 0`）——脏字符串照样能把 dayTotal 腐化，末行兜底解析失败 →
+  //   当日合计归 0、后续模型金额静默丢失。本次补齐，故期望值改为**全部累加点**。
+  //   以后再加累放点必须同步改这个数（守卫故意用精确计数，宁可逼人改也不要放过漏修的分支）。
+  ok('T70-a1 ★recalc 定义 safeCost，且「当日合计」的**全部 4 处**累加都走数值化（裸 `+= stat.cost` = 拼接）',
     /function safeCost\(v\)/.test(rc70)
-    && (rc70.match(/dayTotal \+= safeCost\(stat\.cost\)/g) || []).length === 2
-    && !/dayTotal \+= stat\.cost;/.test(rc70));
+    && (rc70.match(/dayTotal \+= safeCost\(stat\.cost\)/g) || []).length === 4
+    && !/dayTotal \+= stat\.cost;/.test(rc70)
+    && !/dayTotal \+= stat\.cost \|\| 0/.test(rc70));
   ok('T70-a2 ★recalc 落盘前对 dayTotal 再兜一次 safeCost（NaN 落盘即不自愈 → 必须拦在写入前）',
     /dayObj\.total\.cost = Math\.round\(safeCost\(dayTotal\) \* 1e6\) \/ 1e6;/.test(rc70));
   const rd70 = (() => { try { return require(path.join(SRC, 'recalc-day.js')); } catch (e) { return null; } })();
@@ -6368,6 +6426,824 @@ else {
   // ── ⑨ recalc-day 是独立路径，主脚本那条 holidayYearUnknown 告警对它无效 ──
   ok('T70-a12 ★recalc-day 也消费 holidayYearUnknown（进程内按年去重，热路径不刷屏）',
     /peakRules\.holidayYearUnknown\(tMs, HOLIDAYS\)/.test(rc70) && /_holidayWarnedYears/.test(rc70));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// T71 —— v3.59.0（批10）：第二份外部审计（2026-10-14 16:37 工作区报告）「账本脏值防线」四条
+//   S1  recalc-day 两处 early-continue 漏 safeCost（T70-a1 已把期望值 2→4，这里补**行为**级）
+//   M12 build_index 半价（in/out 缺一半）进索引 → JS 侧 None*tokens=0 → 计费静默归 0
+//   M16 lock 覆盖段价格未数值化 → 字符串价 '1'*2='11'；`"cached_price":null` → None*mult 崩整段
+//   M17 三脚本 json.dump 默认 allow_nan=True → 写出 `NaN` 字面量 → Node JSON.parse 抛错计费崩
+//   **反向验证要求**：回退任一条修复，对应断言必须变红；其余断言不得误伤。
+// ═════════════════════════════════════════════════════════════════════════════════════════
+{
+  // 剥注释（JS 的 // 与 Python 的 # 都剥）：守卫自身注释常引用目标形态，不剥会把自己数进去。
+  const strip71 = (s) => String(s || '').replace(/\r\n/g, '\n')
+    .split('\n').map((l) => l.replace(/(^|\s)\/\/.*$/, '$1').replace(/(^|\s)#.*$/, '$1')).join('\n');
+  const bi71 = strip71(fs.readFileSync(path.join(SRC, 'build_index.py'), 'utf8'));
+  const fc71 = strip71(fs.readFileSync(path.join(SRC, 'fetch-cn-prices.py'), 'utf8'));
+  const pt71 = strip71(fs.readFileSync(path.join(SRC, 'parse_tokenhub.py'), 'utf8'));
+
+  ok('T71-a1 ★M17 三脚本 json.dump 全部 allow_nan=False（build_index 2 + fetch-cn-prices 2 + parse_tokenhub 1）',
+    (bi71.match(/json\.dump[a-z]*\([^)]*allow_nan=False/g) || []).length === 2
+    && (fc71.match(/json\.dump[a-z]*\([^)]*allow_nan=False/g) || []).length === 2
+    && (pt71.match(/json\.dump[a-z]*\([^)]*allow_nan=False/g) || []).length === 1);
+  ok('T71-a2 ★M12 新条目闸门拒收半价（in/out 缺一半 → 计费静默归 0 且不告警）',
+    /for f in \('in_price', 'out_price'\):/.test(bi71) && /主价缺失/.test(bi71));
+  ok('T71-a3 ★M16 lock 覆盖段价格数值化（_num 归一 + peak 要求 in/out 齐全）',
+    /def _num\(x\)/.test(bi71) && /in_p, out_p, cache_p = _num\(/.test(bi71) && /跳过 peak 段/.test(bi71));
+  // a4 必须锚到 **gate_new_model 函数体内**：全文搜 `('in_price','out_price','cache_hit')` 会命中
+  //   classify_change 的价格比对循环（既有代码，与闸门无关）→ 误伤（v3.58.0 教训：锚点要唯一到那一处）。
+  const gate71 = (() => {
+    const i = bi71.indexOf('def gate_new_model');
+    if (i < 0) return '';
+    const j = bi71.indexOf('\ndef ', i + 10);
+    return j < 0 ? bi71.slice(i) : bi71.slice(i, j);
+  })();
+  ok('T71-a4 ★M16 cache_hit 缺失仍是合法常态（A5 已定不修：厂商未公布缓存价按 0 计，闸门不得误杀）',
+    /for f in \('in_price', 'out_price'\):/.test(gate71)
+    && !/for f in \('in_price', 'out_price', 'cache_hit'\)/.test(gate71));
+
+  // ── python 探测（与 SPAWN_OK 同纪律：不可用就 envSkip，不假绿）──
+  const pyCands = [];
+  try {
+    const pvDir = 'C:/Users/14779/.workbuddy/binaries/python/versions';
+    for (const v of fs.readdirSync(pvDir)) pyCands.push(path.join(pvDir, v, 'python.exe'));
+  } catch (e) { /* 目录不存在就走 PATH */ }
+  pyCands.push('python', 'python3');
+  let PY71 = null;
+  for (const c of pyCands) {
+    const t = spawnSync(c, ['-V'], { encoding: 'utf8', windowsHide: true, timeout: 20000 });
+    if (t.status === 0) { PY71 = c; break; }
+  }
+
+  if (!SPAWN_OK) envSkip('T71-b/c 行为组（spawn python / recalc-day）', SPAWN_SKIP_REASON);
+  else if (!PY71) envSkip('T71-b/c 行为组（spawn python / recalc-day）', 'python 不可用');
+  else {
+    // ── M12 / M16：隔离跑 build_index.py ──
+    const fx = path.join(tmp, 'b10fx');
+    const fwb = path.join(fx, 'wb');
+    const fsk = path.join(fwb, 'skills', 'token-usage-tracker');
+    const fpr = path.join(fx, 'prices');
+    fs.mkdirSync(fsk, { recursive: true });
+    fs.mkdirSync(fpr, { recursive: true });
+    fs.writeFileSync(path.join(fsk, 'pricing.json'), JSON.stringify({
+      currency: 'CNY', unit: '元/百万 tokens', models: {
+        locknullcache: { name: '锁空缓存', input_price: 1.0, output_price: 2.0, cached_price: null, peak_multiplier: 2, lock: true, region: 'CN' },
+        lockstrprice: { name: '锁字符串价', input_price: '1', output_price: 2.0, cached_price: 0.5, peak_multiplier: 2, lock: true, region: 'CN' },
+        lockgood: { name: '锁正常', input_price: 1.0, output_price: 2.0, cached_price: 0.5, peak_multiplier: 2, lock: true, region: 'CN' },
+      },
+    }));
+    fs.writeFileSync(path.join(fpr, 'latest.json'), JSON.stringify({ vendors: { vA: { models: [
+      { name: '半价', api_name: 'half-price', in_price: null, out_price: 2.0, cache_hit: 0.5, currency: 'CNY', unit: '元/百万 tokens', region: 'CN', source_url: 'http://x', fetched_at: '2026-10-14' },
+      { name: '正常', api_name: 'ok-model', in_price: 3.0, out_price: 4.0, cache_hit: 1.0, currency: 'CNY', unit: '元/百万 tokens', region: 'CN', source_url: 'http://x', fetched_at: '2026-10-14' },
+    ] } } }));
+    // 上一版索引只放 okmodel（halfprice 因此走"新条目闸门"）；all_sources 必带 —— build_index 打印段
+    // 裸取 m['all_sources']（既有缺陷 F-A，生产 51/51 全有故不触发，夹具须贴合生产形态）
+    fs.writeFileSync(path.join(fpr, 'index.json'), JSON.stringify({ built_at: '2026-10-13', models: {
+      okmodel: { name: '正常', api_name: 'ok-model', in_price: 3.0, out_price: 4.0, cache_hit: 1.0, currency: 'CNY', unit: '元/百万 tokens', region: 'CN', primary_source: 'vA', primary_source_type: 'first_party', all_sources: [{ name: '正常', in: 3.0, out: 4.0, cache: 1.0, source: 'vA', source_type: 'first_party' }] },
+    } }));
+    const br = spawnSync(PY71, [path.join(SRC, 'build_index.py')], {
+      env: Object.assign({}, process.env, { WB_ROOT: fwb, CN_PRICES_DIR: fpr }),
+      encoding: 'utf8', timeout: 180000, windowsHide: true,
+    });
+    const M = (() => { try { return JSON.parse(fs.readFileSync(path.join(fpr, 'index.json'), 'utf8')).models || {}; } catch (e) { return {}; } })();
+    ok('T71-b1 ★M16 `"cached_price":null` 不再崩 build_index（None*mult TypeError → 整段停产）',
+      br.status === 0, `exit=${br.status} ${String(br.stderr || '').slice(0, 200)}`);
+    ok('T71-b2 ★M16 字符串价归一为 None（改前 ' + "'1'*2='11'" + ' 错峰价）',
+      !!M.lockstrprice && M.lockstrprice.in_price === null && !M.lockstrprice.peak,
+      `in_price=${JSON.stringify(M.lockstrprice && M.lockstrprice.in_price)}`);
+    ok('T71-b3 ★M16 正常 lock 的 peak 仍正确（1.0×2=2.0，不得被数值化误伤）',
+      !!M.lockgood && !!M.lockgood.peak && M.lockgood.peak.peak.in === 2.0 && M.lockgood.peak.idle.in === 1.0);
+    ok('T71-b4 ★M12 半价条目被闸门拒收（不进索引 → 按未收录计价，而非按 0 计）', !('halfprice' in M));
+    ok('T71-b5 ★M12 拒收有 WARN 留痕（不静默）', /主价缺失/.test(String(br.stderr || '')));
+    ok('T71-b6 ★M12 正常条目不受影响（沿用上一版 3.0）', !!M.okmodel && M.okmodel.in_price === 3.0);
+    try { fs.rmSync(fx, { recursive: true, force: true }); } catch (e) { /* 清理失败不影响断言 */ }
+
+    // ── S1：隔离跑 recalc-day，两个早退分支各验一次 ──
+    const fw = path.join(tmp, 'b10s1');
+    const fsk2 = path.join(fw, 'skills', 'token-usage-tracker');
+    fs.mkdirSync(fsk2, { recursive: true });
+    const LED = { '2026-01-02': { models: {
+      modeldirty: { in: 1000, cached: 0, out: 100, cost: '0.5', hit: 0 },
+      modelnormal: { in: 2000, cached: 0, out: 200, cost: 12.3, hit: 0 },
+    }, total: { cost: 12.8, in: 3000, cached: 0, out: 300 } } };
+    const DAILY_PATH = path.join(fsk2, 'daily-usage.json');
+    const totalOf = () => { try { return JSON.parse(fs.readFileSync(DAILY_PATH, 'utf8'))['2026-01-02'].total.cost; } catch (e) { return null; } };
+    fs.writeFileSync(DAILY_PATH, JSON.stringify(LED));
+    fs.writeFileSync(path.join(fsk2, 'pricing.json'), JSON.stringify({ models: {} }));   // 两个模型都查不到价 → 早退
+    fs.writeFileSync(path.join(fsk2, 'holidays.json'), JSON.stringify({}));
+    const e71 = Object.assign({}, process.env, { WB_ROOT: fw, TOKEN_TRACKER_NO_TOAST: '1' });
+    const ra = spawnSync(NODE, [path.join(SRC, 'recalc-day.js'), '2026-01-02'], { env: e71, encoding: 'utf8', timeout: 90000, windowsHide: true });
+    const t1 = totalOf();
+    fs.writeFileSync(DAILY_PATH, JSON.stringify(LED));
+    const rb = spawnSync(NODE, [path.join(SRC, 'recalc-day.js'), '2026-01-02', 'modelnormal'], { env: e71, encoding: 'utf8', timeout: 90000, windowsHide: true });
+    const t2 = totalOf();
+    ok('T71-c1 ★S1 无价早退分支：脏串 "0.5" + 正常 12.3 = 12.8（改前腐化成 "0.512.3" → 合计归 0、12.3 丢失）',
+      t1 === 12.8, `got=${JSON.stringify(t1)} rc=${ra.status}`);
+    ok('T71-c2 ★S1 onlyModel 早退分支：同样不腐化', t2 === 12.8, `got=${JSON.stringify(t2)} rc=${rb.status}`);
+    try { fs.rmSync(fw, { recursive: true, force: true }); } catch (e) { /* 同上 */ }
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// T73 —— v3.59.0（批12）：「价库流水线单位断言 + 链不断」四条
+//   S5  四家计价单位被 setdefault('元/百万 tokens') 硬盖 → 页面改单位 → 1000× 错价静默过关
+//   S6  parse_tokenhub exit(2)（有意 fail-closed）连带断链 → build_index 停产、四家新数据全晾
+//   M18 build_index 是唯一没有 makedirs 的脚本 → 单独运行/首日部署 FileNotFoundError 裸崩
+//   M21 抓取无重试 → 一次瞬时抖动 = 该厂商当日停更
+//   **反向验证要求**：回退任一条修复，对应断言必须变红；其余断言不得误伤。
+// ═════════════════════════════════════════════════════════════════════════════════════════
+{
+  const strip73 = (s) => String(s || '').replace(/\r\n/g, '\n')
+    .split('\n').map((l) => l.replace(/(^|\s)\/\/.*$/, '$1').replace(/(^|\s)#.*$/, '$1')).join('\n');
+  const fcp73 = strip73(fs.readFileSync(path.join(SRC, 'fetch-cn-prices.py'), 'utf8'));
+  const bi73 = strip73(fs.readFileSync(path.join(SRC, 'build_index.py'), 'utf8'));
+  const pth73 = strip73(fs.readFileSync(path.join(SRC, 'parse_tokenhub.py'), 'utf8'));
+  const tt73 = strip73(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf8'));
+
+  // ── S5：单位断言 ──
+  ok('T73-a1 ★S5 公共单位判定函数存在（全角／半角／大小写／空格归一；元/千·万字符·小时·次一律拒）',
+    /def unit_is_token_million\(text\):/.test(fcp73)
+    && /UNIT_TOKEN_MILLION_RE = re\.compile\(r'元\\s\*\[／\/\]\\s\*百万\\s\*tokens\?'/.test(fcp73));
+  ok('T73-a2 ★S5 智谱单位校验锚到 in/out 两列（不能整表头扫：缓存存储列是「元/百万 Tokens/小时」不同量纲，整扫会被带恒真）',
+    fcp73.indexOf("unit_is_token_million(hdr[cmap['in']]) and unit_is_token_million(hdr[cmap['out']])") >= 0);
+  ok('T73-a3 ★S5 阶跃实现「向上找最近的单位声明」（此前只停在注释层、未实现；读不到 = 非 token 计价表 → 跳过）',
+    /def read_unit_decl\(lines, before_idx/.test(fcp73)
+    && /unit_decl = read_unit_decl\(lines, tbl_start\)/.test(fcp73)
+    && /if unit_decl is None:/.test(fcp73)
+    && /表单位非元\/百万 tokens/.test(fcp73));
+  ok('T73-a4 ★S5 Kimi 单位显式断言（原正则写死 "1M tokens" → 页面改 1K 时静默 0 模型；现 WARN + 跳过）',
+    fcp73.indexOf('([\\d.,]+[MK])\\s*tokens",\\s*(.*?)') >= 0
+    && fcp73.indexOf("m.group(2).upper() != '1M'") >= 0
+    && fcp73.indexOf('计价单位非 1M tokens') >= 0);
+  ok('T73-a5 ★S5 四家解析器都显式回传 unit（setdefault 不再是唯一来源）',
+    (fcp73.match(/'unit': '元\/百万 tokens'/g) || []).length >= 4);
+  ok('T73-a6 ★S5 main 不再静默兜底 unit（裸 setdefault 已删；缺失时 WARN 留痕 + 仍兜底防契约海关拒收）',
+    !/mm\.setdefault\('unit', '元\/百万 tokens'\)/.test(fcp73)
+    && /解析器未回传 unit/.test(fcp73));
+
+  // ── M21：重试 ──
+  ok('T73-a7 ★M21 fetch-cn-prices 抓取重试（指数退避，默认 2 次；CN_PRICE_HTTP_RETRIES 可调）',
+    /HTTP_RETRIES = int\(os\.environ\.get\('CN_PRICE_HTTP_RETRIES'\) or '2'\)/.test(fcp73)
+    && /HTTP_RETRY_BASE_MS \* \(2 \*\* attempt\)/.test(fcp73));
+  ok('T73-a8 ★M21 parse_tokenhub 同口径重试（腾讯文档页抖动一次失败 → 整条源 exit(2) 保留旧版，本可不必）',
+    /TOKENHUB_RETRIES = int\(os\.environ\.get\('CN_PRICE_HTTP_RETRIES'\) or '2'\)/.test(pth73)
+    && /TOKENHUB_RETRY_BASE_MS \* \(2 \*\* attempt\)/.test(pth73));
+
+  // ── M18：目录自建 ──
+  ok('T73-a9 ★M18 build_index 开工前自建价库目录（原为唯一没有 makedirs 的脚本 → 单独运行裸崩）',
+    /os\.makedirs\(PRICES_DIR, exist_ok=True\)/.test(bi73));
+
+  // ── S6：链不断 ──
+  ok('T73-a10 ★S6 单步失败不阻断后续脚本（parse_tokenhub 的有意 fail-closed 不再连带停产 build_index）',
+    /failedSteps\.push\(scripts\[idx\] \+ '\(exit=' \+ code \+ '\)'\);[\s\S]{0,120}resolve\(runAll\(idx \+ 1\)\);/.test(tt73));
+  ok('T73-a11 ★S6 链尾按 failedSteps 定退出码（链不断 ≠ 失败不可见：有失败仍非零收尾、告警照旧）',
+    /code: failedSteps\.length \? 2 : 0/.test(tt73));
+  ok('T73-a12 ★S6 告警文案带失败步骤名（用户知道是哪一源挂了）',
+    /失败步骤: \$\{failedSteps\.join\(', '\)\}/.test(tt73));
+
+  // ── 行为组：单位校验真端到端（python 内联，不起子进程）──
+  const pyCands73 = [];
+  if (process.env.CN_PYTHON) pyCands73.push(process.env.CN_PYTHON);
+  pyCands73.push('python', 'python3');
+  let PY73 = null;
+  for (const c of pyCands73) {
+    const t = spawnSync(c, ['-V'], { encoding: 'utf8', windowsHide: true, timeout: 20000 });
+    if (t.status === 0) { PY73 = c; break; }
+  }
+  if (!PY73) envSkip('T73-b 行为组（python 内联单位校验）', 'python 不可用');
+  else {
+    const fw = path.join(tmp, 'b12s5');
+    const fsk = path.join(fw, 'skills', 'token-usage-tracker');
+    fs.mkdirSync(fsk, { recursive: true });
+    const py = [
+      '# -*- coding: utf-8 -*-',
+      'import importlib.util, sys',
+      "_spec = importlib.util.spec_from_file_location('fcp', " + JSON.stringify(path.join(SRC, 'fetch-cn-prices.py')) + ")",
+      'F = importlib.util.module_from_spec(_spec)',
+      '_spec.loader.exec_module(F)',
+      'fails = []',
+      'def chk(n, c, d=""):',
+      '    print(("  OK   " if c else "  FAIL ") + n + (("  " + d) if d else ""))',
+      '    if not c: fails.append(n)',
+      'chk("unit 半角", F.unit_is_token_million("输入单价（元/百万 Tokens）"))',
+      'chk("unit 全角", F.unit_is_token_million("单位：元／百万 tokens。"))',
+      'chk("unit 元/千拒", not F.unit_is_token_million("LoRA 微调（元/千 Tokens）"))',
+      'ZH = "<table><tr><th>模型名称</th><th>上下文</th><th>输入单价（元/百万 Tokens）</th><th>输出单价（元/百万 Tokens）</th><th>缓存存储（元/百万 Tokens/小时）</th><th>缓存命中（元/百万 Tokens）</th></tr><tr><td>GLM-5</td><td>128K</td><td>4</td><td>8</td><td>限时免费</td><td>1</td></tr></table>"',
+      'r = F.parse_zhipu_docs(ZH)',
+      'chk("智谱正常解析", len(r) == 1, "n=%d" % len(r))',
+      'chk("智谱回传 unit", bool(r) and r[0].get("unit") == "元/百万 tokens")',
+      'ZHB = ZH.replace("输入单价（元/百万 Tokens）", "输入单价（元/千 Tokens）").replace("输出单价（元/百万 Tokens）", "输出单价（元/千 Tokens）")',
+      'chk("智谱 in/out 改元/千 → 整表跳过（缓存存储列仍元/百万/小时，锚列校验才抓得到）", len(F.parse_zhipu_docs(ZHB)) == 0)',
+      'SF = "单位：元／百万 tokens。\\n\\n| Model ID | 输入价格（缓存未命中） | 输入价格（缓存命中） | 输出价格 |\\n| - | - | - | - |\\n| `step-5-preview` | 7 | 0.70 | 20 |\\n\\n| Model ID | 单价 |\\n| - | - |\\n| `stepaudio-3-tts` | 2.5 元／万字符 |\\n"',
+      'rs = F.parse_stepfun_md(SF)',
+      'chk("阶跃 token 表解析 + 万字符表排除", len(rs) == 1 and rs[0].get("unit") == "元/百万 tokens", "n=%d" % len(rs))',
+      'chk("阶跃无单位声明 → 跳过", len(F.parse_stepfun_md(SF.replace("单位：元／百万 tokens。\\n\\n", ""))) == 0)',
+      'chk("阶跃单位元/千 → 跳过", len(F.parse_stepfun_md(SF.replace("元／百万 tokens。", "元／千 tokens。"))) == 0)',
+      'print("RESULT %d %d" % (len(fails), 0))',
+      'sys.exit(1 if fails else 0)',
+    ].join('\n');
+    const pf = path.join(fw, 't73.py');
+    fs.writeFileSync(pf, py, 'utf8');
+    const r73 = spawnSync(PY73, [pf], { encoding: 'utf8', timeout: 120000, windowsHide: true });
+    let matched73 = 0;
+    // ⚠ split(/\r?\n/)：Windows python 输出 CRLF，JS 的 `.` 不匹配 `\r` →
+    //   `(.*)$` 被行尾的 \r 卡住、整行失配（实测 split('\n') 时 10 条断言行 0 识别）。
+    for (const ln of String(r73.stdout || '').split(/\r?\n/)) {
+      const m = /^\s*(OK|FAIL)\s+(.*)$/.exec(ln);
+      if (m) ok('T73-b' + (++matched73) + ' ' + m[2], m[1] === 'OK');
+    }
+    ok('T73-b0 行为组断言行被识别（python 输出格式/编码异常时此处暴露原文）',
+      matched73 > 0,
+      'status=' + r73.status + ' lines=' + String(r73.stdout || '').split('\n').length
+      + ' stdout=[' + String(r73.stdout || '').replace(/\n/g, '\\n') + ']'
+      + ' stderr=[' + String(r73.stderr || '').slice(0, 600) + ']');
+    try { fs.rmSync(fw, { recursive: true, force: true }); } catch (e) { /* 清理失败不影响断言 */ }
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// T72 —— v3.59.0（批11）：「价格冻结与改价告警透传」三条
+//   S2  deepseek-official 主路径透传 lock 标志却覆写价格 → 用户手工核对价（最高防线）被静默穿透
+//   S3  peak_multiplier_note 全仓零消费 → 官方改峰谷倍率、价改而零提示
+//   M5  bigDiff 价差告警只覆盖 CN 主价分支，官方价覆写分支漏报
+//   **反向验证要求**：回退任一条修复，对应断言必须变红；其余断言不得误伤。
+//   ⚠ 只堵 deepseek-official **主路径**的 lock；1.5 跨 key 接管与 1.6 旧模型名绑定里的
+//     `delete m.lock` 是 v3.07 / v3.51.0 的有意设计（防旧名永久冻结在过期价），**不是缺陷**。
+// ═════════════════════════════════════════════════════════════════════════════════════════
+{
+  const strip72 = (s) => String(s || '').replace(/\r\n/g, '\n')
+    .split('\n').map((l) => l.replace(/(^|\s)\/\/.*$/, '$1').replace(/(^|\s)#.*$/, '$1')).join('\n');
+  const ds72 = strip72(fs.readFileSync(path.join(SRC, 'deepseek-official.js'), 'utf8'));
+  const rp72 = strip72(fs.readFileSync(path.join(SRC, 'refresh-prices.js'), 'utf8'));
+
+  // a1/a2 锚到 forEach 主路径体内（:478-536）：全文搜 `existing.lock === true` 会命中 1.5/1.6 段的
+  //   有意设计（防旧名永久冻结在过期价）→ 误伤。锚点用**代码行**（`delete ...retired`），
+  //   注释锚点在剥注释后会消失（v3.58.0 教训：锚点必须唯一且剥注释后仍存活）。
+  const mainPath72 = (() => {
+    const i = ds72.indexOf('parsed.models.forEach');
+    if (i < 0) return '';
+    const j = ds72.indexOf('delete pricing.models[mkey].retired', i);
+    return j < 0 ? ds72.slice(i) : ds72.slice(i, j);
+  })();
+  ok('T72-a1 ★S2 主路径 lock 冻结优先于官方价（留痕 _official_ref + return 跳过覆写）',
+    /if \(existing\.lock === true\) \{/.test(mainPath72)
+    && /_official_ref/.test(mainPath72)
+    && /return;/.test(mainPath72)
+    && !/delete m\.lock/.test(mainPath72));
+  ok('T72-a2 ★S2 冻结告警对用户可见（stderr 明说保留核对价 + 官方现价未覆写）',
+    /已设 lock 冻结 → 保留用户核对价/.test(mainPath72) && /未覆写（如确认采用请手动解除 lock）/.test(mainPath72));
+  ok('T72-a3 ★S3 refresh-prices 消费 peak_multiplier_note（改前零消费 → 官方改倍率零提示）',
+    /peak_multiplier_note/.test(rp72) && /officialPeakNote/.test(rp72));
+  // a4 只断言 M5 **真正改的部分**（officialBlk 分支的 bigDiff 覆盖）。
+  //   ⚠ refresh 侧的 `lockBlocksMainPrice` 锁守卫是 v3.40.0 既有代码（第二道防线），**不是本批改动**，
+  //     故不纳入断言——否则守卫会暗示"本批加了锁"，回退本批改动时它仍绿、失去检出意义。
+  ok('T72-a4 ★M5 官方价覆写分支也走 bigDiff 价差告警（改前只 cnHit 分支检测 → 官方改价静默入账）',
+    /else if \(officialBlk\) \{[\s\S]{0,900}?const oldInOff = m\.input_price, oldOutOff = m\.output_price;/.test(rp72)
+    && /else if \(officialBlk\) \{[\s\S]{0,900}?bigDiff\.push\(`\$\{key\}\(官方价/.test(rp72));
+
+  if (!SPAWN_OK) envSkip('T72-b 行为组（spawn deepseek-official + --require 预加载）', SPAWN_SKIP_REASON);
+  else {
+    // ── S2 端到端：假官方页（--require 预加载 patch fetch，不联网）──
+    // 沙箱会拦 spawn 出的子进程访问本地 HTTP（同进程 fetch 却正常）→ 不走网络，直接替换 fetch。
+    const fx = path.join(tmp, 'b11fx');
+    const fwb = path.join(fx, 'wb');
+    const fsk = path.join(fwb, 'skills', 'token-usage-tracker');
+    fs.mkdirSync(fsk, { recursive: true });
+    const HTML = `<html><body><h1>DeepSeek pricing</h1>
+<table>
+<tr><td>模型</td><td>deepseek-v4-flash</td><td>deepseek-v4-pro</td></tr>
+<tr><td>模型版本</td><td>DeepSeek-V4-Flash</td><td>DeepSeek-V4-Pro</td></tr>
+<tr><td>百万tokens输入（缓存命中）空闲</td><td>0.02</td><td>0.04</td></tr>
+<tr><td>百万tokens输入（缓存命中）高峰时段</td><td>0.04</td><td>0.08</td></tr>
+<tr><td>百万tokens输入（缓存未命中）空闲</td><td>1</td><td>2</td></tr>
+<tr><td>百万tokens输入（缓存未命中）高峰时段</td><td>2</td><td>4</td></tr>
+<tr><td>百万tokens输出 空闲</td><td>4</td><td>8</td></tr>
+<tr><td>百万tokens输出 高峰时段</td><td>8</td><td>16</td></tr>
+</table>
+<p>北京时间周一至周五（不含中国法定节假日）9:00 - 12:00、14:00 - 18:00 为高峰时段，其余为空闲时段。</p>
+</body></html>`;
+    const pre = path.join(fx, 'preload.js');
+    fs.writeFileSync(pre, `const orig = globalThis.fetch;
+globalThis.fetch = async (url, opts) => {
+  if (/deepseek|127\\.0\\.0\\.1|localhost/.test(String(url))) {
+    return new Response(${JSON.stringify(HTML)}, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  }
+  return orig(url, opts);
+};`, 'utf8');
+    fs.writeFileSync(path.join(fsk, 'pricing.json'), JSON.stringify({
+      currency: 'CNY', unit: '元/百万 tokens',
+      models: {
+        'deepseek-v4-flash': { name: 'Flash', input_price: 1.5, cached_price: 0.05, output_price: 4.5, peak_multiplier: 2, lock: true, price_source: 'deepseek官方', region: 'CN' },
+        'deepseek-v4-pro': { name: 'Pro', input_price: 9, cached_price: 0.2, output_price: 20, peak_multiplier: 2, price_source: 'deepseek官方', region: 'CN' },
+      },
+    }));
+    const dr = spawnSync(NODE, ['--require', pre, path.join(SRC, 'deepseek-official.js')], {
+      env: Object.assign({}, process.env, {
+        WB_ROOT: fwb, DS_OFFICIAL_URL: 'http://127.0.0.1:9/deepseek-official', DS_RETRIES: '0',
+        DS_RETRY_DELAY_MS: '1', TOKEN_TRACKER_NO_TOAST: '1',
+      }),
+      encoding: 'utf8', timeout: 120000, windowsHide: true,
+    });
+    const P = (() => { try { return JSON.parse(fs.readFileSync(path.join(fsk, 'pricing.json'), 'utf8')); } catch (e) { return { models: {} }; } })();
+    const flash = P.models['deepseek-v4-flash'] || {};
+    const pro = P.models['deepseek-v4-pro'] || {};
+    const ref = (P._official_ref || []).find((r) => r && r.model === 'deepseek-v4-flash') || null;
+    ok('T72-b1 ★S2 端到端 lock 条目不被官方覆写（仍 1.5/0.05/4.5）',
+      flash.input_price === 1.5 && flash.cached_price === 0.05 && flash.output_price === 4.5,
+      `got=${flash.input_price}/${flash.cached_price}/${flash.output_price} rc=${dr.status}`);
+    ok('T72-b2 ★S2 lock 标志保留（不是只留痕又删标志）', flash.lock === true);
+    ok('T72-b3 ★S2 官方现价留痕 _official_ref（用户想采纳时查得到，顶层与 _manual_audit 同设计）',
+      !!ref && ref.official.input_price === 1 && ref.official.output_price === 4 && ref.frozen.input_price === 1.5);
+    ok('T72-b4 ★S2 冻结告警进 stderr（用户可见）', /已设 lock 冻结/.test(String(dr.stderr || '')));
+    ok('T72-b5 ★S2 非 lock 条目照常被官方更新（Pro → 2/0.04/8，修复没把正常路径堵死）',
+      pro.input_price === 2 && pro.cached_price === 0.04 && pro.output_price === 8,
+      `got=${pro.input_price}/${pro.cached_price}/${pro.output_price}`);
+    ok('T72-b6 ★S2 整轮 exit=0', dr.status === 0, `rc=${dr.status} ${String(dr.stderr || '').slice(0, 160)}`);
+    try { fs.rmSync(fx, { recursive: true, force: true }); } catch (e) { /* 清理失败不影响断言 */ }
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// T74 —— v3.59.0（批13）：假日表健壮性两条
+//   S4  源返回空数组 → truthy 照样进两源交集 → 另一源的有效数据被白丢（只剩"少一天更新"，且零告警）
+//   M31 stale_detail 从 old 继承后只增不减 → 年份恢复后陈旧明细永久残留，--check 与人工排查误判一年
+//   **反向验证要求**：回退任一条修复，对应断言必须变红；其余断言不得误伤。
+//   ⚠ M34（±1 年滚动窗口）经定性为**设计取舍**（降级 + stderr 告警 + 修复指引三件套齐全）→ 不修、不加断言。
+//     别把"窗口外年份按非假日"当缺陷重复排查。
+// ═══════════════════════════════════════════════════════════════════════════
+{
+  const strip74 = (s) => String(s || '').replace(/\r\n/g, '\n')
+    .split('\n').map((l) => l.replace(/(^|\s)\/\/.*$/, '$1').replace(/(^|\s)#.*$/, '$1')).join('\n');
+  const rh74 = strip74(fs.readFileSync(path.join(SRC, 'refresh-holidays.js'), 'utf8'));
+
+  // a 组锚点说明：剥注释后仍存活的**代码行**（v3.58.0 教训：注释锚点剥完就没了）。
+  //   `a.length === 0` 在全文只命中归一那一行 —— `adopt.length === 0` 的字符序列不含 "a.length"
+  //   （'a' 后接 'd'），`b.offDays.length === 0` 同理，故不会误命中。
+  ok('T74-a1 ★S4 源A 空数组归一为 null（空数组=本次不可用，不是"该年 0 天"）',
+    /if \(Array\.isArray\(a\) && a\.length === 0\) a = null;/.test(rh74));
+  ok('T74-a2 ★S4 源B 空数组同样归一（只修一侧 = 另一侧坏源照样白丢数据）',
+    /if \(b && Array\.isArray\(b\.offDays\) && b\.offDays\.length === 0\) b = null;/.test(rh74));
+  ok('T74-a3 ★S4 归一发生在「两源都取不到」判断**之前**（顺序颠倒则归一无效，仍走交集）',
+    rh74.indexOf('a.length === 0') >= 0 && rh74.indexOf('if (!a && !b)') > rh74.indexOf('a.length === 0'));
+  ok('T74-a4 ★M31 stale_detail 每次全新构造（不从 old 继承 → 按当前缺年集合整体重算）',
+    /const staleDetail = \{\};/.test(rh74));
+  ok('T74-a5 ★M31 连续缺失沿用旧 since（缺数据的起始日不该被"今天又缺一次"刷新成今天）',
+    /const prev = \(old\.stale_detail \|\| \{\}\)\[yy\];/.test(rh74)
+    && /since: \(prev && prev\.since\) \|\| new Date\(/.test(rh74));
+
+  if (!SPAWN_OK) envSkip('T74-b 行为组（spawn refresh-holidays + --require 预加载）', SPAWN_SKIP_REASON);
+  else {
+    const fx = path.join(tmp, 'b13fx');
+    const fwb = path.join(fx, 'wb');
+    const fsk = path.join(fwb, 'skills', 'token-usage-tracker');
+    fs.mkdirSync(fsk, { recursive: true });
+    const HOL = path.join(fsk, 'holidays.json');
+    const read = () => { try { return JSON.parse(fs.readFileSync(HOL, 'utf8')); } catch (e) { return {}; } };
+    // 预加载替换 fetch（ghJson 只消费 res.ok / res.json().content(base64)），**全程不联网**。
+    //   FX_EMPTY_A=<年> → 该年源A返回 `{days:[]}`（模拟页面改版/字段改名后的空解析结果）
+    //   FX_FAIL_Y=<年>  → 该年两源都 HTTP 500（模拟源抖动/限流）
+    const pre = path.join(fx, 'preload.js');
+    fs.writeFileSync(pre, `const orig = globalThis.fetch;
+const D = { 2025: ['2025-01-01','2025-05-01'], 2026: ['2026-01-01','2026-05-01'], 2027: ['2027-10-01','2027-10-02','2027-10-03'] };
+globalThis.fetch = async (url, opts) => {
+  const u = String(url);
+  if (!/api\\.github\\.com/.test(u)) return orig(url, opts);
+  const y = (u.match(/\\/(\\d{4})\\.json/) || [])[1] || '';
+  const has = (v) => String(v || '').split(',').indexOf(y) >= 0;
+  if (has(process.env.FX_FAIL_Y)) return { ok: false, status: 500, json: async () => ({}) };
+  const days = D[y] || ['2026-01-01'];
+  let body;
+  if (/holiday-cn/.test(u)) {
+    body = has(process.env.FX_EMPTY_A) ? { days: [] }
+      : { days: days.map((d) => ({ name: 'x', date: d, isOffDay: true })) };
+  } else {
+    body = { arrangements: [{ holiday_dates: days }], source: { source_url: 'https://gov.example/' + y }, holiday_day_count: days.length };
+  }
+  return { ok: true, status: 200, json: async () => ({ content: Buffer.from(JSON.stringify(body)).toString('base64') }) };
+};`, 'utf8');
+    const run = (args, env) => spawnSync(NODE, ['--require', pre, path.join(SRC, 'refresh-holidays.js')].concat(args), {
+      env: Object.assign({}, process.env, { WB_ROOT: fwb, TOKEN_TRACKER_NO_TOAST: '1' }, env || {}),
+      encoding: 'utf8', timeout: 120000, windowsHide: true,
+    });
+
+    // ── S4 端到端：源A 空数组 + 源B 有效 → 必须采用 B（改前：交集为空 → 保留旧数据，白丢一天更新）──
+    fs.writeFileSync(HOL, JSON.stringify({ years: { '2027': ['2027-01-01'] }, stale_detail: {} }), 'utf8');
+    const r4 = run(['2027'], { FX_EMPTY_A: '2027' });
+    const y27 = (read().years || {})['2027'];
+    ok('T74-b1 ★S4 源A 空数组时采用源B 的数据（一个源坏不影响另一个源落地）',
+      JSON.stringify(y27) === JSON.stringify(['2027-10-01', '2027-10-02', '2027-10-03']),
+      `got=${JSON.stringify(y27)} rc=${r4.status} ${String(r4.stderr || '').slice(0, 160)}`);
+    ok('T74-b2 ★S4 不再保留旧数据（改前 adopt=[] → 空年守卫 → 旧值 ' + "'2027-01-01'" + ' 原地不动）',
+      Array.isArray(y27) && y27.indexOf('2027-01-01') < 0, `got=${JSON.stringify(y27)}`);
+    ok('T74-b3 ★S4 走的是「仅单源 → 采用」分支（可观测，不是静默换值）',
+      /仅单源 → 采用/.test(String(r4.stdout || '')));
+
+    // ── M31 端到端：先让 2027 缺数据（沿用旧 since）→ 再让它恢复 → stale_detail 必须清空 ──
+    fs.writeFileSync(HOL, JSON.stringify({
+      years: { '2025': ['2025-01-01'], '2026': ['2026-01-01'] },
+      stale_detail: { '2027': { since: '2026-01-01', reason: '上一轮遗留' } },
+    }), 'utf8');
+    const m1 = run([], { FX_FAIL_Y: '2027' });
+    const H1 = read();
+    ok('T74-b4 ★M31 连续缺失沿用旧 since（起始日仍是 2026-01-01，不是被刷新成今天）',
+      !!H1.stale_detail && H1.stale_detail['2027'] && H1.stale_detail['2027'].since === '2026-01-01',
+      `got=${JSON.stringify(H1.stale_detail)} rc=${m1.status}`);
+    ok('T74-b5 ★M31 缺失年份进 stale_years（可见性不因清理逻辑丢失）',
+      Array.isArray(H1.stale_years) && H1.stale_years.indexOf(2027) >= 0 && H1._stale === true,
+      `got=${JSON.stringify(H1.stale_years)}`);
+    const m2 = run([], {});
+    const H2 = read();
+    ok('T74-b6 ★M31 年份恢复后 stale_detail 清空（改前旧明细永不删除 → --check 误报一年）',
+      H2.stale_detail && Object.keys(H2.stale_detail).length === 0,
+      `got=${JSON.stringify(H2.stale_detail)} rc=${m2.status} ${String(m2.stderr || '').slice(0, 160)}`);
+    ok('T74-b7 ★M31 stale_years 同步清空 + _stale=false（两字段口径一致）',
+      Array.isArray(H2.stale_years) && H2.stale_years.length === 0 && H2._stale === false,
+      `got=${JSON.stringify(H2.stale_years)} _stale=${H2._stale}`);
+    ok('T74-b8 ★M31 2027 数据真的恢复了（不是"把明细删掉假装没事"）',
+      JSON.stringify((H2.years || {})['2027']) === JSON.stringify(['2027-10-01', '2027-10-02', '2027-10-03']),
+      `got=${JSON.stringify((H2.years || {})['2027'])}`);
+    try { fs.rmSync(fx, { recursive: true, force: true }); } catch (e) { /* 清理失败不影响断言 */ }
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// T75 —— v3.59.0（批15）：测试网床 —— 「取消补弹」端到端命名用例（M37）
+//   报告第三节判定「取消补弹链路是最薄的一环」：v2.85 起它就是"弹不出就永久丢一轮 token"的兜底
+//   （取消轮不补弹 → 其 token 静默并入下一轮，历史实证 108.7 万），却**全库零命名用例**——
+//   只有 T17-b* 的源码形态守卫，SPAWN_OK=false 时连 T17-c1 都 SKIP → **调用点被删也全绿**
+//   （v2.85 前科：调用点丢失、6 项回放全 PASS 仍漏检）。故本组必须是**端到端**（真 spawn --round-watch）。
+//   **反向验证判据（M37 核心）**：把 showToast('cancelled-round-watch') 调用点删掉 → b1/b3 必须变红。
+// ═══════════════════════════════════════════════════════════════════════════
+{
+  const src75 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf8'));
+  ok('T75-a1 ★M37 取消补弹三分支的 showToast 调用点齐全（有 usage / 估算 / 无记录）',
+    /showToast\([\s\S]{0,700}?'cancelled-round-watch'[\s\S]{0,60}?\)/.test(src75)
+    && /showToast\([\s\S]{0,700}?'cancelled-round-watch-est'[\s\S]{0,60}?\)/.test(src75)
+    && /showToast\('本轮无 token 消耗记录（手动取消）'/.test(src75));
+  ok('T75-a2 ★M37 补弹后必须推进 lastStopAt（跨进程无去重 → 不推进 = 下一轮 hook 再弹一次）',
+    /lastStopAt: Date\.now\(\) \}, sid\);/.test(src75));
+  ok('T75-a3 ★M37 静默时长/轮询周期 env 可调（否则端到端只能真等 8 秒，没人愿意跑）',
+    /ROUND_WATCH_POLL_MS/.test(src75) && /ROUND_WATCH_QUIET_MS/.test(src75) && /ROUND_WATCH_MAX_MS/.test(src75));
+
+  if (!SPAWN_OK) envSkip('T75-b 取消补弹端到端（spawn --round-watch）', SPAWN_SKIP_REASON);
+  else {
+    const toastPath = path.join(tmp, 'token-tracker-toast.log');
+    const toastOff = () => { try { return fs.statSync(toastPath).size; } catch (e) { return 0; } };
+    // ⚠ 必须按**字节**切片：toast.log 是 append-only，用字节偏移读回增量才对齐；
+    //   按 utf8 字符串 slice(字节数) 会因中文多字节而偏后，把 reason 字段切掉（首轮实测踩到）。
+    const toastSlice = (off) => { try { return fs.readFileSync(toastPath).slice(off).toString('utf8'); } catch (e) { return ''; } };
+    const proj75 = path.join(tmp, 'projects', 'm37');
+    fs.mkdirSync(proj75, { recursive: true });
+    const SID75 = 'm37cancel';
+    const tp75 = path.join(proj75, SID75 + '.jsonl');
+    const SNAP75 = path.join(skillDir, '.snapshot-' + SID75 + '.json');
+    const T75 = Date.now() - 60000;
+    const rowUser = JSON.stringify({ type: 'user', id: 'u1', timestamp: T75, message: { role: 'user', content: 'hi' } });
+    const rowUsage = JSON.stringify({ type: 'assistant', timestamp: T75 + 1000,
+      providerData: { model: 'glm-5.3-flash', messageId: 'm1', usage: { input_tokens: 1000, output_tokens: 100 } } });
+    // 取消标记的真实形态（v2.83 实证：role=assistant + status=incomplete + providerData.error.message 精确
+    // "Interrupted by user"；**勿用** providerData.skipRun —— 183/183 真实取消都带它，排除会 100% 灭掉检测）。
+    const rowCancel = JSON.stringify({ type: 'message', role: 'assistant', status: 'incomplete', timestamp: T75 + 2000,
+      content: 'Interrupted by user', providerData: { error: { message: 'Interrupted by user' } } });
+    const run75 = (rows, maxMs) => {
+      fs.writeFileSync(tp75, rows.join('\n') + '\n');
+      try { fs.rmSync(SNAP75, { force: true }); } catch (e) { /* 上一场景快照必须清，否则进程秒退、用例假绿 */ }
+      const off = toastOff();
+      const r = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--round-watch', SID75, tp75, String(T75), ''], {
+        env: Object.assign({}, env, {
+          TOKEN_TRACKER_NO_TOAST: '1', WB_NO_NET: '1',
+          ROUND_WATCH_POLL_MS: '200', ROUND_WATCH_QUIET_MS: '1000',
+          ROUND_WATCH_ADAPT_QUIET_MS: '500', ROUND_WATCH_MAX_MS: String(maxMs || 12000),
+        }),
+        timeout: 40000, windowsHide: true, encoding: 'utf8',
+      });
+      const snap = (() => { try { return JSON.parse(fs.readFileSync(SNAP75, 'utf8')); } catch (e) { return null; } })();
+      return { r, toast: toastSlice(off), snap };
+    };
+
+    // 场景①：手动取消 + 有 usage → 正常补弹（cancelled-round-watch）
+    const c1 = run75([rowUser, rowUsage, rowCancel], 12000);
+    ok('T75-b1 ★M37 端到端：手动取消 + 静默满 → 真补弹（toast.log 落 cancelled-round-watch）',
+      c1.r.status === 0 && c1.toast.indexOf('"reason":"cancelled-round-watch"') >= 0,
+      `exit=${c1.r.status} toast=${JSON.stringify(c1.toast.slice(0, 160))}`);
+    ok('T75-b2 ★M37 弹窗文案带「（手动取消）」（用户能分清这是取消轮不是正常轮）',
+      c1.toast.indexOf('手动取消') >= 0, JSON.stringify(c1.toast.slice(0, 300)));
+    ok('T75-b3 ★M37 补弹后推进 lastStopAt（跨进程去重靠它；不推进 = 下一轮 hook 再弹一次）',
+      !!c1.snap && Number(c1.snap.lastStopAt) > T75, `snap=${JSON.stringify(c1.snap)}`);
+
+    // 场景②：无取消标记 → **绝不弹**（正常轮交给 Stop 链路；误弹 = 双弹）
+    const c2 = run75([rowUser, rowUsage], 2500);
+    ok('T75-b4 ★M37 对照场景：没有取消标记就绝不补弹（误弹即与 Stop 链路双弹）',
+      c2.r.status === 0 && c2.toast.indexOf('cancelled-round-watch') < 0,
+      `exit=${c2.r.status} toast=${JSON.stringify(c2.toast.slice(0, 160))}`);
+
+    // 场景③：0-usage 取消（usage 未落盘）→ 无记录提示分支
+    const c3 = run75([rowUser, rowCancel], 12000);
+    ok('T75-b5 ★M37 0-usage 取消 → 走「本轮无 token 消耗记录（手动取消）」（不编造数字、也不静默）',
+      c3.r.status === 0 && c3.toast.indexOf('cancelled-round-watch-no-token') >= 0,
+      `exit=${c3.r.status} toast=${JSON.stringify(c3.toast.slice(0, 160))}`);
+    try { fs.rmSync(SNAP75, { force: true }); } catch (e) { /* 场景收尾清理 */ }
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// T76 —— v3.59.0（批15）：并发记账多进程竞态集成测试（M38）
+//   报告：此前只有 T46 的**锁原语单测**（6 子项，验 withFileLock 本身对不对），
+//   从未验证"两个真实进程同时记账"这个真会发生的场景（Stop hook 与轮级 watcher 可同时触发、
+//   团队轮多个子代理结束也近乎同时）。锁原语对 ≠ 组合起来对：读写窗口、锁文件路径、
+//   水位线与账本是否同一把锁，单测全绿也可能在集成层 lost-update（丢一笔 = 少计费，静默）。
+//   判据：两进程各记一笔不同模型 → 账本 total.in 必须是两笔之和，且两个模型各就各位。
+// ═══════════════════════════════════════════════════════════════════════════════════════
+{
+  const src76 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf8'));
+  // ⚠ 两条写盘路径（记账主路径 / 直接落盘）**分开断言**：合起来只验"文件里存在 withFileLock"的话，
+  //   回退其中一条、另一条还在 → 守卫仍绿（反向验证里踩到：只退一处时 T76-a1 稳绿）。
+  ok('T76-a1 ★M38 记账主路径必须走 withFileLock（DAILY_USAGE_FILE.lock）',
+    /const r = withFileLock\(DAILY_USAGE_FILE \+ '\.lock'/.test(src76));
+  ok('T76-a1b ★M38 直接落盘路径同样持锁（两条写盘路径缺一 = 并发下 lost-update）',
+    /withFileLock\(DAILY_USAGE_FILE \+ '\.lock', \(\) => saveDailyUsageRaw\(d\)/.test(src76));
+  ok('T76-a2 ★M38 水位线写入也要持锁（水位线与账本必须同一口径，否则并发下重复计费）',
+    /withFileLock\(LEDGER_WATERMARK_FILE \+ '\.lock'/.test(src76));
+
+  if (!SPAWN_OK) envSkip('T76-b 并发记账集成（spawn 双进程）', SPAWN_SKIP_REASON);
+  else {
+    const D76 = '2026-10-13';
+    const TS76 = 1791856800000; // 2026-10-13 10:00 +0800（周二，高峰段内）
+    const M76A = 'k38-concurrent-a', M76B = 'k38-concurrent-b';
+    const wb76 = path.join(tmp, 'k38-wb');
+    const sk76 = path.join(wb76, 'skills', 'token-usage-tracker');
+    const wj76 = (p, o) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, o); };
+    wj76(path.join(sk76, 'pricing.json'), JSON.stringify({
+      date: D76,
+      models: {
+        [M76A]: { input_price: 1.0, output_price: 2.0, cached_price: 0.5, currency: 'CNY', unit: 'per_1m_tokens', region: 'CN', source_url: 'fixture', fetched_at: '2026-10-13T00:00:00Z' },
+        [M76B]: { input_price: 1.0, output_price: 2.0, cached_price: 0.5, currency: 'CNY', unit: 'per_1m_tokens', region: 'CN', source_url: 'fixture', fetched_at: '2026-10-13T00:00:00Z' },
+      },
+      deepseek_rules: { peak_schedule: '9:00 - 12:00、14:00 - 18:00', weekend_off_peak: true, effective_at: null, updated_at: '2026-10-13' },
+      usd_cny_rate: 7.2,
+    }));
+    wj76(path.join(sk76, 'holidays.json'), '{}');
+    for (const f of fs.readdirSync(skillDir).filter((x) => x.endsWith('.js'))) {
+      fs.copyFileSync(path.join(skillDir, f), path.join(sk76, f));
+    }
+    wj76(path.join(sk76, '.update-check.json'),
+      JSON.stringify({ lastCheckAt: Date.now(), latestVersion: '0.0.0', failCount: 0, nextRetryAt: 0 }));
+    // 两个**同 WB_ROOT**（同一份账本）的独立会话 —— 共享账本才有竞态可言
+    const mk76 = (sid, model) => {
+      const tp = path.join(wb76, 'projects', 'p-' + sid, sid + '.jsonl');
+      const user = JSON.stringify({ timestamp: TS76 - 60000, type: 'message', role: 'user', content: [{ type: 'text', text: 'hi' }] }) + '\n';
+      const line = JSON.stringify({ timestamp: TS76, type: 'message', role: 'assistant',
+        providerData: { model, messageId: 'm-' + sid, usage: { inputTokens: 1000000, outputTokens: 0, inputTokensDetails: [{ cached_tokens: 0 }] } } }) + '\n';
+      wj76(tp, user + line);
+      return { sid, tp, payload: JSON.stringify({ session_id: sid, transcript_path: tp, cwd: wb76 }) };
+    };
+    const A76 = mk76('k38-a', M76A);
+    const B76 = mk76('k38-b', M76B);
+    const env76 = Object.assign({}, env, { WB_ROOT: wb76, WB_LEDGER_MAINT: '1', WB_NO_NET: '1' });
+    // ⚠ 真并行必须借一个**驱动子进程**：selftest 主线程若用 Atomics.wait 忙等，事件循环被冻结
+    //   → 子进程的 'exit' 回调永远排不上队（首轮实测 codes=[null,null]，90s 超时全红）。
+    //   驱动进程自己事件循环正常，异步 spawn 两个孙进程并等齐，把退出码 JSON 打回 stdout。
+    const drv76 = path.join(tmp, 'k38-driver.js');
+    fs.writeFileSync(drv76, `const { spawn } = require('child_process');
+const NODE = process.execPath;
+const script = process.argv[2];
+const kids = [process.argv[3], process.argv[4]].map((p) => {
+  const k = spawn(NODE, [script, '--stop'], { windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'] });
+  try { k.stdin.end(p); } catch (e) { /* silent-ok:诊断 — stdin 写不进去会由退出码暴露，不额外处理 */ }
+  return k;
+});
+let exited = 0; const codes = [null, null];
+const t = setTimeout(() => { kids.forEach((k) => { try { k.kill(); } catch (e) { /* silent-ok:清理 — 已退出进程的 kill 抛错可忽略 */ } }); finish(); }, 60000);
+kids.forEach((k, i) => k.on('exit', (c) => { codes[i] = c; exited++; if (exited >= kids.length) finish(); }));
+function finish() { try { clearTimeout(t); } catch (e) { /* silent-ok:清理 — 定时器已触发时 clearTimeout 抛错可忽略 */ }
+  process.stdout.write(JSON.stringify({ codes, exited })); process.exit(0); }
+`, 'utf8');
+    const dr = spawnSync(NODE, [drv76, path.join(sk76, 'token-tracker.js'), A76.payload, B76.payload],
+      { env: env76, timeout: 90000, windowsHide: true, encoding: 'utf8' });
+    const codes = (() => { try { return JSON.parse(String(dr.stdout || '')).codes; } catch (e) { return [null, null]; } })();
+    let daily76 = null, parseErr76 = '';
+    try { daily76 = JSON.parse(fs.readFileSync(path.join(sk76, 'daily-usage.json'), 'utf8')); }
+    catch (e) { parseErr76 = String((e && e.message) || e); }
+    const m76 = (n) => (daily76 && daily76[D76] && daily76[D76].models && daily76[D76].models[n]) || null;
+    ok('T76-b1 ★M38 两进程都正常退出（并发本身不崩、不死锁）',
+      codes[0] === 0 && codes[1] === 0, `codes=${JSON.stringify(codes)}`);
+    ok('T76-b2 ★M38 并发记账不丢：账本 total.in = 两笔之和 2,000,000（lost-update = 静默少计费）',
+      !!daily76 && daily76[D76] && daily76[D76].total && daily76[D76].total.in === 2000000,
+      `total=${daily76 && daily76[D76] && JSON.stringify(daily76[D76].total)} parseErr=${parseErr76}`);
+    ok('T76-b3 ★M38 两笔各就各位（不串模型、不重复计同一笔）',
+      !!m76(M76A) && m76(M76A).in === 1000000 && !!m76(M76B) && m76(M76B).in === 1000000,
+      `A=${JSON.stringify(m76(M76A))} B=${JSON.stringify(m76(M76B))}`);
+    ok('T76-b4 ★M38 并发写盘后账本仍是合法 JSON（交错写 = 半截文件 → 整本读不出）',
+      !!daily76 && parseErr76 === '', `parseErr=${parseErr76}`);
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// T77 —— v3.59.0（批15）：CI 与测试网床自身的结构守卫（M39 / M40 / M41）
+//   M39 联网那一遍 selftest 用 continue-on-error → 真回归与 runner 网络抖动被一并吞掉（静默放过）
+//   M40 CI 无 Node 矩阵（仅 20，本机实跑 22）、无凭据扫描
+//   M41 源码守卫型断言占比偏高（只验"源码仍含该分支"，不证明行为正确）→ 这里守的是
+//       **行为级（真 spawn）用例的数量不许退化**，防止后人把行为用例删掉、改回只守源码形态。
+// ═══════════════════════════════════════════════════════════════════════════════════════
+{
+  const ymlRel = path.join('.github', 'workflows', 'selftest.yml');
+  const ymlPath = path.join(SRC, ymlRel);
+  let yml = '';
+  try { yml = fs.readFileSync(ymlPath, 'utf8'); } catch (e) { /* 读不到 → 下面逐条红 */ }
+  ok('T77-a1 ★M40 CI 配置文件可读（缺失会让本组全部假绿）', yml.length > 0, ymlRel);
+  ok('T77-a2 ★M39 联网那一遍不再 continue-on-error（原写法把真回归与网络抖动一并吞掉）',
+    // ⚠ 必须锚到 **YAML 键行**：裸搜 `continue-on-error` 会命中本组注释里"为什么删掉它"的说明文字 → 假红。
+    yml.length > 0 && !/^\s*continue-on-error:/m.test(yml));
+  ok('T77-a3 ★M39 联网那一遍有网络可达性门控（不可达 = 显式跳过，不是"跑了但失败被吞"）',
+    /steps\.net\.outputs\.reachable/.test(yml) && /Probe network reachability/.test(yml));
+  ok('T77-a4 ★M40 Node 版本矩阵 20 + 22（本机实跑 22，只跑 20 抓不到版本差异）',
+    /matrix:/.test(yml) && /node-version:\s*\[20,\s*22\]/.test(yml));
+  ok('T77-a5 ★M40 有凭据扫描步骤，且是零依赖自研脚本（不引第三方 action，保住零依赖卖点）',
+    /secret-scan\.js/.test(yml) && fs.existsSync(path.join(SRC, '.github', 'workflows', 'secret-scan.js')));
+  // M41：行为级用例计数不许退化（本批把 T67/T68/T69 三组"从未真跑"的端到端修好、并新增 T75/T76）
+  const selfSrc = (() => { try { return fs.readFileSync(path.join(SRC, 'selftest.js'), 'utf8'); } catch (e) { return ''; } })();
+  const spawnCases = (selfSrc.match(/spawnSync\(NODE/g) || []).length;
+  ok('T77-a6 ★M41 行为级（真 spawn 子进程）用例数不退化（当前 24；删行为用例改守源码形态 = 此条红）',
+    spawnCases >= 24, `实测 ${spawnCases} 处`);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// T78 —— v3.59.0（批14）：价格质量（M3 / M1 / S7）
+//   M3  priceGate 的骤变基线只看"旧值是正数" → **错价自我锁定**：错价一旦入库，之后抓到的正确价
+//       相对它是 1/1000 → 被 abortAt 拦下并保留错价，刷新每天跑、每天被拦，人工不删价永远修不回来
+//       （且告警方向是反的：说"新值骤变"，越看越像新值有问题）。修法：旧值自己超出合理区间
+//       （= 它自己就是那类错价）时不作基线 → 正确价得以写入、错价自愈，并留痕。
+//   M1  多源抓取一次失败即源缺席，而刷新成功后 `pricing.date=today` 当天不再重试 → 抖动 = 缺席 24h。
+//   S7  汇率 7.2 写入后永久沿用且零提示（KI-26 已定不接 live 源，本批只补"陈旧度"提醒）。
+//   ⚠ M2（多源一致门槛）**本批不采纳**：要求 ≥2 源命中才写主价，会让单源收录的模型大面积停更，
+//     停更的代价比"单源可能错"更大，且与本闸门"宁可漏报、绝不误杀"的原则冲突 → 维持现状，
+//     已在计划文档写明理由，留待用户定夺。
+// ═══════════════════════════════════════════════════════════════════════════════════════
+{
+  const rp78 = stripComments(fs.readFileSync(path.join(SRC, 'refresh-prices.js'), 'utf8'));
+  ok('T78-a1 ★M3 骤变校验的基线必须先判「旧值自己可不可信」（改前只看 >0 → 错价拿错价当分母）',
+    /const ovTrusted = ovUsable && ov >= PRICE_SANITY\.min && ov <= PRICE_SANITY\.max;/.test(rp78)
+    && /if \(ovTrusted\) \{/.test(rp78));
+  ok('T78-a2 ★M3 旧值不可信时不拦但**必须留痕**（静默覆盖旧值 = 另一种不可见）',
+    /\} else if \(ovUsable\) \{/.test(rp78) && /疑似历史错价/.test(rp78));
+  ok('T78-a3 ★M1 源抓取走带重试的封装（抖动一次不再让整源缺席 24h）',
+    /async function fetchJsonWithRetry\(/.test(rp78) && /await fetchJsonWithRetry\(s\.url/.test(rp78));
+  ok('T78-a4 ★M1 重试只针对瞬时故障 + 次数 env 可调（与 Python 侧 M21 同一开关名）',
+    /function isRetryableFetchErr\(/.test(rp78) && /CN_PRICE_HTTP_RETRIES/.test(rp78));
+  // ⚠ a5 必须锚到**真正落盘的那一处赋值**：只搜 `usd_cny_rate_updated_at` 这个字符串的话，
+  //   下面读它的 `const rateSince = String(pricing.usd_cny_rate_updated_at || '')` 也含该串 →
+  //   把赋值删掉守卫仍绿（反向验证 R3 实测踩到：删了赋值、872/0/0 全绿 = 假绿）。
+  ok('T78-a5 ★S7 汇率必须落「起始日」并在超期时告警（无 live 源 ≠ 不该提醒）',
+    /if \(!\(prevRateBefore > 0\) \|\| Math\.abs\(prevRateBefore - rate\) > 1e-9\) pricing\.usd_cny_rate_updated_at = today;/.test(rp78)
+    && /RATE_STALE_DAYS/.test(rp78) && /已沿用/.test(rp78));
+  ok('T78-a6 ★S7 汇率起始日在**写回之前**取旧值（取晚了永远等于新值 → 起始日永不更新）',
+    rp78.indexOf('const prevRateBefore = Number(pricing.usd_cny_rate);') < rp78.indexOf('pricing.usd_cny_rate = rate;'));
+
+  // 行为组：priceGate 已导出（module.exports 含 priceGate）→ 可直接真调用，不必 spawn 整条刷新链
+  const mod78 = (() => { try { return require(path.join(skillDir, 'refresh-prices.js')); } catch (e) { return null; } })();
+  if (!mod78 || typeof mod78.priceGate !== 'function') {
+    ok('T78-b 行为组（require refresh-prices）', false, 'priceGate 未导出或模块加载失败');
+  } else {
+    const maxSane = mod78.PRICE_SANITY.max;
+    // b1：旧值是 1000× 错价（远超合理区间）→ 正确价必须能写进来（改前被拦 = 错价自我锁定）
+    const w1 = [];
+    const g1 = mod78.priceGate('m3-fixture', { input_price: 1.0, output_price: 4.0 },
+      { input_price: maxSane * 20, output_price: maxSane * 20 }, w1);
+    ok('T78-b1 ★M3 旧值是超区间错价 → 正确价得以写入（改前：被 abortAt 拦下 = 错价永久自我锁定）',
+      g1.main === false, `main=${g1.main} warnings=${JSON.stringify(w1)}`);
+    ok('T78-b2 ★M3 且必须留痕（不是静默把旧值换了）',
+      w1.some((s) => /疑似历史错价/.test(String(s))), JSON.stringify(w1));
+    // b2：正常旧值 + 真骤变 → 照旧拦（本修复不得削弱原有闸门）
+    const w2 = [];
+    const g2 = mod78.priceGate('m3-fixture', { input_price: 10.0, output_price: 4.0 },
+      { input_price: 2.0, output_price: 4.0 }, w2);
+    ok('T78-b3 ★M3 正常旧值下的骤变仍照旧拦截（修复零削弱：×5 仍判异常并保留旧值）',
+      g2.main === true && w2.some((s) => /骤变/.test(String(s))), `main=${g2.main} ${JSON.stringify(w2)}`);
+    // b3：旧值 0（未公布价 / 首次写入）→ 不拦也不告警（KI-7：0 是合法常态）
+    const w3 = [];
+    const g3 = mod78.priceGate('m3-fixture', { input_price: 3.0, output_price: 4.0 },
+      { input_price: 0, output_price: 0 }, w3);
+    ok('T78-b4 ★M3 旧值 0（未公布价）→ 不拦且不告警（KI-7 合法常态，不得因本修复刷噪音）',
+      g3.main === false && !w3.some((s) => /疑似历史错价/.test(String(s))), `main=${g3.main} ${JSON.stringify(w3)}`);
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════
+// T79 —— v3.59.0（批16）：弹窗宽度常量「代码 ↔ 文档」一致性（M35）
+//   M35 的实质不是"某个数写错了"，而是**同一组常量散在代码和四份文档里、改一处不同步其余**：
+//   v3.50.0 把正文行 51 → 44（KI-17：51 高于通知卡片真实极限 ~46u → 宽度守卫永不触发 → 代码不抢在
+//   Windows 前主动舍 → 行尾金额被气泡直接砍掉），代码改了、README/SKILL 跟着改了，**balance.md 与
+//   TROUBLESHOOTING.md 没跟** → 前者照 51 描述、后者甚至仍在讲 v3.30.0 的旧降级链（先丢价格标签保缓存），
+//   而 v3.44.0 起价格标签已迁行1、行2 改为直接丢缓存占比。**照旧文档排查会得出完全相反的结论**。
+//   本组把"代码现值 + 四份文档现值 + 不得再写 51 + 降级链口径"全钉住，下次动任一处必须同步其余。
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+{
+  const tt79 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf8');
+  ok('T79-a1 ★正文行宽度常量必须为 44（44u 完整显示 / 46u 行尾被砍；51 高于真实极限 → 守卫永不触发 → 金额被砍）',
+    /const TOAST_LINE_MAX_W = 44;/.test(tt79), '红 = 有人把阈值改回 51/45 等无实证值');
+  ok('T79-a2 ★标题两行宽度常量必须为 45 / 42（行1 大字 45、行2 大字 42；实测 41.5u 成 / 46.5u 爆）',
+    /const TOAST_ROW1_MAX_W = 45;/.test(tt79) && /const TOAST_ROW2_MAX_W = 42;/.test(tt79));
+  const rd79 = fs.readFileSync(path.join(SRC, 'README.md'), 'utf8');
+  const sk79 = fs.readFileSync(path.join(SRC, 'SKILL.md'), 'utf8');
+  const bal79 = fs.readFileSync(path.join(SRC, 'docs', 'balance.md'), 'utf8');
+  const ts79 = fs.readFileSync(path.join(SRC, 'TROUBLESHOOTING.md'), 'utf8');
+  const has3 = (s) => /TOAST_ROW1_MAX_W=45/.test(s) && /TOAST_ROW2_MAX_W=42/.test(s) && /TOAST_LINE_MAX_W=44/.test(s);
+  const miss3 = [['README', rd79], ['SKILL', sk79], ['balance', bal79], ['TROUBLESHOOTING', ts79]]
+    .filter(([, s]) => !has3(s)).map(([k]) => k);
+  ok('T79-a3 ★四份现状文档都必须写出 45 / 42 / 44 三个现值（漏一份 = 下次改代码又会漂）',
+    miss3.length === 0, miss3.length ? '未写全的文档: ' + miss3.join(', ') : '');
+  // ⚠ a4 只管**现状**文档：CHANGELOG / KNOWN-ISSUES / version-diary 里的 51 是"旧值史实"，必须保留。
+  const nowDocs79 = { README: rd79, SKILL: sk79, balance: bal79, TROUBLESHOOTING: ts79 };
+  const stale51 = Object.keys(nowDocs79).filter((k) => /TOAST_(LINE|ROW1|ROW2)_MAX_W\s*=\s*51/.test(nowDocs79[k])
+    || /上限\s*51u/.test(nowDocs79[k]) || /51u\s*真实上限/.test(nowDocs79[k]));
+  ok('T79-a4 ★四份现状文档不得把 51 写作现值（v3.50.0 起 51 已作废；CHANGELOG/KNOWN-ISSUES 里的 51 是史实、不在此列）',
+    stale51.length === 0, stale51.length ? '仍写 51 的文档: ' + stale51.join(', ') : '');
+  ok('T79-a5 ★行2 降级链口径必须三处一致：价格标签已迁行1、行2 超宽**直接丢缓存占比**'
+    + '（v3.30.0~v3.43.x 旧口径相反：先丢降级标签保缓存 —— 照旧口径排查会得出相反结论）',
+    /丢缓存占比/.test(ts79) && /丢缓存占比/.test(rd79) && /丢缓存占比/.test(sk79));
+  // M26：v3.55.0（KI-22 二）已把 backfill 从「整份替换」改成**模型级 merge**（抓不到的 (日期,模型)
+  //   保留并标 stale_carried），但 KI-5 / KI-7 / README / SKILL / token-tracker.js 的 stderr 仍在写
+  //   「全量重建替换、新账本不继承旧账本」——与代码**相反**。「别用 --write」的结论不变，但**理由完全
+  //   不同**（现在是「抓得到的 (日期,模型) 用重放值覆盖且不取 max」）→ 照旧理由排查会找错方向。
+  const kn79 = fs.readFileSync(path.join(SRC, 'KNOWN-ISSUES.md'), 'utf8');
+  //   ⚠ 三种措辞都要禁：README 旧版写「全量重建替换」、SKILL 旧版写「全量替换」、KI-7 写「新账本不继承」。
+  //   只禁其中一种 = 回退到另一种措辞时守卫恒绿（写本条时差点只写了前两种之外的组合）。
+  const staleReplace = [['README', rd79], ['SKILL', sk79], ['KNOWN-ISSUES', kn79], ['token-tracker', tt79]]
+    .filter(([, s]) => /全量重建替换|全量替换|新账本不继承/.test(s)).map(([k]) => k);
+  ok('T79-a6 ★backfill --write 不得再被描述为「全量重建替换 / 新账本不继承旧账本」'
+    + '（v3.55.0 起是模型级合并；CHANGELOG / version-diary 里的旧叙述属史实、不在此列）',
+    staleReplace.length === 0, staleReplace.length ? '仍写旧口径: ' + staleReplace.join(', ') : '');
+  // M30：有 rules 时 weekend_off_peak 缺省 false ≠ 无 rules 时的「周末一律低峰」——两条分支口径不同是
+  //   **刻意为之**（不替官方假设周末低峰），但代码里原本没有任何说明 → 读代码的人会当成漏写/不一致。
+  const pr79 = fs.readFileSync(path.join(SRC, 'peak-rules.js'), 'utf8');
+  ok('T79-a7 ★M30 weekend_off_peak 的**缺省语义**必须在代码里写明（有 rules 缺省 false ≠ 无 rules 周末低峰）',
+    /缺省 = false 是刻意的/.test(pr79) && /零实际差异/.test(pr79), '红 = 语义说明被删，读者会当成漏写');
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════
+// T80 —— v3.59.0（批16）：维护链 CLI 的「参数 / 降级」可观测性（M24 / M25 / M32 / M33）
+//   四条同属一类病根：**失败被说成了另一种失败，或失败完全不可见**。
+//   · M24 `recalc-day 2026-13-45` → 报「账本中无 2026-13-45 记录」——把「参数错」说成「数据缺」。
+//     后果不只是误导：用户会以为账本坏了，转头去查账本、甚至去跑 KI-5 明令禁止的 `backfill --write`。
+//   · M25 backfill 是**第三条**计价路径（主链路增量 / recalc 回溯 / backfill 重建），前两条
+//     （v3.32.0 H4、v3.58.0 批8-⑨）都有"假日数据未知"告警，唯独它没有 → 用它重建整个账本时
+//     真假日按高峰 ×2 多算、调休上班日按周末低峰少算，**双向错且零提示**。
+//   · M33 `refresh-holidays abc` → `Number('abc')` = NaN → 拿 NaN 拼 URL 抓两次 404 后静默 exit 2。
+//     与"源挂了 / 没网 / 被限流"**完全无法区分** → 排查方向整个错掉。
+//   · M32 `.holidays-refresh.json` 非原子写 → 写一半被中断留下半截 JSON → 下轮 parse 失败 →
+//     节流条件④「距上次成功 >30 天」永久失效 → **每天重复联网**。
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+{
+  const rc80 = fs.readFileSync(path.join(SRC, 'recalc-day.js'), 'utf8');
+  const bf80 = fs.readFileSync(path.join(SRC, 'backfill.js'), 'utf8');
+  const rh80 = fs.readFileSync(path.join(SRC, 'refresh-holidays.js'), 'utf8');
+  ok('T80-a1 ★M24 recalc-day 必须先校验日期**格式**（非法要说"参数非法"，不许说"账本中无记录"）',
+    /日期参数非法/.test(rc80) && /\\d\{4\}-\\d\{2\}-\\d\{2\}/.test(rc80) && /process\.exit\(2\)/.test(rc80));
+  ok('T80-a2 ★M24 格式对了还要做**日历**校验（`2026-13-45` / `2026-02-30` 形状合法但不是真日期，'
+    + '`new Date` 会静默滚到下一年 → 必须回读年/月/日才认得出）',
+    /dt\.getUTCFullYear\(\) !== p\[0\]/.test(rc80) && /dt\.getUTCMonth\(\) !== p\[1\] - 1/.test(rc80)
+    && /dt\.getUTCDate\(\) !== p\[2\]/.test(rc80));
+  ok('T80-a3 ★M24 校验必须在**查账本之前**（放在查字典之后 = 两种失败仍混在同一句话里）',
+    rc80.indexOf('日期参数非法') >= 0 && rc80.indexOf('日期参数非法') < rc80.indexOf('账本中无 ${date} 记录'));
+  ok('T80-a4 ★M25 backfill 必须补「假日数据未知/陈旧」告警（第三条计价路径，另两条早已有了）',
+    /peakRules\.holidayYearUnknown\(tsMs, HOLIDAYS\)/.test(bf80) && /\[backfill\] ⚠/.test(bf80)
+    && /_holidayWarnedYears/.test(bf80));
+  ok('T80-a5 ★M33 refresh-holidays 参数必须校验（NaN 年份抓两次 404 后静默失败 = 与"源挂了"不可区分）',
+    /参数不是合法年份/.test(rh80) && /\\d\{4\}\$\//.test(rh80) && /年份超出合理区间/.test(rh80));
+  // ⚠ a6 必须锚到**状态文件**那一处写盘：`OUT`（holidays.json）本来就是 tmp+rename，只搜 renameSync
+  //   会命中它 → 把状态文件的修复删掉仍然恒绿（与 T78-a5 同一类假绿，本批第二次撞上）。
+  ok('T80-a6 ★M32 `.holidays-refresh.json` 必须原子写（tmp+rename；直接覆盖会留半截 JSON → 节流失效）',
+    /const stTmp = stPath \+ '\.tmp-' \+ process\.pid;/.test(rh80) && /fs\.renameSync\(stTmp, stPath\);/.test(rh80));
+
+  // 行为组：真 spawn 两个 CLI —— 验证的是"把话说对了"，而不只是"有那段代码"
+  if (!SPAWN_OK) {
+    envSkip('T80-b1 非法日期报错（spawn）', SPAWN_SKIP_REASON);
+    envSkip('T80-b2 非法年份报错（spawn）', SPAWN_SKIP_REASON);
+  } else {
+    const wb80 = path.join(tmp, 'm24-wb');
+    const sk80 = path.join(wb80, 'skills', 'token-usage-tracker');
+    try { fs.mkdirSync(sk80, { recursive: true }); } catch (e) { /* 已存在 */ }
+    for (const f of ['token-tracker.js', ...RUNTIME_COMPANIONS, 'backfill.js']) {
+      try { fs.copyFileSync(path.join(skillDir, f), path.join(sk80, f)); } catch (e) { /* 缺的会由 rc 暴露 */ }
+    }
+    const r1 = spawnSync(NODE, [path.join(sk80, 'recalc-day.js'), '2026-13-45'], {
+      env: Object.assign({}, env, { WB_ROOT: wb80, WB_LEDGER_MAINT: '1', WB_NO_NET: '1' }),
+      timeout: 60000, windowsHide: true, encoding: 'utf8',
+    });
+    const o1 = String(r1.stdout || '') + String(r1.stderr || '');
+    ok('T80-b1 ★`recalc-day 2026-13-45` 必须说「日期参数非法」且**不许**说「账本中无」'
+      + '（红 = 又退回把参数错说成数据缺 → 用户会去跑 backfill）',
+      r1.status === 2 && /日期参数非法/.test(o1) && !/账本中无/.test(o1), `rc=${r1.status} out=${o1.slice(-300)}`);
+    const r2 = spawnSync(NODE, [path.join(sk80, 'refresh-holidays.js'), 'abc'], {
+      env: Object.assign({}, env, { WB_ROOT: wb80, WB_LEDGER_MAINT: '1', WB_NO_NET: '1' }),
+      timeout: 60000, windowsHide: true, encoding: 'utf8',
+    });
+    const o2 = String(r2.stdout || '') + String(r2.stderr || '');
+    ok('T80-b2 ★`refresh-holidays abc` 必须说「参数不是合法年份」（红 = 又去抓 NaN.json 两次 404 后静默失败）',
+      r2.status === 2 && /参数不是合法年份/.test(o2), `rc=${r2.status} out=${o2.slice(-300)}`);
+  }
 }
 
 // 隔离目录清理（v3.33.0 加固）：**有界重试**。

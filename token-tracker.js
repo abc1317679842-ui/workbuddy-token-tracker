@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.58.0 (2026-10-14)
+// token-usage-tracker v3.59.0 (2026-10-14)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -1122,7 +1122,7 @@ function readTranscLinesFrom(tsPath, fromLine) {
           const tf = TRANSC_TRUNCATED_FILE + '.tmp-' + process.pid;
           fs.writeFileSync(tf, JSON.stringify({ at: Date.now(), path: tsPath, watermark: start }));
           fs.renameSync(tf, TRANSC_TRUNCATED_FILE);
-          process.stderr.write(`[token-tracker] ⚠ transcript 完整行数少于水位线 ${start}（历史被压缩/重写），水位线已冻结 → 之后的消耗将静默少计。已被压缩的行本地不可恢复（见 KNOWN-ISSUES KI-5）；**不要跑 backfill --write**——它是全量重建替换，会把压缩窗口外的历史账一并抹掉\n`);
+          process.stderr.write(`[token-tracker] ⚠ transcript 完整行数少于水位线 ${start}（历史被压缩/重写），水位线已冻结 → 之后的消耗将静默少计。已被压缩的行本地不可恢复（见 KNOWN-ISSUES KI-5）；**不要跑 backfill --write**——它自 v3.55.0 起虽是模型级合并（重放抓不到的 (日期,模型) 会保留并标 stale_carried），但**抓得到的一律用重放值覆盖、不取 max**，压缩窗口外的历史账照样会减少\n`);
         }
       } catch (e2) { /* 旗标写失败不影响记账主流程 */ }
       // v3.25.0（KI-5）：显式告知调用方「这是截断」——调用方 incrementalRecord 据此走
@@ -2735,8 +2735,14 @@ function maybeRefreshLocalDb() {
       };
       const spawnEnv = Object.assign({}, process.env);
       if (CN_PRICE_DIR) spawnEnv.CN_PRICES_DIR = CN_PRICE_DIR;
+      // v3.59.0（审计 S6）：失败的步骤名收集（链不断，但最终非零收尾 + 文案可见）
+      const failedSteps = [];
       const runAll = (idx) => new Promise((resolve) => {
-        if (idx >= scripts.length) return resolve({ code: 0, timedOut: false });
+        if (idx >= scripts.length) {
+          // v3.59.0（审计 S6）：只要有过失败步骤，最终就以非零收尾——noteRefreshFailure
+          //   照旧触发、弹窗 ⚠价库 标注不丢（链不断 ≠ 失败不可见）。
+          return resolve({ code: failedSteps.length ? 2 : 0, timedOut: false });
+        }
         let c;
         try {
           // v3.45.0（审计 S-7）：与 maybeRefreshHolidays（2764）/ spawnRoundWatcher（404）同款加
@@ -2768,7 +2774,14 @@ function maybeRefreshLocalDb() {
         c.on('exit', (code) => {
           clearTimeout(killTimer);
           if (code === 0 && !timedOut) return resolve(runAll(idx + 1));
-          resolve({ code, timedOut });
+          // v3.59.0（审计 S6）：单步失败 ≠ 全链停产。实测事故：parse_tokenhub 的 fail-closed
+          //   （页面改版 → exit(2) 并保留上一版数据，这是**正确**的保守）会连带让
+          //   build_index 不跑 → fetch-cn-prices 刚抓到的四家新数据全晾在 latest.json
+          //   里进不了索引 → 当日价库实质停产且无提示。
+          //   修法：记下失败步骤后**继续跑后续脚本**（build_index 本就能沿用各源上一版数据）；
+          //   最终由 runAll 结尾统一以非零收尾，告警链路不变。
+          if (!timedOut) failedSteps.push(scripts[idx] + '(exit=' + code + ')');
+          resolve(runAll(idx + 1));
         });
         c.on('error', (e) => {
           clearTimeout(killTimer);
@@ -2783,7 +2796,9 @@ function maybeRefreshLocalDb() {
           try { fs.unlinkSync(CN_PRICE_REFRESH_ERR); } catch (e) {} // silent-ok:清理 — 清残留错误文件
           return;
         }
-        const why = r.err ? r.err : ((r.timedOut ? `超时 ${REFRESH_TIMEOUT_MS}ms 被杀` : `exit=${r.code}`) + ' | ' + tail(out, 400));
+        const why = r.err ? r.err : ((r.timedOut ? `超时 ${REFRESH_TIMEOUT_MS}ms 被杀` : `exit=${r.code}`)
+          + (failedSteps.length ? `｜失败步骤: ${failedSteps.join(', ')}` : '')
+          + ' | ' + tail(out, 400));
         noteRefreshFailure(attempts + 1, why);
       }).catch((e) => noteRefreshFailure(attempts + 1, '异常: ' + String(e.message).slice(0, 200)));
     });
@@ -6085,7 +6100,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.58.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.59.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
