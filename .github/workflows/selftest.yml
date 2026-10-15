@@ -87,6 +87,7 @@ jobs:
       #   翻步骤列表，现在 job summary 里直接有一行 notice。
       - name: Online coverage marker
         if: always()
+        shell: bash
         run: |
           if [ "${{ steps.net.outputs.reachable }}" = "true" ]; then
             echo "::notice::联网那一遍已执行（T3-R4 价库告警路径有覆盖）"

@@ -72,21 +72,39 @@
 - **关键实测**：680 条 incomplete 行的**终结率 100%**（其后到下一个 `role=user` 之间没有一条 assistant
   completed）→ "识别到中断标记即补弹"不会误弹。
 
+### 补修（首推 CI 后实测到，同版内修正）
+
+首次推送 v3.60.0 后核验 Actions 日志：离线遍 **947 过 / 1 败 / 1 跳过** —— 编码 18 红与 T72-b 4 红**已全消**，
+仅剩 **1 败**；另发现一个**与 selftest 无关**的第二步红：
+
+- **`T82-a6`（仅 CI 红）**：根因 = 该守卫读 `token-tracker.js` / `stop-handler.js` 时**未归一行尾**、正则用字面
+  `\n`，而 Windows runner（`core.autocrlf`）把源检出成 **CRLF** → `,\r\n` 不匹配 `,\n`；本机两文件是 LF → 永远绿。
+  修法：判据抽成模块级 `txInjectionComplete()`（正则改 `\r?\n`）+ 两处读取补 `.replace(/\r\n/g, '\n')`；
+  并加守卫 **`T86`**（b1：判据对 CRLF 源同样成立；b2：LF 源不回归）——"本地 LF / CI CRLF"与"本地 UTF-8 / CI cp1252"
+  是**同一个环境分叉家族**，故一并钉死。
+- **`Online coverage marker` 步（v3.59.1 引入的第二个红）**：该步用 bash 语法却**未声明 `shell: bash`**
+  → Windows runner 默认 `pwsh` → `ParserError: …ps1`（与 selftest 是否通过无关，**恒红**）。修法：补 `shell: bash`。
+- **本地复现 CI 条件**（harness：副本全文转 CRLF + `CI=1 WB_NO_NET=1 PYTHONIOENCODING=cp1252`）：
+  **修复前 红含 `T82-a6`**（成功复现 CI）/ **修复后 950 过 / 0 败 / 1 跳过**。
+
 ### 验证
 
-- **selftest**：正常 **949 过 / 0 败 / 0 跳过**；`PYTHONIOENCODING=cp1252`（复现 CI）**949/0/0**；
-  `WB_NO_NET=1`（复现 CI 离线遍）**948/0/1**（唯一跳过 = `T3-R4` 前提缺口，CI 门禁容许）。
+- **selftest**：正常 **951 过 / 0 败 / 0 跳过**；`PYTHONIOENCODING=cp1252`（复现 CI）**951/0/0**；
+  CRLF + `CI=1` + `WB_NO_NET=1` + cp1252（复现 CI 离线遍**全条件**）**950/0/1**（唯一跳过 = `T3-R4` 前提缺口，门禁容许）。
 - **反向验证（隔离副本，逐项回退 → 对应守卫必红、零误伤）**：
   C1 —— 回退门禁接线 / 合格线 / `GITHUB_ACTIONS` → `T84-a2` / `T84-b2` / `T84-a3` 各精确 1 红；
-  C2 —— 回退三脚本 `reconfigure` → `T85-a1 ×3 + T85-b ×3`；去掉 r73 的 `PY_IO_ENV`（在 cp1252 下）→
-  `T85-a3 + T73-b0`；回退 `makeT72bChildEnv` → `T85-a4 + T85-b4`。
-- **零账本影响**：本版不改记账热路径。
-- **CI 实证**：推送后核验 Actions run 转 `success`。
+  C2 —— 回退三脚本 `reconfigure` → `T85-a1 ×3 + T85-b ×3`；去掉 r73 的 `PY_IO_ENV`（cp1252 下）→ `T85-a3`
+  （`T73-b0` 保持绿：`t73.py` 导入 `fetch-cn-prices` 时被其顶层 `reconfigure` 顺带修好 stdout，故单一回退无法触发它）；
+  回退 `makeT72bChildEnv` → `T85-a4 + T85-b4`；
+  补修 —— 移除 `T82-a6` 的行尾归一（CRLF 条件下）→ `T82-a6` 精确 1 红（见上 harness）。
+- **零账本影响**：本版不改记账热路径（`HEAD` 版 vs 工作版同夹具跑同一次 `--stop`，`daily-usage.json` **逐字节一致**，
+  sha `52cdd88c…`；双跑确定性亦成立）。
+- **CI 实证**：推送后核验 Actions run 转 `success`（首推为 `failure`，见上"补修"）。
 
 ### 守卫
 
 - `T82`（批 A 取消文案）/ `T83`（批 B 弹窗判定链：6 源码 + 3 行为）/ `T84`（C1 门禁：4 源码 + 5 表驱动行为）/
-  `T85`（CI 编码：3×2 源码 + 常量 + 逐点覆盖 + 行为组含 3 端到端 + 纯函数行为）。
+  `T85`（CI 编码：3×2 源码 + 常量 + 逐点覆盖 + 行为组含 3 端到端 + 纯函数行为）/ `T86`（行尾无关：2 行为）。
 - ⚠️ py 文件源码守卫必须剥 `#` 注释（`stripComments` 只剥 `//`/`/* */`，对 py 无效）；不剥则注释里的同文本
   会让断言在回退后**假绿**——本版据此专门在 T85 内自带 `stripPy85`。
 

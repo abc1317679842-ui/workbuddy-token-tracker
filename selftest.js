@@ -7453,6 +7453,13 @@ function finish() { try { clearTimeout(t); } catch (e) { /* silent-ok:清理 —
     `spawn=${dsSpawn} 官方最坏=${officialWorst}`);
 }
 
+// 行尾无关的「注入清单完整性」判据（T82-a6 / T86-b1 共用；`\r?\n` 兼容 Windows CI 的 CRLF 检出）
+const txInjectionComplete = (ttSrc, shSrc) => (
+  shSrc.indexOf('"interruptedRowsAfter"') >= 0
+  && /[ \t]interruptedRowsAfter,\r?\n[ \t]+lastWatcherSpawnError,/.test(shSrc)
+  && /[ \t]interruptedRowsAfter,\r?\n[ \t]+lastWatcherSpawnError,/.test(ttSrc)
+);
+
 // ===== T82（v3.60.0 批A）：用户取消标记识别扩文案（三族）+ no-token 准确文案 =====
 //   背景：全库实测（436 transcript / 15.4 万行）680 条 assistant/incomplete 中断行中，原判据
 //   （精确匹配 `Interrupted by user`）只认出 417 条 = 61%；漏检三族：
@@ -7464,8 +7471,10 @@ function finish() { try { clearTimeout(t); } catch (e) { /* silent-ok:清理 —
 //   → 识别到中断标记即补弹不会误弹。
 {
   const tt82 = (() => { try { return require(path.join(SRC, 'token-tracker.js')); } catch (e) { return null; } })();
-  const ttSrc82 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8');
-  const shSrc82 = fs.readFileSync(path.join(SRC, 'stop-handler.js'), 'utf-8');
+  // ⚠ 必须归一行尾：Windows CI（core.autocrlf）把源检出为 CRLF，a6 用了字面 `\n` 正则 →
+  //   不归一时本地（LF）绿、CI（CRLF）红（v3.60.0 首推实测踩到：CI 离线遍 947 过 / 1 败 = 仅 T82-a6）。
+  const ttSrc82 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const shSrc82 = fs.readFileSync(path.join(SRC, 'stop-handler.js'), 'utf-8').replace(/\r\n/g, '\n');
 
   // ── a. 源码守卫 ──
   const uckFn82 = (ttSrc82.match(/function userCancelKind\(r\) \{[\s\S]*?\n\}/) || [''])[0];
@@ -7493,9 +7502,7 @@ function finish() { try { clearTimeout(t); } catch (e) { /* silent-ok:清理 —
     && shSrc82.indexOf("'（手动取消）本轮无 token 消耗记录'") >= 0
     && shSrc82.indexOf("'cancelled-no-token'") >= 0);
   ok('T82-a6 ★注入完整性：interruptedRowsAfter 必须在 STOP_TX_NAMES / 解构 / 主脚本 tx 三处齐全',
-    shSrc82.indexOf('"interruptedRowsAfter"') >= 0
-    && /[ \t]interruptedRowsAfter,\n[ \t]+lastWatcherSpawnError,/.test(shSrc82)
-    && /[ \t]interruptedRowsAfter,\n[ \t]+lastWatcherSpawnError,/.test(ttSrc82));
+    txInjectionComplete(ttSrc82, shSrc82));
 
   // ── b. 行为验证（直接 require 实现，喂合成行；detail 一律先算成字符串避免无条件求值抛错）──
   const UCK82 = (tt82 && typeof tt82.userCancelKind === 'function') ? tt82.userCancelKind : null;
@@ -7844,6 +7851,24 @@ function finish() { try { clearTimeout(t); } catch (e) { /* silent-ok:清理 —
         `exit=${r85.status} out=${JSON.stringify(String(r85.stdout || '').slice(-40))} err=${JSON.stringify(String(r85.stderr || '').slice(0, 140))}`);
     }
   }
+}
+
+// ===== T86（v3.60.0 补修）：源码守卫必须**行尾无关** —— 防 Windows CI 检出 CRLF 后「本地绿 / CI 红」=====
+//   事故：v3.60.0 首推 CI 离线遍 947 过 / 1 败，唯一红 = T82-a6。根因 = 它的读取未归一行尾、正则用字面
+//   `\n`，而 Windows runner（core.autocrlf）把源检出成 CRLF → `,\r\n` 不匹配 `,\n`；本机 LF 永远绿。
+//   修法：判据抽成 txInjectionComplete（正则 `\r?\n`）+ 读取归一；本守卫锁住「判据对 LF / CRLF 都成立」。
+{
+  const lf86 = (s) => s.replace(/\r\n/g, '\n');
+  const crlf86 = (s) => lf86(s).replace(/\n/g, '\r\n');
+  const rawTT86 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8');
+  const rawSH86 = fs.readFileSync(path.join(SRC, 'stop-handler.js'), 'utf-8');
+  // b1：判据对 CRLF 源同样成立（若有人把 `\r?\n` 改回字面 `\n`，此行与 CI 同因变红）
+  ok('T86-b1 ★注入完整性判据必须行尾无关（CRLF 源同样成立）——防 Windows CI 检出 CRLF 后本地绿/CI 红',
+    txInjectionComplete(crlf86(rawTT86), crlf86(rawSH86)),
+    'CRLF 源下 txInjectionComplete 应为 true（正则须含 \\r?\\n）');
+  // b2：LF 源也成立（本地常规路径不回归）
+  ok('T86-b2 ★注入完整性判据在 LF 源同样成立（本地常规路径不回归）',
+    txInjectionComplete(lf86(rawTT86), lf86(rawSH86)));
 }
 
 //   为什么需要：主脚本在被 require 时会跑 loadPricing → maybeRefreshHolidays（每进程一次、四条件命中即
