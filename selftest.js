@@ -33,6 +33,44 @@ function envSkip(name, reason) {
 }
 const SPAWN_SKIP_REASON = '本环境禁止 node 子进程（SPAWN_OK=false，属环境能力限制、非代码问题；CI 上应真跑）';
 
+// v3.60.0（CI 编码 · 2026-10-15）：所有 python 子进程统一 **utf-8 stdio**（见下）。
+//   根因：CI 是 Windows runner，python 的 stdout 默认走 **locale 编码**（cp1252）——脚本一 print 中文
+//   即 UnicodeEncodeError 整脚本崩（CI 离线遍实测 18 红：T63/T64/T71/T73；本机 locale=UTF-8 故不复现）。
+//   父进程按 utf-8 解码子进程输出（token-tracker.js:2797 `String(b)` / 本文件各 spawn 的 encoding:'utf8'）
+//   → 输出契约本就该是 utf-8。⚠ 这是**测试侧兜底**；三个产品脚本自身另加了 sys.stdout.reconfigure
+//   （治真实 cp1252 Windows 用户），此处额外覆盖 selftest **内联生成**的 python（如 T73 的 t73.py，
+//   非产品文件、改不到）。凡 spawn python 的子进程一律带上本对象（守卫 T85-a3 逐点断言）。
+const PY_IO_ENV = { PYTHONIOENCODING: 'utf-8' };
+
+// v3.60.0（CI 编码 · T72-b）：T72-b 用 `--require` 预加载把 fetch 换成假官方页（**不联网**），但父进程
+//   在 CI 离线遍带 WB_NO_NET=1 —— 子进程会在 fetch **之前**就 `if (NO_NET) throw` 短路
+//   （见 deepseek-official.js 的 `if (NO_NET) throw new Error('WB_NO_NET=1')`）→ 与"联网 + 假页"的
+//   测设自相矛盾 → T72-b3~b6 必红（CI 实测 4 红）。故子进程环境必须**显式清掉联网总开关**。
+//   抽成模块级函数是为了让守卫 T85-b4 对**真实现**做行为断言（本项目硬教训：行为守卫须与源码守卫配对）。
+function makeT72bChildEnv(base) {
+  const e = Object.assign({}, base);
+  delete e.WB_NO_NET; delete e.WB_DISABLE_NET;
+  return e;
+}
+
+// v3.60.0（C1 门禁）：把「envSkip 不计入退出码」这个结构性缺口（KNOWN-ISSUES **C 类第 1 条**，
+//   「沙箱里绿 ≠ 真跑过」）在**权威门禁（CI）**上关掉 —— 但**不动本地语义**。
+//   为什么不能全环境一刀切：本地沙箱可能禁 spawn（SPAWN_OK=false，属环境能力，v3.29.0 已定"不该判红"），
+//   而 CI 上 `SPAWN_OK` 有**前置探针**保证（.github/workflows/selftest.yml 第一步，探不通直接判 job 失败）——
+//   此时任何"被跳过的用例"都＝端到端**未真跑**＝假绿，必须判失败。
+//   唯一的"有意跳过"＝**离线那一遍** T3-R4 的 WB_NO_NET 前提缺口（至多 1 条，见下方 `WB_NO_NET === '1'` 分支）。
+//   语义（三档）：
+//     · CI 且 联网跑（无 WB_NO_NET）→ 合格线 0
+//     · CI 且 离线跑（WB_NO_NET=1）→ 合格线 1（只容那一条前提缺口）
+//     · 非 CI（本地开发）        → 语义不变：envSkip 不影响退出码
+//   为什么抽成纯函数：守卫要对**真函数**做表驱动行为断言（本项目硬教训：行为守卫必须与源码守卫**配对**，
+//   只断言源码文本会在回退后匹配到注释同文本 → 假绿）。
+function ciSkipGate(o) {
+  const expectedPremise = ((o && o.wbNoNet) === '1') ? 1 : 0;   // 离线那一遍的 T3-R4 前提缺口
+  const unexpected = Math.max(0, ((o && o.envSkipCount) || 0) - expectedPremise);
+  return { expectedPremise, unexpected, shouldFail: !!((o && o.inCI) && unexpected > 0) };
+}
+
 // 统一注释剥离（T10/T14/T17 源码守卫与「导出一致性」检查共用这一份，不再各自维护一份实现）：
 // ① 先统一行尾 \r\n → \n（Windows 上 git checkout 默认 core.autocrlf=true，残留 \r 会让行尾正则失效）；
 // ② 逐行剥 `//` 到行尾（`(^|[^:])` 保证 `https://` 这类 `//` 不被误当注释起始）；
@@ -5372,7 +5410,7 @@ else {
       } catch (e) { /* 探测失败 → 回退裸 python */ }
       return 'python';
     })();
-    const probe63 = spawnSync(py63, ['-c', 'print(1)'], { timeout: 20000, windowsHide: true });
+    const probe63 = spawnSync(py63, ['-c', 'print(1)'], { timeout: 20000, windowsHide: true, env: Object.assign({}, process.env, PY_IO_ENV) });
     const pyOk63 = !!(probe63.status === 0);
     if (!SPAWN_OK || !pyOk63) {
       for (const n of ['T63-e1', 'T63-e2', 'T63-e3', 'T63-e4', 'T63-e5', 'T63-e6']) {
@@ -5415,7 +5453,7 @@ else {
           ] },
         },
       }));
-      const env63 = Object.assign({}, process.env, { CN_PRICES_DIR: p63, WB_ROOT: path.join(d63, 'wbroot') });
+      const env63 = Object.assign({}, process.env, PY_IO_ENV, { CN_PRICES_DIR: p63, WB_ROOT: path.join(d63, 'wbroot') });
       const r63 = spawnSync(py63, [path.join(SRC, 'build_index.py')],
         { cwd: d63, env: env63, timeout: 120000, windowsHide: true, encoding: 'utf-8' });
       let idx63 = null, ch63 = [];
@@ -5523,7 +5561,7 @@ else {
       } catch (e) { /* 探测失败 → 回退裸 python */ }
       return 'python';
     })();
-    const probe64 = spawnSync(py64, ['-c', 'print(1)'], { timeout: 20000, windowsHide: true });
+    const probe64 = spawnSync(py64, ['-c', 'print(1)'], { timeout: 20000, windowsHide: true, env: Object.assign({}, process.env, PY_IO_ENV) });
     const pyOk64 = !!(probe64.status === 0);
     if (!SPAWN_OK || !pyOk64) {
       for (const n of ['T64-e1', 'T64-e2', 'T64-e3', 'T64-e4', 'T64-e5', 'T64-e6', 'T64-e7', 'T64-e8']) {
@@ -5585,7 +5623,7 @@ else {
           tiers: [{ type: 'peak', value: '空闲时段', in: 1.0, out: 2.0, cache: 0.1 },
                   { type: 'peak', value: '高峰时段', in: 4.0, out: 8.0, cache: 0.4 }] }],
       }));
-      const env64 = Object.assign({}, process.env, { CN_PRICES_DIR: p64, WB_ROOT: path.join(d64, 'wbroot') });
+      const env64 = Object.assign({}, process.env, PY_IO_ENV, { CN_PRICES_DIR: p64, WB_ROOT: path.join(d64, 'wbroot') });
       const r64 = spawnSync(py64, [path.join(SRC, 'build_index.py')],
         { cwd: d64, env: env64, timeout: 120000, windowsHide: true, encoding: 'utf-8' });
       let idx64 = null, ch64 = [];
@@ -5794,7 +5832,7 @@ else {
       } catch (e) { /* 探测失败 → 回退裸 python */ }
       return 'python';
     })();
-    const probeB65 = spawnSync(pyB65, ['-c', 'print(1)'], { timeout: 20000, windowsHide: true });
+    const probeB65 = spawnSync(pyB65, ['-c', 'print(1)'], { timeout: 20000, windowsHide: true, env: Object.assign({}, process.env, PY_IO_ENV) });
     if (!SPAWN_OK || probeB65.status !== 0) {
       for (const n of ['T65-e9', 'T65-e10']) {
         envSkip(n + ' ★keep_hunyuan 行为验证（真跑 python）',
@@ -5813,7 +5851,7 @@ else {
         "print('PURE_KEPT=%d PURE_UNMAPPED=%d' % (len(k2), len(u2)))",
       ].join('\n');
       const rB65 = spawnSync(pyB65, ['-c', pySrc65, path.join(SRC, 'parse_tokenhub.py')],
-        { timeout: 60000, windowsHide: true, encoding: 'utf-8' });
+        { timeout: 60000, windowsHide: true, encoding: 'utf-8', env: Object.assign({}, process.env, PY_IO_ENV) });
       const logB65 = String(((rB65 && rB65.stdout) || '') + ((rB65 && rB65.stderr) || ''));
       ok('T65-e9 ★三路分流：混元收、第三方丢、**未识别进 unmapped**（旧实现此处静默丢）',
         logB65.indexOf('KEPT=Hy3') >= 0 && logB65.indexOf('UNMAPPED=Hy-New') >= 0,
@@ -6504,7 +6542,7 @@ else {
       okmodel: { name: '正常', api_name: 'ok-model', in_price: 3.0, out_price: 4.0, cache_hit: 1.0, currency: 'CNY', unit: '元/百万 tokens', region: 'CN', primary_source: 'vA', primary_source_type: 'first_party', all_sources: [{ name: '正常', in: 3.0, out: 4.0, cache: 1.0, source: 'vA', source_type: 'first_party' }] },
     } }));
     const br = spawnSync(PY71, [path.join(SRC, 'build_index.py')], {
-      env: Object.assign({}, process.env, { WB_ROOT: fwb, CN_PRICES_DIR: fpr }),
+      env: Object.assign({}, process.env, PY_IO_ENV, { WB_ROOT: fwb, CN_PRICES_DIR: fpr }),
       encoding: 'utf8', timeout: 180000, windowsHide: true,
     });
     const M = (() => { try { return JSON.parse(fs.readFileSync(path.join(fpr, 'index.json'), 'utf8')).models || {}; } catch (e) { return {}; } })();
@@ -6646,7 +6684,7 @@ else {
     ].join('\n');
     const pf = path.join(fw, 't73.py');
     fs.writeFileSync(pf, py, 'utf8');
-    const r73 = spawnSync(PY73, [pf], { encoding: 'utf8', timeout: 120000, windowsHide: true });
+    const r73 = spawnSync(PY73, [pf], { encoding: 'utf8', timeout: 120000, windowsHide: true, env: Object.assign({}, process.env, PY_IO_ENV) });
     let matched73 = 0;
     // ⚠ split(/\r?\n/)：Windows python 输出 CRLF，JS 的 `.` 不匹配 `\r` →
     //   `(.*)$` 被行尾的 \r 卡住、整行失配（实测 split('\n') 时 10 条断言行 0 识别）。
@@ -6740,7 +6778,7 @@ globalThis.fetch = async (url, opts) => {
       },
     }));
     const dr = spawnSync(NODE, ['--require', pre, path.join(SRC, 'deepseek-official.js')], {
-      env: Object.assign({}, process.env, {
+      env: Object.assign(makeT72bChildEnv(process.env), {
         WB_ROOT: fwb, DS_OFFICIAL_URL: 'http://127.0.0.1:9/deepseek-official', DS_RETRIES: '0',
         DS_RETRY_DELAY_MS: '1', TOKEN_TRACKER_NO_TOAST: '1',
       }),
@@ -7415,6 +7453,399 @@ function finish() { try { clearTimeout(t); } catch (e) { /* silent-ok:清理 —
     `spawn=${dsSpawn} 官方最坏=${officialWorst}`);
 }
 
+// ===== T82（v3.60.0 批A）：用户取消标记识别扩文案（三族）+ no-token 准确文案 =====
+//   背景：全库实测（436 transcript / 15.4 万行）680 条 assistant/incomplete 中断行中，原判据
+//   （精确匹配 `Interrupted by user`）只认出 417 条 = 61%；漏检三族：
+//     429 queue.waiting.title（44）/ 429 queue.full.title（5）/ aborted·ECONNRESET（18）。
+//   2026-10-15 14:35 用户真实踩到：排队中手动停止 → ① 取消补弹（cancelled-round-flush）不发；
+//   ② Stop 的 no-token 分支把"手动取消"说成"请求未发出/网络中断"（M33 同族：原因指错）。
+//   另一关键实测：680 条 incomplete 的**终结率 100%** —— 其后到下一个 role=user 行之间没有一条
+//   assistant completed（即 incomplete 就是该轮最后一行，不存在"重试成功"的中间态噪声）
+//   → 识别到中断标记即补弹不会误弹。
+{
+  const tt82 = (() => { try { return require(path.join(SRC, 'token-tracker.js')); } catch (e) { return null; } })();
+  const ttSrc82 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8');
+  const shSrc82 = fs.readFileSync(path.join(SRC, 'stop-handler.js'), 'utf-8');
+
+  // ── a. 源码守卫 ──
+  const uckFn82 = (ttSrc82.match(/function userCancelKind\(r\) \{[\s\S]*?\n\}/) || [''])[0];
+  ok('T82-a1 ★userCancelKind 必须存在且含三族形态（Interrupted by user / 429 queue.waiting|full / aborted）'
+    + '（改前只有一条精确文案 → 全库漏检 39% 的中断）',
+    uckFn82.length > 0
+    && uckFn82.indexOf('^Interrupted by user$') >= 0
+    && uckFn82.indexOf('^429 queue\\.(?:waiting|full)\\.title') >= 0
+    && uckFn82.indexOf('^aborted$') >= 0,
+    uckFn82.length ? 'userCancelKind 函数体内缺形态' : '未取到 userCancelKind 函数体（签名被改？）');
+  const iraFn82 = (ttSrc82.match(/function interruptedRowsAfter\(rows, roundStartMs\) \{[\s\S]*?\n\}/) || [''])[0];
+  ok('T82-a2 ★interruptedRowsAfter 必须改用 userCancelKind（两处口径统一，避免再次漂移）',
+    iraFn82.length > 0 && iraFn82.indexOf('userCancelKind(r) !== null') >= 0,
+    'interruptedRowsAfter 体内未见 userCancelKind');
+  ok('T82-a3 ★interruptedRowsAfter 返回值必须带 kind（no-token 文案要按族区分）',
+    ttSrc82.indexOf('out.push({ ts: Number(r.timestamp), idx: i, kind: userCancelKind(r) });') >= 0);
+  const ibuFn82 = (ttSrc82.match(/function interruptedByUser\(tsPath\) \{[\s\S]*?\n\}/) || [''])[0];
+  ok('T82-a4 ★interruptedByUser（watcher 侧）必须同步扩三族并复用 userCancelKind（两处判据同源）',
+    ibuFn82.length > 0
+    && ibuFn82.indexOf('429 queue\\.(?:waiting|full)\\.title') >= 0
+    && ibuFn82.indexOf('userCancelKind(r) !== null') >= 0,
+    'interruptedByUser 的 intrIn 未扩族');
+  ok('T82-a5 ★stop-handler 的 no-token 分支必须识别取消标记并弹准确文案（不再是"请求未发出/网络中断"）',
+    shSrc82.indexOf('interruptedRowsAfter(readTranscLines(tsPath), aggStart0)') >= 0
+    && shSrc82.indexOf("'（手动取消）本轮无 token 消耗记录'") >= 0
+    && shSrc82.indexOf("'cancelled-no-token'") >= 0);
+  ok('T82-a6 ★注入完整性：interruptedRowsAfter 必须在 STOP_TX_NAMES / 解构 / 主脚本 tx 三处齐全',
+    shSrc82.indexOf('"interruptedRowsAfter"') >= 0
+    && /[ \t]interruptedRowsAfter,\n[ \t]+lastWatcherSpawnError,/.test(shSrc82)
+    && /[ \t]interruptedRowsAfter,\n[ \t]+lastWatcherSpawnError,/.test(ttSrc82));
+
+  // ── b. 行为验证（直接 require 实现，喂合成行；detail 一律先算成字符串避免无条件求值抛错）──
+  const UCK82 = (tt82 && typeof tt82.userCancelKind === 'function') ? tt82.userCancelKind : null;
+  const IRA82 = (tt82 && typeof tt82.interruptedRowsAfter === 'function') ? tt82.interruptedRowsAfter : null;
+  const mk82 = (msg) => ({ type: 'message', role: 'assistant', status: 'incomplete', timestamp: Date.now(), providerData: { error: { message: msg } } });
+  const kUser82 = UCK82 ? UCK82(mk82('Interrupted by user')) : '<无函数>';
+  const kQueue82 = UCK82 ? UCK82(mk82('429 queue.waiting.title (abc/def)')) : '<无函数>';
+  const kFull82 = UCK82 ? UCK82(mk82('429 queue.full.title (abc/def)')) : '<无函数>';
+  const kAbort82 = UCK82 ? UCK82(mk82('aborted')) : '<无函数>';
+  const kRate82 = UCK82 ? UCK82(mk82('429 您的使用量已超出频率限制，将在 X 重置')) : '<无函数>';
+  const kDone82 = UCK82 ? UCK82({ type: 'message', role: 'assistant', status: 'completed' }) : '<无函数>';
+  ok('T82-b1 ★userCancelKind 三族判定正确 + 限流/非中断行必须返回 null（不得误判为"手动取消"）',
+    kUser82 === 'user' && kQueue82 === 'queue' && kFull82 === 'queue' && kAbort82 === 'aborted'
+    && kRate82 === null && kDone82 === null,
+    `user=${kUser82} queue=${kQueue82} full=${kFull82} aborted=${kAbort82} rate=${kRate82} done=${kDone82}`);
+
+  const T82 = 1000000;
+  const rowsQ82 = [
+    { type: 'message', role: 'user', id: 'u82a', timestamp: T82 - 10 },
+    { type: 'message', role: 'assistant', status: 'incomplete', timestamp: T82 + 100, providerData: { error: { message: '429 queue.waiting.title (x/y)' }, skipRun: true } },
+  ];
+  const rQ82 = IRA82 ? IRA82(rowsQ82, T82) : [];
+  ok('T82-b2 ★interruptedRowsAfter 能识别 429 queue.waiting（原判据漏检的形态）+ kind=queue',
+    rQ82.length === 1 && rQ82[0].kind === 'queue', `len=${rQ82.length} kind=${rQ82[0] && rQ82[0].kind}`);
+  const rowsR82 = rowsQ82.concat([{ type: 'resend-fork-notice', editedUserItemId: 'u82a' }]);
+  const rR82 = IRA82 ? IRA82(rowsR82, T82) : ['x'];
+  ok('T82-b3 ★resend-fork 否决仍生效（扩族后不得吞掉"编辑重发"场景）', rR82.length === 0, `len=${rR82.length}`);
+  const rowsOld82 = [
+    { type: 'message', role: 'user', id: 'u82b', timestamp: T82 },
+    { type: 'message', role: 'assistant', status: 'incomplete', timestamp: T82 - 1000, providerData: { error: { message: 'aborted' } } },
+  ];
+  const rOld82 = IRA82 ? IRA82(rowsOld82, T82) : ['x'];
+  ok('T82-b4 ★早于 roundStart 的旧标记仍被排除（防历史标记被"复活"重复补弹）', rOld82.length === 0, `len=${rOld82.length}`);
+
+  // ── b5~b7. 端到端（spawn --stop）：no-token 分支的取消文案 ──
+  //   **R5 教训（v3.60.0 批A 反向验证实测）**：源码守卫 ≠ 行为守卫 —— 只断言"源码里有这行文案"时，
+  //   回退 showToast 调用点后正则仍能匹配到注释/别处的同文本 → 守卫假绿。必须端到端验证
+  //   toast.log 真落 reason=cancelled-no-token（T75-b5 同族：watcher 侧已有行为守卫，Stop 侧此前为零）。
+  if (!SPAWN_OK) envSkip('T82-b5~b7 no-token 取消文案端到端（spawn --stop）', SPAWN_SKIP_REASON);
+  else {
+    const wb82 = path.join(tmp, 'k82-wb');
+    const sk82 = path.join(wb82, 'skills', 'token-usage-tracker');
+    const wj82 = (p, o) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, o); };
+    // ⚠ 必须先建目录再拷 .js（T69/T76 是靠先写 pricing.json 顺带建目录；顺序一反 copyFileSync
+    //   就 ENOENT——且 Node 把**源**路径打在 error.path 上，极具误导性，曾整轮 selftest 崩掉）。
+    fs.mkdirSync(sk82, { recursive: true });
+    // 生产布局：技能脚本拷进 wb82/skills/token-usage-tracker（__dirname == SKILL_DIR，同 T69 夹具）
+    for (const f of fs.readdirSync(skillDir).filter((x) => x.endsWith('.js'))) {
+      fs.copyFileSync(path.join(skillDir, f), path.join(sk82, f));
+    }
+    wj82(path.join(sk82, 'pricing.json'), JSON.stringify({
+      date: '2026-10-15',
+      models: {
+        'k82-fixture': { input_price: 1.0, output_price: 2.0, cached_price: 0.5, currency: 'CNY',
+                         unit: 'per_1m_tokens', region: 'CN', source_url: 'fixture', fetched_at: '2026-10-15T00:00:00Z' },
+      },
+      usd_cny_rate: 7.2,
+    }));
+    wj82(path.join(sk82, 'holidays.json'), '{}');
+    wj82(path.join(sk82, '.update-check.json'),
+      JSON.stringify({ lastCheckAt: Date.now(), latestVersion: '0.0.0', failCount: 0, nextRetryAt: 0 }));
+    const toastLog82 = path.join(wb82, 'token-tracker-toast.log');
+    // ⚠ 必须按**字节**偏移读增量（toast.log append-only，中文多字节，同 T75 教训）
+    const toastOff82 = () => { try { return fs.statSync(toastLog82).size; } catch (e) { return 0; } };
+    const toastSlice82 = (off) => { try { return fs.readFileSync(toastLog82).slice(off).toString('utf8'); } catch (e) { return ''; } };
+    const TS82 = 1791856800000; // 2026-10-13 10:00 +0800（周二，高峰段内）
+    const runStop82 = (sid, rows) => {
+      const tp = path.join(wb82, 'projects', 'proj82', sid + '.jsonl');
+      // ⚠ 每行必须先 JSON.stringify 再 join——直接 join 对象数组会拼出 "[object Object]"
+      //   （实测：transcript 全不可解析 → 流程走"暂无 trace 数据"分支 → 什么都不弹 → 断言假红/假绿）。
+      wj82(tp, rows.map((r) => (typeof r === 'string' ? r : JSON.stringify(r))).join('\n') + '\n');
+      const off = toastOff82();
+      const r = spawnSync(NODE, [path.join(sk82, 'token-tracker.js'), '--stop'], {
+        input: JSON.stringify({ session_id: sid, transcript_path: tp, cwd: wb82 }),
+        env: Object.assign({}, env, { WB_ROOT: wb82, WB_LEDGER_MAINT: '1', WB_NO_NET: '1' }),
+        timeout: 120000, windowsHide: true, encoding: 'utf8',
+      });
+      return { rc: r.status, toast: toastSlice82(off) };
+    };
+    // 场景①：用户提问 + 排队中被停止（429 queue.waiting）无 usage → 必须弹取消文案
+    //   （复现 2026-10-15 14:35 真实踩坑：请求未产生消耗 → 旧文案说成"请求未发出/网络中断"）
+    const SID82 = 'selftest-k82-cancel';
+    const e82 = runStop82(SID82, [
+      { type: 'message', role: 'user', id: 'u82e', timestamp: TS82 - 60000, content: [{ type: 'text', text: 'hi' }] },
+      { type: 'message', role: 'assistant', status: 'incomplete', timestamp: TS82, content: 'Interrupted by user',
+        providerData: { error: { message: '429 queue.waiting.title (abc/def)' }, skipRun: true } },
+    ]);
+    ok('T82-b5 ★端到端：排队中被停止（无 usage）→ Stop 弹「（手动取消）本轮无 token 消耗记录」'
+      + '（R5 教训：源码守卫≠行为守卫，必须看 toast.log 真落 reason=cancelled-no-token）',
+      e82.rc === 0 && e82.toast.indexOf('"reason":"cancelled-no-token"') >= 0
+      && e82.toast.indexOf('（手动取消）本轮无 token 消耗记录') >= 0,
+      `exit=${e82.rc} toast=${JSON.stringify(e82.toast.slice(0, 200))}`);
+    ok('T82-b6 ★端到端：取消原因须按族给准确文案（queue=排队中被停止，不得说成"请求未发出/网络中断"）',
+      e82.toast.indexOf('排队中被停止') >= 0 && e82.toast.indexOf('请求未发出') < 0,
+      `toast=${JSON.stringify(e82.toast.slice(0, 300))}`);
+    // 场景②：对照 —— 无取消标记的无记录轮 → 仍走原 no-token 文案（误判=把正常轮说成手动取消）
+    const e82c = runStop82(SID82 + '-ctrl', [
+      { type: 'message', role: 'user', id: 'u82c', timestamp: TS82 - 60000, content: [{ type: 'text', text: 'hi' }] },
+      { type: 'message', role: 'assistant', status: 'completed', timestamp: TS82, content: [{ type: 'text', text: 'ok' }] },
+    ]);
+    ok('T82-b7 ★端到端对照：无取消标记 → 走原 no-token 文案，绝不弹取消文案'
+      + '（"没弹取消文案"不够——必须真弹 no-token，否则"流程半路崩了"也会假绿）',
+      e82c.rc === 0 && e82c.toast.indexOf('"reason":"no-token"') >= 0
+      && e82c.toast.indexOf('cancelled-no-token') < 0 && e82c.toast.indexOf('手动取消') < 0,
+      `exit=${e82c.rc} toast=${JSON.stringify(e82c.toast.slice(0, 200))}`);
+  }
+}
+
+// ===== T83（v3.60.0 批B·B1/B4）：团队轮「未落定即不弹」+ 普通轮跳过 2.8s 白等 =====
+//   背景（2026-10-15 实测定案，详见 token-tracker-问题文档-弹窗判定链-2026-10-15.md）：
+//   ① **A/B 真因**：`if (isPlainRound || teamDataReady || teamSyncToast)` 里 teamSyncToast 在非普通轮
+//      **恒真**（!isPlainRound && WB_SYNC_TEAM!=='0' && WB_TEAM_SPLIT!=='1'）→ `||` 短路 →
+//      **teamDataReady 被架空** → 子代理还在跑就提前弹（历史 14 次 stop-team-sync 中 teamDataReady=false
+//      4 次 = 28.6%：10-09 07:04 / 10-10 00:15 / **10-15 14:12(A)** / **10-15 14:36(B)**）。
+//   ② **D①/D② 是该"提前弹"的副作用链**（此前一直以为是 aggregateTranscript 的窗口 bug）：
+//      弹完推进 lastStopAt → 下一轮 --hook 算 `inProgress = prevStop < prevStart` = false（判"上轮已结束"）
+//      → **刷新轮起点** → 主模型静默期内子代理烧的 152.9 万落在新起点之前 → 被 `mtime > aggStart0`
+//      切出窗口 → 账本 188.6 万、弹窗只有 38.1 万。
+//      **真实性回放**（1b82171d 现场夹具 → D:/测试临时文件夹/bB，三决策点：14:12 Stop / 14:35 hook / 14:36 Stop）
+//      实测：旧 = 弹窗合计 97 万 / 账本 251.9 万 → 对齐 **38.5%**（子代理 154.9 万零出现）；
+//            新 = 弹窗合计 247 万 / 账本 251.9 万 → 对齐 **98.1%**（残差 = "万"级显示取整）。
+//   ③ **B4**：`subagentsAllSettled` 本轮无子代理文件时 `return any` = false（token-tracker.js:2155）
+//      → 每个普通轮都 `!settled0` → 白等 4×700ms = 2.8s（Stop hook 同步阻塞，等于每次回复多卡 2.8 秒）。
+//   ⚠ 本组守卫的**关键设计**：抑制分支的"不得做某事"必须**剥注释后**扫描——分支内的中文注释里
+//      天然写着"不推进 lastStopAt / 不写 coalesce"，不剥注释会假绿（项目既有教训：源码守卫剥注释再扫）。
+{
+  const shRaw83 = fs.readFileSync(path.join(SRC, 'stop-handler.js'), 'utf-8');
+  const strip83 = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+  const i83 = shRaw83.indexOf('if (teamSyncToast && !teamDataReady) {');
+  const j83 = shRaw83.indexOf('if (isPlainRound || teamDataReady || teamSyncToast) {', i83);
+  const body83 = (i83 >= 0 && j83 > i83) ? strip83(shRaw83.slice(i83, j83)) : '';
+
+  ok('T83-a1 ★团队轮未落定必须早退：抑制分支 `if (teamSyncToast && !teamDataReady)` 必须存在且位于原弹窗判据之前',
+    i83 >= 0 && j83 > i83, `i=${i83} j=${j83}`);
+
+  ok('T83-a2 ★抑制分支**绝不推进水位线**（剥注释后不得出现 lastStopAt / saveSnapshot）'
+    + '——推进即把该轮标成"已结算"，下一次窗口跳过它 → 子代理那段永久丢窗（正是 D① 的机制）',
+    body83.length > 0 && body83.indexOf('lastStopAt') < 0 && body83.indexOf('saveSnapshot') < 0,
+    body83.length ? `body 含禁用调用: ${['lastStopAt', 'saveSnapshot'].filter((k) => body83.indexOf(k) >= 0).join(',')}` : '未取到分支体（锚点被改？）');
+
+  ok('T83-a3 ★抑制分支不得写 coalesce / 不得启 watcher（那是"提前弹"的另一条路；且 detached watcher 会被宿主 Job Object 连带杀）',
+    body83.length > 0 && body83.indexOf('writeCoalesce') < 0 && body83.indexOf('startWatcherVerified') < 0,
+    body83.length ? `body 含禁用调用: ${['writeCoalesce', 'startWatcherVerified'].filter((k) => body83.indexOf(k) >= 0).join(',')}` : '未取到分支体');
+
+  ok('T83-a4 ★抑制分支必须可观测（落 stop-team-defer-silent）并早退（return true）'
+    + '——"静默不弹"若不留痕，线上永远分不清"没被抑制"和"被抑制了"',
+    body83.indexOf('stop-team-defer-silent') >= 0 && body83.indexOf('return true;') >= 0);
+
+  ok('T83-a5 ★逃生阀保持：原判据（含 teamSyncToast 分支）必须仍在抑制分支之后'
+    + '——WB_SYNC_TEAM=0 / WB_TEAM_SPLIT=1 的旧行为不得被本修复改掉',
+    j83 > i83 && shRaw83.slice(j83, j83 + 200).indexOf('teamSyncToast') > 0);
+
+  ok('T83-a6 ★B4：微重判必须由"本轮真有子代理在写"把关（否则每个普通轮白等 4×700ms=2.8s）',
+    /const subActive0 = hasSubagentsRecentlyActive\(tsPath, SUBAGENT_IDLE_MS\);/.test(shRaw83)
+    && /if \(!settled0 && subActive0 && process\.env\.WB_NO_SUB_WAIT !== '1'\)/.test(shRaw83));
+
+  // ── b. 端到端（spawn --stop）：未落定零弹窗 / 落定必弹 + 水位线语义 ──
+  if (!SPAWN_OK) envSkip('T83-b1~b3 团队轮落定判据端到端（spawn --stop）', SPAWN_SKIP_REASON);
+  else {
+    const wb83 = path.join(tmp, 'k83-wb');
+    const sk83 = path.join(wb83, 'skills', 'token-usage-tracker');
+    const wj83 = (p, o) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, o); };
+    fs.mkdirSync(sk83, { recursive: true }); // ⚠ 先建目录再 copyFileSync（否则 ENOENT 且报错指向源路径）
+    for (const f of fs.readdirSync(skillDir).filter((x) => x.endsWith('.js'))) {
+      fs.copyFileSync(path.join(skillDir, f), path.join(sk83, f));
+    }
+    wj83(path.join(sk83, 'pricing.json'), JSON.stringify({
+      date: '2026-10-15',
+      models: {
+        'k83-fixture': { input_price: 1.0, output_price: 2.0, cached_price: 0.5, currency: 'CNY',
+                         unit: 'per_1m_tokens', region: 'CN', source_url: 'fixture', fetched_at: '2026-10-15T00:00:00Z' },
+      },
+      usd_cny_rate: 7.2,
+    }));
+    wj83(path.join(sk83, 'holidays.json'), '{}');
+    wj83(path.join(sk83, '.update-check.json'),
+      JSON.stringify({ lastCheckAt: Date.now(), latestVersion: '0.0.0', failCount: 0, nextRetryAt: 0 }));
+    const SID83 = 'selftest-k83-team';
+    const toastP83 = path.join(wb83, 'token-tracker-toast.log');
+    const compP83 = path.join(wb83, 'token-tracker-compaction.log');
+    const sizeOf83 = (p) => { try { return fs.statSync(p).size; } catch (e) { return 0; } };
+    const slice83 = (p, off) => { try { return fs.readFileSync(p).slice(off).toString('utf8'); } catch (e) { return ''; } };
+    // 造夹具：主 transcript（user + 一条主模型 usage）+ 一个子代理文件（一条 usage、末行 incomplete）
+    //   subAgeMs = 子代理文件 mtime 距现在多久 ⇒ <20s 判未落定，≥20s 判"已停写=落定"
+    const mk83 = (subAgeMs) => {
+      const now = Date.now();
+      const tp = path.join(wb83, 'projects', 'proj83', SID83 + '.jsonl');
+      wj83(tp, [
+        { type: 'message', role: 'user', id: 'u83', timestamp: now - 60000, content: [{ type: 'text', text: 'go' }] },
+        { type: 'message', role: 'assistant', status: 'completed', timestamp: now - 50000,
+          providerData: { usage: { inputTokens: 1000, outputTokens: 100 }, model: 'k83-fixture' } },
+      ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+      const sp = path.join(wb83, 'projects', 'proj83', SID83, 'subagents', 'agent-k83.jsonl');
+      wj83(sp, [
+        { type: 'message', role: 'assistant', status: 'incomplete', timestamp: now - subAgeMs - 1000,
+          providerData: { usage: { inputTokens: 2000, outputTokens: 200 }, isSubAgent: true, model: 'k83-fixture' } },
+      ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+      const t = (now - subAgeMs) / 1000; // 显式设 mtime（决定 subagentsAllSettled 的"已停写"判定）
+      fs.utimesSync(sp, t, t);
+      wj83(path.join(sk83, '.snapshot-' + SID83 + '.json'),
+        JSON.stringify({ file: tp, stat: null, lastUserMsgAt: now - 60000, lastStopAt: 0 }));
+      return tp;
+    };
+    const runStop83 = (tp) => {
+      const off = sizeOf83(toastP83), coff = sizeOf83(compP83);
+      const r = spawnSync(NODE, [path.join(sk83, 'token-tracker.js'), '--stop'], {
+        input: JSON.stringify({ session_id: SID83, transcript_path: tp, cwd: wb83 }),
+        env: Object.assign({}, env, { WB_ROOT: wb83, WB_LEDGER_MAINT: '1', WB_NO_NET: '1', WB_SYNC_TEAM: '1', WB_TEAM_SPLIT: '' }),
+        timeout: 120000, windowsHide: true, encoding: 'utf8',
+      });
+      let snap = {};
+      try { snap = JSON.parse(fs.readFileSync(path.join(sk83, '.snapshot-' + SID83 + '.json'), 'utf8')); } catch (e) { snap = {}; }
+      return { rc: r.status, toast: slice83(toastP83, off), comp: slice83(compP83, coff), snap };
+    };
+    // b1/b2：子代理 5 秒前才写过（末行 incomplete → 未落定）→ 零弹窗 + 留痕 + 水位线不动
+    const e83a = runStop83(mk83(5000));
+    ok('T83-b1 ★端到端：团队轮未落定 → Stop **零弹窗** + 落 stop-team-defer-silent'
+      + '（旧代码此处必弹——正是 A 型"提前弹"的行为级复现）',
+      e83a.rc === 0 && e83a.toast.trim() === '' && e83a.comp.indexOf('stop-team-defer-silent') >= 0,
+      `exit=${e83a.rc} toast=${JSON.stringify(e83a.toast.slice(0, 150))} comp=${JSON.stringify(e83a.comp.slice(0, 180))}`);
+    ok('T83-b2 ★端到端：未落定抑制时**绝不推进 lastStopAt**（推进即把跳过区间标成已结算 → 下次窗口跳过它）',
+      e83a.rc === 0 && !(Number(e83a.snap.lastStopAt) > 0), `lastStopAt=${e83a.snap.lastStopAt}`);
+    // b3：对照 —— 子代理已停写 ≥20s（落定）→ 必须弹 + 推进水位线（防"修成永不弹"）
+    const e83b = runStop83(mk83(25000));
+    ok('T83-b3 ★端到端对照：子代理已落定（停写 ≥20s）→ 必须弹窗（reason=team-sync*）**且**推进 lastStopAt'
+      + '（"少弹了"与"弹错了"两侧都要抓：只断言"不弹"会漏掉修成"永远不弹"）',
+      e83b.rc === 0 && e83b.toast.indexOf('"reason":"team-sync') >= 0 && e83b.comp.indexOf('stop-team-sync') >= 0
+      && Number(e83b.snap.lastStopAt) > 0,
+      `exit=${e83b.rc} toast=${JSON.stringify(e83b.toast.slice(0, 150))} lastStopAt=${e83b.snap.lastStopAt}`);
+  }
+}
+
+// ===== T84（v3.60.0 · C1 门禁）：CI 上「跳过」必须判失败（关掉 KNOWN-ISSUES C 类第 1 条的假绿缺口）=====
+//   背景：`envSkipCount` 不计入退出码 → 沙箱/CI 上"绿 ≠ 真跑过"（C1）。修法：ciSkipGate 纯函数 + 退出前调用，
+//   **仅 CI 生效**（本地沙箱禁 spawn 属环境能力，v3.29.0 已定"不该判红"，语义不变）。
+//   ⚠ 源码断言一律**剥注释后**扫：本节与 ciSkipGate 的中文注释里天然写着 inCI/unexpected/shouldFail，
+//      不剥注释会**假绿**（项目既有教训：源码守卫必须剥注释再扫）。
+{
+  const self84 = stripComments(fs.readFileSync(path.join(SRC, 'selftest.js'), 'utf-8'));
+  ok('T84-a1 ★C1 门禁：ciSkipGate 纯函数必须存在（inCI + unexpected + shouldFail 三要素齐全）',
+    /function\s+ciSkipGate\s*\(/.test(self84)
+    && /\.inCI\b/.test(self84) && /unexpected/.test(self84) && /shouldFail/.test(self84));
+  ok('T84-a2 ★C1 门禁：退出前必须**真调用** ciSkipGate 且 shouldFail 时 fail++（只定义不调用＝没修好）',
+    /ciSkipGate\s*\(\s*\{\s*inCI:/.test(self84) && /if\s*\(\s*_gate\.shouldFail\s*\)\s*fail\+\+/.test(self84));
+  ok('T84-a3 ★C1 门禁：必须同时认 process.env.CI 与 GITHUB_ACTIONS（GitHub Actions 两者都设；只认其一遇 runner 差异会静默失效）',
+    /process\.env\.CI\b/.test(self84) && /process\.env\.GITHUB_ACTIONS\b/.test(self84));
+  ok('T84-a4 ★C1 门禁：不得引入 exit 2（重蹈 v3.29.0 A-3 覆辙：exit 2 被 GitHub Actions 一律判失败、且像"测试失败"）',
+    !/process\.exit\(\s*2\s*\)/.test(self84));
+  // ── b. 表驱动行为断言（对**真函数**，非重实现）──
+  const g84 = (o) => ciSkipGate(o);
+  ok('T84-b1 ★C1 门禁行为：CI + 有非预期跳过 → 判失败',
+    g84({ inCI: true, envSkipCount: 3, wbNoNet: undefined }).shouldFail === true);
+  ok('T84-b2 ★C1 门禁行为：CI + 离线跑 + 正好 1 条前提缺口 → **不**判失败（否则离线那一遍永远红）',
+    g84({ inCI: true, envSkipCount: 1, wbNoNet: '1' }).shouldFail === false);
+  ok('T84-b3 ★C1 门禁行为：CI + 离线跑 + 2 条（1 前提 + 1 真跳过）→ 判失败（前提缺口不得掩盖真跳过）',
+    g84({ inCI: true, envSkipCount: 2, wbNoNet: '1' }).shouldFail === true);
+  ok('T84-b4 ★C1 门禁行为：非 CI（本地）→ 无论多少跳过都不判失败（沙箱禁 spawn 属环境能力，语义不变）',
+    g84({ inCI: false, envSkipCount: 9, wbNoNet: undefined }).shouldFail === false);
+  ok('T84-b5 ★C1 门禁行为：CI + 联网跑 + 0 跳过 → 不判失败（正常路径）',
+    g84({ inCI: true, envSkipCount: 0, wbNoNet: undefined }).shouldFail === false);
+}
+
+// ===== T85（v3.60.0 · CI 编码）：钉死「CI 连红 3 天」的两个根因（编码 18 红 + T72-b 4 红）=====
+//   背景（2026-10-15 实查 GitHub Actions API，非推断）：CI 自 v3.53.0 起连红 3 天，22 红 = 18 编码 + 4 T72-b：
+//     ① 编码：CI 是 Windows runner，python 的 stdout 默认走 locale 编码 cp1252 → print 中文即
+//        UnicodeEncodeError 整脚本崩（T63/T64/T71/T73）。本机 locale=UTF-8 → 本地永远绿
+//        ⇒ 典型"本地绿 / CI 红"环境分叉（本地全绿掩盖了 CI 全红）。
+//     ② T72-b：CI 离线遍的 WB_NO_NET=1 被 spawn 继承 → deepseek-official 在 fetch 前短路。
+//   ⚠ py 文件的源码断言必须剥 **#** 注释（本文件的 stripComments 只剥 `//`/`/* */`，对 py 无效）；
+//     不剥注释 → 注释里的同文本会让断言在回退后**假绿**（项目既有教训）。
+{
+  const stripPy85 = (s) => String(s || '').replace(/\r\n/g, '\n')
+    .split('\n').map((l) => l.replace(/(^|\s)#.*$/, '$1')).join('\n');
+  const raw85 = fs.readFileSync(path.join(SRC, 'selftest.js'), 'utf-8');
+  const cut85 = raw85.indexOf('===== T85');
+  // 只扫 T85 之前的**主测试体**：T85 自身那个"故意用 cp1252 复现 CI"的 spawn 是本守卫的测试装置，
+  //   不是被测代码，不该被自己的规则要求带 PY_IO_ENV（否则守卫误伤自己）。
+  const self85 = stripComments(cut85 > 0 ? raw85.slice(0, cut85) : raw85);
+  const pyFiles85 = ['build_index.py', 'parse_tokenhub.py', 'fetch-cn-prices.py'];
+  for (const f of pyFiles85) {
+    let s85 = '';
+    try { s85 = stripPy85(fs.readFileSync(path.join(SRC, f), 'utf-8')); } catch (e) { /* 文件缺失 → 断言红 */ }
+    ok(`T85-a1 ★CI 编码：${f} 入口须强制 stdout/stderr 为 utf-8（Windows locale=cp1252 下打印中文即崩）`,
+      /sys\.stdout\.reconfigure\(\s*encoding\s*=\s*['"]utf-8['"]/.test(s85)
+      && /sys\.stderr\.reconfigure\(\s*encoding\s*=\s*['"]utf-8['"]/.test(s85));
+  }
+  ok('T85-a2 ★CI 编码：测试侧兜底常量 PY_IO_ENV = { PYTHONIOENCODING: \'utf-8\' } 必须存在',
+    /const\s+PY_IO_ENV\s*=\s*\{\s*PYTHONIOENCODING:\s*['"]utf-8['"]\s*\}/.test(self85));
+  // a3：**每个** spawn python 的子进程都必须带 PY_IO_ENV（漏一个 → 该用例在 CI 上崩）。
+  //   窗口取 match 前后各一段：env63/env64 在 spawn 的**紧邻上一行**构造（PY_IO_ENV 位于 match 之前）。
+  {
+    const re85 = /spawnSync\(\s*(py\w*|PY\w+)\s*,/g;
+    const miss85 = [];
+    let m85, n85 = 0;
+    while ((m85 = re85.exec(self85)) !== null) {
+      n85++;
+      const win = self85.slice(Math.max(0, m85.index - 320), m85.index + 360);
+      if (win.indexOf('PY_IO_ENV') < 0) miss85.push(m85[1]);
+    }
+    ok('T85-a3 ★CI 编码：所有 spawn python 的子进程都带 PY_IO_ENV（含 selftest 内联 t73.py——产品脚本之外唯一来源）',
+      n85 >= 8 && miss85.length === 0, `spawn点=${n85} 漏带=[${miss85.join(',')}]`);
+  }
+  ok('T85-a4 ★CI 编码：T72-b 的 spawn env 必须经 makeT72bChildEnv(process.env)（显式清联网总开关）',
+    /makeT72bChildEnv\s*\(\s*process\.env\s*\)/.test(self85));
+  // ── b. 行为断言（真跑；与源码断言配对 —— 只断言源码文本会在回退后匹配到注释同文本 → 假绿）──
+  // b4 纯 JS：对**真函数**断言（不依赖 python）
+  {
+    const e85 = makeT72bChildEnv({ WB_NO_NET: '1', WB_DISABLE_NET: '1', KEEP: 'y' });
+    ok('T85-b4 ★CI 编码行为：makeT72bChildEnv 清 WB_NO_NET/WB_DISABLE_NET 且保留其它键',
+      e85.WB_NO_NET === undefined && e85.WB_DISABLE_NET === undefined && e85.KEEP === 'y',
+      `WB_NO_NET=${e85.WB_NO_NET} WB_DISABLE_NET=${e85.WB_DISABLE_NET} KEEP=${e85.KEEP}`);
+  }
+  // b1~b3 需 python：把每个产品脚本**在 PYTHONIOENCODING=cp1252 下导入并打印中文** —— reconfigure 真生效
+  //   才过；缺失则 import 时设不上 utf-8 → 末尾 print 中文即崩 → 精确复现 CI 的那一红。
+  const py85 = (() => {
+    if (process.env.CN_PYTHON) return process.env.CN_PYTHON;
+    try {
+      const root = path.join(os.homedir(), '.workbuddy', 'binaries', 'python', 'versions');
+      for (const v of fs.readdirSync(root).sort().reverse()) {
+        const p = path.join(root, v, 'python.exe');
+        if (fs.existsSync(p)) return p;
+      }
+    } catch (e) { /* 探测失败 → 回退裸 python */ }
+    return 'python';
+  })();
+  const probe85 = spawnSync(py85, ['-V'], { encoding: 'utf8', windowsHide: true, timeout: 20000 });
+  if (!SPAWN_OK || probe85.status !== 0) {
+    envSkip('T85-b 行为组（python reconfigure 端到端，cp1252 模拟）',
+      !SPAWN_OK ? SPAWN_SKIP_REASON : '未找到可用 python');
+  } else {
+    for (const f of pyFiles85) {
+      const code85 = [
+        'import importlib.util',
+        `_p = ${JSON.stringify(path.join(SRC, f))}`,
+        "_s = importlib.util.spec_from_file_location('m85', _p)",
+        '_m = importlib.util.module_from_spec(_s)',
+        '_s.loader.exec_module(_m)',
+        "import sys; sys.stdout.write('中文OK')",
+      ].join('\n');
+      const r85 = spawnSync(py85, ['-c', code85], {
+        encoding: 'utf8', windowsHide: true, timeout: 60000,
+        env: Object.assign({}, process.env, { PYTHONIOENCODING: 'cp1252' }),   // ← 复现 CI 的 cp1252
+      });
+      ok(`T85-b ★CI 编码行为：${f} 在 PYTHONIOENCODING=cp1252 下仍能打印中文（reconfigure 真生效）`,
+        r85.status === 0 && String(r85.stdout || '').indexOf('中文OK') >= 0,
+        `exit=${r85.status} out=${JSON.stringify(String(r85.stdout || '').slice(-40))} err=${JSON.stringify(String(r85.stderr || '').slice(0, 140))}`);
+    }
+  }
+}
+
 //   为什么需要：主脚本在被 require 时会跑 loadPricing → maybeRefreshHolidays（每进程一次、四条件命中即
 //   **detach** spawn 一个 refresh-holidays.js 子进程并往 SNAP_DIR 写 `.holidays-refresh.json`）。该子进程
 //   存活到测试结束之后，恰好与这里的 rmSync 抢同一批文件 → Windows 上 rimraf 报
@@ -7435,6 +7866,16 @@ for (let i = 0; i < 5; i++) {
 //   CI 的 WB_NO_NET 前提缺口），不是代码问题，**不再让 job 变红**（旧行为 exit 2 会被 GitHub Actions
 //   一律判失败，且红的原因看起来像"测试失败"）。CI 正常环境下 envSkip 应为 0，summary 会显式标注。
 //   为此**不需要** job 级 continue-on-error —— 那玩意无法区分 exit 1/2，会连带吞掉真实回归。
+// v3.60.0（C1 门禁）：**保留**上面本地语义不动，另在 **CI** 上把"跳过"变成硬失败（见 ciSkipGate 顶部）。
+//   出口复用同一条 `fail ? 1 : 0`（**不再引入 exit 2**，避免重蹈 A-3 覆辙）。
+const _inCI = !!(process.env.CI || process.env.GITHUB_ACTIONS);   // GitHub Actions 两者都设；只看其一遇 runner 差异会静默失效
+const _gate = ciSkipGate({ inCI: _inCI, envSkipCount, wbNoNet: process.env.WB_NO_NET });
+if (_gate.shouldFail) fail++;   // 计入 fail：与"真断言失败"走同一出口 → 退出码 1
 console.log(`\n结果：${pass} 过 / ${fail} 败 / ${envSkipCount} 环境受限跳过`
-  + (envSkipCount > 0 ? '（需要 node 子进程或 WB_NO_NET 前提缺口；属环境能力限制、不计入退出码；CI 上应为 0）' : ''));
+  + (envSkipCount > 0 ? '（需要 node 子进程或 WB_NO_NET 前提缺口；属环境能力限制；本地不计入退出码、CI 上按 C1 门禁计入）' : ''));
+if (_gate.shouldFail) {
+  console.error(`✗ CI 门禁（C1）：出现 ${_gate.unexpected} 个非预期跳过`
+    + `（CI 上 SPAWN_OK 已有前置探针保证、离线那一遍的 WB_NO_NET 前提缺口至多 ${_gate.expectedPremise} 条）`
+    + ` —— 这些端到端用例并未真跑，"绿"是假的，判失败。`);
+}
 process.exit(fail ? 1 : 0);

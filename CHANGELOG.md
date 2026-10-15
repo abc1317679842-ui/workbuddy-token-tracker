@@ -3,6 +3,93 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.60.0（2026-10-15）—— CI 由「连红 3 天」转绿（批 C2）+ CI 门禁（C1）+ 弹窗判定链（批 B）+ 取消标记文案（批 A）
+
+> 触发：用户复核「C1（`envSkipCount` 不计入退出码——"沙箱里绿 ≠ 真跑过"）现在还假绿吗」。为回答它去查 CI，
+> **实查 GitHub Actions API 后发现：CI 在 main 上自 `v3.53.0`（2026-10-12 19:18）起已连红 3 天**（其后每次
+> push 全部 `failure`，最近一次 **22 条断言红**），而此前一直被当作「CI 绿可信」——那是**只读 `selftest.yml`
+> 配置就下结论**，属推断而非实测（已纠正，记入硬教训：核对 CI 必须查 Actions 真实 run 结论）。
+> 本版把 CI 转绿，并合批发布此前未发版的批 A / 批 B / C1 门禁。
+
+### 修复
+
+- **CI 连红根因①：python stdout 编码（18 红）**
+  - 病根：CI 跑在 **Windows runner**，python 的 stdout 默认走 **locale 编码 cp1252**——脚本一 `print` 中文即
+    `UnicodeEncodeError`、整脚本崩（日志原文 `…\Python\3.12.10\x64\Lib\encodings\cp1252.py line 19, in encode`）。
+    命中 `T63-e1~e7`(6) / `T64-e1~e8`(8) / `T71-b1~b6`(4) / `T73-b0`(1)。
+  - **为什么本地看不出**：本机 python 的 stdout 是 UTF-8 → **本地永远绿**；这是典型的「本地绿 / CI 红」环境分叉
+    （本地 939/0/0 曾长期掩盖 CI 全红）。
+  - 修法：① 三个产品脚本（`build_index.py` / `parse_tokenhub.py` / `fetch-cn-prices.py`）入口加
+    `sys.stdout.reconfigure(encoding='utf-8', errors='replace')`（+ stderr）——调用方 `token-tracker.js`
+    本就按 utf-8 解码流水线输出（`String(b)`），**utf-8 本就是契约**；老 cp1252 控制台也不再崩（个别字符降级 `?`），
+    顺带修好「真实 cp1252 Windows 用户跑每日刷新会整步失败」的产品缺陷。
+    ② selftest 侧**所有 python spawn** 统一带 `PYTHONIOENCODING=utf-8`（常量 `PY_IO_ENV`）——覆盖 selftest
+    **内联生成**的 python（如 T73 的 `t73.py`，不是产品文件、脚本侧改不到）。
+- **CI 连红根因②：T72-b 继承 CI 离线遍的 `WB_NO_NET=1`（4 红）**
+  - 病根：`T72-b` 用 `--require` 把 fetch 换成假官方页（**刻意不联网**），但 CI 离线那一遍父进程带
+    `WB_NO_NET=1` → 子进程在 fetch **之前**就短路退出（`deepseek-official.js` 的 `if (NO_NET) throw`）→
+    与「联网 + 假页」的测设自相矛盾。本地不设该变量、故本地不红（**又一处环境分叉**）。
+  - 修法：子进程环境经 `makeT72bChildEnv()` 显式清掉 `WB_NO_NET` / `WB_DISABLE_NET`。
+- **C1：`envSkipCount` 不计入退出码 → CI 上判失败（关掉 KNOWN-ISSUES C 类第 1 条）**
+  - 新增纯函数 `ciSkipGate({inCI, envSkipCount, wbNoNet})`：**仅在 CI** 把「跳过」当硬失败（本地沙箱禁 spawn
+    属环境能力，v3.29.0 已定"不该判红"——**本地语义不变**）；离线那一遍的 `T3-R4` 前提缺口容许 1 条
+    （`WB_NO_NET === '1'` 时），其余任何跳过一律判失败。
+  - 出口复用同一条 `fail ? 1 : 0`（**不引入 exit 2**，避免重蹈 v3.29.0 A-3：exit 2 会被 GitHub Actions 一律
+    判失败、且看起来像"测试失败"）。CI 判据同时认 `process.env.CI` 与 `GITHUB_ACTIONS`。
+
+### 弹窗判定链（批 B）
+
+- **B1★（A/B 型真缺陷 + D① 副作用链）**：`stop-handler.js` 原判据 `if (isPlainRound || teamDataReady || teamSyncToast)`
+  中 `teamSyncToast` 在非普通轮**恒真** → `||` 短路 → `teamDataReady`（子代理是否落定）被完全架空 → **团队轮无条件弹**：
+  - A 型：主任务没跑完就弹（用户现场 14:12）；B 型：同一任务重派子代理后再弹一次（14:36）。
+  - D①：**提前弹的副作用链**（全套里最隐蔽的一环）——弹窗推进 `lastStopAt` → 下一轮 `--hook` 判"上一轮已结束"
+    → **刷新轮起点** → 主模型静默期内子代理烧的 token 整段落在新起点之前 → 被 `mtime > aggStart0` 切出窗口
+    （`1b82171d` 会话实测：账本 188.6 万、弹窗只有 38.1 万，152.9 万消失）。
+  - 修法：团队轮**未落定 → 只记账、不弹**（新增抑制分支，留痕 `stop-team-defer-silent`）；关键是
+    **绝不推进 `lastStopAt`** → 轮保持开放 → 下一轮 hook 不刷新轮起点 → 任务真结束那次 Stop 从**原轮起点**聚合
+    = **一个任务一条弹窗、金额完整**；期间若用户取消，由**既有**两条兜底（`--hook` 的 `cancelled-round-flush`、
+    轮级 `--round-watch`）按同一轮起点补弹，无需新机制。
+  - 真实性回放（`1b82171d` 真实夹具，新旧代码同夹具对照）：弹窗/账本对齐率 **38.5% → 98.1%**（14:12 旧必弹
+    59 万 → 新零弹窗；14:36 弹 209 万含子代理；残差 = "万"级显示取整）。
+- **B4（效率）**：`subagentsAllSettled` 在本轮无子代理文件时 `return any` = false（`token-tracker.js:2155`）
+  → 每个普通轮都满足 `!settled0` → 白等 `4 × 700ms = 2.8s`（历史 `stop-plain-immediate` 1550 次 → 累计
+  数十小时无效阻塞；Stop hook 同步阻塞，等于每次回复多卡 2.8 秒）。加"本轮真有子代理在写"闸
+  （`hasSubagentsRecentlyActive`）后再微重判。
+- **判定不做 B2**：把子代理纳入下界改 `lastStopAt`。立项理由是"修 D①"，但实测 D① 真因是 **A 的副作用链**
+  （B1 已从根上消除）；B2 反与用户"上次没算的只记账就完事"定案冲突，且造成主/子两套窗口起点不对称 → 不做。
+- **逃生阀不变**：`WB_SYNC_TEAM=0`（旧行为）/ `WB_TEAM_SPLIT=1`（按批拆分弹）。
+- **边界**：普通轮（无子代理）**不受影响**，仍 0ms 直弹 —— 与 KI-1「普通轮提前弹维持现状」并存不矛盾。
+
+### 取消标记文案（批 A）
+
+- 病根：取消判据只认 `Interrupted by user`；no-token 分支**没有取消识别** → 排队中被停止（`429 queue.waiting`）
+  的轮被说成"请求未发出 / 网络中断"（把排查指向错误方向）。全库实测：680 条 incomplete 中断行中仅 417 条
+  （61%）被原判据认出，漏检 `429 queue.waiting/full`（49 条）与 `aborted/ECONNRESET`（18 条）。
+- 修法：新增 `userCancelKind(r)` 统一判定（`user` / `queue` / `aborted` 三族），`interruptedRowsAfter` 与
+  `interruptedByUser` **共用同一形态清单**（避免两处判据再次漂移——A3 口径分裂的病根土壤）；no-token 分支改为
+  据族给准确文案：toast 标题「（手动取消）本轮无 token 消耗记录」，正文标注 `排队中被停止` / `请求被中止` /
+  `请求被中断`。**不再一律说成"请求未发出/网络中断"**。
+- **关键实测**：680 条 incomplete 行的**终结率 100%**（其后到下一个 `role=user` 之间没有一条 assistant
+  completed）→ "识别到中断标记即补弹"不会误弹。
+
+### 验证
+
+- **selftest**：正常 **949 过 / 0 败 / 0 跳过**；`PYTHONIOENCODING=cp1252`（复现 CI）**949/0/0**；
+  `WB_NO_NET=1`（复现 CI 离线遍）**948/0/1**（唯一跳过 = `T3-R4` 前提缺口，CI 门禁容许）。
+- **反向验证（隔离副本，逐项回退 → 对应守卫必红、零误伤）**：
+  C1 —— 回退门禁接线 / 合格线 / `GITHUB_ACTIONS` → `T84-a2` / `T84-b2` / `T84-a3` 各精确 1 红；
+  C2 —— 回退三脚本 `reconfigure` → `T85-a1 ×3 + T85-b ×3`；去掉 r73 的 `PY_IO_ENV`（在 cp1252 下）→
+  `T85-a3 + T73-b0`；回退 `makeT72bChildEnv` → `T85-a4 + T85-b4`。
+- **零账本影响**：本版不改记账热路径。
+- **CI 实证**：推送后核验 Actions run 转 `success`。
+
+### 守卫
+
+- `T82`（批 A 取消文案）/ `T83`（批 B 弹窗判定链：6 源码 + 3 行为）/ `T84`（C1 门禁：4 源码 + 5 表驱动行为）/
+  `T85`（CI 编码：3×2 源码 + 常量 + 逐点覆盖 + 行为组含 3 端到端 + 纯函数行为）。
+- ⚠️ py 文件源码守卫必须剥 `#` 注释（`stripComments` 只剥 `//`/`/* */`，对 py 无效）；不剥则注释里的同文本
+  会让断言在回退后**假绿**——本版据此专门在 T85 内自带 `stripPy85`。
+
 ## v3.59.1（2026-10-15）—— v3.59.0 整体复审补修（批17 · 1 高危 + 5 中危）
 
 > 触发：v3.59.0 发版后应用户要求做「整体性审查，特别是代码判断、逻辑判断……重点是你这些修改的整体性判断」——

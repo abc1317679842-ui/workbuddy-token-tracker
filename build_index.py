@@ -22,6 +22,16 @@ import re
 import sys
 import shutil
 
+# v3.60.0（CI 编码 · 2026-10-15）：Windows 上 sys.stdout 默认走 **locale 编码**（如 cp1252）——
+#   一旦 print 中文即 UnicodeEncodeError、整个脚本崩（CI Windows runner 实测；本机 locale=UTF-8 故不复现）。
+#   调用方 token-tracker.js 按 utf-8 解码流水线输出 → 输出契约本就该是 utf-8。
+#   强制 utf-8 + errors='replace'：管道/CI 下输出正确，老 cp1252 控制台也不再崩（个别字符降级为 '?'）。
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 # v3.52.0（审计批2·S1）：价库目录可用 CN_PRICES_DIR 显式指定（同另两个流水线脚本）。
 #   原实现恒读写 HERE/prices，而调用方（token-tracker.js）读的是自动发现的 CN_PRICE_DIR ——

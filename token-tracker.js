@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.59.1 (2026-10-15)
+// token-usage-tracker v3.60.0 (2026-10-15)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -2256,21 +2256,42 @@ function hasSubagentsRecentlyActive(tsPath, windowMs) {
 // v2.83 初版误把"取消→用户新消息→模型回复"判成续跑，导致真实取消场景全部漏弹（实测 ab3c8bf6）。
 // 返回 [{ts}] 列表。
 // 与 interruptedByUser（watcher 即时信号）不同：这里只看主 transcript（hook 端无子代理上下文）。
+// v3.60.0（批A）：用户取消标记的**统一判定**（原先只有 interruptedRowsAfter 内一条精确文案）。
+//   全库实测（436 transcript / 15.4 万行）：680 条 incomplete 中断行中，仅 417 条（61%）是
+//   「Interrupted by user」被原判据认出；漏检三族 ——
+//     ① 429 queue.waiting.title（44 条）/ 429 queue.full.title（5 条）：排队 / 队列满时被停止。
+//        2026-10-15 14:35 用户真实踩到：排队中手动停止 → 既不走取消补弹、又在 no-token 分支被
+//        说成"请求未发出/网络中断"（M33 同族的"原因指错"）。
+//     ② aborted / ECONNRESET（18 条）：在飞请求被中止。
+//   另一关键实测：680 条 incomplete 行的**终结率 100%** —— 其后到下一个 role=user 行之间
+//   **没有一条** assistant completed（即 incomplete 就是该轮最后一行，不存在"重试成功"的中间态
+//   噪声）→ "识别到中断标记即补弹"不会误弹。
+//   ⚠️ 判据**不用** providerData.skipRun 做匹配键（它是"应用中止在飞请求"的通用字段，取消 / 重发 /
+//      分叉都写，见 interruptedRowsAfter 顶部原注释），只按 error.message 形态识别；
+//      重发 / 分叉由 resend-fork 否决另行排除。
+function userCancelKind(r) {
+  if (!r || r.role !== 'assistant' || r.status !== 'incomplete') return null;
+  const pd = r.providerData || {};
+  const msg = String((pd.error && pd.error.message) || '').trim();
+  if (/^Interrupted by user$/i.test(msg)) return 'user';
+  if (/^429 queue\.(?:waiting|full)\.title/i.test(msg)) return 'queue';
+  if (/^aborted$/i.test(msg)) return 'aborted';
+  return null;
+}
+
 function interruptedRowsAfter(rows, roundStartMs) {
   const out = [];
   let lastIdx = -1;
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
     if (!r || r.type !== 'message') continue;
-    const isCancel = r.role === 'assistant' && r.status === 'incomplete'
-      && r.providerData && r.providerData.error
-      && /^Interrupted by user$/i.test(String(r.providerData.error.message || '').trim());
+    const isCancel = userCancelKind(r) !== null;
     // ⚠️ 勿用 providerData.skipRun 作取消判据（2026-09-22 全库实证）：207 个 transcript 中
     //    183/183 条真实取消标记**全部**带 providerData.skipRun=true —— 它是应用中止在飞请求时的
     //    通用字段（用户点停止 / 编辑重发 / 分叉 都会写），**不是"编辑重发"的特征**。
     //    据此排除会 100% 灭掉真实取消检测。真正有效的是下方"后续完成行即否决"（修复1b）。
     if (isCancel && (Number(r.timestamp) || 0) > (roundStartMs || 0)) {
-      out.push({ ts: Number(r.timestamp), idx: i }); lastIdx = i;
+      out.push({ ts: Number(r.timestamp), idx: i, kind: userCancelKind(r) }); lastIdx = i;
     }
   }
   if (lastIdx >= 0) {
@@ -2303,7 +2324,12 @@ function interruptedByUser(tsPath) {
     if (r.role !== 'assistant') return false; // v2.49：真正的中断标记是 assistant（主模型输出被中断），排除 role=user 的摘要
     // ⚠️ 此处禁止加 skipRun 判据：183/183 真实取消均带 providerData.skipRun=true（见 interruptedRowsAfter 顶部注释）。
     const c = Array.isArray(r.content) ? r.content.map((x) => (x && x.text) || '').join('') : (typeof r.content === 'string' ? r.content : '');
-    return /^\s*Interrupted by user\s*$/i.test(c); // 精确匹配，排除长摘要里顺带提到 "Interrupted by user"（1686e062 上下文压缩误弹）
+    if (/^\s*Interrupted by user\s*$/i.test(c)) return true; // 精确匹配，排除长摘要里顺带提到 "Interrupted by user"（1686e062 上下文压缩误弹）
+    // v3.60.0（批A）：扩展族——content 与 providerData.error.message 同值（实测 429 queue.waiting / aborted 均如此）。
+    //   与 interruptedRowsAfter 共用同一形态清单，避免两处判据再次漂移（A3 口径分裂的病根土壤）。
+    if (/^\s*429 queue\.(?:waiting|full)\.title/i.test(c)) return true;
+    if (/^\s*aborted\s*$/i.test(c)) return true;
+    return userCancelKind(r) !== null;
   };
   // 1. 主 transcript 最后一行
   if (intrIn(lastTranscLine(tsPath))) return true;
@@ -6122,7 +6148,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.59.1'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.60.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -6872,6 +6898,7 @@ function main() {
     hasSubagentsRecentlyActive,
     incrementalRecord,
     inferRoundStartFromText,
+    interruptedRowsAfter,
     lastWatcherSpawnError,
     latestTraceFile,
     ledgerKey,
@@ -7272,6 +7299,7 @@ module.exports = {
   subagentsAllSettled, // v3.38.0：子代理「是否已全部落定」判据（终止态 / incomplete 且停写≥20s），selftest 可直接单测
   splitByModelStats, showToastsSplitByModel, // v3.38.0：按模型分条（拆分 / 弹窗），selftest 可直接单测
   interruptedRowsAfter,
+  userCancelKind, // v3.60.0（批A）：用户取消标记的统一判定（按 error.message 形态），selftest 可直接单测
   incrementalRecord, loadLedgerWatermark, saveLedgerWatermark,
   // v3.39.0（A2）：「记账成功但水位线没落盘」的回滚（纯文件层、可单测，避免只能靠注释自证）
   rollbackLedgerAfterWatermarkFailure,

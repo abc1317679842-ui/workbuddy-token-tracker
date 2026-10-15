@@ -46,6 +46,7 @@ function handleStopEnd(ctx) {
     hasSubagentsRecentlyActive,
     incrementalRecord,
     inferRoundStartFromText,
+    interruptedRowsAfter,
     lastWatcherSpawnError,
     latestTraceFile,
     ledgerKey,
@@ -243,7 +244,17 @@ function handleStopEnd(ctx) {
           //   关闭开关：WB_NO_SUB_WAIT=1（测试 / 异常时快速回退，直接判未落定、不进微重判）。
           const settled0 = subagentsAllSettled(tsPath, aggStart0, SUBAGENT_IDLE_MS);
           teamDataReady = settled0;
-          if (!settled0 && process.env.WB_NO_SUB_WAIT !== '1') {
+          // v3.60.0（批B·B4）：**本轮根本没有子代理在写 → 不进微重判**。
+          //   根因：`subagentsAllSettled` 在本轮无子代理文件时 `return any`＝false（token-tracker.js:2155），
+          //   于是**每个普通轮**都满足 `!settled0` → 白等 4×700ms＝2.8s（历史 stop-plain-immediate 1550 次
+          //   → 累计数十小时无效阻塞；Stop hook 是同步阻塞的，等于每次回复都多卡 2.8 秒）。
+          //   判据：`hasSubagentsRecentlyActive`（20s 窗内有无子代理文件写入）——无 → 2.8s 内不可能有任何
+          //   落定变化，等它是纯浪费。有（含"子代理刚起、文件刚落"）→ 照旧微重判，保住 v3.13 那个
+          //   「文件比 Stop 早 0.7s 写完」的场景。
+          //   ⚠️ 语义变化面：跳过等待时 teamDataReady 仍为 false → 团队轮走下方"未落定不弹"分支
+          //   （轮保持开放，下次 Stop 从原轮起点聚合，**不丢数据**）；普通轮不受影响（走 isPlainRound）。
+          const subActive0 = hasSubagentsRecentlyActive(tsPath, SUBAGENT_IDLE_MS);
+          if (!settled0 && subActive0 && process.env.WB_NO_SUB_WAIT !== '1') {
             for (let i = 0; i < 4 && !teamDataReady; i++) {
               sleepSync(700);
               try {
@@ -253,6 +264,38 @@ function handleStopEnd(ctx) {
             }
           }
         } catch (e) { teamDataReady = false; }
+        // v3.60.0（批B·B1★｜A/B 根因 + D① 副作用链）：**团队轮必须落定才弹** —— 未落定 → 只记账、不弹。
+        //   病根：下方原判据 `isPlainRound || teamDataReady || teamSyncToast` 中，teamSyncToast 在非普通轮
+        //   **恒真**（= `!isPlainRound && WB_SYNC_TEAM!=='0' && WB_TEAM_SPLIT!=='1'`）→ `||` 短路 →
+        //   **teamDataReady 被完全架空** → 子代理还在跑就提前弹。实证（本机 compaction 日志）：
+        //   `stop-team-sync` 共 14 次，其中 teamDataReady=false 4 次（28.6%）——
+        //     · 2026-10-09 07:04（subCount=0）· 2026-10-10 00:15（subCount=0）提前弹（B 型）
+        //     · **2026-10-15 14:12:12**（subCount=1）＝用户报的 A（子代理刚派完就弹）
+        //     · **2026-10-15 14:36:46**（subCount=0）＝用户报的 B（同一任务再弹一次）
+        //   ★ 副作用链（本轮实测还原，`1b82171d` 会话，是全套里最隐蔽的一环）：
+        //     提前弹不仅"多弹一次"，它还会**永久改变轮边界**——弹完推进 lastStopAt=14:12:12 →
+        //     下一轮 --hook 算 `inProgress = prevStop < prevStart` ＝false（判"上一轮已结束"）→
+        //     **刷新轮起点**到 14:35:32/14:36:00 → 子代理 14:11:47~14:35:02 烧的 **152.9 万**整段落在
+        //     新起点之前 → 被 `mtime > aggStart0` 切出窗口 → **账本 188.6 万、弹窗只有 38.1 万**（D①/D②）。
+        //   修法：未落定 → 立即收工（**不弹 / 不写 coalesce / 不 spawn watcher / 不推进 lastStopAt**）。
+        //   「**不推进 lastStopAt**」是关键：轮保持开放（下轮 hook 的 inProgress 恒真 → **不刷新起点**）
+        //   → 任务真正结束（子代理落定）的那次 Stop 从**原轮起点**聚合 → **一个任务一条弹窗、金额完整**；
+        //   期间用户若取消，由**既有**两条取消兜底按同一轮起点补弹「（手动取消）」整轮，无需新机制：
+        //     · --hook 的 `cancelled-round-flush`（token-tracker.js:7151+，条件 `intrInfo.ts > lastStopAt`）
+        //     · 轮级 `--round-watch`（token-tracker.js:6032+，取消确认 + 静默满即弹，退出条件含 lastStopAt）
+        //   与用户 2026-10-15 16:44 定案一致：「未落定即不弹、只记账」+「下次结算只弹当次的」。
+        //   逃生阀语义**不变**：`WB_SYNC_TEAM=0`（团队轮无条件同步弹＝旧行为）与 `WB_TEAM_SPLIT=1`
+        //   （按批拆分弹）都使 teamSyncToast=false → 本分支不成立 → 照旧走下方原路径。
+        //   守卫：T83（源码 + 行为）钉死本分支存在、条件含 `!teamDataReady`、且**绝不含**水位线推进 / coalesce 写入。
+        if (teamSyncToast && !teamDataReady) {
+          appendCompactionLog('stop-team-defer-silent', {
+            sid: effSid, subCount: agg && agg.subCount, teamActive: !!(agg && agg.teamActive),
+            roundStart: roundStart0, aggStart: aggStart0, subActive: hasSubagentsRecentlyActive(tsPath, SUBAGENT_IDLE_MS),
+            total: agg && agg.total,
+          });
+          out({ hookSpecificOutput: {} });
+          return true;
+        }
         if (isPlainRound || teamDataReady || teamSyncToast) {
           // 同步立即弹（不 spawn watcher、不等确认窗），并清掉 coalesce 以免被兜底二次补弹。
           // v3.44.0：团队轮（teamSyncToast）也走这里 —— 见上方判断块注释。
@@ -452,6 +495,28 @@ function handleStopEnd(ctx) {
         //   判据：transcript 末尾 30 行内存在「新鲜」压缩标记（10 分钟内）→ 静默跳过本次弹窗。
         //   保留原快照推进（上面已写 lastStopAt），轮次边界行为与原来完全一致；
         //   账本不受影响：incrementalRecord 已在本函数开头按水位线跑过，本分支只决定"弹不弹"。
+        // v3.60.0（批A）：准确文案 —— 本轮其实是被（用户）中断的，不是"请求未发出/网络中断"。
+        //   实测 2026-10-15 14:35：用户在 429 排队中被停止 → 本轮无 usage（请求未产生消耗）→
+        //   旧文案把"手动取消"说成"网络中断"（M33 同族：原因被说错，把排查指向错误方向）。
+        //   判据复用 interruptedRowsAfter（与 --hook 侧 cancelled-round-flush 同源，口径统一）；
+        //   本分支上方已推进 lastStopAt → intrInfo.ts 早于它 → --hook 侧不会重复补弹（同 v3.08 修复2 语义）。
+        let cancelRows0 = [];
+        try { cancelRows0 = interruptedRowsAfter(readTranscLines(tsPath), aggStart0); } catch (e) { /* 读取失败按"无取消标记"处理，回落原文案 */ }
+        if (cancelRows0.length) {
+          const lastCancel = cancelRows0[cancelRows0.length - 1];
+          const kindTxt = lastCancel.kind === 'queue' ? '排队中被停止'
+            : (lastCancel.kind === 'aborted' ? '请求被中止' : '请求被中断');
+          const reasonC = '你手动取消了本轮（' + kindTxt + '，未产生消耗）';
+          const auxC = (today0 ? '今日累计 ' + today0 + ' ｜ ' : '') + (bal0 ? bal0 + ' ｜ ' : '');
+          const bodyC = dispWidth(auxC + reasonC) > TOAST_LINE_MAX_W ? reasonC : (auxC + reasonC);
+          appendCompactionLog('stop-no-token-cancelled', { sid, aggStart: aggStart0, kind: lastCancel.kind, at: lastCancel.ts });
+          writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sid, sameRound: false, transcriptPath: tsPath,
+            stat: null, note: 'cancelled-round-no-token', source: 'transcript-cancelled', kind: lastCancel.kind,
+            payload: summarizePayload(payloadRaw) });
+          showToast('（手动取消）本轮无 token 消耗记录', bodyC, 'cancelled-no-token');
+          out({ hookSpecificOutput: {} });
+          return true;
+        }
         const freshMarker0 = freshCompactionMarker(tsPath);
         if (freshMarker0) {
           appendCompactionLog('stop-no-token-compaction-skip', { sid, markerId: freshMarker0, aggStart: aggStart0 });
@@ -469,4 +534,4 @@ function handleStopEnd(ctx) {
   return false;
 }
 
-module.exports = { handleStopEnd, STOP_TX_NAMES: ["SUBAGENT_IDLE_MS","TOAST_LINE_MAX_W","aggregateMainOnly","aggregatePerModel","aggregateTranscript","allInRoundSubFilesTerminal","appendCompactionLog","balanceText","captureTranscShape","clearCoalesce","coalescePath","dispWidth","ensureNewModelPricing","estimateInterrupted","freshCompactionMarker","hasSubagentsRecentlyActive","incrementalRecord","inferRoundStartFromText","lastWatcherSpawnError","latestTraceFile","ledgerKey","lineFor","loadSnapshot","mergeEstIntoModels","noPriceTag1","periodNote","readCoalesceInfo","readTranscLines","roundLabel","saveSnapshot","shortModelName","showToast","showToastsSplitByModel","sleep","sleepSync","startWatcherVerified","subagentPending","subagentsAllSettled","summarizePayload","terminalError","toastLine1","toastLine2","toastLineTagged","todayUsageTxt","traceWallDurMs","transcriptPathFromPayload","writeCoalesce","writeProbe"] };
+module.exports = { handleStopEnd, STOP_TX_NAMES: ["SUBAGENT_IDLE_MS","TOAST_LINE_MAX_W","aggregateMainOnly","aggregatePerModel","aggregateTranscript","allInRoundSubFilesTerminal","appendCompactionLog","balanceText","captureTranscShape","clearCoalesce","coalescePath","dispWidth","ensureNewModelPricing","estimateInterrupted","freshCompactionMarker","hasSubagentsRecentlyActive","incrementalRecord","inferRoundStartFromText","interruptedRowsAfter","lastWatcherSpawnError","latestTraceFile","ledgerKey","lineFor","loadSnapshot","mergeEstIntoModels","noPriceTag1","periodNote","readCoalesceInfo","readTranscLines","roundLabel","saveSnapshot","shortModelName","showToast","showToastsSplitByModel","sleep","sleepSync","startWatcherVerified","subagentPending","subagentsAllSettled","summarizePayload","terminalError","toastLine1","toastLine2","toastLineTagged","todayUsageTxt","traceWallDurMs","transcriptPathFromPayload","writeCoalesce","writeProbe"] };
