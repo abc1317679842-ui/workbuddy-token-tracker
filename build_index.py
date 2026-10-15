@@ -337,10 +337,23 @@ def main():
     # v3.53.0（审计批3）：上一版索引**提前读取** —— 新条目闸门与变更分级都以它为基线
     #   （原先只在「逐模型沿用」段读，闸门/分级拿不到基线就无法判断什么是「新」）。
     prev = None
-    try:
-        prev = json.load(open(OUT, encoding='utf-8'))
-    except Exception:
-        prev = None
+    prev_read_error = None
+    # 注：OUT 不存在 = 首次构建，是正常部署场景，不告警。
+    if os.path.exists(OUT):
+        try:
+            prev = json.load(open(OUT, encoding='utf-8'))
+        except Exception as e:
+            # v3.61.0（审计 S2，严重）：修前这里是裸 except → prev=None **静默无告警**，
+            #   「首次构建」与「上一版索引损坏/权限异常」在输出里长得一模一样（都是 gate_full=False）。
+            #   后果：索引损坏时新条目闸门退化成最小契约、逐模型沿用基线丢失，用户却只看到一次"正常"刷新。
+            #   （「写出空索引」那条已被 :666 的安全阀挡住——闸门清空整库就回退上一版，
+            #     所以这里要治的是**看不见**，不是空索引本身。）
+            prev = None
+            prev_read_error = repr(e)[:200]
+    if prev_read_error:
+        sys.stderr.write('[build_index][WARN] 上一版索引 %s 读取失败（%s）→ 本次按「首次构建」走最小契约闸门，'
+                         '新条目溯源要求已放宽、逐模型沿用基线丢失；请检查该文件是否损坏或权限异常\n'
+                         % (OUT, prev_read_error))
     prev_models = (prev or {}).get('models') or {}
     # gate_mode：有上一版可对比 → 新条目必须带完整溯源；首次构建 → 只卡最小契约（防整库清空）
     gate_full = bool(prev_models)

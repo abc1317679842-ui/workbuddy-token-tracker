@@ -727,6 +727,49 @@ def parse_stepfun_md(md, drop_re=None, keep_over_re=None):
     return out
 
 
+# v3.61.0（审计 F1 修复建议 2）：Kimi 行正则 + 行解析抽成**纯函数**，供 selftest 夹具测试
+#   （不打网络、不读盘）——F1 的根因正是"没有 parse_kimi 的夹具测试"，索引漂移才能在线上躺一个版本。
+KIMI_ROW_RE = re.compile(
+    r'\["(?P<name>[^"]+)",\s*"(?P<unit>[\d.,]+[MK])\s*tokens",\s*'
+    r'(?P<prices>.*?),\s*"(?P<total>[\d,]+) tokens"\]')
+
+
+def parse_kimi_row(line):
+    """解析 Kimi 文档页的一行表格 → (记录 dict | None, 原因)。
+
+    纯函数（无 IO / 无网络 / 无全局副作用）→ selftest 可直接 require 本模块做夹具测试。
+    原因取值：
+      'no-match' —— 不是表格行（调用方据此不计入 matched_rows）；
+      'unit'     —— 计价单位非 1M tokens（v3.59.0 审计 S5 的单位断言，量纲错位会 1000× 错价）；
+      'prices'   —— 价格个数不足 2（<2 无法构成 in/out）；
+      None       —— 成功。
+    价格语义 = [缓存命中, 输入(未命中), 输出]；k3 行多出历史列（共 5 个价）→ 统一取**末 3 位**。
+    """
+    m = KIMI_ROW_RE.match(str(line).strip())
+    if not m:
+        return None, 'no-match'
+    if m.group('unit').upper() != '1M':
+        return None, 'unit'
+    prices = re.findall(r'"¥([\d.]+)"', m.group('prices'))
+    if len(prices) >= 3:
+        cache, inp, outp = prices[-3:]  # k3 行多历史列 → 取末 3 位
+    elif len(prices) == 2:
+        cache, inp, outp = None, prices[0], prices[1]
+    else:
+        return None, 'prices'
+    return {
+        'name': m.group('name'),
+        'brand': 'kimi',
+        'api_name': m.group('name'),
+        'source_type': 'first_party',
+        'unit': '元/百万 tokens',  # v3.59.0（S5）：单位断言通过后显式回传
+        'in_price': ['%s元' % inp],
+        'out_price': ['%s元' % outp],
+        'cache_hit': ['%s元' % cache] if cache else [],
+        'tier_note': 'Kimi 官方价(¥/1M tokens)',
+    }, None
+
+
 def parse_kimi():
     """Kimi(Moonshot) 官方价：各模型单独的 mintlify 文档页(.md 源，比 HTML 干净)。
     v0.3(2026-09-28)：moonshot.cn 文档已 301 迁至 platform.kimi.com（requests 自动跟随，
@@ -740,6 +783,7 @@ def parse_kimi():
     """
     out = []
     base = 'https://platform.kimi.com/docs/pricing/'
+    matched_rows = 0  # v3.61.0：正则匹配到的行数 —— 用于区分「页面没行」与「行全被跳过」
     for pg in KIMI_PAGES:
         try:
             t = http_get(base + pg + '.md', 20)
@@ -749,45 +793,37 @@ def parse_kimi():
         for line in t.splitlines():
             if not line.strip().startswith('['):
                 continue
-            m = re.match(r'\["([^"]+)",\s*"([\d.,]+[MK])\s*tokens",\s*(.*?),\s*"([\d,]+) tokens"\]', line)
-            if not m:
+            rec, reason = parse_kimi_row(line)
+            if reason == 'no-match':
                 continue
+            matched_rows += 1
             # v3.59.0（审计 S5）：单位显式断言。原正则把 "1M tokens" 写死成字面量 →
             #   页面改用「1K tokens」计价时整行不匹配 → 静默 0 模型（连 WARN 都没有）。
             #   现放宽量纲匹配再显式校验：非 1M tokens 计价 → WARN + 跳过（可见的失败）。
-            if m.group(2).upper() != '1M':
+            if reason == 'unit':
                 print('[WARN] kimi %s: 计价单位非 1M tokens（%s tokens）→ 跳过该行'
-                      % (pg, m.group(2)))
+                      % (pg, KIMI_ROW_RE.match(line.strip()).group('unit')))
                 continue
-            name = m.group(1)
+            if rec is None:
+                continue
+            name = rec['api_name']
             # v3.52.0（S4）：同其余解析器 —— 只丢真快照，soft 收录 + 待确认留痕
             if not apply_snap_verdict(name):
                 continue
-            prices = re.findall(r'"¥([\d.]+)"', m.group(2))
-            if len(prices) >= 3:
-                cache, inp, outp = prices[-3:]  # k3 行多历史列 → 取末 3 位
-            elif len(prices) == 2:
-                cache, inp, outp = None, prices[0], prices[1]
-            else:
-                continue
-            out.append({
-                'name': name,
-                'brand': 'kimi',
-                'api_name': name,
-                'source_type': 'first_party',
-                'unit': '元/百万 tokens',  # v3.59.0（S5）：行首 "1M tokens" 单位断言通过后显式回传
-                'in_price': ['%s元' % inp],
-                'out_price': ['%s元' % outp],
-                'cache_hit': ['%s元' % cache] if cache else [],
-                'tier_note': 'Kimi 官方价(¥/1M tokens)',
-                'source': 'Kimi 官方文档 %s.md' % pg,
-            })
+            rec['source'] = 'Kimi 官方文档 %s.md' % pg
+            out.append(rec)
     seen, uniq = set(), []
     for m in out:
         if m['api_name'] in seen:
             continue
         seen.add(m['api_name'])
         uniq.append(m)
+    # v3.61.0（审计 F1/P2）：细粒度告警。main() 的「0 模型即 failed」只知道**结果**，
+    #   这里补上**原因**：正则匹配到行却 0 条收录 = 每行都被跳过（快照判定 / 单位断言 / 价格位数），
+    #   而不是「页面没行」。没有这段，F1 那种「每行静默 continue」在下游看起来和「官网改版」一模一样。
+    if matched_rows and not uniq:
+        print('[WARN] kimi: 正则匹配到 %d 行但 0 条收录（快照判定/单位断言/价格位数把每行都跳过）'
+              '→ 该厂商将 0 模型，价格沿用上版' % matched_rows)
     return uniq
 
 

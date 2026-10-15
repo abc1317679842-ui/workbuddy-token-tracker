@@ -9,6 +9,9 @@
 // 用法：
 //   node backfill.js             → **dry-run（默认）**：只扫描+打印将写入的账本，不落任何盘
 //   node backfill.js --write     → 真正写入（先自动备份 daily-usage.json 与水位线）
+//   node backfill.js --write --force → 允许「账本写失败时把水位线回退到写入前」
+//     （v3.61.0 审计 G4：默认**不回退**，只许单调递增 —— 回退会抹掉主链路并发推进的进展，
+//      导致下轮重读已记账行 = 重复计费。确需回退才显式加 --force，并自行承担该风险）
 //
 // 语义与口径（与 token-tracker.js 增量记账严格对齐）：
 // - usage 提取：extractUsage 同口径（usage / rawUsage / message.usage 三处落点 + 数值钳制取整）
@@ -38,6 +41,7 @@ const os = require('os');
 //   本文件不再需要任何哈希。（保留无人使用的 import 会诱导下一个人继续在本地拼键。）
 const { detectWorkBuddyRoot } = require('./wb-root.js'); // v3.42.0（plan-B B1）：数据根探测单点实现，已抽到 wb-root.js
 const { mergeDailyLedger } = require('./ledger-merge.js'); // v3.55.0（S3）：账本合并抽成可单测纯函数
+const { measureTranscriptLines } = require('./transc-lines.js'); // v3.61.0（审计 F2）：行数/残行口径单一实现（与主链共用）
 
 const WB = process.env.WB_ROOT || detectWorkBuddyRoot();
 const SKILL_DIR = path.join(WB, 'skills', 'token-usage-tracker');
@@ -118,10 +122,15 @@ function usageFromRow(r) {
 
 // 读 jsonl：返回 { rows, physicalLines }。
 //   rows —— 容错跳过空行/半写行的可解析行（与 readTranscLines 同口径，供统计用）；
-//   physicalLines —— 文件内 '\n' 累计数（**物理完整行数**），仅供水位线使用。
+//   physicalLines —— 物理行数（**含残行 +1**），仅供水位线使用。
 // v3.19.2（B1 对齐）：水位线口径必须 = physicalLines。主脚本 v3.19.2 起 readTranscLinesFrom 的
 //   totalLines 就是物理完整行数；此处若仍记「可解析行数」，空行/坏行会让记下的水位线比真实偏移小 k，
 //   主脚本下一轮从偏早的偏移重读已计过的行 → 重复记账。
+// v3.61.0（审计 F2，致命）：上一行注释说的「= 物理完整行数」只对了一半 —— 主链自 v3.42.0（A19）起，
+//   末尾残行（无 '\n' 但 JSON.parse 成功）**既计入 rows 又让水位线 +1**；而本函数仍只数 '\n'。
+//   → rows 收了残行（= 回填已经记了它的 token）、水位线却没盖住它 → 主链下一轮重读 = **双记**（钱量双错、静默）。
+//   修法：行数口径收敛到 transc-lines.js 的单一实现，两侧都调它（本函数与主链 readTranscLinesFrom 共用），
+//   由调用关系保证一致；下方 :248 那句「与主脚本 totalLines 同口径」的过期注释随之作废。
 function readRows(fp) {
   let raw = '';
   try { raw = fs.readFileSync(fp, 'utf-8'); } catch (e) { return { rows: [], physicalLines: 0 }; }
@@ -131,7 +140,7 @@ function readRows(fp) {
     if (!s) continue;
     try { rows.push(JSON.parse(s)); } catch (e) { /* 半写行跳过 */ }
   }
-  return { rows, physicalLines: (raw.match(/\n/g) || []).length };
+  return { rows, physicalLines: measureTranscriptLines(raw).lines };
 }
 
 // 成本：单行级计算（峰谷按行时间）；findModel 与主脚本同口径（归一化/去标点/边界匹配）
@@ -539,16 +548,32 @@ function main() {
     let restored = false;
     // v3.58.0（批8-③）：水位线是本次新建（写入前不存在）时 bak2 必然不存在 —— 那是「无需回滚」，不是失败。
     let needless = false;
+    // v3.61.0（审计 G4）：默认**不回退**水位线（只许单调递增），确需回退要显式 `--force`。
+    //   bak2 是步骤 B 写入**前**的快照，而写入后主链路可能已并发推高水位线（backfill 与主链
+    //   并发推进是常态）→ 原样恢复 bak2 会把主线进展一并抹掉 = 水位线**回退** → 下轮主链从
+    //   偏早偏移重读**已记账**的行 → **重复计费**（不可恢复地多收费）。
+    //   放任不一致的后果相反，是**少记**（主链按推高的水位线跳过这些行，重跑 backfill 即恢复）——
+    //   与写入侧逐键 max 同一哲学：**宁可少记，不重记**。
+    let keptMonotonic = false;
     try {
-      if (fs.existsSync(bak2)) restored = saveLedgerRawAtomic(WATERMARK, fs.readFileSync(bak2));
+      if (fs.existsSync(bak2)) {
+        if (process.argv.includes('--force')) {
+          restored = saveLedgerRawAtomic(WATERMARK, fs.readFileSync(bak2));
+        } else {
+          keptMonotonic = true;
+        }
+      }
       else if (!wmExisted) needless = true;
     } catch (e) {} // silent-ok:降级 — 回滚是尽力而为，失败由下方告警兜底
     // v3.58.0（批8-③）：改前只有「已回滚 / 回滚失败」两态 → 首次回填（原本无水位线）时 bak2 必不存在，
     //   于是**必定**落到「回滚失败！请手动用 .bak-backfill-* 还原」= 谎报故障：其实没有任何东西要还原，
     //   用户照着做反而可能把别处的备份盖进来。现在三态，把「无需回滚」讲清楚。
-    const rollbackState = restored ? '已回滚到写入前状态'
-      : (needless ? '无需回滚（水位线文件是本次新建的，原本不存在）'
-        : '回滚失败！请手动用 .bak-backfill-* 还原');
+    // v3.61.0（审计 G4）：再加第四态「未回退（默认单调）」—— 回退本身在这里是**更危险**的那个选项。
+    const rollbackState = restored ? '已回滚到写入前状态（--force，已承担水位线回退→重复计费的风险）'
+      : (keptMonotonic ? '未回退（默认单调递增：回退会抹掉主线并发推进的进展 → 重复计费；'
+        + '保留现值只会少记，重跑 backfill 即恢复。确需回退请显式加 --force）'
+        : (needless ? '无需回滚（水位线文件是本次新建的，原本不存在）'
+          : '回滚失败！请手动用 .bak-backfill-* 还原'));
     console.error('[backfill] ' + why + '，本次回填已作废；水位线'
       + rollbackState
       + '（放任水位线与账本不一致的后果是**少记**而非多收：主链路会按推高的水位线跳过这些行，重跑 backfill 即恢复）；请退出 WorkBuddy 后重试');

@@ -106,7 +106,8 @@ const SPAWN_OK = canSpawn();
 // v3.35.0（B2）：stop-handler.js 拆出后必须跟兄弟脚本同等待遇——语法检查与裸 catch 扫描都要覆盖，
 //   否则"迁出去就没人扫了"会静默削弱 T33 的守卫面（裸 catch 基线是按这些文件的**总和**定的，当前值见 T33-a1）。
 const SYNTAX_FILES = ['token-tracker.js', 'refresh-prices.js', 'deepseek-official.js', 'refresh-holidays.js',
-  'backfill.js', 'recalc-day.js', 'peak-rules.js', 'selftest.js', 'stop-handler.js', 'wb-root.js'];
+  'backfill.js', 'recalc-day.js', 'peak-rules.js', 'selftest.js', 'stop-handler.js', 'wb-root.js',
+  'transc-lines.js', 'ledger-merge.js'];
 
 // ── T0：语法检查 ───────────────────────────────────────────────────────────
 for (const f of SYNTAX_FILES) {
@@ -125,9 +126,11 @@ fs.mkdirSync(skillDir, { recursive: true });
 //   整段测试全炸（v3.32.0 缺 refresh-holidays.js 时踩过同一坑）。此清单由下方 T37-a2 自动校验。
 // v3.42.0（plan-B B1）：wb-root.js 必须随行——数据根探测抽成单点实现后，主脚本/backfill/recalc/
 //   refresh-prices 四个文件顶层都 require 它；隔离目录缺它 = 全段 MODULE_NOT_FOUND（同上两坑的第三次）。
+// v3.61.0（审计 F2）：transc-lines.js 必须随行——主脚本与 backfill 顶层都 require 它（残行/行数口径
+//   单一实现），隔离目录缺它 = 全段 MODULE_NOT_FOUND（与前三个坑同因，第四次）。
 const RUNTIME_COMPANIONS = ['refresh-prices.js', 'deepseek-official.js', 'refresh-holidays.js',
   'pricing.json', 'holidays.json', 'peak-rules.js', 'recalc-day.js', 'stop-handler.js', 'wb-root.js',
-  'ledger-merge.js']; // v3.55.0（S3）：账本合并抽成独立模块，backfill 顶层 require → 必须随行
+  'ledger-merge.js', 'transc-lines.js'];
 for (const f of ['token-tracker.js', ...RUNTIME_COMPANIONS]) {
   fs.copyFileSync(path.join(SRC, f), path.join(skillDir, f));
 }
@@ -461,8 +464,12 @@ else {
     !/function mergeLocalDbMirror/.test(bfSrc) && /tt\.mergeLocalPriceDb\(/.test(bfSrc));
   ok('T9-B5b backfill 复用 tt.findModel（不再自带实现）',
     !/^function findModel\s*\(/m.test(bfSrc) && /const findModel = tt\.findModel/.test(bfSrc));
-  ok('T9-B5c backfill 水位线口径 = 物理换行数',
-    /physicalLines:\s*\(raw\.match\(\/\\n\/g\) \|\| \[\]\)\.length/.test(bfSrc));
+  ok('T9-B5c ★backfill 水位线口径 = **含残行**的物理行数（与主链共用 transc-lines.js 单一实现）',
+    /physicalLines:\s*measureTranscriptLines\(raw\)\.lines/.test(bfSrc)
+    && !/raw\.match\(\/\\n\/g\)/.test(bfSrc),
+    'v3.61.0（审计 F2）：口径已从「只数 \'\\n\'」修正为「残行 parse 成功也 +1」—— '
+    + '主链自 v3.42.0（A19）起就是这么做的，backfill 只数 \'\\n\' 会把残行的 token 记了却不让水位线盖住它，'
+    + '主链下一轮重读 = 双记。两侧必须共用同一实现。');
 
   // B6：aggregateTranscript 的 subModels 必须做行级时间过滤（旧行不得算进本轮）
   {
@@ -6611,9 +6618,11 @@ else {
     && /unit_decl = read_unit_decl\(lines, tbl_start\)/.test(fcp73)
     && /if unit_decl is None:/.test(fcp73)
     && /表单位非元\/百万 tokens/.test(fcp73));
+  // v3.61.0（审计 F1）：判据随实现升级为**命名分组**形态 —— 分组编号漂移正是 F1 的病根，
+  //   继续钉"数字分组长这样"会把修复本身判成回归。单位断言语义不变。
   ok('T73-a4 ★S5 Kimi 单位显式断言（原正则写死 "1M tokens" → 页面改 1K 时静默 0 模型；现 WARN + 跳过）',
-    fcp73.indexOf('([\\d.,]+[MK])\\s*tokens",\\s*(.*?)') >= 0
-    && fcp73.indexOf("m.group(2).upper() != '1M'") >= 0
+    /\(\?P<unit>\[\\d\.,\]\+\[MK\]\)\\s\*tokens/.test(fcp73)
+    && /m\.group\('unit'\)\.upper\(\) != '1M'/.test(fcp73)
     && fcp73.indexOf('计价单位非 1M tokens') >= 0);
   ok('T73-a5 ★S5 四家解析器都显式回传 unit（setdefault 不再是唯一来源）',
     (fcp73.match(/'unit': '元\/百万 tokens'/g) || []).length >= 4);
@@ -7869,6 +7878,339 @@ const txInjectionComplete = (ttSrc, shSrc) => (
   // b2：LF 源也成立（本地常规路径不回归）
   ok('T86-b2 ★注入完整性判据在 LF 源同样成立（本地常规路径不回归）',
     txInjectionComplete(lf86(rawTT86), lf86(rawSH86)));
+}
+
+// ===== T87（v3.61.0 · 审计 F1，致命）：Kimi 解析器夹具测试 + 命名分组守卫 =====
+//   事故：v3.59.0 给 Kimi 行正则加「单位」捕获组 → 分组编号整体 +1，但
+//   `prices = re.findall(r'"¥([\d.]+)"', m.group(2))` 没跟着改（group(2) 现在是单位串 "1M"）
+//   → findall 恒返回空 → **每一行都走 else: continue → Kimi 整厂商 0 模型、零行级告警**，
+//   潜伏 v3.59.0~v3.60.0 两个版本。pricing.json 里 kimi 尚有 3 条 lock 价，所以现象不是「全缺失」，
+//   而是「**永不更新**」——新模型（kimi-k2.7-code 等）直接掉 DEFAULT_RATE 兜底价，用户无感知。
+//   修法：正则改**命名分组** + 行解析抽成纯函数 parse_kimi_row（可夹具测试、不打网络）。
+//   本守卫 = 源码侧钉死命名分组与调用形态 + 行为侧用**真身纯函数**喂样本行断言字段。
+{
+  const fcpRaw = fs.readFileSync(path.join(SRC, 'fetch-cn-prices.py'), 'utf-8').replace(/\r\n/g, '\n');
+  // py 注释剥离（带引号状态）—— 守卫必须扫"代码"，注释里同文本不算（否则可被注释绕过）。
+  const stripPy = (s) => s.split('\n').map((line) => {
+    let out = ''; let q = null;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (q) { out += c; if (c === '\\') out += line[++i] || ''; else if (c === q) q = null; continue; }
+      if (c === '"' || c === "'") { q = c; out += c; continue; }
+      if (c === '#') break;
+      out += c;
+    }
+    return out;
+  }).join('\n');
+  const fcp = stripPy(fcpRaw);
+  // 锚点收窄到 Kimi 段：全文件扫会误伤别的解析器（阶跃 parse_stepfun_md 合法使用 m.group(2)）——
+  //   守卫必须锚到"那一处"，否则要么恒绿要么误报（本项目纪律）。
+  const kimiSeg = fcp.slice(fcp.indexOf('KIMI_ROW_RE'), fcp.indexOf('def parse_pricing_deepseek'));
+  ok('T87-a1 ★Kimi 行正则必须用命名分组（name/unit/prices/total）——根治分组索引漂移',
+    /KIMI_ROW_RE\s*=\s*re\.compile\(/.test(kimiSeg)
+    && /\(\?P<name>/.test(kimiSeg) && /\(\?P<unit>/.test(kimiSeg)
+    && /\(\?P<prices>/.test(kimiSeg) && /\(\?P<total>/.test(kimiSeg));
+  ok('T87-a2 ★Kimi 段不得再用数字分组取价格段（m.group(2)/group(3) 即 F1 病根）',
+    !/m\.group\(\s*[23]\s*\)/.test(kimiSeg),
+    'Kimi 段仍出现 m.group(2)/m.group(3) —— 命名分组被改回数字索引，F1 会复发');
+  ok('T87-a3 ★parse_kimi 必须调用纯函数 parse_kimi_row（夹具测试的挂点）',
+    /def parse_kimi_row\(/.test(fcp) && /parse_kimi_row\(line\)/.test(fcp)
+    && /KIMI_ROW_RE\.match\(/.test(fcp));
+  ok('T87-a4 ★细粒度告警：匹配到行却 0 条收录必须 WARN（区分"页面没行"与"行全被跳过"）',
+    /matched_rows/.test(fcp) && /0 条收录/.test(fcpRaw));
+
+  // ── 行为组：require 真身纯函数喂样本行（不打网络）──
+  const pyCands87 = [];
+  if (process.env.CN_PYTHON) pyCands87.push(process.env.CN_PYTHON);
+  pyCands87.push('python', 'python3');
+  let PY87 = null;
+  for (const c of pyCands87) {
+    const t = spawnSync(c, ['-V'], { encoding: 'utf8', windowsHide: true, timeout: 20000 });
+    if (t.status === 0) { PY87 = c; break; }
+  }
+  if (!PY87) envSkip('T87-b 行为组（Kimi 行解析夹具）', 'python 不可用');
+  else {
+    const fw87 = path.join(tmp, 'b87kimi');
+    fs.mkdirSync(fw87, { recursive: true });
+    const py87 = [
+      '# -*- coding: utf-8 -*-',
+      'import importlib.util, json, sys, re',
+      "_spec = importlib.util.spec_from_file_location('fcp87', " + JSON.stringify(path.join(SRC, 'fetch-cn-prices.py')) + ")",
+      'F = importlib.util.module_from_spec(_spec)',
+      '_spec.loader.exec_module(F)',
+      'fails = []',
+      'def chk(n, c, d=""):',
+      '    print(("  OK   " if c else "  FAIL ") + n + (("  " + d) if d else ""))',
+      '    if not c: fails.append(n)',
+      'K3 = \'["kimi-k3","1M tokens","\u00a520.00","\u00a540.00","\u00a52.00","\u00a520.00","\u00a5100.00","1,048,576 tokens"]\'',
+      'K27 = \'["kimi-k2.7-code","1M tokens","\u00a51.30","\u00a56.50","\u00a527.00","262,144 tokens"]\'',
+      'r3, why3 = F.parse_kimi_row(K3)',
+      'chk("k3 行解析成功（5 价取末 3 位）", r3 is not None and why3 is None, "why=%r" % (why3,))',
+      'chk("k3 in=20.00", bool(r3) and r3["in_price"] == ["20.00\u5143"], "got=%r" % (r3 and r3["in_price"],))',
+      'chk("k3 out=100.00", bool(r3) and r3["out_price"] == ["100.00\u5143"])',
+      'chk("k3 cache=2.00", bool(r3) and r3["cache_hit"] == ["2.00\u5143"])',
+      'chk("k3 unit \u56de\u4f20 \u5143/\u767e\u4e07 tokens", bool(r3) and r3["unit"] == "\u5143/\u767e\u4e07 tokens")',
+      'chk("k3 brand=kimi", bool(r3) and r3["brand"] == "kimi")',
+      'r27, why27 = F.parse_kimi_row(K27)',
+      'chk("k2.7-code in=6.50 / out=27.00 / cache=1.30", bool(r27) and r27["in_price"] == ["6.50\u5143"] and r27["out_price"] == ["27.00\u5143"] and r27["cache_hit"] == ["1.30\u5143"], "got=%r" % (r27,))',
+      '_, w_unit = F.parse_kimi_row(\'["kimi-k3","2K tokens","\u00a51.30","\u00a56.50","\u00a527.00","262,144 tokens"]\')',
+      'chk("\u8ba1\u4ef7\u5355\u4f4d\u975e 1M \u2192 reason=unit\uff08v3.59.0 S5 \u5355\u4f4d\u65ad\u8a00\u4fdd\u6301\uff09", w_unit == "unit", "got=%r" % (w_unit,))',
+      '_, w_pr = F.parse_kimi_row(\'["kimi-x","1M tokens","\u00a51.30","262,144 tokens"]\')',
+      'chk("\u4ef7\u683c\u4e2a\u6570\u4e0d\u8db3 2 \u2192 reason=prices", w_pr == "prices", "got=%r" % (w_pr,))',
+      '_, w_nm = F.parse_kimi_row("\u8fd9\u4e0d\u662f\u8868\u683c\u884c")',
+      'chk("\u975e\u8868\u683c\u884c \u2192 reason=no-match", w_nm == "no-match", "got=%r" % (w_nm,))',
+      'gi = sorted(F.KIMI_ROW_RE.groupindex.keys())',
+      'chk("groupindex \u6070\u4e3a\u56db\u547d\u540d\u5206\u7ec4\uff08\u4e0d\u6df7\u6570\u5b57\u5206\u7ec4\uff09", gi == ["name", "prices", "total", "unit"], "got=%r" % (gi,))',
+      // \u8de8\u6587\u4ef6\u4e00\u81f4\u6027\uff1ak3 \u89e3\u6790\u7ed3\u679c\u5fc5\u987b\u4e0e pricing.json \u91cc\u7528\u6237\u5df2\u6821\u5bf9\u7684 lock \u4ef7\u5b8c\u5168\u4e00\u81f4\uff08\u5426\u5219\u89e3\u6790\u5668\u4e0e\u5df2\u53d1\u5e03\u4ef7\u5c31\u5206\u53c9\u4e86\uff09',
+      'P = "pricing.json"',
+      'import os',
+      'pp = os.path.join(' + JSON.stringify(SRC) + ', "pricing.json")',
+      'try:',
+      '    lock = json.load(open(pp, encoding="utf-8"))["models"].get("kimi-k3", {})',
+      '    chk("\u8de8\u6587\u4ef6\uff1ak3 \u89e3\u6790\u503c == pricing.json lock \u4ef7\uff08in20/cached2/out100\uff09",',
+      '        bool(r3) and float(r3["in_price"][0][:-1]) == float(lock.get("input_price"))',
+      '        and float(r3["out_price"][0][:-1]) == float(lock.get("output_price"))',
+      '        and float(r3["cache_hit"][0][:-1]) == float(lock.get("cached_price")),',
+      '        "lock=%r" % ({k: lock.get(k) for k in ("input_price", "output_price", "cached_price")},))',
+      'except Exception as e:',
+      '    chk("\u8de8\u6587\u4ef6\uff1apricing.json \u8bfb\u53d6", False, repr(e)[:120])',
+      'print("RESULT %d %d" % (len(fails), 0))',
+      'sys.exit(1 if fails else 0)',
+    ].join('\n');
+    const pf87 = path.join(fw87, 't87.py');
+    fs.writeFileSync(pf87, py87, 'utf8');
+    const r87 = spawnSync(PY87, [pf87], { encoding: 'utf8', timeout: 120000, windowsHide: true, env: Object.assign({}, process.env, PY_IO_ENV) });
+    let matched87 = 0;
+    for (const ln of String(r87.stdout || '').split(/\r?\n/)) {
+      const m = /^\s*(OK|FAIL)\s+(.*)$/.exec(ln);
+      if (m) ok('T87-b' + (++matched87) + ' ' + m[2], m[1] === 'OK');
+    }
+    ok('T87-b0 行为组断言行被识别（python 输出格式/编码异常时此处暴露原文）',
+      matched87 > 0,
+      'status=' + r87.status + ' lines=' + String(r87.stdout || '').split('\n').length
+      + ' stdout=[' + String(r87.stdout || '').replace(/\n/g, '\\n') + ']'
+      + ' stderr=[' + String(r87.stderr || '').slice(0, 600) + ']');
+    try { fs.rmSync(fw87, { recursive: true, force: true }); } catch (e) { /* 清理失败不影响断言 */ }
+  }
+}
+
+// ===== T88（v3.61.0 · 审计 F2，致命）：残行口径单一实现 + backfill/主链一致性 =====
+//   事故：主链 readTranscLinesFrom 自 v3.42.0（A19）起「残行 parse 成功 → 收下该行且水位线 +1」；
+//   而 backfill.js 的 readRows 用 `raw.split('\n')` 把残行**也解析进 rows**（= 回填已记它的 token），
+//    physicalLines 却只数 '\n'（水位线没盖住这一行）→ 跑过 backfill 后，主链下一轮从旧水位线
+//   **重读该残行 = 同一行 token 记两次**（钱量双错、静默）。
+//   修法：抽 transc-lines.js 的 measureTranscriptLines 作单一实现，两侧共用。
+//   本守卫 = 源码侧钉死两侧都调它 + 行为侧断言「残行被 rows 收录 ⇔ 水位线 +1」这个不变量。
+{
+  const tlSrc = (() => { try { return fs.readFileSync(path.join(SRC, 'transc-lines.js'), 'utf-8').replace(/\r\n/g, '\n'); } catch (e) { return ''; } })();
+  const bfRaw = fs.readFileSync(path.join(SRC, 'backfill.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const bf = stripComments(bfRaw);
+  const ttRaw = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const tt = stripComments(ttRaw);
+  ok('T88-a1 ★transc-lines.js 必须存在且导出 measureTranscriptLines',
+    /function measureTranscriptLines/.test(tlSrc) && /module\.exports\s*=\s*\{\s*measureTranscriptLines/.test(tlSrc));
+  ok('T88-a2 ★backfill 的 physicalLines 必须来自 measureTranscriptLines（不得再裸数 \'\\n\'）',
+    /measureTranscriptLines\(raw\)\.lines/.test(bf) && !/raw\.match\(\/\\n\/g\)/.test(bf),
+    'backfill 仍在自行数 \'\\n\' —— F2 会复发');
+  ok('T88-a3 ★主链 readTranscLinesFrom 必须调用同一个 measureTranscriptLines',
+    /measureTranscriptLines\(buf\.toString\('utf-8', off\)\)/.test(tt));
+  ok('T88-a4 ★backfill 必须 require transc-lines.js（依赖显式，防"复制实现靠注释同步"）',
+    /require\('\.\/transc-lines\.js'\)/.test(bf));
+
+  let TL = null;
+  try { TL = require(path.join(SRC, 'transc-lines.js')); } catch (e) { TL = null; }
+  if (!TL || typeof TL.measureTranscriptLines !== 'function') {
+    ok('T88-b0 transc-lines.js 可被 require（纯模块、无副作用）', false, 'require 失败');
+  } else {
+    ok('T88-b0 transc-lines.js 可被 require（纯模块、无副作用）', true);
+    const M = TL.measureTranscriptLines;
+    const line = (n) => Array.from({ length: n }, (_, i) => JSON.stringify({ i, ts: 1000 + i })).join('\n');
+    const full = line(5) + '\n';                                   // 5 完整行 + 正常尾
+    const residual = line(5) + '\n' + JSON.stringify({ i: 99 });    // 5 完整行 + 残行（合法 JSON）
+    const half = line(5) + '\n' + '{"i": 99, "ts":';                 // 5 完整行 + 半写残缺行
+    const empty = '';
+    const mFull = M(full), mRes = M(residual), mHalf = M(half), mEmpty = M(empty);
+    ok('T88-b1 ★残行是合法 JSON → 行数 +1 且 residualRow 非空（v3.42.0 A19 语义）',
+      mRes.lines === 6 && mRes.residualRow && mRes.residualRow.i === 99,
+      'lines=' + mRes.lines + ' residualRow=' + JSON.stringify(mRes.residualRow));
+    ok('T88-b2 半写残缺行 → 不加 1、residualRow 为空（等文件长全再读，绝不提前记账）',
+      mHalf.lines === 5 && mHalf.residualRow === null, 'lines=' + mHalf.lines);
+    ok('T88-b3 正常尾（以 \'\\n\' 结尾）→ 不加 1', mFull.lines === 5 && mFull.residualRow === null, 'lines=' + mFull.lines);
+    ok('T88-b4 空文本 → 0', mEmpty.lines === 0);
+    ok('T88-b5 CRLF 文本与 LF 同结果（行尾无关）',
+      M(full.replace(/\n/g, '\r\n')).lines === mFull.lines
+      && M(residual.replace(/\n/g, '\r\n')).lines === mRes.lines
+      && M(residual.replace(/\n/g, '\r\n')).residualRow !== null);
+    // 核心不变量：残行被 backfill 的 rows 收录 ⇔ 被水位线盖住（F2 的病灶就是这两件事脱钩）
+    const inRows = (text) => {
+      const last = text.split('\n').slice(-1)[0].trim();
+      if (!last) return false;
+      try { JSON.parse(last); return true; } catch (e) { return false; }
+    };
+    const samples = [full, residual, half, empty, line(3), line(3) + '\n' + '{}'];
+    let invOk = true; const invDetail = [];
+    for (const s of samples) {
+      const m = M(s);
+      const nl = (s.match(/\n/g) || []).length;
+      const rowHas = inRows(s);
+      const resHas = m.residualRow !== null;
+      if (resHas !== rowHas) { invOk = false; invDetail.push('脱钩: ' + JSON.stringify(s.slice(-24))); }
+      if (m.lines !== nl + (rowHas ? 1 : 0)) { invOk = false; invDetail.push('行数错: ' + JSON.stringify(s.slice(-24))); }
+    }
+    ok('T88-b6 ★不变量：残行被 rows 收录 ⇔ 水位线 +1（F2 病灶即二者脱钩）',
+      invOk, invDetail.join(' | '));
+  }
+}
+
+// ===== T89（v3.61.0 · 审计 S1/S4，严重）：Stop hook 顶层异常守卫 + toast 失败不再静默 =====
+//   事故：Stop hook 是产品核心交付物（toast）的**唯一出口**。修前主流程无顶层 try —— transcript 畸形 /
+//   快照读取抛非 SyntaxError（EACCES 等）/ 任何未预期输入，异常直接冒泡出 Stop hook：本轮通知彻底
+//   静默丢失、无降级、退出码仍 0；异常若发生在持锁段内，还可能绕过 clearCoalesce/lastStopAt 收尾，
+//   把冷却状态留在脏值，影响下一轮合并判定。
+//   另外（S4）：同步弹窗的 catch 只打一行 stderr，而**普通轮本就不写 coalesce** → toast 一抛就是零兜底。
+//   修法：①handleStopEnd 包顶层 try/catch（降级 toast + out + 返回 true，不推进 lastStopAt）；
+//          ②同步弹窗 catch 里补降级 toast + 留痕。
+{
+  const shRaw = fs.readFileSync(path.join(SRC, 'stop-handler.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const sh = stripComments(shRaw);
+  // ⚠ 判据收紧（v3.61.0 反向验证 R3 抓到假绿）：改前有个
+  //   `|| (function handleStopEnd 存在 && return handleStopEndInner(ctx) 存在)` 兜底分支 ——
+  //   把「守卫被拆掉、只剩裸转发」的回退形态也判成绿（实测 R3 回退后 a1 仍绿 = 守卫等于没有）。
+  //   按「锚点必须唯一到那一处」纪律：只认「try 包住 Inner 调用」这一种形态，裸转发不算。
+  ok('T89-a1 ★handleStopEnd 必须是顶层守卫（try 包住 handleStopEndInner；裸转发不算）',
+    /function handleStopEnd\(ctx\)\s*\{[^}]*try\s*\{[^}]*handleStopEndInner\(ctx\)/.test(sh));
+  ok('T89-a2 ★原主流程必须改名为 handleStopEndInner（守卫有东西可包）',
+    /function handleStopEndInner\(ctx\)/.test(sh));
+  ok('T89-a3 ★同步弹窗 catch 必须有降级 toast（普通轮不写 coalesce → 否则零兜底）',
+    /⚠ 本轮用量显示失败/.test(shRaw) && /stop-sync-toast-failed/.test(shRaw));
+  ok('T89-a4 ★降级路径不得推进 lastStopAt（轮保持开放 → 下轮从原轮起点补弹，防重复记账）',
+    /未推进 lastStopAt/.test(shRaw));
+
+  let SH = null;
+  try { SH = require(path.join(SRC, 'stop-handler.js')); } catch (e) { SH = null; }
+  if (!SH || typeof SH.handleStopEnd !== 'function') {
+    ok('T89-b0 stop-handler.js 可被 require', false, 'require 失败');
+  } else {
+    ok('T89-b0 stop-handler.js 可被 require', true);
+    // b1：ctx 为 null（解构即抛 TypeError）→ 顶层守卫必须兜住、不得冒泡、必须返回 true
+    let threw = null; let ret = null;
+    try { ret = SH.handleStopEnd(null); } catch (e) { threw = e; }
+    ok('T89-b1 ★ctx=null（内部必抛）不得冒泡，且返回 true（已降级收口）',
+      threw === null && ret === true,
+      'threw=' + (threw && threw.message) + ' ret=' + JSON.stringify(ret));
+    // b2：降级 toast 自身也抛 → 仍不得冒泡，且 out 必须被调到（hook 正常收口）
+    let outCalled = 0; let threw2 = null; let ret2 = null;
+    const badCtx = {
+      sid: 'x', payloadRaw: '{}', pricing: {},
+      out: () => { outCalled++; },
+      tx: { showToast: () => { throw new Error('toast-boom'); } },
+    };
+    try { ret2 = SH.handleStopEnd(badCtx); } catch (e) { threw2 = e; }
+    ok('T89-b2 ★降级 toast 自身再抛也不冒泡，且 out 被调用（hook 收口）',
+      threw2 === null && ret2 === true && outCalled === 1,
+      'threw=' + (threw2 && threw2.message) + ' ret=' + JSON.stringify(ret2) + ' outCalled=' + outCalled);
+    // b3：out 自身也抛 → 依旧不得冒泡（catch 里绝不能再抛）
+    let threw3 = null; let ret3 = null;
+    const badCtx2 = { sid: 'x', payloadRaw: '{}', pricing: {}, out: () => { throw new Error('out-boom'); }, tx: {} };
+    try { ret3 = SH.handleStopEnd(badCtx2); } catch (e) { threw3 = e; }
+    ok('T89-b3 ★out 自身也抛时依旧不冒泡（catch 内绝不再抛）',
+      threw3 === null && ret3 === true, 'threw=' + (threw3 && threw3.message) + ' ret=' + JSON.stringify(ret3));
+  }
+}
+
+// ===== T90（v3.61.0 · 审计 S2/G4）：失败可见性 + 水位线只许前进 =====
+//   S2：build_index.py 的 prev 读取修前是裸 except → prev=None **静默无告警**，「首次构建」与
+//       「上一版索引损坏/权限异常」在输出里长得一模一样（都是 gate_full=False）→ 索引损坏时闸门退化、
+//       沿用基线丢失，用户却只看到一次"正常"刷新。（写出空索引那条已被 :666 安全阀挡住。）
+//   G4：backfill 的 rollbackWatermark 修前**盲恢复 bak2**（写入前快照）→ 写入后主链路可能已并发推高
+//       水位线 → 一并抹掉 = 水位线**回退** → 下轮主链重读已记账行 = **重复计费**（不可恢复地多收费）。
+//       修法：默认不回退（只许单调递增），确需回退显式 --force。
+{
+  const biRaw = fs.readFileSync(path.join(SRC, 'build_index.py'), 'utf-8').replace(/\r\n/g, '\n');
+  const stripPy = (s) => s.split('\n').map((line) => {
+    let out = ''; let q = null;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (q) { out += c; if (c === '\\') out += line[++i] || ''; else if (c === q) q = null; continue; }
+      if (c === '"' || c === "'") { q = c; out += c; continue; }
+      if (c === '#') break;
+      out += c;
+    }
+    return out;
+  }).join('\n');
+  const bi = stripPy(biRaw);
+  ok('T90-a1 ★prev 读取失败必须显式告警并区分「首次构建」与「异常损坏」',
+    /prev_read_error/.test(bi) && /上一版索引 %s 读取失败/.test(biRaw) && /os\.path\.exists\(OUT\)/.test(bi),
+    '剥注释后未见 prev_read_error / 告警文案 —— S2 的"看不见"会复发');
+  const bfAll = fs.readFileSync(path.join(SRC, 'backfill.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const bfCode = stripComments(bfAll);
+  ok('T90-a2 ★水位线回滚默认关闭（只许单调递增），确需回退要显式 --force',
+    /keptMonotonic/.test(bfCode) && /process\.argv\.includes\('--force'\)/.test(bfCode));
+  ok('T90-a3 ★回滚文案必须把「未回退（默认单调）」讲清楚（回滚本身是更危险的选项）',
+    /未回退（默认单调递增/.test(bfAll));
+
+  // ── 行为组：真跑 build_index（CN_PRICES_DIR/WB_ROOT 全隔离），验证「损坏索引必须喊出来」──
+  //   源码守卫只能证明"代码这么写"，证明不了"跑起来真的会喊"——S2 治的正是"看不见"，所以必须端到端。
+  const pyCands90 = [];
+  if (process.env.CN_PYTHON) pyCands90.push(process.env.CN_PYTHON);
+  pyCands90.push('python', 'python3');
+  let PY90 = null;
+  for (const c of pyCands90) {
+    const t = spawnSync(c, ['-V'], { encoding: 'utf8', windowsHide: true, timeout: 20000 });
+    if (t.status === 0) { PY90 = c; break; }
+  }
+  if (!PY90) envSkip('T90-b 行为组（损坏索引必须告警）', 'python 不可用');
+  else {
+    const fw90 = path.join(tmp, 'b90bi');
+    const sk90 = path.join(fw90, 'skills', 'token-usage-tracker');
+    fs.mkdirSync(sk90, { recursive: true });
+    try { fs.copyFileSync(path.join(SRC, 'pricing.json'), path.join(sk90, 'pricing.json')); } catch (e) { /* 缺 pricing.json 时下面会暴露 */ }
+    const py90 = [
+      '# -*- coding: utf-8 -*-',
+      'import importlib.util, os, sys, json, tempfile, io, contextlib',
+      'base = tempfile.mkdtemp(prefix="t90-")',
+      'prices = os.path.join(base, "prices"); os.makedirs(prices)',
+      'wb = os.path.join(base, "wb"); sk = os.path.join(wb, "skills", "token-usage-tracker"); os.makedirs(sk)',
+      'import shutil',
+      'shutil.copyfile(' + JSON.stringify(path.join(SRC, 'pricing.json')) + ', os.path.join(sk, "pricing.json"))',
+      'os.environ["CN_PRICES_DIR"] = prices',
+      'os.environ["WB_ROOT"] = wb',
+      'fails = []',
+      'def chk(n, c, d=""):',
+      '    print(("  OK   " if c else "  FAIL ") + n + (("  " + d) if d else ""))',
+      '    if not c: fails.append(n)',
+      '# \u4e0a\u4e00\u7248\u7d22\u5f15\u5199\u574f\uff08JSON \u8bed\u6cd5\u9519\uff09',
+      'open(os.path.join(prices, "index.json"), "w", encoding="utf-8").write(\'{"models": {oops\')',
+      '_spec = importlib.util.spec_from_file_location("bi90", ' + JSON.stringify(path.join(SRC, 'build_index.py')) + ')',
+      'M = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(M)',
+      'err = io.StringIO()',
+      'try:',
+      '    with contextlib.redirect_stderr(err):',
+      '        M.main()',
+      'except Exception as e:',
+      '    pass  # \u4ea7\u7269\u7ed3\u679c\u5982\u4f55\u4e0d\u5f71\u54cd\u672c\u65ad\u8a00\uff1a\u6211\u4eec\u53ea\u5173\u5fc3\u544a\u8b66\u662f\u5426\u6253\u51fa\u6765',
+      'o = err.getvalue()',
+      'chk("\u635f\u574f\u7684\u4e0a\u4e00\u7248\u7d22\u5f15 \u2192 \u663e\u5f0f\u544a\u8b66\uff08\u4e0d\u518d\u9759\u9ed8 prev=None\uff09",',
+      '    ("\u4e0a\u4e00\u7248\u7d22\u5f15" in o and "\u8bfb\u53d6\u5931\u8d25" in o), o[:300].replace("\\n", " | "))',
+      'chk("\u544a\u8b66\u91cc\u5fc5\u987b\u533a\u5206\u201c\u9996\u6b21\u6784\u5efa\u201d\u4e0e\u201c\u5f02\u5e38\u635f\u574f\u201d\uff08\u63d0\u5230\u6700\u5c0f\u5951\u7ea6\u95e8/\u7ef4\u6c9b\u57fa\u7ebf\uff09",',
+      '    ("\u9996\u6b21\u6784\u5efa" in o) or ("\u7ef4\u6c9b\u57fa\u7ebf" in o), o[:300].replace("\\n", " | "))',
+      'print("RESULT %d %d" % (len(fails), 0))',
+      'sys.exit(1 if fails else 0)',
+    ].join('\n');
+    const pf90 = path.join(fw90, 't90.py');
+    fs.writeFileSync(pf90, py90, 'utf8');
+    const r90 = spawnSync(PY90, [pf90], { encoding: 'utf8', timeout: 180000, windowsHide: true, env: Object.assign({}, process.env, PY_IO_ENV) });
+    let matched90 = 0;
+    for (const ln of String(r90.stdout || '').split(/\r?\n/)) {
+      const m = /^\s*(OK|FAIL)\s+(.*)$/.exec(ln);
+      if (m) ok('T90-b' + (++matched90) + ' ' + m[2], m[1] === 'OK');
+    }
+    ok('T90-b0 行为组断言行被识别（python 输出格式/编码异常时此处暴露原文）',
+      matched90 > 0,
+      'status=' + r90.status + ' stdout=[' + String(r90.stdout || '').replace(/\n/g, '\\n') + ']'
+      + ' stderr=[' + String(r90.stderr || '').slice(0, 600) + ']');
+    try { fs.rmSync(fw90, { recursive: true, force: true }); } catch (e) { /* 清理失败不影响断言 */ }
+  }
 }
 
 //   为什么需要：主脚本在被 require 时会跑 loadPricing → maybeRefreshHolidays（每进程一次、四条件命中即

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.60.0 (2026-10-15)
+// token-usage-tracker v3.61.0 (2026-10-16)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -64,6 +64,7 @@ const priceRefreshModule = require('./refresh-prices.js');
 //   它需要的 46 个只读能力由调用点显式注入（漏传/改名 → selftest T37 立刻红）。
 const { handleStopEnd, STOP_TX_NAMES } = require('./stop-handler.js');
 const { detectWorkBuddyRoot } = require('./wb-root.js'); // v3.42.0（plan-B B1）：数据根探测单点实现，已抽到 wb-root.js
+const { measureTranscriptLines } = require('./transc-lines.js'); // v3.61.0（审计 F2）：行数/残行口径单一实现（与 backfill 共用）
 
 // v3.16（2026-09-28，外部用户 PR#2 要点采纳）：数据根智能探测。
 // 背景：较新版本 WorkBuddy 客户端可能把数据根迁移到 ~/.workbuddy-ai（~/.workbuddy 仅剩
@@ -1148,22 +1149,19 @@ function readTranscLinesFrom(tsPath, fromLine) {
   // 残余段起点：最后一个 '\n' 之后；若 lastNl 在 off 之前（off 之后已无任何 '\n'），
   // 则 off 到末尾整体都是残余段。
   const tailStart = (lastNl >= off) ? lastNl + 1 : off;
-  // 统计 [off, tailStart) 内（即最后一个 '\n' 之前）的完整行数 = '\n' 个数
-  let added = 0;
-  for (let p = buf.indexOf(0x0a, off); p !== -1 && p < tailStart; p = buf.indexOf(0x0a, p + 1)) added++;
-  // 残余段：最后 '\n' 之后到 EOF。若它是合法完整 JSON（如末尾无 trailing '\n' 的已写完行）则收下，
-  // 否则（半写残缺行）安全跳过，等下一轮文件长全再读。
-  const tail = buf.toString('utf-8', tailStart);
-  const tailTrim = tail.trim();
-  let tailRow = null;
-  if (tailTrim) {
-    try { tailRow = JSON.parse(tailTrim); } catch (e) { /* 残缺 JSON → 安全跳过 */ }
-  }
+  // v3.61.0（审计 F2，致命）：行数口径（**含残行 +1**）收敛到 transc-lines.js 的单一实现，
+  //   与 backfill.js 的 readRows **共用同一个函数**。
+  //   修前这里是本地手写一份「数 '\n'，残行 parse 成功再 +1」，而 backfill 那份只数 '\n'
+  //   → 跑过 backfill 后，主链下一轮从旧水位线**重读该残行 = 同一行 token 记两次**（钱量双错、静默）。
+  //   现在由**调用关系**保证两侧一致，不再有"复制实现靠注释同步"这最后一处。
+  const measured = measureTranscriptLines(buf.toString('utf-8', off));
+  const added = measured.lines;
+  const tail = measured.residualText;
+  const tailRow = measured.residualRow;
   // 拼装解析输入：完整行段 + 末尾残行（若有）。用同一个 parseTranscChunk 保证行结构完全一致。
   let chunk = buf.toString('utf-8', off, tailStart);
   if (tailRow !== null) {
     chunk += '\n' + tail; // 以换行拼入残行，parseTranscChunk 按行 split 可正确解析出该残行
-    added++;              // ⚠ 残行计入水位线（见上方计数同步说明），避免下一轮重读重复计费
   }
   const rows = parseTranscChunk(chunk);
   return { rows, totalLines: start + added };
@@ -6148,7 +6146,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.60.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.61.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

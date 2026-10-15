@@ -25,7 +25,35 @@
 const fs = require('fs');
 const path = require('path');
 
+// v3.61.0（审计 S1，严重）：Stop hook **顶层异常守卫**。
+//   Stop hook 是产品核心交付物（toast）的**唯一出口**：任何未捕获异常都会让本轮通知彻底静默丢失
+//   （无降级、无补弹、退出码仍 0）；异常若发生在持锁段内，还可能绕过 clearCoalesce / lastStopAt
+//   收尾，把冷却状态留在脏值，影响下一轮合并判定。
+//   修法：包一层 try/catch —— 失败时 ①stderr 留痕 ②尝试弹一条降级提示（自身再包 try，绝不能再抛）
+//   ③out() 保证 hook 正常收口 ④返回 true，**不让 main() 落到 traces 兜底路径**（那可能重复记账）。
+//   ⚠ 不推进 lastStopAt：轮保持开放 → 下轮 --hook 从原轮起点重新聚合补弹（与 v3.60.0 批 B 的水位线纪律同源：
+//     宁可少显示一次，不可重复记账）。
 function handleStopEnd(ctx) {
+  try {
+    return handleStopEndInner(ctx);
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    try { process.stderr.write(`[token-tracker] Stop 处理异常（已降级，未推进 lastStopAt）: ${msg}\n`); }
+    catch (e0) { /* silent-ok:诊断 — stderr 自身失败无从可写，只能放弃 */ }
+    try {
+      const tx = (ctx && ctx.tx) || {};
+      if (typeof tx.showToast === 'function') {
+        tx.showToast('⚠ 本轮用量统计失败', msg.slice(0, 120), 'stop-handler-crash', (ctx && ctx.sid) || null);
+      }
+    } catch (e1) { /* silent-ok:降级 — 降级 toast 自身失败就不再尝试，绝不能在 catch 里再抛 */ }
+    try {
+      if (ctx && typeof ctx.out === 'function') ctx.out({ hookSpecificOutput: {} });
+    } catch (e2) { /* silent-ok:降级 — out 失败只能尽人事，hook 框架会自行超时 */ }
+    return true; // 已在函数内收口（降级）
+  }
+}
+
+function handleStopEndInner(ctx) {
   const { sid, payloadRaw, pricing, out, tx } = ctx;
   const {
     SUBAGENT_IDLE_MS,
@@ -366,7 +394,24 @@ function handleStopEnd(ctx) {
               }, sid);
             } catch (e) { /* 快照写失败不影响弹窗 */ }
             appendCompactionLog(isPlainRound ? 'stop-plain-immediate' : 'stop-team-sync', { sid: effSid, subCount: agg && agg.subCount, teamActive: !!(agg && agg.teamActive), teamDataReady });
-          } catch (e) { process.stderr.write(`[token-tracker] 同步弹窗失败(${isPlainRound ? '普通轮' : '团队轮'}): ${e.message}\n`); }
+          } catch (e) {
+            process.stderr.write(`[token-tracker] 同步弹窗失败(${isPlainRound ? '普通轮' : '团队轮'}): ${e.message}\n`);
+            // v3.61.0（审计 S1/S4）：toast 失败**不能再静默**。
+            //   普通轮原本不写 coalesce → 这里一旦抛异常就是**零兜底**：本轮弹窗彻底丢失、无补弹、
+            //   退出码仍 0（用户以为"这轮没用量"）。团队轮虽有 coalesce 兜底，但状态停在一半
+            //   （coalesce 留着、lastStopAt 没推进）→ 下一轮合并判定基于脏状态。
+            //   修法：catch 里补一次降级 toast（自身再包 try，绝不能再抛）+ 留痕。
+            //   lastStopAt **保持不推进**：轮保持开放 → 下轮 --hook 从原轮起点重新聚合补弹
+            //   （与 v3.60.0 批 B 纪律一致：宁可少显示一次，不可重复记账）。
+            try {
+              showToast('⚠ 本轮用量显示失败', String((e && e.message) || e).slice(0, 120), 'toast-failed', tsPath);
+            } catch (e4) { /* silent-ok:降级 — 降级 toast 自身失败就不再尝试，绝不能在 catch 里再抛 */ }
+            try {
+              appendCompactionLog('stop-sync-toast-failed', {
+                sid: effSid, plain: !!isPlainRound, err: String((e && e.message) || e).slice(0, 200),
+              });
+            } catch (e5) { /* silent-ok:诊断 — 留痕失败不影响主流程 */ }
+          }
           out({ hookSpecificOutput: {} });
           return true;
         }
