@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // recalc-day.js —— 账本回溯重算工具（v2.93 附带，独立进程，不侵入 token-tracker.js 主链路）
 //
-// 用途：新模型价格补录之后，把当天曾按「未收录」记成 ¥0 的历史数据，按现价 + 峰谷重算。
+// 用途：新模型价格补录之后，把当天曾按「未收录」记成 ¥0 的历史数据，按**目标日当天的价格**
+//      （v3.62.0 起；此前一律用现价）+ 峰谷重算。
 //      没有这个工具时，补录只能让「之后的消耗」计上价，当天之前的部分永远是 0，账本失真。
 //
 // v3.24.0 行为变更（级联④）：**峰谷占比拿不到时不再改写已有金额** ——
@@ -9,19 +10,35 @@
 //   原账 = 0 → 按空闲价补记（本工具的核心用途：¥0 欠账补价，低估可接受且报告会标注）。
 //
 // 用法：
-//   node recalc-day.js                  → 重算今天（全部有价模型）
-//   node recalc-day.js 2026-09-10       → 重算指定日期
+//   node recalc-day.js                  → 重算今天（全部有价模型）【dry-run：只报告，不写账本】
+//   node recalc-day.js 2026-09-10       → 重算指定日期（dry-run）
 //   node recalc-day.js 2026-09-10 deepseek-v4.1-flash
+//   node recalc-day.js 2026-09-10 --write  → **写回账本**（先备份；默认必须显式加 --write）
+//   node recalc-day.js 2026-09-10 --current-price → 显式按**今天**的单价回算（逃逸口，见 F-3）
+//
+// ⚠ v3.62.0（外部审计 F-3/G-1）：两处行为变更 ——
+//   ① **价格口径**：由「pricing.json 现价」改为「**目标日当天的价格快照价**」（见下方「数据来源」）。
+//      厂商调价后跑 `node recalc-day.js <历史日>` 不再把那天的金额按今天的单价改写；
+//      该日无快照即**拒绝执行**（exit 1，并提示现有快照范围与 `--current-price` 逃逸口）。
+//   ② **默认行为**：由「直接写账本」反转为「只报告」（dry-run）。历史上它默认写盘，而文档与用户
+//      认知都把它当"查看历史金额"用 → 跑一次就把历史金额按当时的单价改写，账本失去可回放性。
+//      现在想写回必须显式 --write，且 dry-run 会明确提示"未写盘 + 价格口径"。
 //
 // 峰谷判定：读 toast 日志里该模型当天的轮次时间戳，按「工作日 9:00-12:00 / 14:00-18:00（北京）」
 //          判定高峰；按轮次数占比近似 token 占比（同一天内轮次分布不均时会有少量误差，日志中会标注）。
-// 数据来源：daily-usage.json（总量）+ token-tracker-toast.log（轮次时间）+ pricing.json（现价）
+// 数据来源：daily-usage.json（总量）+ token-tracker-toast.log（轮次时间）
+//   + **目标日当天的价格快照**（`prices/history/prices-<日期>.json`，由 build_index.py 每日落；
+//     v3.62.0/F-3 起为默认口径。`--current-price`、或"今天尚无快照"时回退 pricing.json 现价）
+// v3.62.0（外部审计 F-3）：快照里的价格才是那天主链路真实在用的价格（含 pricing.json 的 lock
+//   权威覆盖层）。缺快照时**拒绝回算**并提示 `--current-price` 逃逸口（显式声明"我就是要按
+//   今天的单价改写历史"，风险自担）。
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const peakRules = require('./peak-rules.js'); // v3.19.0（P1）：峰谷判定单一实现（原先硬编码时段，与官方动态时段脱节）
 const { detectWorkBuddyRoot } = require('./wb-root.js'); // v3.42.0（plan-B B1）：数据根探测单点实现，已抽到 wb-root.js
+const priceHistory = require('./price-history.js'); // v3.62.0（外部审计 F-3）：每日价格快照单一实现
 
 const WB = process.env.WB_ROOT || detectWorkBuddyRoot();
 const SKILL_DIR = path.join(WB, 'skills', 'token-usage-tracker');
@@ -224,8 +241,42 @@ function backupDaily() {
   } catch (e) { /* 备份失败不阻塞（写盘本身仍是原子的） */ }
 }
 
+// v3.62.0（外部审计 F-3/G-1）：CLI 参数解析（纯函数，selftest 直接单测 —— 只靠源码形态
+//   守不住"默认 dry-run"这个语义，必须能真跑一遍）。
+//   返回 { doWrite, currentPrice, unknown, argv }：
+//     · doWrite      —— 是否显式要求写盘（默认 false = dry-run）
+//     · currentPrice —— 是否显式要求按**现价**回算（默认 false = 按当天快照价）
+//     · unknown      —— 无法识别的 --flag（调用方据此 exit 2；位置参数口径完全不变）
+//     · argv         —— 剥掉 flag 后的位置参数（[日期] [模型名]）
+function parseWriteFlag(rawArgv) {
+  const arr = Array.isArray(rawArgv) ? rawArgv.map(String) : [];
+  const flags = arr.filter((a) => a.startsWith('--'));
+  const argv = arr.filter((a) => !a.startsWith('--'));
+  return {
+    doWrite: flags.includes('--write'),
+    currentPrice: flags.includes('--current-price'),
+    unknown: flags.filter((f) => f !== '--write' && f !== '--dry-run' && f !== '--current-price'),
+    argv,
+  };
+}
+
 function main() {
-  const argv = process.argv.slice(2);
+  const rawArgv = process.argv.slice(2);
+  // v3.62.0（外部审计 F-3 / G-1）：`--write` 显式开关，**默认 dry-run**。
+  //   改前本工具默认直接写账本，而它的价格口径是「现价」（见文件头「数据来源」行）——
+  //   于是 `node recalc-day.js 2026-09-10` 这个看起来像"查看历史金额"的命令，实际会把
+  //   那天的金额按**今天**的单价重写。账本因此失去"可回放"这个最值钱的属性，且
+  //   README/SKILL 从未对这一处写"会改写账本"（对读 key / 联网都警示充分，独独漏了它）。
+  //   现反转为：默认只报告不落盘；写盘必须显式 `--write`。
+  //   ⚠ 位置参数口径不变（日期、模型名）——先剥 flag 再取位置参数，故 `--write` 写在前后都行。
+  const parsed = parseWriteFlag(rawArgv);
+  const doWrite = parsed.doWrite;
+  const argv = parsed.argv;
+  if (parsed.unknown.length) {
+    console.error(`✗ 无法识别的参数：${parsed.unknown.join(' ')}`
+      + `（本工具只接受 --write 落盘 / --dry-run 只报告 / --current-price 按现价；位置参数为 [日期] [模型名]）`);
+    process.exit(2);
+  }
   // v3.24.0：缺省日期用**本地**日期（原 `toISOString()` 是 UTC —— 北京 00:00~08:00 之间跑，
   // 会把"今天"算成前一天：账本里没有那天的记录 → "账本中无 X 记录"，或重算了错误的一天）。
   const _n = new Date();
@@ -258,6 +309,58 @@ function main() {
   const day = daily[date];
   if (!day) { console.error(`账本中无 ${date} 记录`); process.exit(1); }
 
+  // ── v3.62.0（外部审计 F-3）：价格口径解析 —— 默认「当天价」，缺快照即拒绝 ──────────────
+  //   病根（审计原话）：本工具历来按 pricing.json 的**现价**回算历史。厂商调价后跑一次
+  //   `node recalc-day.js 2026-09-10`，那天的金额就被按**今天**的单价改写 —— 账本失去
+  //   "可回放"这个最值钱的属性，而命令看起来像"查看历史金额"，README/SKILL 从未警示。
+  //   修法：价库流水线每天落一份快照（build_index.py 的 write_price_history），回算按
+  //   「目标日」取快照。快照 = 那天索引的最终形态 = 那天主链路真实在用的价格
+  //   （含 pricing.json 的 lock 权威覆盖层）。
+  //   三条边界，逐条说清"为什么这么定"：
+  //    ① 缺快照 → **拒绝**（exit 1）：没有那天的价格材料，任何"回算"都是按今天的价编历史。
+  //       逃逸口是 `--current-price`（显式声明要按现价改写，风险自担，报告里标注口径）。
+  //    ② **今天**缺快照 → 按现价回算并标注：今天的现价就是当天的价（日内改价属极少数，
+  //       且快照由每日流水线产生，白天跑 recalc 时它通常还没落）。
+  //    ③ 快照里没有某模型 → 判"当天无价"（与索引侧 S-3 同口径）：那天价库里确实没有它，
+  //       不能拿今天的价补历史 —— 那正是 F-3 要消灭的行为。
+  //       ⚠ v3.62.0（外部审计 AUD-F-01）：这条前提**只从 AUD-F-01 修复那一版快照起才成立**。
+  //       旧快照只收索引层，pricing.json 自有条目（如 deepseek-v4.1-flash）缺席 →
+  //       它们在这条分支上被误判"当天无价"（保留原账/只记 token，且当时无任何告警）。
+  //       判据：快照 models 数与 `pricing.json ∪ index` 的模型数差多少（差得越多说明快照越旧）。
+  //   ⚠ 峰谷规则（deepseek_rules）**不在快照里**（它是 pricing.json 顶层字段、由
+  //      deepseek-official 每日刷新）：这里把当前规则透传给 at-time pricing，属已知残留
+  //      （历史某天规则与今天不同时，峰谷判定仍按今天的规则）。价格才是金额主项，
+  //      规则的时态差异留待快照格式扩展，此处如实标注、不装作没有。
+  let priceBasis = '';        // 报告/提示里显示的口径说明
+  let pricingUsed = pricing;  // recalcDay 实际查价用的 pricing
+  if (parsed.currentPrice) {
+    priceBasis = '现价（--current-price 显式指定：按今天的单价回算历史）';
+  } else {
+    const histDir = priceHistory.historyDirOf(tt.CN_PRICE_DIR);
+    const snap = priceHistory.readSnapshot(histDir, date);
+    if (snap) {
+      pricingUsed = priceHistory.pricingFromSnapshot(snap);
+      // 峰谷规则透传（见上方③的说明）：快照不含规则，用当前规则判历史时段
+      if (pricing && pricing.deepseek_rules) pricingUsed.deepseek_rules = pricing.deepseek_rules;
+      priceBasis = `当天价（快照 prices/history/prices-${date}.json，${(snap.models && Object.keys(snap.models).length) || 0} 个模型）`;
+    } else {
+      const isToday = date === (() => {
+        const n = new Date();
+        return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}-${String(n.getDate()).padStart(2, '0')}`;
+      })();
+      if (!isToday) {
+        const dates = priceHistory.listSnapshotDates(histDir);
+        console.error(`✗ ${date} 没有价格快照（${priceHistory.snapshotPath(histDir, date)} 不存在）→ 无法按**当天价**回算。`);
+        console.error('  按今天的单价回算历史会把那天的金额改写（审计 F-3 要消灭的行为）。两个选择：');
+        console.error('    ① 等每日价库流水线补建快照后重跑（快照自本次修复起每日生成，历史日期不会补建）；');
+        console.error('    ② 确认就是要按现价改写：加 --current-price 再跑一次（报告会标注该口径）。');
+        if (dates.length) console.error(`  现有快照：${dates[0]} ~ ${dates[dates.length - 1]}（共 ${dates.length} 天）`);
+        process.exit(1);
+      }
+      priceBasis = '现价（今天尚无快照：今天的现价即当天价）';
+    }
+  }
+
   // v3.29.0（S-2 补漏）：锁外预热 roundHoursOf —— 它是本工具里唯一的重 I/O（每次调用都整份读 toast 日志）。
   //   v3.56.0（G6）：预热改走 readToastRounds **一次读入、按模型分组** —— 原实现逐模型各整份读一遍
   //   （N 模型 = N 次全量读 + N 次全量 JSON.parse），日志随使用时间单调增长，成本线性恶化；
@@ -278,7 +381,10 @@ function main() {
   // v3.29.0（S-2 补漏）：把「重算一天」抽成函数，逻辑逐字搬自原 L115-175（findModel/峰谷/no_price/costOf 一律不动）。
   //   基准改为**传入的 dayObj**：锁内传入的是 cur[date] 现值（不再是锁外旧快照），
   //   这样「目标日期自己在锁外窗口被主链路追加的新数据」才不会被旧快照静默抹掉。
-  function recalcDay(dayObj) {
+  //   v3.62.0（外部审计 F-3）：第二个参数 pricingUsed = 本次回算的价格口径（默认当天快照价，
+  //   --current-price 时为现价）—— 原先函数体直接闭包引用外层的 pricing（= 现价），
+  //   那是 F-3 的病根；现在口径由调用方显式传入，函数本身不再隐含"用今天的价"。
+  function recalcDay(dayObj, pricingUsed) {
     let dayTotal = 0;
     const report = [];
     // v3.59.0（批16）：**可观测性补漏** —— recalc 此前没有任何"到底处理了几个模型"的输出信号：
@@ -300,7 +406,7 @@ function main() {
       // v3.23.5：查价改走主脚本的 findModel（归一化 + 边界匹配 + 别名），与 backfill / 主链路同口径。
       // 原先裸查字典 `(pricing.models || {})[model]` —— 账本里的模型名与价库键差一个后缀/别名就取不到价，
       // 表现为「同一天 backfill 算得出金额、recalc 算不出」，且没有任何报错。
-      const hit = tt.findModel(pricing, model, 'price');
+      const hit = tt.findModel(pricingUsed, model, 'price');
       const m = hit ? hit.m : null;
       if (!m || typeof m.input_price !== 'number') { dayTotal += safeCost(stat.cost); continue; }
 
@@ -315,7 +421,7 @@ function main() {
       let peakRatio = null;
       if (pm > 1) {
         if (hours) {
-          peakRatio = hours.filter((iso) => isPeakBeijing(iso, pricing)).length / hours.length;
+          peakRatio = hours.filter((iso) => isPeakBeijing(iso, pricingUsed)).length / hours.length;
         }
         // 有峰谷但拿不到轮次时间 → peakRatio 保持 null（占比未知 → 走降级路径）
       } else {
@@ -422,28 +528,45 @@ function main() {
   let rereadFailed = false;
   let targetMissing = false;
   let recalc = null;
-  const lockRes = tt.withFileLock(DAILY + '.lock', () => {
-    let cur = null;
-    try { cur = JSON.parse(fs.readFileSync(DAILY, 'utf-8').replace(/^\uFEFF/, '')); } catch (e) { cur = null; }
-    if (!cur || typeof cur !== 'object') { rereadFailed = true; return; } // 重读失败 → 不写，原文件保持不动
-    // v3.29.0（S-2 补漏）：目标日期锁外存在、锁内却没了（极端并发删除）→ 不写盘，锁外报错退出
-    if (!cur[date]) { targetMissing = true; return; }
-    backupDaily();          // 备份仍在本工具写盘之前执行
-    // v3.29.0（S-2 补漏）：以锁内现值 cur[date] 为基准重算（不再是锁外旧快照），其余日期绝不触碰
-    recalc = recalcDay(cur[date]);
-    writeOk = tt.saveDailyUsageRaw(cur);
-  }, { ttl: 300000, retries: 50 });
+  if (doWrite) {
+    const lockRes = tt.withFileLock(DAILY + '.lock', () => {
+      let cur = null;
+      try { cur = JSON.parse(fs.readFileSync(DAILY, 'utf-8').replace(/^\uFEFF/, '')); } catch (e) { cur = null; }
+      if (!cur || typeof cur !== 'object') { rereadFailed = true; return; } // 重读失败 → 不写，原文件保持不动
+      // v3.29.0（S-2 补漏）：目标日期锁外存在、锁内却没了（极端并发删除）→ 不写盘，锁外报错退出
+      if (!cur[date]) { targetMissing = true; return; }
+      backupDaily();          // 备份仍在本工具写盘之前执行
+      // v3.29.0（S-2 补漏）：以锁内现值 cur[date] 为基准重算（不再是锁外旧快照），其余日期绝不触碰
+      recalc = recalcDay(cur[date], pricingUsed);
+      writeOk = tt.saveDailyUsageRaw(cur);
+    }, { ttl: 300000, retries: 50 });
 
-  if (!lockRes || !lockRes.ok) {
-    // 抢锁失败：绝不无锁续写（否则又退回「旧快照整体覆盖」老问题）
-    console.error('账本正被占用（WorkBuddy 可能正在运行），请先退出 WorkBuddy 再执行 recalc-day');
-    process.exit(1);
+    if (!lockRes || !lockRes.ok) {
+      // 抢锁失败：绝不无锁续写（否则又退回「旧快照整体覆盖」老问题）
+      console.error('账本正被占用（WorkBuddy 可能正在运行），请先退出 WorkBuddy 再执行 recalc-day');
+      process.exit(1);
+    }
+    if (rereadFailed) { console.error('账本读取失败，原文件未改动；请检查 daily-usage.json'); process.exit(1); }
+    if (targetMissing) { console.error(`账本中无 ${date} 记录（重算期间被并发改动？）；原文件未改动`); process.exit(1); }
+    if (!writeOk) { console.error('账本写入失败，原文件未改动'); process.exit(1); }
+  } else {
+    // v3.62.0（外部审计 F-3/G-1）：dry-run —— **不进锁、不备份、不写盘**，只读快照算一遍报告。
+    //   与 --write 用同一个 recalcDay()，故两边的报告逐字一致（差异只在最后那行提示）。
+    recalc = recalcDay(day, pricingUsed);
   }
-  if (rereadFailed) { console.error('账本读取失败，原文件未改动；请检查 daily-usage.json'); process.exit(1); }
-  if (targetMissing) { console.error(`账本中无 ${date} 记录（重算期间被并发改动？）；原文件未改动`); process.exit(1); }
-  if (!writeOk) { console.error('账本写入失败，原文件未改动'); process.exit(1); }
 
-  console.log(`===== 回溯重算 ${date} =====`);
+  console.log(`===== 回溯重算 ${date}${doWrite ? '' : '（dry-run：未写盘）'} =====`);
+  // v3.62.0（外部审计 F-3/G-1）：dry-run 必须在**报告第一行之前**把"没写盘"说清楚，
+  //   并把"这份报告是按什么价算的"一并写明——否则用户看到"原 ¥1.20 → 现 ¥2.40"，
+  //   既不知道账本没变，也不知道差额来自"今天改了价"而不是"那天算错了"。
+  if (!doWrite) {
+    console.log('  ⚠ 本次为 dry-run：**未写回账本**，上面的金额只是推算的结果');
+    console.log(`  ⚠ 价格口径：${priceBasis}`);
+    if (!parsed.currentPrice) {
+      console.log('     （历史日按当天价回算 = 复现那天主链路的口径；确要按今天单价改写历史才加 --current-price）');
+    }
+    console.log('  确认要写回账本：加 --write 再跑一次（会先备份 daily-usage.json）');
+  }
   if (!recalc.report.length) console.log('无需修正（各模型金额已一致）');
   for (const r of recalc.report) {
     // v3.29.0：report 里有**两类**条目 —— ①「金额变更」带 old/neu/rounds/peakRatio；
@@ -468,4 +591,4 @@ function main() {
 if (require.main === module) main();
 
 // v3.58.0（批8-①）：safeCost 一并导出 —— 供 selftest 做**行为级**验证（只靠源码形态守不住「数值化」语义）。
-module.exports = { peakSplitOf, costOf, readToastRounds, groupToastLines, safeCost };
+module.exports = { peakSplitOf, costOf, readToastRounds, groupToastLines, safeCost, parseWriteFlag };

@@ -12,6 +12,9 @@ daily-usage.json
 .coalesce-*.json.lock
 .coalesce-*.json.watch-debug
 coalesce-*.json
+# v3.63.0：Stop「在飞标记」—— 内含**会话转录的本地绝对路径**，入库即泄露，且每个
+#   「最后一次 Stop 后再无事件」的会话都会留一个（不会自清）→ 必须忽略。
+.stopmark-*.json
 .transcript-*.jsonl
 .snapshot-dbg*.json
 .stop-probe*.json

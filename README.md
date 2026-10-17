@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.61.0-blue)
+![Version](https://img.shields.io/badge/version-v3.63.0-blue)
 
 > 在每次回答后显示 **Token 消耗 / 耗时 / 折算费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -86,24 +86,35 @@
 # ② 或把它加进 SKILL 顶部的查价开关清单，让每日刷新自动补价
 
 # 然后回算历史（自动备份 + 原子写 + 自动清除 no_price 标记）：
-node recalc-day.js              # 今天
-node recalc-day.js 2026-10-02   # 指定某天
+# ⚠ v3.62.0 起 recalc-day.js **默认只报告、不写账本**（dry-run），且按**目标日当天的价格快照**
+#   （prices/history/prices-<日期>.json，价库流水线每日生成，含 lock 权威覆盖层）回算——厂商调价后
+#   不再把历史金额按今天的单价改写。**该日没有快照就直接拒绝执行**（exit 1，并提示现有快照范围），
+#   免得"按今天的价编历史"；确要按现价改写历史，显式加 --current-price（报告会标注该口径）：
+node recalc-day.js              # 今天（dry-run：只报告，不改账本；今天的现价即当天价）
+node recalc-day.js 2026-10-02   # 指定某天（dry-run：按该日快照价）
+node recalc-day.js 2026-10-02 --write           # 确认要写回账本时才加（先备份 daily-usage.json）
+node recalc-day.js 2026-10-02 --current-price   # 该日无快照、且确认就是要按现价改写历史
 node recalc-day.js              # 不带参数即当天；历史多天需逐日执行
 ```
 
+> 快照说明：`backfill.js` 同样按**行所属日期**取快照计价（重建整本历史时绝大多数日期早于快照机制，故缺快照**降级为现价并逐日 stderr 告警**，不硬拒绝——与 recalc 刻意相反）；峰谷规则不在快照里，历史时段判定仍按当前规则（已知残留，见 `KNOWN-ISSUES.md` KI-31）。
+
 > 注意：⚠ `backfill --write` **不是**整份替换（v3.55.0 / KI-22 起是**模型级合并**：重放抓不到的 `(日期,模型)` 保留并标 `stale_carried`），但**抓得到的 (日期,模型) 一律用重放值覆盖、不取 max** → 用它回填时，transcript 被压缩掉的行对应的量照样会**减少**，**不要为回填目的跑它**（详见 `TROUBLESHOOTING.md` 与 KNOWN-ISSUES KI-5）。
 
-### ⚠️ 弹窗标注速查：`⚠未计价` / `⚠账缺` / `⚠缓存价未知` / `⚠价核验`
+### ⚠️ 弹窗标注速查：`⚠未计价` / `⚠账缺` / `⚠缓存价未知` / `⚠价核验` / `⚠价旧` / `⚠价锁` / `⚠假日`
 
-弹窗正文行（行2）末尾偶尔会出现 `｜⚠未计价` / `｜⚠账缺` / `｜⚠缓存价未知` / `｜⚠价核验`。它们和你直接能在弹窗里看到的 `（估算）` 一样，是**有意暴露的数据缺口提示**，不是渲染错误；`｜⚠无公开价` 见上一节。含义各不相同：
+弹窗正文行（行2）末尾偶尔会出现 `｜⚠未计价` / `｜⚠账缺` / `｜⚠缓存价未知` / `｜⚠价核验` / `｜⚠N家价旧` / `｜⚠价锁` / `｜⚠假日`。它们和你直接能在弹窗里看到的 `（估算）` 一样，是**有意暴露的数据缺口提示**，不是渲染错误；`｜⚠无公开价` 见上一节。含义各不相同：
 
 | 标注 | 出现位置 | 含义（触发条件） | 你该怎么办 |
 |---|---|---|---|
-| `｜⚠未计价` | 行2 末尾 | **本轮有 token 消耗、但金额算不出来**：该模型在 `pricing.json` 里查不到匹配（未收录 / `findModel` 未命中），或混合轮里**部分模型无价** → 金额位显示 `未收录`（混合轮为有价部分的**部分和**） | 「这轮金额缺了一块」。补 `pricing.json` 该条目价 → `node recalc-day.js <日期>` 回算历史；**不要用 `backfill --write`**（模型级合并但重放值覆盖同 key 且不取 max → 压缩掉的行对应的量会减少，见 KI-5）。无输入/输出的空轮不会标 |
+| `｜⚠未计价` | 行2 末尾 | **本轮有 token 消耗、但金额算不出来**：该模型在 `pricing.json` 里查不到匹配（未收录 / `findModel` 未命中），或混合轮里**部分模型无价** → 金额位显示 `未收录`（混合轮为有价部分的**部分和**） | 「这轮金额缺了一块」。补 `pricing.json` 该条目价 → `node recalc-day.js <日期>` 回算历史（**v3.62.0 起默认 dry-run 不写盘**，确认要写回加 `--write`）；**不要用 `backfill --write`**（模型级合并但重放值覆盖同 key 且不取 max → 压缩掉的行对应的量会减少，见 KI-5）。无输入/输出的空轮不会标 |
 | `｜⚠账缺` | 行2 末尾 | 平台**压缩 / 重写过 transcript**，文件完整行数少于水位线 → 压缩窗口之后**可能静默少计**。v3.25.0 起新消耗已自动恢复记账，但**被压缩掉的历史行本地不可恢复**（见 `KNOWN-ISSUES.md` KI-5） | 对账时这段历史缺口**以服务商账单为准**；旗标（`.transcript-truncated.json`）7 天自动过期，**不要用 `backfill --write`** |
-| `｜⚠缓存价未知` | 行2 末尾 | **v3.31.0 起**（此前无任何提示）。该模型**有输入/输出单价、金额算得出来**，但**厂商没公布"缓存命中"的单价** → 缓存 token 只能按 **0 元**计。本技能场景下缓存占比常达 ~97%，故金额是**系统性低估**（实测低估区间 45%~86%），而弹窗看上去完全正常 | 不是故障、是**口径偏低的可见化**。金额位**照常显示、不隐藏**；要精确对账请以服务商账单为准。若厂商后续公布缓存价，跑 `node refresh-prices.js` 补录后 `node recalc-day.js <日期>` 回算 |
+| `｜⚠缓存价未知` | 行2 末尾 | **v3.31.0 起**（此前无任何提示）。该模型**有输入/输出单价、金额算得出来**，但**厂商没公布"缓存命中"的单价** → 缓存 token 只能按 **0 元**计。本技能场景下缓存占比常达 ~97%，故金额是**系统性低估**（实测低估区间 45%~86%），而弹窗看上去完全正常 | 不是故障、是**口径偏低的可见化**。金额位**照常显示、不隐藏**；要精确对账请以服务商账单为准。若厂商后续公布缓存价，跑 `node refresh-prices.js` 补录后 `node recalc-day.js <日期> --write` 回算（默认 dry-run，见上文命令块警示） |
 | `价⚠️` / `官价⚠️` | 行2 末尾 | 价格多源刷新**全源失败** / DeepSeek **官方价抓取失败** → 本轮金额按上一次的价格估算 | 属刷新失败的可见化；看 `pricing.json` 的 `last_refresh_error` / `deepseek_refresh_error`，稍后重刷即可 |
 | `｜⚠价核验` | 行2 末尾 | `pricing.json` 里存在**待人工核验**的告警条目（`_price_audit.warnings` 价格一致性自检 / `_ambig_warnings` 模糊匹配歧义）**且点名了本轮这个模型** → 该模型计价可能不准。**v3.30.0 起才会这样**：之前它读的是 `last_refresh_note`（刷新操作流水账），历史告警会永久留在文本里 → 每条弹窗都挂标签、永远消不掉 | 跑 `node refresh-prices.js` 重刷一次价库（干净则告警字段被删、标签自动消失）。详细条目在 `pricing.json` 的 `_price_audit` / `_ambig_warnings`，**每次刷新进程的 stderr 也会全量打印**（含与本轮无关的告警） |
+| `｜⚠N家价旧` / `｜⚠价旧` | 行2 末尾 | **v3.62.0 起**。价库流水线的**输入源降级**：当日有厂商抓取失败 / 解析出 0 模型 / 契约字段（单位币种）缺失被拒收 → `⚠N家价旧`（N = 降级厂商数）；或 `latest.json` / `tokenhub_lang.json` 整体陈旧（>36h）→ `⚠价旧`。**这些厂商的价格可能已是旧值，本地却在照它计费** | 厂商级：确认网络畅通后手动跑价库流水线（`fetch-cn-prices.py` → `parse_tokenhub.py` → `build_index.py`）或等每日自动刷新；官网改版导致 0 模型时需改对应解析器。明细（哪几家、旧了多久、自哪天起）在 `--report` 顶部，`build_index` 的 stderr 也会全量打印。厂商恢复后字段自动清空、标签自动撤下 |
+| `｜⚠价锁` | 行2 末尾 | **v3.62.0 起**。`pricing.json` 的 **lock 覆盖层**（用户手工校对过的"权威价"）自身不可信：① `invalid_lock` = 条目 `input_price`/`output_price` 缺失或非数值（已 fail-closed **拒收**，该模型继续按抓取源价格计）；② `stale_lock` = 官方对照时刻早于 36h（`deepseek-official` 停更 / 人工核录太久以前）→ 冻结价可能已变 | 核对 `pricing.json` 里对应 lock 条目的主价与对照时刻，或删掉该条目让抓取源接管。明细在 `--report` 顶部（含模型名、种类、自哪天起） |
+| `｜⚠假日` | 行2 末尾 | **v3.62.0 起**。**仅当本轮涉及峰谷计价模型时**才标：该年法定假日数据缺失/陈旧（`holidays.json` 的 `years[年] = null` + `_stale`）→ 该年峰谷判定按「非假日」降级（v3.62.0 起**不套高峰倍率**，保守方向：宁可少算不多算） | 联网后跑 `node refresh-holidays.js <年>` 补数据；修复前真假日会少算、调休上班日会多算（双向都不准，但不再单向多算）。与 `⚠时段`（官方时段文案没抓到）并存不互斥 |
 
 > 这些标注都受弹窗宽度守卫保护，**顺序即优先级**：超宽时先丢「价格来源降级」类标注（`⚠价核验` → `价⚠️` → `官价⚠️`，详情都能在 stderr / 日志里追），仍放不下才丢**缓存命中百分比**；`⚠未计价` / `⚠账缺` 是「数据不可信」信号，**任何情况下都不丢**（v3.30.0 起。此前顺序相反，会出现"缓存百分比被 `⚠价核验` 顶掉"）。
 
@@ -146,6 +157,9 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 | 🛑 **手动取消补弹**（v2.83/v2.84） | 用户手动取消任务时 WorkBuddy **不触发 Stop hook**（取消被挂起直到下一条消息），被取消轮的 token 会被并进下一轮弹窗、无法辨认。v2.83 起在 hook 端识别 transcript 的 `Interrupted by user` 取消标记并**立即补弹**（文案带 **（手动取消）**，日志 `reason=cancelled-round-flush`）；**v2.84** 修正续跑判定——取消后先有用户新消息 = 新轮次（补弹），取消后直接跟模型回复 = 续跑（不补弹）。5 项回放测试全通过 |
 | 🧮 **计价精度**（v2.82.2） | 未收录模型改**边界分隔匹配**（不再 glm-5.3-air 撞 glm-5 的价）；模型名缺失/`unknown` 不记价；缓存价缺失按 0 计（不再拍脑袋 ×10%） |
 | 🔤 **可读性** | 大数自动用「万/亿」单位（287.9万 / 1.5亿），缓存占比精确到两位小数（99.12%） |
+| 🕘 **历史按当日快照计价**（v3.62.0） | `recalc-day.js` / `backfill.js` 回算历史时读**当日价格快照**（`prices/history/prices-<日期>.json`），不再拿今天的现价改写昨天的金额；`recalc` 缺快照直接拒绝（`--current-price` 才走现价），`backfill` 缺快照降级现价并**逐日告警**。`recalc-day.js` 默认只报告不写账本，加 `--write` 才落盘 |
+| 🛡️ **被砍轮补账补弹**（v3.63.0）| WorkBuddy 在任务完成后 ~200ms 就回收进程，Stop 钩子有被判半路的窄窗口（历史 157 次里 3 次，1.9%）。现在 Stop **开跑即写待结算标记**（~1ms），下一次任何事件由 `--hook` 按水位线**补记账 + 补弹窗**（弹窗标「补」）；记不住的钱不再依赖"钩子能跑完" |
+| ⚡ **钩子减负**（v3.63.0） | 跨会话孤儿轮对账只挂 `--hook`、不再挂 `--stop`（命中候选要聚合整份转录，实测最坏 ≈11.5s，而 Stop 预算仅 ~650ms）；记账步骤排到所有"只影响显示"的增强之前，被中断也**钱先落盘** |
 
 ## 🏪 本地官方价格库（v2.81 起）
 
@@ -178,6 +192,8 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 | `ENABLE_PRICE_REFRESH` | `true` | 每日价格自动刷新 | **7 个公开价格源**：llmabacus（`llmabacus.com/api/prices`）、llm-prices-cn（GitHub raw，llmabacus 每日镜像）、OpenRouter（`openrouter.ai/api/v1/models`）、LiteLLM（GitHub raw）、Portkey×3 provider（`configs.portkey.ai/pricing/deepseek.json` / `openai.json` / `anthropic.json`） | 否 |
 | `ENABLE_MODEL_LOOKUP` | `true` | 新模型价格自动补录 | 同上（llmabacus 优先，OpenRouter 兜底） | 否 |
 | `ENABLE_UPDATE_CHECK` | `true` | 版本更新检查（**每 7 天最多 1 次**） | 仅 `https://api.github.com/repos/abc1317679842-ui/workbuddy-token-tracker` 的 `releases/latest` 与 `git/matching-refs/tags/v`（两个端点取较大版本） | 否 |
+
+> **「7 源」≠ 7 个独立数据源**（口径详见 [docs/pricing-refresh.md](docs/pricing-refresh.md) 的「源的独立性口径」段）：`llm-prices-cn` 是 `llmabacus` 的每日 GitHub 镜像（**同一份数据**，只在主源挂掉时顶班，两者一致**不构成互证**）；Portkey×3 是同一平台的三个 provider 文件。去重后独立数据源实为 **4 个**（llmabacus / OpenRouter / LiteLLM / Portkey）——多源的意义是**交叉验证与互补覆盖**，不是 7 份独立报价。
 
 **默认配置 = 零密钥联网**：唯一携带 API key 的请求（余额查询）默认关闭；其余联网均为**公开价格源 / 公开仓库，不要求任何密钥**，失败自动降级为本地价，不影响统计与 toast。**例外（不是要求，是"已有就用"）**：若你的环境已经设了 `GH_TOKEN` / `GITHUB_TOKEN`，假日表刷新会自动带上它以放宽 GitHub 限流（**不设也完全可用**，匿名限流 60 次/小时对本技能绰绰有余）；代码**不读任何本地凭据文件**。
 
@@ -412,11 +428,15 @@ cp -r workbuddy-token-tracker ~/.workbuddy/skills/token-usage-tracker
 | 文件 | 作用 |
 |---|---|
 | `token-tracker.js` | 主脚本：`--hook` 注入 / `--stop` 通知 / `--report` 账本（重算用 `recalc-day.js`，见下行） |
+| `stop-handler.js` | Stop 端（`--stop`）处理：v3.35.0 从主脚本 `main()` 整块迁出（单向依赖，不反向 require 主脚本） |
 | `refresh-prices.js` | 多源价格刷新（每天首次运行自动触发，也可手动跑） |
 | `peak-rules.js` | 峰谷时段判定的**唯一实现**：主脚本 / `backfill.js` / `recalc-day.js` 共用（v3.19.0 起，消除三份硬编码副本） |
+| `wb-root.js` | 数据根（WorkBuddy root）探测**单点实现**：v3.42.0 抽出，主脚本 / `backfill.js` / `recalc-day.js` / `refresh-prices.js` 共用（改一处即全仓生效） |
+| `transc-lines.js` | transcript「物理行数 / 残行」口径的**单一实现**：v3.61.0（审计 F2）抽出，主链与 `backfill.js` 共用（修残行双记） |
+| `ledger-merge.js` | 账本合并**纯函数**：v3.55.0 从 `backfill.js` 锁内抽出（修掉「按日期整块顶掉 → 模型用量整片丢失」） |
+| `price-history.js` | 每日价格快照的**单一实现**（目录解析 / 读取 / 快照→价目形态）：v3.62.0（审计 F-3）抽出，`recalc-day.js` 与 `backfill.js` 共用（回溯按「当时价」而非现价） |
 | `deepseek-official.js` | DeepSeek 官方定价抓取（被 refresh-prices 调用） |
 | `refresh-holidays.js` | 中国法定节假日双源刷新（峰谷计费用）。**v3.32.0 起默认自动**：每日链路按四条件自适应触发（缺今年 / 10-12 月缺明年 / 任一年陈旧 / >30 天未成功），无需手动；强制触发 `node refresh-holidays.js <年>`，只读体检 `node refresh-holidays.js --check`。两源不一致时**取交集**（保守）并在 **stderr 逐日告警**（列出仅 A / 仅 B 认定的假日）；差异按年落 `holidays.json` 的 `cross_check_diff.<年份>.only_a / .only_b`；缺数据年份落 `null` + `_stale/stale_years` 标记（**绝不写空数组**） |
-| `peak-rules.js` | 峰谷时段判定的**唯一实现**（主脚本 / `recalc-day.js` / `backfill.js` 共用，避免三处硬编码口径分裂） |
 | `fetch-cn-prices.py` | 国内厂商官网价抓取（Python 3；`requests` 可选，缺失自动回退 urllib） |
 | `parse_tokenhub.py` / `build_index.py` | 本地官方价库解析/建索引（可选） |
 | `pricing.json` / `holidays.json` | 价格库 / 节假日数据（技能目录内） |
@@ -426,7 +446,7 @@ cp -r workbuddy-token-tracker ~/.workbuddy/skills/token-usage-tracker
 | `KNOWN-ISSUES.md` | 已知未修问题（脱敏公开记录） |
 | `TROUBLESHOOTING.md` | **故障排查手册**（弹窗诊断日志 + 34 行故障速查表），v3.23.0 从 SKILL.md 移出 |
 | `docs/balance.md` | 余额显示细节（原理 / 启用条件 / 模式识别 / 隐私） |
-| `docs/pricing-refresh.md` | 价格刷新策略（5 源）+ 峰谷时段口径 + 计费公式 |
+| `docs/pricing-refresh.md` | 价格刷新策略（7 源）+ 峰谷时段口径 + 计费公式 |
 | `docs/windows-notification.md` | Windows「不弹横幅」修复（SmartOptOut 注册表法 + 实测证据） |
 | `rounds/`（运行时生成） | 轮次明细留档 `rounds-YYYY-MM.jsonl`，保留最近 6 个月，**不入库** |
 | `exports/`（运行时生成） | `--report --csv` 的 CSV 导出目录，**不入库** |

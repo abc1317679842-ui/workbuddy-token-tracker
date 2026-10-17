@@ -456,7 +456,12 @@ def main():
         # 峰谷规则缺失只告警、仍写模型价：模型价是主数据，峰谷规则缺失时 build_index 会沿用上一版
         #   （:217-273 的逐模型沿用逻辑）。若为此整份不写，反而会让 Hunyuan 整条源消失（F5 的过度保守）。
         sys.stderr.write('[parse_tokenhub][WARN] 未提取到峰谷时段规则（页面文案可能变化）；仍写入模型价，峰谷规则由 build_index 沿用上一版\n')
-    fetched_at = __import__('datetime').datetime.now().isoformat(timespec='seconds')
+    # v3.62.0（外部审计 F-4）：北京时间（aware）。本文件是 tokenhub_lang.json 的唯一产出方，
+    #   而 build_index 的 SOURCE_TTL_HOURS 单独校验它的新鲜度（它不受流水线日期约束，
+    #   停更时此前完全无感）。改前用本地 naive 时间 → 非 UTC+8 机器上新鲜度判定偏移。
+    fetched_at = __import__('datetime').datetime.now(
+        __import__('datetime').timezone(__import__('datetime').timedelta(hours=8), 'CST')
+    ).isoformat(timespec='seconds')
     # v3.51.0（审计批1·A/B）：region/currency/unit 全部来自页面显式解析（标签 + 表头声明），
     # 不再硬编码；每条模型记录携带完整契约字段，供 build_index 契约海关校验。
     for m in models:

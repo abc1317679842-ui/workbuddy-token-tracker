@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.61.0 (2026-10-16)
+// token-usage-tracker v3.63.0 (2026-10-17)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -91,6 +91,18 @@ function loadLocalFlag(name, dflt) {
   try {
     const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, 'local-config.json'), 'utf-8'));
     return typeof cfg[name] === 'boolean' ? cfg[name] : dflt;
+  } catch (e) { return dflt; }
+}
+// v3.62.0（批4·续）：读**字符串档位**的本地配置（与 loadLocalFlag 同源文件，均不进仓库）。
+//   兼容布尔简写：`true → onStr`、`false → dflt` —— 与本文件其余键（enable_balance_query 等 boolean）
+//   风格一致，避免用户按 boolean 习惯写 `"orphan_scan": true` 时静默不生效；
+//   字符串原样返回；类型不符 / 文件缺失 / 解析失败一律 dflt（**默认永不擅自开启**）。
+function loadLocalStr(name, dflt, onStr) {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, 'local-config.json'), 'utf-8'));
+    const v = cfg[name];
+    if (typeof v === 'boolean') return v ? (onStr || dflt) : dflt;
+    return typeof v === 'string' ? v : dflt;
   } catch (e) { return dflt; }
 }
 const ENABLE_BALANCE_QUERY = loadLocalFlag('enable_balance_query', false);
@@ -266,9 +278,95 @@ function writeCoalesce(sid, agg, meta) {
   }
   try { fs.writeFileSync(coalescePath(sid), JSON.stringify(payload)); }
   catch (e) { process.stderr.write(`[token-tracker] 合并文件写入失败: ${e.message}\n`); }
+  // v3.63.0：合并文件 = "本轮已交给后续补弹路径收口"的凭据 → 在飞标记已完成使命，就地清掉。
+  //   放在这里而不是逐个调用点，是为了让 4 处 writeCoalesce 自动覆盖（漏一处就是永久残留标记）。
+  clearStopMark(sid);
 }
 function clearCoalesce(sid) {
   try { fs.unlinkSync(coalescePath(sid)); } catch (e) { /* 不存在则忽略 */ }
+}
+
+// ── v3.63.0（2026-10-17 致命竞态兜底）：Stop 钩子被宿主回收窗口砍断 → 补账补弹 ────────────────
+// 病根：宿主在"任务完成"后约 200ms 就重建会话 runtime（10:20:42.286 `launch-spec resolved`），
+//   把 --stop 子进程连同 Job Object 一起树杀。Stop 冷启动就要 300ms，跑满约 650ms
+//   ⇒ 命中窗口时进程死在中途，`writeCoalesce` 还没执行 → 既无弹窗、也无 hook-fallback 可兜。
+//   实测 157 次"压缩后续跑"里 3 次命中（09-11 / 10-08 / 10-17），中位数 2198ms 正常跑完。
+// 为什么必须"死前先写"：整树杀什么都不留（KI-13 实测）。所以标记必须在**聚合之前**落盘（~1ms），
+//   而不是等算完再写 —— 这是本项目唯一能对抗树杀的放置点。
+// 为什么不会重复弹/重复记账（三重闸）：
+//   ① 状态闸 —— 只认 `lastStopAt < 标记时间`（Stop 正常收口必然推进 lastStopAt）；
+//   ② 水位闸 —— 调 incrementalRecord 前后比对水位线，没涨就说明那轮早已入账 → 静默清标记；
+//   ③ 幂等闸 —— incrementalRecord 本身按水位线去重，重复调用绝不重复计费。
+// 触发点：只在 `--hook`（用户下次提交 / 下次 Stop 都是新 Job），零常驻、零轮询。
+function stopMarkPath(sid) {
+  const safe = String(sid || '').replace(/[^a-zA-Z0-9_-]/g, '');
+  return safe ? path.join(SNAP_DIR, `.stopmark-${safe}.json`) : null;
+}
+function writeStopMark(sid, meta) {
+  const p = stopMarkPath(sid);
+  if (!p) return;
+  try { fs.writeFileSync(p, JSON.stringify(Object.assign({ at: Date.now() }, meta || {}))); }
+  catch (e) { /* silent-ok:诊断 — 标记写不进去只是失去兜底，不得影响正常链路 */ }
+}
+function readStopMark(sid) {
+  const p = stopMarkPath(sid);
+  if (!p) return null;
+  try { return JSON.parse(fs.readFileSync(p, 'utf-8')); } catch (e) { return null; }
+}
+function clearStopMark(sid) {
+  const p = stopMarkPath(sid);
+  if (!p) return;
+  try { fs.unlinkSync(p); } catch (e) { /* 不存在则忽略 */ }
+}
+// 返回 true = 本次确实补了一笔（调用方无需再做任何事）；false = 无事可做（正常路径）。
+function recoverKilledStop(o) {
+  const sid = o && o.sid;
+  const mk = readStopMark(sid);
+  if (!mk || !mk.at || !mk.tsPath) return false;
+  try {
+    const snap = loadSnapshot(sid) || {};
+    // 闸①：Stop 已收口（推进过 lastStopAt）→ 标记是正常残留，清掉即可。
+    if ((snap.lastStopAt || 0) >= mk.at) { clearStopMark(sid); return false; }
+    const aggStart = mk.aggStart || mk.roundStart || 0;
+    let agg = null;
+    try { agg = aggregateTranscript(mk.tsPath, aggStart); } catch (e) { agg = null; }
+    if (!agg || !agg.total) { clearStopMark(sid); return false; }
+    // 闸②：记账前后水位线比对 —— 没涨 ⇒ 那轮其实已入账（Stop 死在记账之后），不重复弹。
+    const key = ledgerKey(sid, mk.tsPath);
+    const before = ((loadLedgerWatermarkSafe().wm[key] || {}).main) || 0;
+    try {
+      incrementalRecord(mk.tsPath, sid, {
+        sid, roundStart: mk.roundStart || 0, durMs: agg.durMs,
+        model: agg.modelMain || agg.model, subModels: agg.subModels,
+        subCount: agg.subCount, teamActive: agg.teamActive === true,
+        source: 'stop-killed-recover',
+      });
+    } catch (e) { /* silent-ok:降级 — 记账失败就不弹（没有硬账就没有可信数字），留给下一次事件重试 */ }
+    const after = ((loadLedgerWatermarkSafe().wm[key] || {}).main) || 0;
+    if (after <= before) { clearStopMark(sid); return false; }
+    // 闸③ 之后的展示段：与正常 Stop 同口径（子代理标注 / 分模型分条）
+    const subsMap = subagentModelSet(mk.tsPath, mk.roundStart || 0);
+    const baseName = shortModelName(agg, o.pricing);
+    const entry = subsMap.get(normalizeModelName(agg.model || ''));
+    const model = entry ? baseName + subagentTagOf(entry) : baseName;
+    const bal = balanceText();
+    const todayTxt = todayUsageTxt();
+    if (!showToastsSplitByModel(agg, {
+      pricing: o.pricing, tsPath: mk.tsPath, roundStart: mk.roundStart || 0,
+      subs: subsMap, firstToday: todayTxt, reason: 'stop-killed-recover',
+    })) {
+      showToast(toastLine1(agg, model, periodNote(agg, o.pricing), bal, todayTxt, noPriceTag1(agg, o.pricing)), toastLine2(agg, o.pricing), 'stop-killed-recover');
+    }
+    appendCompactionLog('stop-killed-recover', { sid, aggStart, linesBefore: before, linesAfter: after, total: agg.total, markAgeMs: Date.now() - mk.at });
+    saveSnapshot({ file: mk.tsPath, stat: agg, lastUserMsgAt: (snap.lastUserMsgAt || 0), lastStopAt: Date.now() }, sid);
+    clearStopMark(sid);
+    return true;
+  } catch (e) {
+    try { appendCompactionLog('stop-killed-recover-failed', { sid, err: String((e && e.message) || e).slice(0, 200) }); }
+    catch (e2) { /* silent-ok:诊断 — 留痕自身失败无从可写，放弃 */ }
+    clearStopMark(sid);
+    return false;
+  }
 }
 // 多子回合时起一个 detached 后台 watcher：延迟 DELAY_TOAST_MS 后复查，无新 trace 则弹汇总。
 // 父进程是 Stop hook（同步短生命周期），必须 unref 让 watcher 独立存活；Windows 下 detached
@@ -1780,7 +1878,11 @@ function showToastsSplitByModel(agg, opts) {
     //   改为 ''（与 balI 同样只在第一条显示）；单条路径不受影响（i 恒为 0）。
     const todayI = i === 0 ? (o.firstToday != null ? o.firstToday : todayUsageTxt()) : '';
     const balI = i === 0 ? (o.bal || '') : '';
-    const periodI = periodNote(p.stat, pricing);
+    // v3.62.0（批4）：periodSuffix —— 给"补弹"这类**来源标注**用的可选后缀（孤儿轮对账传「（补弹 …）」）。
+    //   不传 = 与旧版逐字节一致（既有三处调用点都不传）。
+    const periodI = o.periodSuffix
+      ? [periodNote(p.stat, pricing), o.periodSuffix].filter(Boolean).join(' ')
+      : periodNote(p.stat, pricing);
     if (needTag) {
       showToast(toastLineTagged(p.stat, pricing, tag), toastLine2(p.stat, pricing), o.reason || 'split-by-model', o.tsPath);
     } else {
@@ -2393,6 +2495,188 @@ function readTrace(f) {
   throw lastErr;
 }
 
+// ═══ v3.62.0（批4 · 孤儿轮对账 / 跨会话补弹）══════════════════════════════════════════
+// 背景（2026-10-16 23:43:54 实证；详见 KNOWN-ISSUES KI-33 与审计裁决文档「四更」）：
+//   宿主主线程重复风暴 → 会话 CLI 进程被**整树杀死**（Stop 钩子被连带带走，日志停在 23:43:54.416，
+//   82.7 秒后冷启动成新 pid）→ 该轮 `lastStopAt` 从未推进 = **孤儿轮**：token 已产生、却永不弹窗；
+//   下一轮 Stop 把两轮**合并**弹出（实测 50m39s，用户无法辨认）。
+//
+//   为什么既有三条兜底全救不了：`hook-fallback` 靠 coalesce 文件、`cancelled-round-flush` 靠转录里的
+//   取消标记、`stale-coalesce-settled` 靠 coalesce 残留时长 —— **三条都以"死前写下的标记"为前提**，
+//   而"整树杀"恰恰什么都不留（进程内 JS 立即停止，连 `process.on('exit')` 都不触发）。
+//
+//   本机制的判据**不依赖死前写入**：`快照.lastStopAt < 快照.lastUserMsgAt`。
+//   `lastUserMsgAt` 是**用户提交那一刻**写下的（那时进程活得好好的），与后来怎么死无关。
+//
+// 设计约束（对齐业界 at-least-once + 幂等 + 状态对账）：
+//   · 判据用**状态**（快照水位线），不用日志。实测 `toast.log` 2471 条里只有 541 条带会话标识
+//     （且全部来自 watcher 路径），**主弹窗路径 sessionId 恒为 null** → 弹窗日志只能做人工排查，
+//     不能当"弹过没弹过"的真相。幂等改由「认领文件 + 快照水位线推进」承担。
+//   · **先弹后推**：先推后弹一旦在弹之前崩 = 静默丢失（更坏）；先弹后推最坏是重复一次。
+//     取重复、不取丢失。
+//   · 零常驻进程：挂在已有钩子（--hook / --stop）上低频扫描；不建计划任务、不要额外权限。
+//   · 只处理**别的会话**的孤儿（`curSid` 跳过）：本会话自身的欠账由既有分支处理；对自己下手会把
+//     "本轮正在跑"误判成孤儿（中途提交时无法自证"跑完了没"），而 v2.27 守卫正是靠保留旧起点
+//     来保护"专家团运行中途用户插话"（实测曾因起点被刷晚漏掉 409.3 万 tokens）。
+const ORPHAN_MIN_AGE_MS = Number(process.env.WB_ORPHAN_MIN_AGE_MS) || 60000;
+const ORPHAN_IDLE_MS = Number(process.env.WB_ORPHAN_IDLE_MS) || 20000;
+const ORPHAN_MAX = Number(process.env.WB_ORPHAN_MAX) || 8;
+// v3.62.0（批4·续）：**年龄上限**（默认 72h）。开 on 当天实测：本机 50 个快照里有 10 个"欠账态"
+//   （5 个历史测试残留 + 4 个 6~16 天前的陈年会话），若无上限，首次钩子会一口气补弹满 8 条垃圾弹窗。
+//   72h 覆盖用户的真实诉求场景（进程被杀 → 隔夜 / 隔周末再干活才补），同时把陈年旧账挡在外面。
+//   要补陈年旧账：临时设 WB_ORPHAN_MAX_AGE_MS=2592000000（30 天）跑一次即可。
+const ORPHAN_MAX_AGE_MS = Number(process.env.WB_ORPHAN_MAX_AGE_MS) || 72 * 3600 * 1000;
+const ORPHAN_CLAIM_TTL_MS = 7 * 24 * 3600 * 1000;
+
+// 三档：off / observe（只写候选日志，不弹不推水位）/ on（补弹 + 推进）。
+//   取值优先级（v3.62.0 批4·续）：**环境变量显式设置即权威**（含设成非法值时按 off —— 便于临时压测
+//   与一键关停，不会被本地配置"反悔"）；未设置（或空串）才回落 local-config.json 的 orphan_scan
+//   （本机常开用，该文件不进仓库 → 仓库分发版无此键 = dflt 'off'，与旧版逐字节同行为）。
+function orphanScanMode() {
+  const envV = process.env.WB_ORPHAN_SCAN;
+  const raw = (envV != null && envV !== '') ? envV : loadLocalStr('orphan_scan', 'off', 'on');
+  const v = String(raw).trim().toLowerCase();
+  return (v === 'observe' || v === 'on') ? v : 'off';
+}
+function orphanClaimPath(sid, roundStart) {
+  const safe = String(sid).replace(/[^a-zA-Z0-9_-]/g, '');
+  return safe ? path.join(SNAP_DIR, `.orphan-${safe}-${roundStart}.json`) : '';
+}
+// 认领 = 原子创建（'wx'）。已存在 → 另一个钩子已处理（或处理中）该轮 → 跳过，防并发双弹。
+function orphanClaim(sid, roundStart) {
+  const p = orphanClaimPath(sid, roundStart);
+  if (!p) return false;
+  try { fs.writeFileSync(p, JSON.stringify({ at: Date.now(), pid: process.pid }), { flag: 'wx' }); return true; }
+  catch (e) { return false; }
+}
+function orphanRelease(sid, roundStart) {
+  const p = orphanClaimPath(sid, roundStart);
+  if (!p) return;
+  try { fs.unlinkSync(p); } catch (e) { /* silent-ok:清理 — 释放失败交由 TTL 清理 */ }
+}
+function cleanupOrphanClaims() {
+  try {
+    const now = Date.now();
+    const files = fs.readdirSync(SNAP_DIR)
+      .filter((f) => /^\.orphan-.*\.json$/.test(f))
+      .map((f) => { const full = path.join(SNAP_DIR, f); try { return { full, mtime: fs.statSync(full).mtimeMs }; } catch (e) { return null; } })
+      .filter(Boolean).sort((a, b) => b.mtime - a.mtime);
+    for (let i = 100; i < files.length; i++) { try { fs.unlinkSync(files[i].full); } catch (e) { /* silent-ok:清理 */ } }
+    for (const f of files) { if (now - f.mtime <= ORPHAN_CLAIM_TTL_MS) continue; try { fs.unlinkSync(f.full); } catch (e) { /* silent-ok:清理 */ } }
+  } catch (e) { /* silent-ok:清理 — 清理失败不影响主流程 */ }
+}
+// 补弹标注用的「MM-DD HH:MM」（本地时区；只进弹窗文案与日志，不参与任何判据）。
+function fmtClock(ms) {
+  const d = new Date(ms);
+  const p = (n) => (n < 10 ? '0' + n : '' + n);
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// 扫全部会话快照 → 找孤儿轮 → （observe 只记 / on 补弹）。**绝不外抛**：它挂在用户提交（--hook）
+// 的必经路径上。返回 {mode, scanned, candidates, capped, skipped}（供测试与诊断用）。
+//
+// v3.63（2026-10-17 减负）：**只在 --hook 调用，不进 --stop**。实测（本机 46 个快照）：
+//   常态扫描 3~15ms，可忽略；但只要命中**一个**欠账候选，就要聚合它的 transcript ——
+//   126MB 会话文件单次 1438ms，ORPHAN_MAX=8 ⇒ 最坏 ≈11.5 秒。而 Stop 钩子的总预算只有 ~650ms
+//   （宿主在"任务完成"后约 200ms 就重建会话 runtime；2026-10-17 10:20:42 实证 token-tracker
+//   子进程被砍在聚合阶段）。把对账挂在 Stop = 每次都在赌"今天有没有候选"，一旦真有，先把本轮的
+//   记账与弹窗一起拖死 —— 恰好制造了它本来要兜的那种漏。--hook 每次提交都扫同一批快照，功能零损失。
+function scanOrphanRounds(opts) {
+  const o = opts || {};
+  const pricing = o.pricing;
+  const mode = orphanScanMode();
+  const res = { mode, scanned: 0, candidates: [], capped: [], skipped: [] };
+  if (mode === 'off') return res;
+  try {
+    const curSid = String(o.curSid || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    const now = Date.now();
+    const cands = [];
+    for (const f of fs.readdirSync(SNAP_DIR)) {
+      const m = /^\.snapshot-(.+)\.json$/.exec(f);
+      if (!m) continue;
+      const sid = m[1];
+      if (curSid && sid === curSid) continue; // 只处理别的会话（自身欠账由既有分支处理，见顶部注释）
+      res.scanned++;
+      let S = null;
+      try { S = JSON.parse(fs.readFileSync(path.join(SNAP_DIR, f), 'utf-8')); } catch (e) { continue; }
+      if (!S || typeof S !== 'object') continue;
+      const R = Number(S.lastUserMsgAt) || 0;
+      const lastStop = Number(S.lastStopAt) || 0;
+      if (R <= 0) continue;                       // 无轮起点（全新会话 / 手动运行）
+      if (lastStop >= R) continue;                // 已结算 → 不是孤儿
+      if (now - R < ORPHAN_MIN_AGE_MS) continue;  // 太新：Stop 可能还在路上
+      // 陈年旧账（超过年龄上限）不补 —— 见 ORPHAN_MAX_AGE_MS 顶部注释（首次开启会炸一串历史垃圾）。
+      //   仍记入 skipped：observe 档能直观看到"确实有欠账、但已超龄"，便于区分"没检测到"与"检测到但没补"。
+      if (now - R > ORPHAN_MAX_AGE_MS) { res.skipped.push({ sid, why: 'too-old', ageMs: now - R }); continue; }
+      const tsPath = S.file;
+      if (!tsPath) continue;
+      let st = null;
+      try { st = fs.statSync(tsPath); } catch (e) { continue; }  // 转录已不在 → 无从聚合
+      if (now - st.mtimeMs < ORPHAN_IDLE_MS) continue;           // 主转录仍在写 → 本轮还活着
+      if (hasSubagentsRecentlyActive(tsPath, ORPHAN_IDLE_MS)) continue; // 子代理仍在写 → 本轮还活着
+      cands.push({ sid, roundStart: R, tsPath, snap: S, ageMs: now - R });
+    }
+    cands.sort((a, b) => b.ageMs - a.ageMs);      // 最老的先补（用户等得最久的那条）
+    res.candidates = cands.map((c) => ({ sid: c.sid, roundStart: c.roundStart, ageMs: c.ageMs }));
+    let acted = 0;
+    for (const c of cands) {
+      if (acted >= ORPHAN_MAX) break;
+      try {
+        const agg = aggregateTranscript(c.tsPath, c.roundStart);
+        if (!agg) { res.skipped.push({ sid: c.sid, why: 'no-agg' }); continue; }
+        if (mode === 'observe') {
+          try {
+            appendCompactionLog('orphan-candidate', {
+              sid: c.sid, roundStart: c.roundStart, ageMs: c.ageMs, total: agg.total,
+              model: agg.modelMain || agg.model, curSid: curSid || null,
+            });
+          } catch (e) { /* silent-ok:诊断 — 观测日志写失败不得影响主流程 */ }
+          res.capped.push({ sid: c.sid, total: agg.total, observe: true });
+          continue;
+        }
+        // ── on：认领 → 记账 → 弹窗 → **最后**才推进水位线（先弹后推，见顶部注释）──
+        if (!orphanClaim(c.sid, c.roundStart)) { res.skipped.push({ sid: c.sid, why: 'claimed' }); continue; }
+        let failed = true;
+        try {
+          incrementalRecord(c.tsPath, c.sid);                   // 记账（按行号水位线，天然幂等）
+          try { ensureNewModelPricing(pricing, agg); } catch (e) { /* silent-ok:降级 — 补价失败不影响补弹 */ }
+          const bal = balanceText();
+          const mark = `（补弹 ${fmtClock(c.roundStart)}）`;
+          if (!showToastsSplitByModel(agg, {
+            pricing, tsPath: c.tsPath, roundStart: c.roundStart,
+            bal, firstToday: todayUsageTxt(), reason: 'orphan-cap', periodSuffix: mark,
+          })) {
+            showToast(
+              toastLine1(agg, shortModelName(agg, pricing),
+                [periodNote(agg, pricing), mark].filter(Boolean).join(' '),
+                bal, todayUsageTxt(), noPriceTag1(agg, pricing)),
+              toastLine2(agg, pricing), 'orphan-cap', c.tsPath,
+            );
+          }
+          // 弹窗已出 → 推进水位线（幂等键落地）。此后该会话自己的 hook/Stop 视为已结算，不会重弹。
+          saveSnapshot(Object.assign({}, c.snap, { lastStopAt: Date.now() }), c.sid);
+          failed = false;
+          try {
+            appendCompactionLog('orphan-capped', {
+              sid: c.sid, roundStart: c.roundStart, ageMs: c.ageMs, total: agg.total,
+              model: agg.modelMain || agg.model, durMs: agg.durMs || 0, curSid: curSid || null,
+            });
+          } catch (e) { /* silent-ok:诊断 */ }
+          res.capped.push({ sid: c.sid, total: agg.total });
+          acted++;
+        } finally {
+          // 认领文件**只在失败时释放**（成功则保留：万一快照推进没落盘，它仍能挡住重复补弹；
+          // 到期由 cleanupOrphanClaims 清理）。失败释放 → 下一次钩子会重试（取重复、不取丢失）。
+          if (failed) orphanRelease(c.sid, c.roundStart);
+        }
+      } catch (e) {
+        res.skipped.push({ sid: c.sid, why: 'error:' + String((e && e.message) || e).slice(0, 80) });
+      }
+    }
+  } catch (e) { /* silent-ok:降级 — 对账整体失败绝不带走本轮 hook/Stop 主流程 */ }
+  return res;
+}
+
 function loadSnapshot(sid) {
   try {
     return JSON.parse(fs.readFileSync(snapPath(sid), 'utf-8'));
@@ -2456,6 +2740,10 @@ function cleanupCoalesceLocks(curSid) {
 
 function cleanupSnapshots(curSid) {
   try {
+    // v3.62.0（批4）：孤儿轮认领文件（.orphan-*.json）与快照同处一个目录，同样需要 prune
+    //   （否则每次补弹留一个文件、永不回收）。它**不走**下面 50 个的数量上限——否则认领文件会把
+    //   真快照挤出前 50 名导致误删。规则单列：最多 100 个 + 7 天。
+    cleanupOrphanClaims();
     const now = Date.now();
     const cutoff = now - 30 * 24 * 3600 * 1000; // 30 天
     const files = fs.readdirSync(SNAP_DIR)
@@ -2620,6 +2908,22 @@ function mergeLocalPriceDb(pricing) {
   //   看着像支持各厂商峰谷，实则非 DeepSeek 厂商一律按 1× 计价。
   //   接上不可行（自由文本无从解析）→ 按"别悬着"原则删掉这半截（build_index.py 同步停止生成）。
   pricing.local_db = { built_at: db.built_at || null, models: mergedCount };
+  // v3.62.0（外部审计 F-1/S-4/S-7）：输入源降级状态挂到 pricing —— 见 build_index.py 的
+  //   `_fetch_degraded`。此前"厂商抓取失败/停更/输入源陈旧"只有 hook 子进程的 stderr 一条通道
+  //   （用户看不到），index.json 顶层无记录 → Node 侧无从展示，最终态是"厂商已涨价半年、
+  //   本地按半年前的价计费、UI 显示今日已刷新"。
+  //   ⚠ 只在非空时挂，干净时显式 delete：该字段由 build_index 每日重写、厂商恢复后自动消失
+  //     （自愈），不会变成 v3.30.0（A-8）那种"永久条目 = 永久噪音"。
+  const _deg = db._fetch_degraded;
+  const _degOn = _deg && typeof _deg === 'object'
+    && ((_deg.vendors && typeof _deg.vendors === 'object' && Object.keys(_deg.vendors).length > 0)
+        || (Array.isArray(_deg.stale_sources) && _deg.stale_sources.length > 0)
+        // v3.62.0（F-2/S-3）：价锁自身的问题（invalid_lock / stale_lock）也要能挂上去 ——
+        //   漏这一路时「只有价锁坏、厂商抓取全正常」的降级会被下面的 delete 抹掉，
+        //   ⚠价锁 标签与 authoritativeIssuesNotice 明细双双失效（审计要防的正是这种静默）。
+        || (Array.isArray(_deg.authoritative_issues) && _deg.authoritative_issues.length > 0));
+  if (_degOn) pricing._fetch_degraded = _deg;
+  else delete pricing._fetch_degraded;
   return pricing;
 }
 
@@ -2635,6 +2939,9 @@ function stripLocalDbEntries(pricing) {
     }
   }
   delete out.local_db;
+  // v3.62.0（外部审计 F-1/S-4/S-7）：降级状态同理**只入内存、不入 pricing.json** ——
+  //   它由 index.json 每日重建，落盘只会变成一份永不更新的陈旧告警（自愈性被破坏）。
+  delete out._fetch_degraded;
   // v3.19.2（B4）：防御性保留——现版本已不再读取 peak_rules，但磁盘上可能仍是旧版 index.json
   //   合并过、或由其它写入方带进来的字段，一并剥离，避免污染 pricing.json。
   delete out.peak_rules;
@@ -4379,6 +4686,14 @@ function reportRangeTxt(from, to) {
   const agg = aggregateRangeModels(d, from, to);
   const names = Object.keys(agg.models).sort();
   const lines = [];
+  // v3.62.0（外部审计 F-1/S-4/S-7 / S-6）：降级提示置于表格之前；无降级时 '' → 输出不变
+  const _degNotice = fetchDegradedNotice();
+  if (_degNotice) lines.push(_degNotice);
+  const _holNotice = holidayDegradedNotice();
+  if (_holNotice) lines.push(_holNotice);
+  // v3.62.0（外部审计 F-2/S-3）：价锁不可信明细（同纪律：只读 index.json、无问题返回 '' → 输出不变）
+  const _authNotice = authoritativeIssuesNotice();
+  if (_authNotice) lines.push(_authNotice);
   lines.push(`===== ${from} ~ ${to}（${agg.days} 天有记录）=====`);
   lines.push('| 模型 | 输入 | 输出 | 缓存 | 缓存命中 | 总 token | 金额 |');
   lines.push('| --- | --- | --- | --- | --- | --- | --- |');
@@ -4813,6 +5128,15 @@ function reportTxt(arg) {
   else targets = [today];
   if (!targets.length) return '账本为空（暂无记录）';
   const lines = [];
+  // v3.62.0（外部审计 F-1/S-4/S-7）：价格源降级提示置于**表格之前**（它是"当前价库健康度"，
+  //   不是某一天的事，放日期区块里会被误读成"那天价格有问题"）。无降级时返回 '' → 输出不变。
+  const _degNotice = fetchDegradedNotice();
+  if (_degNotice) lines.push(_degNotice);
+  const _holNotice = holidayDegradedNotice();
+  if (_holNotice) lines.push(_holNotice);
+  // v3.62.0（外部审计 F-2/S-3）：价锁不可信明细（同纪律：只读 index.json、无问题返回 '' → 输出不变）
+  const _authNotice = authoritativeIssuesNotice();
+  if (_authNotice) lines.push(_authNotice);
   for (const date of targets) {
     const day = d[date];
     if (!day) { lines.push(`===== ${date} =====\n  （无记录）`); continue; }
@@ -4868,6 +5192,15 @@ function reportSummaryTxt(arg) {
   else targets = [today];
   if (!targets.length) return '账本为空';
   const lines = [];
+  // v3.62.0（外部审计 F-1/S-4/S-7）：同 reportTxt/reportRangeTxt —— 降级提示置于最前；
+  //   无降级时 '' → 输出逐字节不变（summary 是"今天花了多少"的默认入口，最不能缺这条）
+  const _degNotice = fetchDegradedNotice();
+  if (_degNotice) lines.push(_degNotice);
+  const _holNotice = holidayDegradedNotice();
+  if (_holNotice) lines.push(_holNotice);
+  // v3.62.0（外部审计 F-2/S-3）：价锁不可信明细（同纪律：只读 index.json、无问题返回 '' → 输出不变）
+  const _authNotice = authoritativeIssuesNotice();
+  if (_authNotice) lines.push(_authNotice);
   for (const date of targets) {
     const day = d[date];
     if (!day) { lines.push(`${date}  （无记录）`); continue; }
@@ -5063,6 +5396,50 @@ function peakRuleTag(pricing) {
   return '';
 }
 
+// v3.62.0（外部审计 F-1/S-4/S-7）：输入源降级标注（行2 末尾，与 dbStaleTag 的 ⚠价库 同机制）。
+//   触发源（任一非空即标）：
+//     ① pricing._fetch_degraded.vendors       —— 厂商抓取失败/0 模型/契约字段缺失（S-7）
+//     ② pricing._fetch_degraded.stale_sources —— latest.json 整体或 tokenhub 单独陈旧（>36h）
+//   语义：**这些厂商/源的价格可能已经是旧值**，本地却在照它计费。此前这条信息只有
+//   build_index 子进程的 stderr 一行，而调用方是 hook 子进程 → 用户看不到（审计原话：
+//   "把唯一告警挂在最不可靠的通道上"）。
+//   文案：厂商级 → `⚠N家价旧`（N = 降级厂商数）；仅源级陈旧 → `⚠价旧`。
+//   ⚠ 与 v3.30.0（A-8）"永久噪音"坑的区别：本字段由 build_index **每日重写**，厂商恢复后
+//     `failed` 清空 → 字段消失 → 标签自动撤下（自愈）。故此处**不**做"点名本轮模型"过滤
+//     （A-8 那条是因为 last_refresh_note 是永不清理的操作流水账，性质不同）。
+//   详情（哪几家、旧了多久、自哪天起）走 --report 顶部 + stderr 全量，行2 只放极短标签。
+function fetchDegradedTag(pricing) {
+  if (!pricing || typeof pricing !== 'object') return '';
+  const deg = pricing._fetch_degraded;
+  if (!deg || typeof deg !== 'object') return '';
+  const nv = (deg.vendors && typeof deg.vendors === 'object') ? Object.keys(deg.vendors).length : 0;
+  const ns = Array.isArray(deg.stale_sources) ? deg.stale_sources.length : 0;
+  if (!nv && !ns) return '';
+  return nv ? `⚠${nv}家价旧` : '⚠价旧';
+}
+
+// v3.62.0（外部审计 F-2 / S-3）：**价锁**（pricing.json 的 lock 覆盖层）不可信的 toast 标注。
+//   与 fetchDegradedTag 的分工：那条说的是"厂商抓取源降级"（源侧），这条说的是
+//   "本该最权威的那一层自己出了问题"（权威侧）。数据源 = index.json 的
+//   `_fetch_degraded.authoritative_issues`（build_index 每日重写，模型级）：
+//     ① invalid_lock（S-3）—— lock 条目 in/out 主价缺失或非数值。build_index 已 fail-closed
+//        （不覆盖、不注入），但"这个模型本该用权威价、实际仍在用抓取值"用户必须知道；
+//     ② stale_lock（F-2）—— lock 条目的对照时刻（deepseek-official 上次成功对照官方页 /
+//        人工核录 adopted_at）早于 TTL(36h) → 官方参考价可能已变。
+//   文案 `⚠价锁`（行2 宽度敏感，TOAST_LINE_MAX_W=44）。
+//   自愈：问题修复/条目被删 → 下次 build_index 重写该字段为空 → 标签自动撤下（不做点名过滤：
+//     该字段本身就是模型级、由每日重建清空，不属 v3.30.0 A-8 那类"永不清理的流水账"）。
+//   详情（哪个模型、哪种、自哪天起、原文 reason）走 authoritativeIssuesNotice() 的 --report 出口。
+function authoritativeErrTag(pricing) {
+  if (!pricing || typeof pricing !== 'object') return '';
+  const deg = pricing._fetch_degraded;
+  if (!deg || typeof deg !== 'object') return '';
+  const arr = Array.isArray(deg.authoritative_issues)
+    ? deg.authoritative_issues.filter((x) => x && typeof x === 'object') : [];
+  if (!arr.length) return '';
+  return '⚠价锁';
+}
+
 // v3.29.0（A-8）：价格诊断告警链修复 —— refresh-prices.js 会往 pricing.json 落四类诊断字段，
 //   但此前 token-tracker.js **只消费 last_refresh_error**，其余（_price_audit / last_refresh_note /
 //   _ambig_warnings）全部只写不读，用户在弹窗里完全看不到。这里补上：toast 只挂一个**极短**标签
@@ -5124,9 +5501,107 @@ function priceAuditTag(stat, pricing) {
   return hit.length ? '⚠价核验' : '';
 }
 
+// v3.62.0（外部审计 F-1/S-4/S-7）：**只读**直取 index.json 的降级状态 → 人类可读提示行。
+//   为什么不复用 fetchDegradedTag/pricing._fetch_degraded：--report 是只读路径，而 loadPricing()
+//   会触发 maybeRefreshLocalDb()（spawn 整条价库流水线）与 maybeRefreshHolidays() ——
+//   在"查看报表"这个动作上引出联网副作用是不可接受的。故这里直接读 index.json 的同一字段，
+//   不合并、不刷新、零副作用；与 toast 侧**同一数据源**（build_index 每日重写的那一份）。
+//   返回 '' = 无降级（此时报表输出与改动前逐字节一致，既有"入口逐字节不变"断言不受影响）。
+function fetchDegradedNotice() {
+  let db = null;
+  try { db = JSON.parse(fs.readFileSync(CN_PRICE_DB, 'utf-8')); } catch (e) { return ''; }
+  const deg = db && db._fetch_degraded;
+  if (!deg || typeof deg !== 'object') return '';
+  const vendors = (deg.vendors && typeof deg.vendors === 'object') ? deg.vendors : {};
+  const stale = Array.isArray(deg.stale_sources) ? deg.stale_sources : [];
+  if (!Object.keys(vendors).length && !stale.length) return '';
+  const out = [];
+  if (Object.keys(vendors).length) {
+    const items = Object.keys(vendors).map((k) => `${k}（${vendors[k]}${deg.since && deg.since[k] ? `，自 ${deg.since[k]} 起` : ''}）`);
+    out.push(`⚠ 价格源降级 ${Object.keys(vendors).length} 家：${items.join('；')} → 这些厂商的价格可能已是旧值`);
+  }
+  for (const s of stale) {
+    out.push(`⚠ 输入源陈旧：${s.source}（fetched_at ${s.fetched_at}，已 ${s.age_hours} 小时，阈值 ${deg.ttl_hours || 36}h）→ 索引可能整体沿用旧价`);
+  }
+  out.push('  修复：确认网络畅通后手动跑价库流水线（fetch-cn-prices.py → parse_tokenhub.py → build_index.py），'
+    + '或等每日自动刷新；厂商官网改版导致 0 模型时需改对应解析器');
+  return out.join('\n');
+}
+
+// v3.62.0（外部审计 F-2 / S-3）：价锁不可信的**报表**提示行（三个出口共用）。
+//   与 fetchDegradedNotice 同纪律：**只读** index.json，不触发 loadPricing 的刷新副作用；
+//   无问题时返回 '' → 既有报表出口输出逐字节不变（T92-b4 那类断言不受影响）。
+//   语义与 authoritativeErrTag 的 ⚠价锁 一一对应：行2 只放标签，明细在这里。
+function authoritativeIssuesNotice() {
+  let db = null;
+  try { db = JSON.parse(fs.readFileSync(CN_PRICE_DB, 'utf-8')); } catch (e) { return ''; }
+  const deg = db && db._fetch_degraded;
+  if (!deg || typeof deg !== 'object') return '';
+  const arr = Array.isArray(deg.authoritative_issues)
+    ? deg.authoritative_issues.filter((x) => x && typeof x === 'object') : [];
+  if (!arr.length) return '';
+  const out = [`⚠ 权威价锁（pricing.json lock 覆盖层）${arr.length} 项不可信`];
+  for (const it of arr) {
+    const kind = it.kind === 'stale_lock' ? '官方对照时刻已过期'
+      : (it.kind === 'invalid_lock' ? '条目主价缺失或非数值' : String(it.kind || '未知问题'));
+    out.push(`  · ${it.model || '(未命名)'}：${kind}${it.since ? `（自 ${it.since} 起）` : ''}`
+      + `${it.reason ? `\n    ${it.reason}` : ''}`);
+  }
+  out.push('  后果：invalid_lock 的这些模型当前按抓取源价格计费（fail-closed，未用坏值覆盖）；'
+    + 'stale_lock 的模型按可能已变更的官方参考价计费');
+  out.push('  修复：核对 pricing.json 对应 lock 条目的 input_price/output_price 与对照时刻，'
+    + '或删除该条目让抓取源接管');
+  return out.join('\n');
+}
+
+// v3.62.0（外部审计 S-6）：法定假日数据降级的 toast 标注（行2 末尾，同 dbStaleTag 机制）。
+//   现状：holidays.json 的 `years[2027] = null` + `stale_years: [2027]` → **2027-01-01 起**，
+//   该年峰谷判定按「非假日」降级。原本唯一的告警是 isPeakHour 里那条 stderr（每年每进程 1 条），
+//   而这是 hook 子进程的 stderr → 用户看不到。
+//   两条设计约束：
+//     ① **只在本轮涉及峰谷计价模型时才标**（peakMultOf>1）—— 无峰谷模型的轮次里，假日数据
+//        可不可信与金额毫无关系，标了就是纯噪音（对齐 v3.30.0 A-8「点名本轮模型」的教训）；
+//     ② 与 peakRuleTag 的 ⚠时段 并存不互斥：⚠时段 = 官方时段文案没抓到；⚠假日 = 假日表不可信。
+function holidayDegradedTag(stat, pricing) {
+  if (!pricing || typeof pricing !== 'object' || !stat) return '';
+  let peakish = false;
+  const names = roundModelNames(stat);
+  for (const n of names) {
+    const hit = findModel(pricing, n, 'price');
+    if (hit && peakMultOf(hit.m, n) > 1) { peakish = true; break; }
+  }
+  if (!peakish) return '';
+  try {
+    return peakRules.holidayYearDegraded(Date.now(), HOLIDAYS_FILE) ? '⚠假日' : '';
+  } catch (e) { return ''; } // 探针失败绝不影响弹窗
+}
+
+// v3.62.0（外部审计 S-6）：假日降级的**报表**提示行（--report 三个出口共用）。
+//   与 fetchDegradedNotice 同样**只读** holidays.json，不触发任何刷新副作用；无降级返回 ''。
+//   同时把 v3.62.0 起的行为变化说清楚：该年不再套高峰倍率（保守），故两个方向的误差都在，
+//   但不再有"单向多算"。
+function holidayDegradedNotice() {
+  let h = null;
+  try { h = JSON.parse(fs.readFileSync(HOLIDAYS_FILE, 'utf-8')); } catch (e) { return ''; }
+  const y = String(new Date(Date.now() + 8 * 3600 * 1000).getUTCFullYear()); // 北京年
+  const v = (h.years || {})[y];
+  const stale = h._stale === true && Array.isArray(h.stale_years) && h.stale_years.map(String).indexOf(y) >= 0;
+  const unknown = !Array.isArray(v) || v.length === 0;
+  if (!unknown && !stale) return '';
+  const why = unknown
+    ? `${y} 年法定假日数据缺失（years[${y}] = ${v === null ? 'null' : JSON.stringify(v)}）`
+    : `${y} 年法定假日数据被标记陈旧`;
+  return [
+    `⚠ ${why} → 该年峰谷判定按「非假日」降级`,
+    '  · v3.62.0 起：该年**不套高峰倍率**（保守方向：宁可少算，不多算）',
+    '  · 后果：真假日会少算（未享低峰）、调休上班日会多算（未按高峰）—— 双向都不准，但不再单向多算',
+    `  · 修复：联网后跑 node refresh-holidays.js ${y}`,
+  ].join('\n');
+}
+
 function periodNote(stat, pricing) {
   const base = periodPeakNote(stat, pricing);
-  const tag = [dbStaleTag(pricing), peakRuleTag(pricing)].filter(Boolean).join(' ');
+  const tag = [dbStaleTag(pricing), peakRuleTag(pricing), fetchDegradedTag(pricing), holidayDegradedTag(stat, pricing), authoritativeErrTag(pricing)].filter(Boolean).join(' ');
   if (!base) return tag;
   if (!tag) return base;
   return `${base} ${tag}`;
@@ -6146,7 +6621,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.61.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.63.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -6316,6 +6791,21 @@ function maybeFetchLatestForStop(nowMs) {
     if (!hookIdle(now, st)) return; // hook 在跑：检查由 hook 端负责
     if (maybeFetchLatest(st, now)) saveUpdateState(st);
   } catch (e) { /* 预检查失败静默 */ }
+}
+
+// v3.62.0（外部审计 AUD-C-01）：取消轮补弹（cancelled-round-flush）的聚合起点
+//   **必须钳到上次结算点**，理由链如下（完整实证在 flush 分支调用点）：
+//   ① flush 守卫只保证「取消标记比 lastStopAt 新」，起点却仍用旧 roundStartH；
+//   ② 同步弹窗结算后，stop-handler 把 lastUserMsgAt 写回**上次结算点**
+//      （`Math.max(psnapP.lastUserMsgAt, aggStart0)`），不是下一次提交时刻；
+//   ③ 于是「已结算轮之后再取消」时 roundStartH 仍停在那个**已经弹过的轮起点**
+//      → 整段已结算 token 被原样重弹一遍，还错标「（手动取消）」
+//      （生产实证 toast.log 2026-10-16T07:09:46 plain-immediate「输入 3322万…¥30.33」
+//        → 07:17:10 cancelled-round-flush 数字全同 + （手动取消））。
+//   未结算轮（roundStartH > lastStopAt）逐字节不变；已结算轮只剩两个结算点之间的尾段，
+//   尾段为空 → aggregateTranscript 返回 null → 自然静默，且**不推进 lastStopAt**。
+function cancelledFlushStart(roundStartMs, lastStopAtMs) {
+  return Math.max(roundStartMs || 0, lastStopAtMs || 0);
 }
 
 function main() {
@@ -6538,7 +7028,6 @@ function main() {
       appendWatchDebug({ type: 'lock-denied', ts: Date.now(), sid: fSid, pid: myPid });
       return;
     }
-
     // 首查：若合并文件已被清理/已弹 → 退出（释放锁）
     const info0 = readCoalesceInfo(fSid);
     if (!info0 || !info0.agg) {
@@ -6560,7 +7049,6 @@ function main() {
     const initialTerminalError = info0.terminalError || null;
     let lastTailTs = -1;    // 上次轮询时看到的最后一行时间戳（用于检测"新行追加"）
     let firstPollDone = false; // v2.58：initialTerminalError 提升仅限首轮（修复 compaction 误弹）
-
     const pollTail = () => {
       if (!tsPath) return 'unknown';
       return mainModelState(tsPath);
@@ -6858,6 +7346,8 @@ function main() {
   // --stop 路径不再做全量刷新（只走各分支的 ensureNewModelPricing 补价），弹窗不被延迟。
   // 风险可接受：若当天第一次使用就是 Stop（罕见），价格用旧的，下次 --hook 会刷新。
   if (asHook) pricing = autoRefreshPricing(pricing);
+  if (asHook) scanOrphanRounds({ curSid: sid, pricing }); // v3.63：只挂 --hook（减负理由见函数顶部 v3.63 注释）
+  if (asHook) recoverKilledStop({ sid, pricing }); // v3.63.0：Stop 被宿主回收窗口砍断后的补账补弹（见函数顶部注释）
   // 刷新失败/文件缺失时的提醒（不静默）；仅 --hook 路径（刷新实际发生处）提示，避免 --stop 误报"过期"
   if (asHook && pricing && pricing.date !== todayStr()) {
     process.stderr.write(`[token-tracker] 定价数据过期（${pricing.date}），自动刷新未成功，请手动运行 refresh-prices.js\n`);
@@ -6888,6 +7378,7 @@ function main() {
     balanceText,
     captureTranscShape,
     clearCoalesce,
+    clearStopMark,
     coalescePath,
     dispWidth,
     ensureNewModelPricing,
@@ -6927,6 +7418,7 @@ function main() {
     transcriptPathFromPayload,
     writeCoalesce,
     writeProbe,
+    writeStopMark,
   } })) return;
 
   // v2.56：traces 兜底路径的子代理守卫——如果 entry trace 的 sessionId != Stop payload 的 session_id，
@@ -7147,15 +7639,15 @@ function main() {
         const intrRows = interruptedRowsAfter(transcRowsH, roundStartH);
         const intrInfo = intrRows.length ? intrRows[intrRows.length - 1] : null;
         if (intrInfo && intrInfo.ts > roundStartH && intrInfo.ts > (snapPre.lastStopAt || 0)) {
-          // 聚合起点 = 旧 roundStartH（含被取消轮全部调用）；终点天然为 transcript 当前末尾
-          let aggC = aggregateTranscript(tsPathH, roundStartH);
+          const flushStartH = cancelledFlushStart(roundStartH, snapPre.lastStopAt); // AUD-C-01：钳到上次结算点
+          let aggC = aggregateTranscript(tsPathH, flushStartH);
           // v3.06（修复·取消轮零用量漏补弹）：把"被中断估算"提到判断之前，
           //   原实现是 `if (aggC) { ...估算... }` —— 一旦本轮没有任何**已完成**的 usage 落盘
           //   （典型：用户刚提交就手动取消，模型还在思考），aggregateTranscript 返回 null，
           //   整个块被跳过 → 即使 estimateInterrupted() 估到了被中断的思考消耗，
           //   也**既不弹窗也不记账，静默丢弃**。
           //   现在：估算非空时先构造一个零值基底 agg，让下面的合并/弹窗/记账照常执行。
-          const estByModelC = estimateInterrupted(transcRowsH, 0, roundStartH);
+          const estByModelC = estimateInterrupted(transcRowsH, 0, flushStartH);
           const estNamesC = Object.keys(estByModelC);
           if (!aggC && estNamesC.length) {
             aggC = { in: 0, out: 0, cached: 0, total: 0, model: estNamesC[0], durMs: 0, count: 0 };
@@ -7168,7 +7660,7 @@ function main() {
               aggC.in += estInC; aggC.out += estOutC; aggC.cached += estCachedC; aggC.total += estInC + estOutC;
               mergeEstIntoModels(aggC, estByModelC); // v3.26.0（⑧ 自审修正）：估算段并入分模型明细
             }
-            const durC = Math.max(0, intrInfo.ts - roundStartH); // 取消时刻 - 轮起点 = 被取消轮墙钟时长
+            const durC = Math.max(0, intrInfo.ts - flushStartH); // 取消时刻 - 结算后尾段起点 = 尾段墙钟时长（AUD-C-01：不再回算已弹过的整轮时长）
             aggC.durMs = aggC.durMs || durC;
             const modelC = shortModelName(aggC, pricing);
             ensureNewModelPricing(pricing, aggC);
@@ -7308,7 +7800,18 @@ module.exports = {
   loadPricing, autoRefreshPricing, addModelPrice, savePricing, normalizeModelName, saveDailyUsageRaw,
   getTranscriptStats, sidFromPath, ledgerKey,
   // v3.18.4（G2/G3）：护栏与抢救函数导出，selftest 可直接单测（不再只能靠 spawn，受限环境也能验）
-  guardRebuildScale, salvageModelsFromText, dbStaleTag,
+  guardRebuildScale, salvageModelsFromText, dbStaleTag, peakRuleTag,
+  // v3.62.0（外部审计 F-1/S-4/S-7）：写盘前剥离本地库合并条目 + 降级状态，selftest 需行为级验证
+  stripLocalDbEntries,
+  // v3.62.0（外部审计 F-1/S-4/S-7）：输入源降级的两个出口（toast 短标签 / 报表提示行），selftest 可直接单测
+  fetchDegradedTag, fetchDegradedNotice,
+  // v3.62.0（外部审计 S-6）：假日数据降级的两个出口（toast 短标签 / 报表提示行）
+  holidayDegradedTag, holidayDegradedNotice,
+  // v3.62.0（外部审计 F-2/S-3）：价锁不可信的两个出口（toast 短标签 / 报表提示行）
+  authoritativeErrTag, authoritativeIssuesNotice,
+  // v3.62.0（外部审计 F-3）：价库目录导出——recalc-day.js / backfill.js 读每日价格历史快照
+  //   （prices/history/prices-<date>.json）要用它定位，避免每个消费端各自复制一遍目录发现逻辑
+  CN_PRICE_DIR,
   // v3.19.0（P6）：本地官方价库合并导出——recalc-day.js 复用它，避免"只读主库漏掉本地库"
   mergeLocalPriceDb, isPeakHour,
   // v3.19.1（N1）：时段告警标签导出，selftest 直接单测（无法解析时 toast 必须可见）
@@ -7336,4 +7839,9 @@ module.exports = {
   // v3.45.0（审计 F-2 / P-20）：账本原子写单点，导出供 backfill.js 复用 —— 回滚路径不再自带
   //   copyFileSync / writeFileSync（**复制实现靠注释同步**正是本项目要治的病根，这里直接改成调用）。
   saveLedgerRawAtomic,
+  // v3.62.0（批4）：孤儿轮对账（跨会话补弹）导出 —— selftest 可直接在隔离沙箱里构造"会话 A 被整树杀"
+  //   的夹具，断言"会话 B 的一次 --hook/--stop 会补弹 A"以及"补弹后回 A 不再弹"（幂等），
+  //   不必真去杀一个进程（那个场景不可控且会污染真实账本）。
+  scanOrphanRounds, orphanScanMode, orphanClaimPath, orphanClaim, orphanRelease,
+  ORPHAN_MIN_AGE_MS, ORPHAN_IDLE_MS, ORPHAN_MAX_AGE_MS,
 };

@@ -49,17 +49,32 @@ def detect_workbuddy_root():
     语义（与 Node 完全一致，勿自作聪明「更稳」——两端必须算出同一个根）：
       ① WB_ROOT 环境变量**非空即用**（空串等同未设置；不校验目录是否存在，对应 Node 的 `||`）；
       ② 否则在 [~/.workbuddy-ai, ~/.workbuddy] 中取第一个含 traces/ 或 settings.json 签名者；
-      ③ 都不命中 → 兜底 ~/.workbuddy（对应 Node 末尾的 return）。
-    ⚠️ 本函数需与 fetch-cn-prices.py 中的同名实现保持一致，且必须与 token-tracker.js:239-249 等价
-      （两个 py 文件无共享模块，各自实现）。
+      ③ 仍不命中 → 按「目录本身是否存在」再选一轮（v3.62.0 S-1 补齐，见下）；
+      ④ 都不存在 → 兜底 ~/.workbuddy（对应 Node 末尾的 return）。
+    ⚠️ 本函数需与 Node 的 detectWorkBuddyRoot（wb-root.js）**逐轮等价**；两个 py 文件无共享模块，
+      各自实现（fetch-cn-prices.py 的同名实现已在 v3.62.0 F-2 拆除，此处是 py 侧唯一一份）。
+      等价性由 selftest T99 契约测试盯住（同一合成目录树，py 与 node 必须算出同一个根）。
     """
     env = os.environ.get('WB_ROOT')
     if env:  # 空串等同未设置，与 Node 的 `process.env.WB_ROOT ||` 一致
         return env
     h = os.path.expanduser('~')
-    for c in (os.path.join(h, '.workbuddy-ai'), os.path.join(h, '.workbuddy')):
+    cands = (os.path.join(h, '.workbuddy-ai'), os.path.join(h, '.workbuddy'))
+    for c in cands:
         try:
             if os.path.exists(os.path.join(c, 'traces')) or os.path.exists(os.path.join(c, 'settings.json')):
+                return c
+        except OSError:
+            pass
+    # v3.62.0（外部审计 S-1）：marker 全不命中时，按目录存在性再选一轮，最后才兜底。
+    #   改前两个候选都没 marker（如 traces/ 尚未首次创建、settings.json 被清空/改名）就**直接**返回
+    #   `.workbuddy` —— 若实际用的是 `.workbuddy-ai`，则 pricing.json(lock) 权威覆盖层与账本整套
+    #   路径错位到另一个根，表现为「已校对的官方价从索引里消失」，且全程零报错。
+    #   Node 侧（wb-root.js v3.58.0 批8-⑦）早就有这一轮，本文件此前缺失 → 同机两端会算出不同的根。
+    #   口径与 Node 逐字对齐：用 exists（含同名文件），不用 isdir —— 镜像 fs.existsSync 的语义。
+    for c in cands:
+        try:
+            if os.path.exists(c):
                 return c
         except OSError:
             pass
@@ -95,6 +110,158 @@ CONTRACT_FULL = ('currency', 'unit', 'region', 'source_url', 'fetched_at')
 PRICE_MIN, PRICE_MAX = 0.0005, 5000.0        # 元/百万 tokens，与 fetch-cn-prices 的 priceGate 同口径
 SEMANTIC_GUARDED = ('unit', 'currency')      # 这两个字段变了 = 计价基准变了
 BIG_JUMP = 5.0                               # 价格跳变阈值：>5× 或 <1/5 → 采纳但仍 WARN
+
+# ── v3.62.0（外部审计 F-4）：Python 侧统一北京时间 ──────────────────────────────
+# 背景：本项目三个 py 脚本**原本零时区概念**（grep zoneinfo|tzinfo|utcnow 全空），所有
+#   datetime.now() / date.today() 都按机器本地时区算。而价格流水线的语义全是「北京时间」：
+#   ① 阶跃公告「自北京时间 X 起由 A 调整为 B」要用当前时刻比生效时刻（fetch-cn-prices:702）；
+#   ② cn-prices-<date>.json 的文件名是**数据归属日**，跨日边界（北京时间 0 点前后）用本地日
+#      会落错文件名 → 之后按日回溯（第三批 F-3 根治）取不到当天的快照；
+#   ③ 本文件的降级时间戳 generated_at 同样该用北京时刻。
+#   机器不在 UTC+8 时整体偏移若干小时 → 提前或延后采用新价，且零告警。
+# ⚠️ 与 Node 侧口径的关系：Node 侧 todayStr()/isPeakHour 用的都是**北京时间**
+#    （isNightHour/isPeakHour 统一 +8h 后取 UTC 分量），故此处对齐 Node，不是自创一套。
+CN_TZ = datetime.timezone(datetime.timedelta(hours=8), 'CST')
+
+def beijing_now():
+    """当前北京时间（aware datetime）。"""
+    return datetime.datetime.now(CN_TZ)
+
+def beijing_today():
+    """当前北京日期（str, YYYY-MM-DD）。"""
+    return beijing_now().date().isoformat()
+
+# ── v3.62.0（外部审计 F-1/S-4/S-7）：输入源降级状态结构化 ──────────────────────
+# 背景：抓取失败/停更的信号**本来就写出来了，只是没人读**：
+#   · fetch-cn-prices.py 把每家厂商的失败原因写进 latest.json 的 `_fetch_summary.failed`
+#     （注释明写"需下游配合读取"），而 build_index 只读 `vendors` 子树 → 整条通道悬空；
+#   · latest.json / tokenhub_lang.json 都有 `fetched_at`，但从未被用来判断"是不是今天的"；
+#   · 单位缺失被契约海关拒收（S-7）只进 stderr，接不进任何用户可见出口。
+# 唯一还能看见的通道是子进程 stderr —— 而调用方 token-tracker.js:2704 maybeRefreshLocalDb()
+#   是 hook 子进程，它的 stderr 用户基本看不到。于是最终态是：厂商已涨价半年，本地按半年前的
+#   价计费，UI 显示"今日已刷新"。
+# 现把三类信号汇成顶层 `_fetch_degraded`，由 Node 侧挂到 pricing 并显示到 toast / --report。
+# ⚠️ 该字段**只在有降级时非空**，且由 build_index 每日重写 → 厂商恢复后自动消失（自愈），
+#   不会变成 v3.30.0（A-8）那种"永久条目 = 永久噪音"。
+SOURCE_TTL_HOURS = 36   # 输入源新鲜度阈值：超过即视为陈旧（留一天多的余量给跨日/重试）
+
+def _age_hours(iso_ts):
+    """ISO 时间戳距现在的小时数；解析失败返回 None（调用方按"未知"处理，不猜）。"""
+    if not iso_ts or not isinstance(iso_ts, str):
+        return None
+    try:
+        t = datetime.datetime.fromisoformat(iso_ts)
+    except Exception:
+        return None
+    if t.tzinfo is None:
+        # 抓取脚本写入的是**本地** naive 时间（F-4 同源问题）→ 按北京时间解释，
+        # 与"这些脚本跑在本机"的语义一致；不可修正为 UTC，那会把正常数据误判成 8h 陈旧。
+        t = t.replace(tzinfo=CN_TZ)
+    return (beijing_now() - t).total_seconds() / 3600.0
+
+def _degraded_state(d, skipped, prev, auth_issues=None):
+    """汇总输入源降级状态 → dict（无降级时 vendors 为空 dict）。
+
+    三类信号：
+      ① _fetch_summary.failed —— 当日抓取失败/0 模型的厂商（含原因）；
+      ② fetched_at 陈旧 —— latest.json 整体与 tokenhub_lang.json 单独（后者不受流水线日期约束）；
+      ③ 契约字段缺失被拒收 —— 单位/币种缺失（S-7：页面改单位 → 整厂停更的那条路）。
+      ④ auth_issues —— pricing.json(lock) 权威条目自身的问题（v3.62.0 S-3 坏值拒收 /
+         F-2 官方对照停更），模型级、与"厂商抓取失败"语义不同，故单列一个字段。
+    since：同一厂商上一版已在降级 → 继承旧起始日（让用户知道"已经旧了 N 天"，不是今天才坏）。
+    """
+    vendors = {}
+    stale = []
+    fs = d.get('_fetch_summary') if isinstance(d, dict) else None
+    if isinstance(fs, dict):
+        failed = fs.get('failed')
+        if isinstance(failed, dict):
+            for k, why in failed.items():
+                vendors[str(k)] = '抓取失败：%s' % (why or '未知原因')
+    # ②-a latest.json 整体陈旧 —— 记进 stale_sources（源级），**不进 vendors**：
+    #   vendors 的键是真实厂商、toast 要按它数「N 家」，把"整个抓取文件陈旧"算成一家会虚高。
+    age = _age_hours(d.get('fetched_at') if isinstance(d, dict) else None)
+    if age is not None and age > SOURCE_TTL_HOURS:
+        stale.append({'source': 'latest.json', 'fetched_at': d.get('fetched_at'),
+                      'age_hours': round(age, 1)})
+    # ②-b tokenhub 单独判断：它由 parse_tokenhub.py 独立产出，停更时 build_index 完全无感
+    if os.path.exists(TOKENHUB):
+        try:
+            th = json.load(open(TOKENHUB, encoding='utf-8'))
+            th_age = _age_hours(th.get('fetched_at'))
+            if th_age is not None and th_age > SOURCE_TTL_HOURS:
+                stale.append({'source': 'tokenhub_lang.json', 'fetched_at': th.get('fetched_at'),
+                              'age_hours': round(th_age, 1)})
+                vendors.setdefault('tencent_tokenhub', '腾讯云 TokenHub 文档陈旧（已 %.1f 小时，'
+                                                      '混元价格可能非最新）' % th_age)
+        except Exception:
+            vendors.setdefault('tencent_tokenhub', '腾讯云 TokenHub 文档读取失败（混元价格可能非最新）')
+    else:
+        # 文件缺失：首日部署同样缺失，故只在"上一版索引里有混元条目"时才报
+        # （否则全新安装会被一条无意义告警骚扰）。
+        if prev_has_tokenhub(prev):
+            vendors.setdefault('tencent_tokenhub', '腾讯云 TokenHub 文档缺失（混元价格可能非最新）')
+    # ③ 契约字段缺失（S-7）——按厂商聚合，一条厂商级原因胜过 N 条模型级
+    for who, why in (skipped or []):
+        if '契约字段缺失' not in str(why):
+            continue
+        vk = str(who).split('/')[0]
+        if vk in ('tokenhub',):
+            vk = 'tencent_tokenhub'
+        if vk and vk not in vendors:
+            vendors[vk] = '契约字段缺失（%s）——页面可能改了单位/币种，已拒收' % why
+    prev_deg = (prev or {}).get('_fetch_degraded') or {}
+    prev_vendors = prev_deg.get('vendors') if isinstance(prev_deg, dict) else None
+    since = {}
+    if isinstance(prev_vendors, dict):
+        for k in vendors:
+            if k in prev_vendors:
+                s = (prev_deg.get('since') or {}).get(k) if isinstance(prev_deg.get('since'), dict) else None
+                since[k] = s or prev_deg.get('generated_at', '')[:10] or beijing_today()
+    for k in vendors:
+        since.setdefault(k, beijing_today())
+    # ④ lock 权威条目问题（S-3 坏值 / F-2 对照停更）—— 模型级，since 继承同 vendors 口径
+    prev_deg = (prev or {}).get('_fetch_degraded') or {}
+    prev_auth_since = prev_deg.get('since') if isinstance(prev_deg.get('since'), dict) else {}
+    prev_auth_models = {str(i.get('model')) for i in (prev_deg.get('authoritative_issues') or [])
+                        if isinstance(i, dict) and i.get('model')}
+    auth = []
+    for it in (auth_issues or []):
+        if not isinstance(it, dict) or not it.get('model'):
+            continue
+        mk = str(it['model'])
+        # 同一模型上一版已在降级 → 继承旧起始日（"已经坏了 N 天"，不是今天才坏）
+        if mk in prev_auth_models:
+            s_since = prev_auth_since.get('auth:' + mk) or beijing_today()
+        else:
+            s_since = beijing_today()
+        auth.append({
+            'model': mk,
+            'kind': str(it.get('kind') or 'unknown'),
+            'reason': str(it.get('reason') or ''),
+            'since': s_since,
+        })
+    auth_since = {'auth:' + r['model']: r['since'] for r in auth}
+    return {
+        'generated_at': beijing_now().isoformat(timespec='seconds'),
+        'vendors': vendors,       # 厂商级降级（键=厂商键）；非空即有厂商价格可能为旧值
+        'since': dict(since, **auth_since),  # 每个键自哪天起降级（继承上一版）
+        'stale_sources': stale,   # 源级陈旧明细（含年龄；latest.json 整体 + tokenhub 单独）
+        # v3.62.0（S-3/F-2）：lock 权威条目自身问题（模型级）——坏手工价被拒收 / 官方对照停更
+        'authoritative_issues': auth,
+        'ttl_hours': SOURCE_TTL_HOURS,
+    }
+
+def prev_has_tokenhub(prev):
+    """上一版索引里是否有腾讯 TokenHub 来源的条目（用于区分"真停更"与"首日部署"）。"""
+    try:
+        for e in ((prev or {}).get('models') or {}).values():
+            for s in (e.get('all_sources') or []):
+                if 'TokenHub' in str(s.get('source') or ''):
+                    return True
+    except Exception:
+        pass
+    return False
 
 # ── v3.54.0（审计批4·L5 冗余交叉 / CN·USD 一致性 / 峰谷 effective_from）──────────────
 # 背景：至此索引产出环节仍是**单源无条件采信** —— 主候选按 first_party > channel 排序后取第一个，
@@ -294,6 +461,129 @@ def classify_change(pe, ne):
     return sorted(set(kinds)), detail
 
 
+# ── v3.62.0（外部审计 F-4②/F-3）：每日价格快照 ──────────────────────────────────
+# 为什么需要：index.json 每日**整份覆盖**，`cn-prices-<date>.json`（第一棒产出）只覆盖
+#   4 家国内官方厂商（聚合源 / TokenHub / lock 覆盖层不在内）→ 两者都无法回答
+#   "某一天某个模型的单价是多少"。recalc/backfill 按当时价重算（F-3）因此无据可依。
+# 快照形态（紧凑，≈5KB/天，无清理压力；同日重复构建覆盖同名文件 = 幂等）：
+#   prices/history/prices-<date>.json
+#   { "date", "built_at", "models": { "<index 键>": {in,out,cache,peak_mult,effective_from,source} } }
+# 消费者：recalc-day.js / backfill.js 经 price-history.js 读取（单一实现）。
+HISTORY_DIR = os.path.join(PRICES_DIR, 'history')
+
+
+def _snap_alnum(s):
+    """与 token-tracker.js 的 alnumKey **逐字同口径**（只留 [a-z0-9]）。
+    快照能否与计费面对上，全靠这套归一化两边一致——口径一漂，同一条目就会在
+    快照里变成「另一个模型」，静默失效原样复发。"""
+    return re.sub(r'[^a-z0-9]', '', str(s or '').lower())
+
+
+def _snap_num(v):
+    """数值判定：显式排除 bool —— Python 里 True 是 int 的子类，会让 JSON 的 true 混进价格。"""
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def write_price_history(merged):
+    """把**当天主链实际生效的定价面**落成当日价格快照。
+
+    ⚠ v3.62.0（外部审计 AUD-F-01）：旧实现只写索引最终形态（merged），并在注释里声称
+    「merged = mergeLocalPriceDb 喂给计费的那一份」——**这条断言是假的**。Node 侧计费面是
+    `mergeLocalPriceDb(pricing.json)`，逐条规则是：
+      ① 索引条目与 pricing.json 某条 alnumKey 相同 → **索引值胜**（覆盖 pricing.json 该条）；
+      ② 但该 pricing.json 条目标了 `lock=True` → **pricing.json 值胜**（lock 永远赢）；
+      ③ 索引里没有的 pricing.json 条目 → **直接用 pricing.json 值**。
+    旧实现只落了「索引 + 索引内已注入的 lock 项」，②③ 两层落在快照之外 —— 生产实测 6 个模型
+    （deepseek-v4.1-flash / deepseek-flash / glm-4.7-flash / kimi-k3-1 / kimi-k2.5 /
+    hunyuan-a13b-instruct）**计费有价、快照无价** ⇒ recalc 永久判"当天无价"跳过、
+    backfill --write 静默记 ¥0，且「无价模型」清单还按现价判定 → 零可见信号。
+    故此处按同一套规则补齐 ②③：**只补索引未覆盖的条目、并让 lock 条目覆盖索引值**。
+    绝不能"裸拼 pricing.json"（会把索引已赢的条目反向覆盖，制造快照价≠当天计费价的新分叉）。
+    """
+    try:
+        os.makedirs(HISTORY_DIR, exist_ok=True)
+        models = {}
+        for key, e in (merged or {}).items():
+            if not isinstance(e, dict):
+                continue
+            in_p, out_p, cache_p = e.get('in_price'), e.get('out_price'), e.get('cache_hit')
+            # 只收有主价的条目：None 主价进了快照，将来按它回溯就是"当天这模型无价"
+            # （与索引侧 S-3 的拒收口径一致 —— 坏值不落历史材料）。
+            if not isinstance(in_p, (int, float)) or not isinstance(out_p, (int, float)):
+                continue
+            rec = {'in': in_p, 'out': out_p}
+            if isinstance(cache_p, (int, float)):
+                rec['cache'] = cache_p
+            pk = e.get('peak') or {}
+            if isinstance(pk, dict) and isinstance(pk.get('peak'), dict) and isinstance(pk.get('idle'), dict):
+                off = pk['idle'].get('in')
+                peakv = pk['peak'].get('in')
+                if isinstance(off, (int, float)) and off > 0 and isinstance(peakv, (int, float)):
+                    rec['peak_mult'] = round(peakv / off, 4)
+            if e.get('effective_from'):
+                rec['effective_from'] = e['effective_from']
+            if e.get('superseded_at'):
+                rec['superseded_at'] = e['superseded_at']
+            src = e.get('primary_source')
+            if src:
+                rec['source'] = str(src)[:80]
+            models[key] = rec
+        # ── 补 pricing.json 自有条目（规则 ②③，见 docstring）──────────────────────────
+        # 读不到 pricing.json 不阻断产出，但必须 WARN：否则快照会**静默**缺一层计费面
+        # （正是 AUD-F-01 的病根形态：跑完了、没报错、数是缺的）。
+        base_models = {}
+        try:
+            with open(PRICING, 'r', encoding='utf-8') as f:
+                _pb = json.load(f)
+            base_models = (_pb or {}).get('models') or {}
+        except Exception as e:
+            sys.stderr.write('[build_index][WARN] 价格历史快照：读取 pricing.json 失败（%r）——'
+                             '本次快照将缺少「只存在于 pricing.json」的模型，'
+                             'recalc/backfill 对它们会按当天无价处理\n' % (e,))
+        ak_of = {}
+        for _k in models:
+            _ak = _snap_alnum(_k)
+            if _ak and _ak not in ak_of:
+                ak_of[_ak] = _k
+        for bk, bv in base_models.items():
+            if not isinstance(bv, dict):
+                continue
+            bin_p, bout_p = bv.get('input_price'), bv.get('output_price')
+            if not _snap_num(bin_p) or not _snap_num(bout_p):
+                continue  # 无主价不落历史材料（与索引侧 S-3 同口径）
+            ak = _snap_alnum(bk)
+            tgt = ak_of.get(ak)
+            locked = bv.get('lock') is True
+            if tgt and not locked:
+                continue  # 规则①：索引已覆盖且非 lock → 快照必须保持索引值（= 当天计费值）
+            rec = {'in': bin_p, 'out': bout_p}
+            cache_b = bv.get('cached_price')
+            if _snap_num(cache_b):
+                rec['cache'] = cache_b
+            pm_b = bv.get('peak_multiplier')
+            if _snap_num(pm_b) and pm_b > 0:
+                rec['peak_mult'] = pm_b
+            rec['source'] = 'pricing.json(自有/已校对)'
+            key_b = tgt if tgt else bk
+            models[key_b] = rec
+            if ak and not tgt:
+                ak_of[ak] = key_b
+        snap = {
+            'date': beijing_today(),
+            'built_at': beijing_now().isoformat(timespec='seconds'),
+            'models': models,
+        }
+        path = os.path.join(HISTORY_DIR, 'prices-%s.json' % snap['date'])
+        tmp = '%s.tmp-%d' % (path, os.getpid())
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(snap, f, ensure_ascii=False, indent=2, allow_nan=False)
+        os.replace(tmp, path)
+        print('已写入价格历史快照 %s（%d 个模型）' % (path, len(models)))
+    except Exception as e:
+        sys.stderr.write('[build_index][WARN] 价格历史快照写入失败（%r）——索引照常产出，'
+                         '但 recalc/backfill 的「按当时价」将取不到今天\n' % (e,))
+
+
 def append_changes(records):
     """审计流水 append-only（滚动上限内）。写失败只 WARN —— 审计是留痕，不能阻断索引产出。"""
     if not records:
@@ -391,6 +681,11 @@ def main():
                 'region': m.get('region'),
                 'source_url': m.get('source_url'),
                 'fetched_at': m.get('fetched_at'),
+                # v3.62.0（外部审计 F-4）：**结构化生效时间**（源显式声明时透传）。
+                #   目前只有阶跃公告检测会产这两个字段（见 fetch-cn-prices.parse_adjustment_notices）；
+                #   其余厂商没有生效时间概念 → 缺省（不猜，见下方 change 分级里的继承/今日推定）。
+                'effective_from': m.get('effective_from'),
+                'superseded_at': m.get('superseded_at'),
             })
 
     # 摄入腾讯云 TokenHub 文档（含峰谷分档 / 原厂直供 / 输入长度分档）
@@ -481,7 +776,8 @@ def main():
         # v3.51.0（审计批1·B）：契约字段随主候选落进索引。下游 mergeLocalPriceDb
         #   （token-tracker.js:2544-2571）按固定字段白名单读取，未知字段直接忽略 →
         #   对计费侧零影响；这些字段供契约海关校验与人工审计消费。
-        for f in ('currency', 'unit', 'region', 'source_url', 'fetched_at'):
+        for f in ('currency', 'unit', 'region', 'source_url', 'fetched_at',
+                  'effective_from', 'superseded_at'):
             if primary.get(f):
                 entry[f] = primary[f]
         # 携带峰谷价格：优先主候选；主候选无 peak 时从同组 first_party 候选里补
@@ -515,6 +811,13 @@ def main():
     # 若该项未被任何抓取源覆盖（如官方页是 SPA 抓不到的 Hy4），也作为 first_party 权威项注入
     overlay = 0
     injected = 0
+    # v3.62.0（外部审计 S-3 / F-2）：lock 权威条目的问题清单 → 汇进 _fetch_degraded，
+    #   由 Node 侧挂到 pricing 并显示到 toast（⚠价锁）/ --report 顶部（见 _degraded_state）。
+    auth_issues = []
+    # v3.62.0（S-3）：审计流水与日期基线在此初始化（lock 覆盖层要先于闸门段写入
+    #   authoritative_invalid，而闸门段原本才定义这两个变量 → 上移，勿再下移）
+    changes = []
+    today_iso0 = datetime.date.today().isoformat()
     if os.path.exists(PRICING):
         p = json.load(open(PRICING, encoding='utf-8'))
         # v3.51.0（审计批1·B）：pricing.json 文件级 currency/unit 传播到 lock 覆盖/注入条目
@@ -522,6 +825,21 @@ def main():
         p_currency = p.get('currency') or 'CNY'
         p_unit = p.get('unit') or '元/百万 tokens'
         # v3.19.2（B4）：原先此处把 DeepSeek 峰谷规则串并入顶层 peak_rules，已随该字段一并删除
+        # ── v3.62.0（外部审计 F-2）：lock 条目的**诚实新鲜度** ────────────────────────
+        # DeepSeek 的 Python 侧自读闭环拆除后，lock 条目是"用户手工核对价"，没有"当日抓取"可言。
+        # 原实现给它盖 today 的 fetched_at（冒充当日新抓的 first_party）→ 下游无条件信任。
+        # 现改为挂**可查证的对照时刻**（都没有就不写：未知 ≠ 新鲜，写今天就是撒谎）：
+        #   ① _official_ref[model].ref_at —— deepseek-official.js 最近一次成功解析官方页、
+        #      并与冻结价对照的时刻（每日刷新；它变旧 = 官方页已经很久没被成功核对了）；
+        #   ② _manual_audit[model].adopted_at / manual_at —— 手动价被官方收录 / 人工核对时刻。
+        official_ref = {}
+        for r in (p.get('_official_ref') or []):
+            if isinstance(r, dict) and r.get('model') and r.get('ref_at'):
+                official_ref[str(r['model'])] = str(r['ref_at'])
+        manual_at = {}
+        for r in (p.get('_manual_audit') or []):
+            if isinstance(r, dict) and r.get('model'):
+                manual_at[str(r['model'])] = r.get('adopted_at') or r.get('manual_at')
         for key, v in p.get('models', {}).items():
             if not v.get('lock'):
                 continue
@@ -540,6 +858,25 @@ def main():
                 if _raw is not None and _num(_raw) is None:
                     sys.stderr.write('[build_index][WARN] lock 条目 %s 的 %s=%r 非数值，已按缺失处理'
                                      '（字符串价会乘出错价、null 价会崩 peak 计算）\n' % (key, _f, _raw))
+            # ── v3.62.0（外部审计 S-3，严重）：权威分支最小校验（非空 + 数值性）────────────
+            # 原实现直接 `merged[k].update({'in_price': in_p, ...})`：in_p 为 None 时会把
+            # 抓取来的**好值覆盖成 None**（该模型计费静默归 0），注入分支则会写出主价为 None 的
+            # "权威条目"。病根：lock 覆盖层为了"用户手工校对必须无条件生效"绕过前面所有校验，
+            # 而校验同时也负责"值非 None"（用户在 pricing.json 里手滑删掉 input_price 即触发）。
+            # 口径与 gate_new_model（v3.59.0 M12）一致：**in/out 必须齐全且为数值**
+            # （缺一半 → JS 侧 None*tokens=0 → 静默少收且不告警）；
+            # cache 可缺（A5 已定常态：厂商未公布缓存命中价按 0 计合法）。
+            # 价格区间（PRICE_MIN/MAX）**不在此卡**：lock = 用户显式核对过的值，越界是用户的
+            # 选择而非解析错误（S-2 的存量闸门统一另属一批，不混在这里）。
+            if in_p is None or out_p is None:
+                why = ('pricing.json(lock) 条目主价缺失或非数值（input_price=%r / output_price=%r）；'
+                       '已保留抓取源原值、未用坏值覆盖' % (v.get('input_price'), v.get('output_price')))
+                sys.stderr.write('[build_index][ERROR] lock 条目 %s %s\n' % (key, why))
+                auth_issues.append({'model': key, 'kind': 'invalid_lock', 'reason': why})
+                changes.append({'ts': datetime.datetime.now().isoformat(timespec='seconds'),
+                                'built_at': today_iso0, 'model': key, 'kind': 'authoritative_invalid',
+                                'reason': why})
+                continue  # 不覆盖、不注入（fail-closed：坏的手工价不得进入索引）
             # 峰谷：peak_multiplier 表示高峰价倍数（DeepSeek 原厂系）
             peak = None
             if v.get('peak_multiplier') and v['peak_multiplier'] != 1:
@@ -557,6 +894,18 @@ def main():
                                  'cache': (cache_p if cache_p is not None else 0) * mult},
                     }
             contract = {'currency': p_currency, 'unit': p_unit, 'region': v.get('region') or 'CN'}
+            # F-2：诚实新鲜度（有对照时刻才写；没有则保持抓取源原样/缺失，不伪造今天）
+            honest_ts = official_ref.get(key) or manual_at.get(key)
+            if honest_ts:
+                contract['fetched_at'] = honest_ts
+                h_age = _age_hours(honest_ts)
+                if h_age is not None and h_age > SOURCE_TTL_HOURS:
+                    auth_issues.append({
+                        'model': key, 'kind': 'stale_lock',
+                        'reason': '官方价对照已停更（%s，已 %.1f 小时 > %dh 阈值）——'
+                                  'lock 冻结价可能已非最新，请联网后跑价库流水线核对'
+                                  % (honest_ts, h_age, SOURCE_TTL_HOURS),
+                    })
             if k in merged:
                 upd = {
                     'in_price': in_p,
@@ -606,8 +955,8 @@ def main():
     #      拒收的代价是「按未收录计价」，仍优于「收一个差 1000 倍的价并按它记账」。
     #   ② 安全阀：闸门若把整库清空而上一版非空 → 整体回退上一版（fail-closed 到已知好状态）。
     #   ③ 分级：与上一版逐条对比，值变自动采纳并留痕；语义变（unit/currency）保留旧价挂起。
-    changes = []
-    today_iso0 = datetime.date.today().isoformat()
+    # v3.62.0（S-3）：changes 初始化**上移到 lock 覆盖层之前** —— 权威条目的坏值拒收
+    #   （authoritative_invalid）也走同一套审计流水，而覆盖层在闸门段之前执行。
     rejected = []
     for key in list(merged.keys()):
         e = merged[key]
@@ -626,8 +975,29 @@ def main():
                             'built_at': today_iso0, 'model': key, 'kind': 'new',
                             'values': {f: e.get(f) for f in ('in_price', 'out_price', 'cache_hit')},
                             'source': e.get('primary_source')})
+            # v3.62.0（外部审计 F-4）：新条目 = 本地第一次观察到该组价 → 今天起生效。
+            #   （源显式声明的 effective_from 已在合并段透传，此处不覆盖。）
+            if not e.get('effective_from'):
+                e['effective_from'] = today_iso0
             continue
         kinds, detail = classify_change(pe, e)
+        # ── v3.62.0（外部审计 F-4）：价格条目生效时间 ──────────────────────────────
+        # 语义：effective_from = 当前这组价**自哪天起有效**——回答"某天用的到底是哪个价"
+        #   （F-3 按当时价重算的判据之一；没有它，历史金额不可追溯）。
+        # 推定规则（只基于可观测事实，不猜厂商公告）：
+        #   ① 源显式声明（阶跃公告检测产出的 effective_from）→ 已由上方透传，不覆盖；
+        #   ② 与上一版三价全同 → 价格没变 → 继承上一版生效日；上一版没有该字段时（本机制
+        #      首次上线）退一级用「上一版索引构建日」—— 它证明价格至少那天已生效，比写今天诚实；
+        #   ③ 价格变了 / 新条目 → 今天起生效（本地第一次观察到该组值的日期）。
+        # 旧价被取代的日子 = 新价的 effective_from，随 price 变更写进审计流水。
+        _prev_eff = pe.get('effective_from')
+        if not e.get('effective_from'):
+            _same_price = all(pe.get(f) == e.get(f) for f in ('in_price', 'out_price', 'cache_hit'))
+            e['effective_from'] = (_prev_eff or (prev or {}).get('built_at') or today_iso0) \
+                if _same_price else today_iso0
+        if 'price' in kinds:
+            detail.setdefault('effective', {})['old_from'] = _prev_eff
+            detail['effective']['new_from'] = e.get('effective_from')
         if 'peak_rule' in kinds:
             # v3.54.0（批4）：峰谷规则自今天起生效 —— 历史 recalc 金额会随之漂移，
             #   "金额=派生值"口径允许漂移，但生效日期必须落在索引里（否则事后无从解释金额变动）。
@@ -816,7 +1186,10 @@ def main():
             non_cny.append(k)
 
     result = {
-        'built_at': datetime.date.today().isoformat(),  # 每日刷新闸门：skill 读此字段判断是否需要重抓
+        # v3.62.0（外部审计 F-4）：改用**北京日期**。改前用 date.today()（机器本地日），
+        #   非 UTC+8 机器上跨日边界会把"明天的抓取"标成昨天 → Node 侧每日刷新闸门
+        #   （built_at !== todayStr()）误判为需重抓，或反之漏刷。
+        'built_at': beijing_today(),
         'merged_at': d.get('fetched_at'),
         'currency': 'CNY',
         'unit': '元/百万 tokens',
@@ -837,8 +1210,23 @@ def main():
         },
         'conflict_resolved': conflicts,
         'authoritative_overrides': overlay,
+        # v3.62.0（外部审计 F-1/S-4/S-7）：输入源降级状态。**仅在非空时对用户有意义**，
+        #   Node 侧 mergeLocalPriceDb 挂到 pricing._fetch_degraded，由 toast / --report 显示。
+        #   厂商恢复后 build_index 每日重写 → 字段自动清空（自愈，不会变永久噪音）。
+        '_fetch_degraded': _degraded_state(d, skipped, prev, auth_issues),
         'models': merged,
     }
+    # v3.62.0：降级状态落到 stderr（保持既有"脚本层可见"），并显式提示这是**用户不可见**的通道，
+    #   真正的出口是 index.json 顶层字段 → toast。避免后人以为"打了 stderr 就算可见"。
+    _deg = result['_fetch_degraded']
+    if _deg['vendors'] or _deg['stale_sources'] or _deg.get('authoritative_issues'):
+        _parts = ['%s=%s' % (k, v) for k, v in list(_deg['vendors'].items())[:10]]
+        _parts += ['%s 陈旧 %.1fh' % (s['source'], s['age_hours']) for s in _deg['stale_sources'][:5]]
+        _parts += ['lock条目 %s: %s' % (a['model'], a['reason']) for a in _deg.get('authoritative_issues', [])[:5]]
+        sys.stderr.write('[build_index][WARN] 输入源降级（价格可能为旧值；已写入 index.json 的 '
+                         '_fetch_degraded，弹窗/报表会显示）：%s\n' % '; '.join(_parts))
+    else:
+        sys.stderr.write('[build_index] 输入源全部正常（无降级）\n')
     # v3.52.0（审计批2·G7）：写盘前**滚动备份上一版**。原实现只有 tmp + os.replace 的原子写
     #   （防读到半截 JSON），但**新索引内容出错时无法回滚**：一旦抓取/合并逻辑把价格算错并落盘，
     #   上一版正确索引已被覆盖、连人工恢复的材料都没有（只留 ≤7 天逐模型沿用，救不回整份错价）。
@@ -855,6 +1243,16 @@ def main():
         # v3.59.0（批10·M17）：allow_nan=False，理由同 changes.jsonl —— 写出 `NaN` 会让 Node 侧 JSON.parse 崩
         json.dump(result, f, ensure_ascii=False, indent=2, allow_nan=False)
     os.replace(tmp, OUT)
+    # ── v3.62.0（外部审计 F-4②/F-3）：每日价格快照 ──────────────────────────────
+    # 背景：`cn-prices-<date>.json`（第一棒产出）天天在写、天天在磁盘上，却从没人读 ——
+    #   而它只覆盖 4 家国内官方厂商，聚合源价 / TokenHub / lock 覆盖层全不在内，
+    #   recalc 按它回溯会大面积"无当时价"。且 index.json 每日**整份覆盖**，没有历史版本。
+    # 现按**当天计费面**（索引最终形态 + pricing.json 自有条目，见 write_price_history docstring）
+    #   落每日快照：prices/history/prices-<date>.json —— 紧凑模型价图（≈5KB/天，无清理压力）。
+    #   ⚠ 旧注释称 merged「即 mergeLocalPriceDb 喂给计费的那一份」= 假（AUD-F-01），merged 只是索引层。
+    # 消费者：recalc-day.js / backfill.js 的 price-history.js（F-3 按当时价重算）。
+    # ⚠ 同日重复构建 → 覆盖同名文件（幂等；built_at 刷新为当次构建时刻）。
+    write_price_history(merged)
     print('合并完成：%d 个归一化模型，解决 %d 处来源冲突，%d 个被 pricing.json(lock) 权威覆盖（其中 %d 个为新注入的官方项）；跳过 %d 条契约不全/无价条目（详见 stderr）'
           % (len(merged), conflicts, overlay, injected, len(skipped)))
     print('已写入 %s' % OUT)

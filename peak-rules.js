@@ -108,8 +108,29 @@ function holidayYearUnknown(tsMs, holidaysPath) {
   } catch (e) { return true; }
 }
 
+// v3.62.0（外部审计 S-6）：「表在、但该年假日数据未知/陈旧」→ 保守判定（不套高峰倍率）。
+//   背景：假日数据缺失时 isPeakAt 原本是 **fail-open** —— 仍按"工作日高峰"判，于是
+//     · 真假日 → 按工作日本判高峰 → ×2 **多算**；
+//     · 调休上班日（周末上班）→ 按周末低峰 → ×1 **少算**。
+//   两个方向都错，而唯一的告警只进 hook 子进程的 stderr（用户看不到），且每年每进程仅一条。
+//   holidays.json 现值即有此状态：years[2027] = null、stale_years=[2027] → **2027-01-01 起生效**。
+//   现反转为 fail-closed：不可信 → 不判高峰（错成少收而非多收，与本工具"宁缺勿错"的一贯原则一致）。
+//   ⚠ 与 holidayYearUnknown 的分界（关键，别改）：**文件整体缺失不算降级**。
+//     首次运行 / 测试夹具（不落 holidays.json）是正常形态；若也算降级，所有无表调用会一律
+//     不判高峰 —— 既误伤既有测试，也把"没部署"和"数据坏了"混为一谈。只有"表在但该年不可信"
+//     才是审计要点名的那个降级。
+function holidayYearDegraded(tsMs, holidaysPath) {
+  if (!holidaysPath) return false;
+  try { fs.statSync(holidaysPath); } catch (e) { return false; } // 表不在 = 未部署/测试，不算降级
+  return holidayYearUnknown(tsMs, holidaysPath);
+}
+
 // tsMs：UTC epoch 毫秒（绝对时刻）→ 返回该时刻在北京时间下是否处于高峰
-function isPeakAt(tsMs, pricing, holidaysPath) {
+// opts.holidayUnknownNoPeak：默认 true（保守）。显式传 false 可回到 v3.61.0 的 fail-open 行为
+//   （仅供对照测试/临时排障用，产品路径不要传）。
+function isPeakAt(tsMs, pricing, holidaysPath, opts) {
+  const conservative = !opts || opts.holidayUnknownNoPeak !== false;
+  if (conservative && holidayYearDegraded(tsMs, holidaysPath)) return false; // v3.62.0（S-6）：不可信 → 不判高峰
   const bj = new Date(Number(tsMs) + 8 * 3600 * 1000);
   const dow = bj.getUTCDay();
   const hm = bj.getUTCHours() + bj.getUTCMinutes() / 60;
@@ -146,4 +167,4 @@ function isPeakAt(tsMs, pricing, holidaysPath) {
   return DEFAULT_RANGES.some((r) => hm >= r.s && hm < r.e);
 }
 
-module.exports = { isPeakAt, isHolidayBeijing, holidayYearUnknown, holidaysLoadError, parsePeakSchedule, DEFAULT_RANGES };
+module.exports = { isPeakAt, isHolidayBeijing, holidayYearUnknown, holidayYearDegraded, holidaysLoadError, parsePeakSchedule, DEFAULT_RANGES };

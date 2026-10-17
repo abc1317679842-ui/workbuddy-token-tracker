@@ -25,6 +25,12 @@
 const fs = require('fs');
 const path = require('path');
 
+// v3.62.0（审计后续·留痕）：Stop 主链路「最后到达的步骤」。顶层守卫只兜**同步异常**，抓不到进程被
+//   外部终止（宿主收割 / OOM / 崩溃）的情形——实证 2026-10-16 23:43:55Z(pid 26324)：只落了
+//   stop-transcript 一条、rounds 无该轮记录、**守卫的降级 toast 也从未出现**（⇒ 不是同步异常死亡）。
+//   故在 :148→:189 段内补写 stop-step 步进标记，把原先只能缩到「41 行」的死亡窗口切成可定位的段。
+let LAST_STOP_STEP = 'init';
+
 // v3.61.0（审计 S1，严重）：Stop hook **顶层异常守卫**。
 //   Stop hook 是产品核心交付物（toast）的**唯一出口**：任何未捕获异常都会让本轮通知彻底静默丢失
 //   （无降级、无补弹、退出码仍 0）；异常若发生在持锁段内，还可能绕过 clearCoalesce / lastStopAt
@@ -40,6 +46,19 @@ function handleStopEnd(ctx) {
     const msg = String((e && e.message) || e);
     try { process.stderr.write(`[token-tracker] Stop 处理异常（已降级，未推进 lastStopAt）: ${msg}\n`); }
     catch (e0) { /* silent-ok:诊断 — stderr 自身失败无从可写，只能放弃 */ }
+    // v3.62.0（审计后续）：**异常必须持久留痕**。hook 场景的 stderr 无接收方（实测本机 stderr 不落
+    //   任何日志文件），事后唯一可查的是 compaction.log —— 旧守卫只写 stderr ⇒ 出事时 0 处可诊断。
+    //   step = 死在哪个调用（见文件顶部 LAST_STOP_STEP）；stack 供定位到行。
+    try {
+      const tx0 = (ctx && ctx.tx) || {};
+      if (typeof tx0.appendCompactionLog === 'function') {
+        tx0.appendCompactionLog('stop-crash', {
+          sid: (ctx && ctx.sid) || null, step: LAST_STOP_STEP,
+          name: (e && e.name) || null, err: msg.slice(0, 300),
+          stack: String((e && e.stack) || '').slice(0, 1200),
+        });
+      }
+    } catch (e5) { /* silent-ok:诊断 — 留痕自身失败不得再抛，否则守卫形同虚设 */ }
     try {
       const tx = (ctx && ctx.tx) || {};
       if (typeof tx.showToast === 'function') {
@@ -66,6 +85,7 @@ function handleStopEndInner(ctx) {
     balanceText,
     captureTranscShape,
     clearCoalesce,
+    clearStopMark,
     coalescePath,
     dispWidth,
     ensureNewModelPricing,
@@ -105,7 +125,17 @@ function handleStopEndInner(ctx) {
     transcriptPathFromPayload,
     writeCoalesce,
     writeProbe,
+    writeStopMark,
   } = tx;
+    // v3.62.0（审计后续·留痕）：步进标记 = 同步写一条 stop-step（见文件顶部 LAST_STOP_STEP 注释）。
+    //   自身失败绝不外抛（诊断留痕不得影响主流程）。入口先归零 —— 生产里每个 Stop 是新进程，但
+    //   同进程内重复调用（测试 / 未来复用）时，残留值会把"未走到任何标记就抛"误报成上一轮的步骤。
+    LAST_STOP_STEP = 'init';
+    const stopStep = (name, extra) => {
+      LAST_STOP_STEP = name;
+      try { appendCompactionLog('stop-step', Object.assign({ sid, step: name }, extra || {})); }
+      catch (e) { /* silent-ok:诊断 — 步进标记写入失败不得影响主流程 */ }
+    };
     const tsPath = transcriptPathFromPayload(payloadRaw);
     // v2.57（第一阶段修复）：Stop payload 无 stopReason 字段（实测只有 session_id/transcript_path/
     // cwd/hook_event_name/stop_hook_active/agent_type/last_assistant_message/...），stopReason 只存在于
@@ -146,6 +176,13 @@ function handleStopEndInner(ctx) {
     const aggStart0 = settledAt0 > roundStart0 ? settledAt0 : roundStart0;
     // v2.87：compaction 事件观测（方案①）——Stop 决策点落盘形态快照 + 聚合起点决策，事后可完整还原事件序列
     appendCompactionLog('stop-transcript', { sid, roundStart0, lastStopAt: settledAt0, aggStart: aggStart0, shape: captureTranscShape(tsPath) });
+    // v3.63.0（2026-10-17 竞态兜底）：**聚合之前**先落一笔"本轮在飞"标记（一次小文件写，~1ms）。
+    //   宿主会在任务完成后约 200ms 重建 runtime 并树杀本进程（10:20:42.286 实证），而聚合一段
+    //   126MB 转录要 1438ms —— 等算完再写就什么都不剩（KI-13 实测：整树杀不留任何痕迹）。
+    //   所以标记必须放在这里：**唯一早于高风险段、又已拿到聚合起点**的位置。
+    //   收口侧：正常弹窗路径推进 lastStopAt（recover 的状态闸）或写 coalesce（内部清标记）；
+    //   被砍侧：下次 `--hook` 读到它 → recoverKilledStop() 补账补弹。
+    if (tsPath && roundStart0 > 0) writeStopMark(sid, { tsPath, roundStart: roundStart0, aggStart: aggStart0 });
         if (tsPath && roundStart0 > 0) {
       let agg = aggregateTranscript(tsPath, aggStart0);
       // v3.05（2026-09-11 修复·重复弹窗）：两次重试**必须沿用 aggStart0，不能回退到 roundStart0**。
@@ -157,10 +194,50 @@ function handleStopEndInner(ctx) {
       //   且窗口不回退 —— **既不漏新数据，也不会重弹旧数据**。
       if (!agg) { sleep(500); agg = aggregateTranscript(tsPath, aggStart0); } // transcript 尾部可能未 flush
       if (!agg) { sleep(1500); agg = aggregateTranscript(tsPath, aggStart0); }
+      // v3.62.0（审计后续·留痕）：三轮聚合仍为空 → 直接落到 main() 的 trace 兜底尾巴，**原先零留痕**；
+      //   若尾巴也无声（本会话无 trace 文件）即表现为"整轮静默丢失"（2026-10-16 23:43:55Z 的疑似形态之一）。
+      if (!agg) appendCompactionLog('stop-agg-null', { sid, roundStart0, aggStart: aggStart0, tsPath });
       if (agg) {
+        // v3.63（2026-10-17 记账优先）：**先把钱落盘，再做显示**。
+        //   病根：宿主在"任务完成"后约 200ms 就回收会话 runtime（2026-10-17 10:20:42 实证），
+        //   而 Stop 钩子要 ~650ms（node 冷启动 300ms + 聚合 + 估算 + 时长 + 查价 + 记账）。
+        //   旧顺序把 estimateInterrupted / traceWallDurMs / shortModelName（**只影响弹窗显示**）
+        //   摆在 incrementalRecord 之前 → 被砍在显示步骤上时，**硬账跟着一起丢**
+        //   （实测：水位线停在 567 行，6 次调用 29.5 万 tokens 未记账）。
+        //   现改为：聚合 → 粗略时长 → 补价 → **记账** → 才做估算/精确时长/短名。
+        //   代价：账本 `durMs` 用 transcript 口径（各模型最后调用时刻 − 轮起点），比 trace 口径粗
+        //   但同源、不为 0；弹窗仍用 trace 精确值。token 与金额**不受任何影响**（估算段只进弹窗）。
+        try {
+          let lastTs0 = 0;
+          for (const b of Object.values(agg.models || {})) { if (b && b.lastTs > lastTs0) lastTs0 = b.lastTs; }
+          if (lastTs0 > roundStart0) agg.durMs = lastTs0 - roundStart0;
+        } catch (e) { /* silent-ok:降级 — 保留聚合自带时长，绝不影响记账 */ }
+      // v3.62.0（审计后续·关键隔离）：**价格补录是本段唯一会联网 + 读写价库的调用**（lookupCnPrice 走
+      //   execFileSync，价库写入走 withFileLock）——它的抛错/阻塞是本段最高风险点。包住它：失败只记
+      //   stop-step-failed，**绝不能带走下方的 incrementalRecord（记账）与弹窗分支**。
+      stopStep('pre-price');
+      let nmNote = '';
+      try { nmNote = ensureNewModelPricing(pricing, agg).note; }
+      catch (e) { stopStep('price-failed', { err: String((e && e.message) || e).slice(0, 200) }); }
+      stopStep('priced');
+      // v2.64：补价完成后再记账——确保新模型首用时 pricing.json 已含该模型价格，
+      // 否则 incrementalRecord 内 loadPricing() 读不到价、calcCost 返回 null，cost 被静默丢弃。
+      // 记账与弹窗解耦：即使弹窗时机错（多弹/漏弹），账本也已正确。
+      // v3.20.0：带上轮次元信息 → 这一轮会在 rounds/rounds-YYYY-MM.jsonl 留一条明细。
+      incrementalRecord(tsPath, sid, {
+        sid, roundStart: roundStart0, durMs: agg.durMs,
+        model: agg.modelMain || agg.model, subModels: agg.subModels,
+        subCount: agg.subCount, teamActive: agg.teamActive === true,
+        source: 'stop-transcript', label: roundLabel(tsPath, roundStart0),
+      });
+      stopStep('recorded', { total: agg.total });
+      // ===== 以下全部是"只影响弹窗显示"的增强：被砍也绝不回头影响上面那笔硬账 =====
         // v2.53：本轮可能"完整调用（有 usage）+ 被中断思考（无 usage）"混合——合并被中断估算，
         // 让弹窗显示两边汇总（之前只显示完整调用部分，被中断思考漏了）。
-        const estByModel0 = estimateInterrupted(readTranscLines(tsPath), 0, aggStart0);
+        // v3.62.0（审计后续）：估算补数是**旁路增强**（挂掉只是少显示被中断段），失败不得带走整轮记账/弹窗。
+        let estByModel0 = {};
+        try { estByModel0 = estimateInterrupted(readTranscLines(tsPath), 0, aggStart0); }
+        catch (e) { stopStep('estimate-failed', { err: String((e && e.message) || e).slice(0, 200) }); }
         const estNames0 = Object.keys(estByModel0);
         if (estNames0.length) {
           const estIn0 = estNames0.reduce((s, n) => s + estByModel0[n].in, 0);
@@ -180,18 +257,10 @@ function handleStopEndInner(ctx) {
           const wd = traceWallDurMs(latestTraceFile(true), roundStart0, sid, tsPath);
           if (wd.source === 'trace') agg.durMs = wd.durMs;
         } catch (e) { /* 保留 transcript 口径 */ }
-        const modelShort = shortModelName(agg, pricing);
-      const nmNote = ensureNewModelPricing(pricing, agg).note;
-      // v2.64：补价完成后再记账——确保新模型首用时 pricing.json 已含该模型价格，
-      // 否则 incrementalRecord 内 loadPricing() 读不到价、calcCost 返回 null，cost 被静默丢弃。
-      // 记账与弹窗解耦：即使弹窗时机错（多弹/漏弹），账本也已正确。
-      // v3.20.0：带上轮次元信息 → 这一轮会在 rounds/rounds-YYYY-MM.jsonl 留一条明细。
-      incrementalRecord(tsPath, sid, {
-        sid, roundStart: roundStart0, durMs: agg.durMs,
-        model: agg.modelMain || agg.model, subModels: agg.subModels,
-        subCount: agg.subCount, teamActive: agg.teamActive === true,
-        source: 'stop-transcript', label: roundLabel(tsPath, roundStart0),
-      });
+        // v3.62.0（审计后续）：模型短名只影响显示，失败回落原始模型名（绝不带走记账/弹窗）。
+        let modelShort;
+        try { modelShort = shortModelName(agg, pricing); }
+        catch (e) { stopStep('shortname-failed', { err: String((e && e.message) || e).slice(0, 200) }); modelShort = (agg.modelMain || agg.model) || ''; }
       const line = lineFor(agg, false, modelShort);
         writeProbe({ time: new Date().toISOString(), event: 'Stop', ok: true, sid, sameRound: false, transcriptPath: tsPath, stat: agg, line, source: 'transcript', payload: summarizePayload(payloadRaw) });
         // 只有专家团（本轮有子代理 subagents 或有团队活动）才走合并延迟弹一次汇总——避免普通
@@ -393,6 +462,10 @@ function handleStopEndInner(ctx) {
                 lastStopAt: Date.now(),
               }, sid);
             } catch (e) { /* 快照写失败不影响弹窗 */ }
+            // v3.63.0：本轮已同步弹窗并推进 lastStopAt = 收口完成 → 在飞标记就地清掉。
+            //   不清的后果：每个「最后一次 Stop 后再无事件」的会话都会留下一个含本地绝对路径的
+            //   .stopmark-*.json（实测 89eb68b8 会话残留），虽被状态闸兜住但会永久堆积。
+            clearStopMark(sid);
             appendCompactionLog(isPlainRound ? 'stop-plain-immediate' : 'stop-team-sync', { sid: effSid, subCount: agg && agg.subCount, teamActive: !!(agg && agg.teamActive), teamDataReady });
           } catch (e) {
             process.stderr.write(`[token-tracker] 同步弹窗失败(${isPlainRound ? '普通轮' : '团队轮'}): ${e.message}\n`);
@@ -579,4 +652,4 @@ function handleStopEndInner(ctx) {
   return false;
 }
 
-module.exports = { handleStopEnd, STOP_TX_NAMES: ["SUBAGENT_IDLE_MS","TOAST_LINE_MAX_W","aggregateMainOnly","aggregatePerModel","aggregateTranscript","allInRoundSubFilesTerminal","appendCompactionLog","balanceText","captureTranscShape","clearCoalesce","coalescePath","dispWidth","ensureNewModelPricing","estimateInterrupted","freshCompactionMarker","hasSubagentsRecentlyActive","incrementalRecord","inferRoundStartFromText","interruptedRowsAfter","lastWatcherSpawnError","latestTraceFile","ledgerKey","lineFor","loadSnapshot","mergeEstIntoModels","noPriceTag1","periodNote","readCoalesceInfo","readTranscLines","roundLabel","saveSnapshot","shortModelName","showToast","showToastsSplitByModel","sleep","sleepSync","startWatcherVerified","subagentPending","subagentsAllSettled","summarizePayload","terminalError","toastLine1","toastLine2","toastLineTagged","todayUsageTxt","traceWallDurMs","transcriptPathFromPayload","writeCoalesce","writeProbe"] };
+module.exports = { handleStopEnd, STOP_TX_NAMES: ["SUBAGENT_IDLE_MS","TOAST_LINE_MAX_W","aggregateMainOnly","aggregatePerModel","aggregateTranscript","allInRoundSubFilesTerminal","appendCompactionLog","balanceText","captureTranscShape","clearCoalesce","clearStopMark","coalescePath","dispWidth","ensureNewModelPricing","estimateInterrupted","freshCompactionMarker","hasSubagentsRecentlyActive","incrementalRecord","inferRoundStartFromText","interruptedRowsAfter","lastWatcherSpawnError","latestTraceFile","ledgerKey","lineFor","loadSnapshot","mergeEstIntoModels","noPriceTag1","periodNote","readCoalesceInfo","readTranscLines","roundLabel","saveSnapshot","shortModelName","showToast","showToastsSplitByModel","sleep","sleepSync","startWatcherVerified","subagentPending","subagentsAllSettled","summarizePayload","terminalError","toastLine1","toastLine2","toastLineTagged","todayUsageTxt","traceWallDurMs","transcriptPathFromPayload","writeCoalesce","writeProbe","writeStopMark"] };

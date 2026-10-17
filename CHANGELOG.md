@@ -3,6 +3,153 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.63.0（2026-10-17）—— 钩子减负 + 记账优先 + 「被砍轮」补账补弹
+
+> 触发：v3.62.0 之后的实测追问——「压缩上下文之后续跑的那轮任务正常完成了，弹窗去哪了？」
+> 用户定夺：①**放弃跨会话补弹**（本机 `orphan_scan:"off"`，代码与守卫保留）；②**记账必须万无一失**，
+> 弹窗可以迟到、不能凭空白丢；③**不加看门狗 / 常驻进程 / 计划任务**（权限面太大，已否决）。
+
+### 一、减负：孤儿轮对账不再挂在 `--stop` 上
+
+`scanOrphanRounds` 的挂载点从 `if (asHook || asStop)` 收到**只挂 `--hook`**。依据是实测的预算对撞：
+46 个快照常态扫一遍 3.3~15.5ms，但**命中候选要聚合该会话整份 transcript** —— 126MB / 28479 行实测
+**1438ms**，`ORPHAN_MAX=8` ⇒ 最坏 **≈11.5 秒**；而 Stop 钩子的时间预算只有 ~650ms（node 冷启动已占 300ms）。
+`UserPromptSubmit` 早就在跑同一份对账，Stop 这一份是**纯重复**，且一旦真命中就反噬本轮记账与弹窗。
+守卫 **T102-a7**。
+
+### 二、记账优先：把钱落盘排到所有"只影响显示"的步骤之前
+
+`stop-handler.js` 的 `if (agg)` 分支重排为：
+
+```
+聚合 → 粗算 durMs → 补价 → incrementalRecord → 估算被中断段 → 精确时长 → 模型短名 → 弹窗
+```
+
+`estimateInterrupted` / `traceWallDurMs` / `shortModelName` 三者全是显示层增强，原先挡在记账**之前**，
+任一抛错或进程被砍都会让这一轮**白算**。另加零成本时长兜底「各模型 `lastTs` − `roundStart0`」
+（transcript 同源，比 trace 粗但绝不为 0），替代"必须等 trace 才有时长"的隐性依赖。
+守卫 **T105-a1/a2/b1/b2**。
+
+### 三、「被砍轮」的补账与补弹（KI-37）
+
+宿主在任务完成 **~200ms** 就 `launch-spec resolved` 重建会话 runtime、回收旧进程（Windows Job Object 连带杀），
+650ms 的 Stop 钩子因此存在被砍在半路的窄窗口。历史 157 次「压缩后续跑」里 **3 次（1.9%）** 连一条弹窗都没留下，
+且**与转录大小无关**（596 / 2133 / 3690 行都命中过，25231 行那次反而被别的路径救回）——是竞态，不是"聚合太慢"。
+
+修法不是"让钩子更快"（快不过 300ms 冷启动），而是**换放置点**：
+
+- Stop 在 `appendCompactionLog('stop-transcript')` 之后、`aggregateTranscript` **之前**写
+  `.stopmark-<sid>.json`（~1ms）。这是整条链上唯一"早于高风险段、又已经知道从哪算"的位置——
+  整树杀什么都不留，所以标记必须活着写。
+- `--hook` 进来调 `recoverKilledStop()`：**状态闸**（`lastStopAt < 标记时间`）→ 聚合 → 记账
+  （**记账前后比对水位线**，没涨即早已入账、静默退出）→ 弹窗（reason `stop-killed-recover`）→ 清标记。
+- `writeCoalesce()` 内部顺手清标记（4 处调用点统一覆盖，漏一处就是永久残留）；同步弹窗成功收口处也清
+  （否则每个"最后一次 Stop 后再无事件"的会话都会留一个含**本地绝对路径**的残留文件）。
+- **不挂 `--stop`**：补账要重聚合一遍转录，挂了会反噬本轮。
+
+守卫 **T106-a1~a6**（源码：挂载点 / 顺序 / 三重闸 / 清标记 / 不挂 stop / 收口清理）+
+**T106-b1~b4**（真 spawn `--hook` 端到端：补弹且水位线真推进 / 幂等零新增 / 已结算零新增 / 无标记零新增）。
+
+**剩余边界（如实标注）**：被砍之后**再无任何事件**（用户不再提交、也没有下一次 Stop），标记会留在盘上，
+那条弹窗就不会出现——"下一次事件"是唯一能活的时机。
+
+### 四、其它
+
+- `.stopmark-*.json` 进 `.gitignore`：文件内含会话转录的**本地绝对路径**，不得入库。
+- 弃用跨会话补弹：本机 `local-config.json` 置 `orphan_scan:"off"`；`scanOrphanRounds` 与 T102 全族**保留**
+  （仓库默认即关闭，行为不变），理由与取舍见 KI-33。
+
+---
+
+## v3.62.0（2026-10-17）—— 外部审计 v3.61.0（三批）+ 复审 P1 修完
+
+> 触发：两份外部审计——①对 v3.61.0 的全量审（三批，KI-31/KI-32）；②对修复后代码的复审（KI-34/KI-35）。
+> 用户定夺：**能落的全部修完**，只留 P2/P3 登记项（KI-36）与两处刻意不动（A5 Won't fix / S3 方向相反）。
+> 本版共修 **1 严重 + 3 中危 + 2 高价值审计项**。
+
+### F-2【严重】`fetch-cn-prices` 自我引用闭环
+
+`VENDORS['deepseek']` 用 `mode:'pricing'` **读回 `pricing.json`（流水线自己的最终汇）冒充"当日新抓的
+first_party 官方价"**。官方调价后只要 `deepseek-official.js` 那一轮失败，本地价就**永久停在旧值**，
+而 `latest.json` 仍带 `fetched_at=今天` → 下游无条件信任（源 = 汇的闭环）。
+
+**修**：DeepSeek 改 `mode:'external'`（本脚本明确不抓，`status='skipped'` 不计失败），官方价只走
+Node 侧 `deepseek-official.js` → `pricing.json` → `build_index` 的 lock 覆盖层；`parse_pricing_deepseek` 整段拆除。
+
+### S-3【中危】lock 覆盖层零校验 → 静默少收
+
+in/out 主价缺失或非数值时**照写进索引**（JS 侧 `None * tokens = 0`），或把抓来的好值覆盖成 `None`。
+**修**：fail-closed 拒收（不覆盖、不注入）+ stderr + `changes.jsonl` + `authoritative_issues` 模型级降级
+（toast `⚠价锁`、`--report` 明细）。
+
+同时修 **F-2 诚实新鲜度**：lock 条目的 `fetched_at` 原写今天（伪造新鲜）→ 改挂
+`_official_ref[model].ref_at` / `_manual_audit` 的 `adopted_at`/`manual_at`；都没有则**不写**（未知 ≠ 新鲜），
+年龄 >36h 记 `stale_lock`。
+
+### S-1【中危】数据根探测 py/node 不一致
+
+`wb-root.js` v3.58.0 有「marker 全不命中 → 按目录存在性再选一轮」，`build_index.py` 的同名函数没有 →
+同机两端可能算出不同的根（lock 覆盖层静默失效）。**修**：py 侧补齐第二轮 + **契约测试 T99**
+（同一合成目录树，py 与 node 必须算出同一个根）。
+
+### F-3【中危】历史不可复现（根治）
+
+`recalc-day.js` / `backfill.js` 都按 `pricing.json` 的**现价**回算历史 → 厂商调价后跑一次，就把那天的金额
+按**今天**的单价改写，命令却看着像"查看历史 / 重建账本"。
+
+**修**：价库流水线每日落**当日快照**（`build_index.py` 的 `write_price_history` →
+`prices/history/prices-<北京日>.json`，含 lock 权威覆盖层），回溯按**目标日**取快照；快照的目录解析 / 读取 /
+形态转换抽成单点模块 **`price-history.js`**（"复制实现靠注释同步"在本仓已翻车三次，不许再有第四处）。
+
+**两条路径处置刻意相反**：`recalc` 面向"某一日复核"→ 缺快照 **fail-closed 拒绝**（exit 1 + 现有快照范围 +
+`--current-price` 逃逸口）；`backfill` 面向"重建整本历史"→ 绝大多数日期早于快照机制，硬拒绝会让工具不可用 →
+缺快照**降级为现价并逐日 stderr WARN**（不静默）。`recalc-day.js` 另改为**默认只报告不写账本**（dry-run），
+确需写回加 `--write`。
+
+⚠ 已知残留（如实标注）：峰谷规则 `deepseek_rules` 不在快照里（它是 `pricing.json` 顶层字段），
+历史某天规则与今天不同时峰谷判定仍按今天的规则——价格才是金额主项。
+
+### A-4 拍板：保留阶跃抓取
+
+审计原判「无计费消费者」**被证伪**：`pricing.json` 无 `step-*`，但 `index.json` 有 6 个有效条目 →
+`mergeLocalPriceDb` 并入内存 pricing → `findModel` 命中 → `calcCost` 出非零金额 = **有消费者**。
+处置 = 保留 + 行为守卫 **T98-b1** 钉住（合成"不并入"世界必红）。
+
+### Stop 端「静默丢轮」的可观测化 + 辅助步骤隔离（KI-32）
+
+原先一次异常就能让整轮静默丢失且零留痕。**修**：Stop hook 加**顶层异常守卫**（落持久日志 `stop-crash`，
+含 step + stack）+ 模块级 `LAST_STOP_STEP` + `stopStep` 步进留痕（自身失败不外抛）+ 把四个高危旁路
+（价格补录 / 估算被中断段 / 精确时长 / 模型短名）**逐个 try 隔离**；同步弹窗 catch 降级 toast
+（普通轮不写 coalesce = 一抛即零兜底），降级**不推进 `lastStopAt`**；聚合三轮仍为空必须留痕 `stop-agg-null`。
+守卫 **T101-a1~a7**。
+
+### 跨会话补弹：孤儿轮对账（KI-33，仓库默认关闭）
+
+新增 `scanOrphanRounds`：扫其他会话的 `.snapshot-*.json` 找"有用户消息、无 Stop 收口"的孤儿轮，
+按行数水位线补账补弹。三道闸防重复（72h 年龄闸 / 状态闸 / 水位线幂等）。
+**仓库默认关闭**（`orphan_scan` 未配置即 off），本机曾开启验证，本版起本机亦关闭（见 v3.63.0）。
+守卫 **T102**。已知边界：同会话自身欠账仍"合并弹"、跨进程极端并发可能双弹（AUD-C-02 未动根因）。
+
+### AUD-F-01【P1】每日价格快照漏一层定价面
+
+`write_price_history` 只写抓取源合并后的索引，**不含 `pricing.json` 自有条目**（手工录入 / `deepseek-official`
+的 lock 覆盖层）→ recalc/backfill 对"只在 pricing.json 里"的模型静默拿不到价。**修**：快照补
+`pricing.json` 自有条目，三条合并规则与 `mergeLocalPriceDb` 逐字对齐（该层优先 / 缓存价缺失按输入价 /
+坏条目拒收）。守卫 **T104**。生产当日快照已按新口径重写（51→57 条，与现价差 0，recalc 覆盖 3/4→4/4）。
+
+### AUD-C-01【P1】取消轮重弹「已结算段」并错标「（手动取消）」
+
+`cancelledFlushStart` 未钳 `lastStopAt` → 取消后紧接着的 Stop 会把**已经结算并弹过**的那段再弹一次，
+还会把正常轮标成"手动取消"。**修**：取消时用 `cancelledFlushStart` 钳住 `lastStopAt` 水位线，只补未结算段。
+守卫 **T103**。
+
+### 累计验证（v3.62.0 + v3.63.0 一起发）
+
+selftest **1174/0/0**；四路环境 harness 达标（②③④全绿，①路仅 T12-j 组为测试自身联网脆弱性）；
+反向验证 **R1~R57** 逐项染红目标守卫、零误伤；零账本实证：HEAD vs 工作版同夹具 `--stop`，
+账本 **384B 逐字节一致**（sha `fc42f871ae30f7a2`）；真实账本 `daily-usage.json` 49923B 全程零变更。
+
+
 ## v3.61.0（2026-10-16）—— 外部审计（v3.60.0 全量审）第一批 P0 + 第二批 P1 合并修完
 
 > 触发：用户提交外部审计报告 `AUDIT-REPORT.md`（对着 v3.60.0 全量审），要求「把全部看完一起汇总判断，

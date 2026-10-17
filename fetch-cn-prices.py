@@ -2,9 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 国内厂商官方人民币价抓取器（v0.5，2026-10-02）
-- v0.5：① 数据根探测 detect_workbuddy_root()（WB_ROOT > ~/.workbuddy-ai > ~/.workbuddy，与 Node 侧
-  detectWorkBuddyRoot 同口径）——修「客户端迁到 ~/.workbuddy-ai 后 Python 侧仍写死 ~/.workbuddy」；
-  ② requests 分支补 verify=，修 CN_PRICES_INSECURE_TLS 降级对「装了 requests 的机器」静默失效；
+- v3.62.0（外部审计 F-2，致命→严重）：**拆除 DeepSeek 自我引用闭环**。
+  原实现 VENDORS['deepseek'] 用 `mode:'pricing'` 读回 pricing.json 自己的产物
+  （而 pricing.json 正是这条流水线的最终汇）→「源 = 汇」：DeepSeek 官方调价后，
+  只要 Node 侧 deepseek-official.js 那一轮失败，本地价就永远停在旧值，且
+  latest.json 里还带着 `fetched_at=今天` + `source_type=first_party` 冒充当日新抓。
+  现 DeepSeek 改走 `mode:'external'`（明确"本脚本不抓"）：它的官方价只有一条链路 ——
+  Node 侧 deepseek-official.js（真抓官方页）→ pricing.json；进索引走 build_index.py 的
+  pricing.json(lock) 权威覆盖层（同一份数据、诚实标签、不伪造 fetched_at）。
+  随之删除本脚本的数据根探测（ detect_workbuddy_root / PRICING_PATH 全删）——
+  它只为那个自读服务；数据根探测现存两处：build_index.py（价库流水线）与
+  wb-root.js（Node 单点），由 selftest T99 契约测试盯一致。
+- v0.5：② requests 分支补 verify=，修 CN_PRICES_INSECURE_TLS 降级对「装了 requests 的机器」静默失效；
   ③ 抓取失败改为结构化摘要（stderr + JSON _fetch_summary），exit code 维持 fail-soft 语义（详见 main()）。
 - v0.4：requests 降为可选依赖（缺失自动回退 urllib 的 fetch()，无 requests 的机器不再 ImportError 整条崩）；
   TLS 恢复严格证书校验（价格影响计费；确需降级设 CN_PRICES_INSECURE_TLS=1，会打警告）
@@ -36,14 +45,33 @@ import zlib
 import hashlib
 import datetime
 import urllib.request
+
+# ── v3.62.0（外部审计 F-4）：统一北京时间 ──────────────────────────────────────
+# 背景：本脚本原本**零时区概念**（grep zoneinfo|tzinfo|utcnow 全空），所有 datetime.now() /
+#   date.today() 都按机器本地时区算，而价格流水线的语义全是「北京时间」：
+#     ① 阶跃公告「自北京时间 X 起由 A 调整为 B」要用当前时刻比生效时刻（下方 parse_stepfun_md）；
+#     ② cn-prices-<date>.json 的文件名是**数据归属日**，跨日边界（北京 0 点前后）用本地日会落错
+#        文件名 → 之后按日回溯取不到当天的快照；
+#     ③ fetched_at 是新鲜度判定的输入（build_index 的 SOURCE_TTL_HOURS 校验读它），本地 naive
+#        时间在非 UTC+8 机器上会让"8 小时前的数据"被算成"0 小时前"或反之。
+#   机器不在 UTC+8 时整体偏移若干小时 → 提前或延后采用新价，且零告警。
+# ⚠️ 与 Node 侧口径一致（isPeakHour / isNightHour / todayStr 用的都是北京时间），不是自创一套。
+CN_TZ = datetime.timezone(datetime.timedelta(hours=8), 'CST')
+
+def beijing_now():
+    """当前北京时间（aware datetime）。"""
+    return datetime.datetime.now(CN_TZ)
+
+def beijing_today():
+    """当前北京日期（str, YYYY-MM-DD）。"""
+    return beijing_now().date().isoformat()
 try:
     import requests  # 可选依赖：全脚本只有 Kimi 文档页用到；缺失时 http_get() 自动回退 urllib
 except ImportError:
     requests = None
 
 # v3.60.0（CI 编码 · 2026-10-15）：Windows 上 sys.stdout 默认走 **locale 编码**（如 cp1252）——
-#   一旦 print 中文即 UnicodeEncodeError、整个脚本崩（CI Windows runner 实测；本机 locale=UTF-8 故不复现）。
-#   调用方 token-tracker.js 按 utf-8 解码流水线输出 → 输出契约本就该是 utf-8。
+#   一旦 print 中文即 UnicodeEncodeError、整个脚本崩（CI Windows runner 实测；本机 locale=UTF-8 故不复现）。#   调用方 token-tracker.js 按 utf-8 解码流水线输出 → 输出契约本就该是 utf-8。
 #   强制 utf-8 + errors='replace'：管道/CI 下输出正确，老 cp1252 控制台也不再崩（个别字符降级为 '?'）。
 try:
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -69,35 +97,13 @@ if os.environ.get('CN_PRICES_INSECURE_TLS') == '1':
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
 TIMEOUT = 30
 
-def detect_workbuddy_root():
-    """v0.5（2026-10-02）：WorkBuddy 数据根探测，与 Node 侧 detectWorkBuddyRoot
-    （token-tracker.js:239-249 / refresh-prices.js:40-50）**逐字等价**。背景：新版客户端可能把数据根
-    迁到 ~/.workbuddy-ai，若此处写死 ~/.workbuddy，本脚本读 DeepSeek 价的 PRICING_PATH 会指向错误
-    路径，且 build_index.py 的「沿用旧价」分支会静默兜底，用户完全察觉不到。
-    语义（与 Node 完全一致，勿自作聪明「更稳」——两端必须算出同一个根）：
-      ① WB_ROOT 环境变量**非空即用**（空串等同未设置；不校验目录是否存在，对应 Node 的 `||`）；
-      ② 否则在 [~/.workbuddy-ai, ~/.workbuddy] 中取第一个含 traces/ 或 settings.json 签名者；
-      ③ 都不命中 → 兜底 ~/.workbuddy（对应 Node 末尾的 return）。
-    ⚠️ 本函数需与 build_index.py 中的同名实现保持一致，且必须与 token-tracker.js:239-249 等价
-      （两个 py 文件无共享模块，各自实现）。
-    """
-    env = os.environ.get('WB_ROOT')
-    if env:  # 空串等同未设置，与 Node 的 `process.env.WB_ROOT ||` 一致
-        return env
-    h = os.path.expanduser('~')
-    for c in (os.path.join(h, '.workbuddy-ai'), os.path.join(h, '.workbuddy')):
-        try:
-            if os.path.exists(os.path.join(c, 'traces')) or os.path.exists(os.path.join(c, 'settings.json')):
-                return c
-        except OSError:
-            pass
-    return os.path.join(h, '.workbuddy')
-
-
-# DeepSeek 官方价由用户已在 pricing.json 校对（lock），不重复抓取，
-# 直接读该文件作为库的 DeepSeek first_party 源。
-WB_ROOT = detect_workbuddy_root()
-PRICING_PATH = os.path.join(WB_ROOT, 'skills', 'token-usage-tracker', 'pricing.json')
+# v3.62.0（外部审计 F-2）：本脚本**不再做数据根探测**。
+#   原实现 detect_workbuddy_root() 只为 `mode:'pricing'` 的 DeepSeek 自读服务
+#   （读 WB_ROOT/skills/token-usage-tracker/pricing.json）。该自读已拆除 → 探测随之删除：
+#   少一份"靠注释约定同步"的根判据复制（S-1 家族）。现存两处：
+#     · build_index.py  —— 价库流水线侧（读 pricing.json 的 lock 权威覆盖层）；
+#     · wb-root.js      —— Node 单点实现（主脚本/backfill/recalc 共用）。
+#   两端一致性由 selftest T99 契约测试保证（同一组合成目录树分别跑，结果必须相同）。
 
 # 阿里云(通义千问)不抓本地库——计费统一走聚合源(llmabacus)人民币价；
 # 其官方价分地域/阶梯/思考模式/Batch半价，本地难以精确解析，故放弃本地存储。
@@ -209,6 +215,60 @@ STEP_ADJ_RE = re.compile(
     r'自北京时间\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*(\d{1,2}):(\d{2})\s*起'
     r'由\s*([\d.]+)\s*元[／/]百万\s*tokens\s*调整为\s*([\d.]+)\s*元[／/]百万\s*tokens')
 
+# v3.62.0（外部审计 F-4）：调价公告检测的**可复用层**（原为阶跃专属、整段内联在 parse_stepfun_md 里）。
+#   背景：这是全项目**唯一**一处"识别厂商预告调价"的逻辑（其余厂商完全没有生效时间概念），
+#   却硬编码在阶跃解析器内 + 只认一句中文句式 → 别的厂商出同类公告只能再抄一遍。
+#   抽成「句式库 + 纯函数」：将来扩厂商只需往 ADJ_NOTICE_PATTERNS 补一条正则，
+#   「模型名归一 / 字段判定 / 生效时间格式化」这套逻辑不再复制。
+#   ⚠ 句式必须**保守**：宁可漏认（漏认 = 按现值计，与没有公告一样）也不可误认
+#     （误认 = 把普通句子当成公告、按旧值入账）——故每条正则都要求"起…由…调整为…"完整结构。
+ADJ_NOTICE_PATTERNS = [STEP_ADJ_RE]
+
+# 公告句里的模型名形态：「<显示名> 的（缓存命中）?（输入|输出）?价格 …」或行内 `step-x` 代码名。
+# ⚠ (输入|输出) 在两条正则里都必须**可选**：缓存列的公告写的是「的缓存命中价格」（没有输入/输出
+#   字样），写成必选时该句连 NAME_RE 都匹配不了 → names 为空 → 整条公告被丢弃（缓存调价静默
+#   漏采，而缓存占总金额约 97%）。字段归属：有「缓存命中」→ cache，否则按 输入/输出 → in/out。
+_ADJ_NAME_RE = re.compile(r'([A-Za-z][A-Za-z0-9 .\-]{2,40}?)\s*的\s*(缓存命中)?(输入|输出)?价格')
+_ADJ_FIELD_RE = re.compile(r'的\s*(缓存命中)?(输入|输出)?价格')
+_ADJ_API_RE = re.compile(r'`(step-[0-9a-z.\-]+)`')
+
+
+def parse_adjustment_notices(text, patterns=None):
+    """从页面文本抽取「调价公告」→ {归一化模型名: {old, new, effective, field}}。
+
+    纯函数（无 IO / 无网络）→ selftest 可直接喂样本文本断言（F-4 的行为挂点）。
+    patterns：句式库（默认 ADJ_NOTICE_PATTERNS）；新厂商接入只补这一项。
+    effective：'YYYY-MM-DDTHH:MM'（公告写的是北京时间，故直接按字面取值、不做时区转换）。
+    field：'in' / 'out' / 'cache'（公告针对哪一列）。
+    """
+    pats = ADJ_NOTICE_PATTERNS if patterns is None else patterns
+    adjustments = {}
+    for ln in (text or '').splitlines():
+        for pat in pats:
+            m = pat.search(ln)
+            if not m:
+                continue
+            y, mo, d, hh, mm, old_v, new_v = m.groups()
+            # 模型名：显示名（有空格，与 API id 不同形）与行内 `api-id` 都收，两边去标点归一后对齐
+            names = set()
+            nm_m = _ADJ_NAME_RE.search(ln)
+            if nm_m:
+                names.add(re.sub(r'[\s_\-.]', '', nm_m.group(1).lower()))
+            for nm in _ADJ_API_RE.findall(ln):
+                names.add(re.sub(r'[\s_\-.]', '', nm.lower()))
+            if not names:
+                continue  # 认不出是对哪个模型的公告 → 不猜（漏认的代价远小于误认）
+            fld_m = _ADJ_FIELD_RE.search(ln)
+            field = 'cache' if (fld_m and fld_m.group(1)) else ('out' if (fld_m and fld_m.group(2) == '输出') else 'in')
+            for nk in names:
+                adjustments[nk] = {
+                    'old': float(old_v), 'new': float(new_v),
+                    'effective': '%04d-%02d-%02dT%02d:%02d' % (int(y), int(mo), int(d), int(hh), int(mm)),
+                    'field': field,
+                }
+            break  # 一行命中一条句式即够（多条同时命中 = 句式库写重了，先到的赢）
+    return adjustments
+
 # 厂商配置。mode:
 #   tr     —— 页面含 <table>，逐行提取含"元"的行
 #   bundle —— SPA，价格硬编码在前端 JS bundle 里，需三步解析
@@ -235,8 +295,15 @@ VENDORS = {
     },
     'deepseek': {
         'name': 'DeepSeek',
-        'url': '(来自 pricing.json 用户已校对官方价)',
-        'mode': 'pricing',
+        # v3.62.0（外部审计 F-2）：**本脚本不抓 DeepSeek**。原先是 `mode:'pricing'` ——
+        #   读回 pricing.json 自己的产物冒充"当日新抓的 first_party 官方价"（源=汇 闭环：
+        #   官方调价后只要 deepseek-official.js 那一轮失败，本地价就永久停在旧值，
+        #   而 latest.json 仍带 fetched_at=今天，下游无条件信任）。现改为显式 external：
+        #   DeepSeek 官方价只走 Node 侧 deepseek-official.js（真抓官方页）→ pricing.json，
+        #   进本地索引走 build_index.py 的 pricing.json(lock) 权威覆盖层（诚实标签）。
+        #   ⚠ 该条目**不计入抓取失败**（不是失败，是设计上不抓）——否则每天都会假降级一次。
+        'url': '(不抓：官方价走 deepseek-official.js → pricing.json)',
+        'mode': 'external',
     },
     'zhipu': {
         'name': '智谱 GLM',
@@ -604,37 +671,16 @@ def parse_stepfun_md(md, drop_re=None, keep_over_re=None):
         「单价」表（元／万字符、元／小时、元／音色）不是 token 计价，直接跳过；
       - 列语义按表头文本映射（缓存未命中→in、缓存命中→cache、输出→out），不按位置；
       - 单位从表格上方最近的「单位：X。」正文读取，读不到即该表契约不全、跳过；
-      - 调价公告（生效日期在未来）→ 当日按公告的「由」值入账，future 值写 tier_note；
-        生效日期已过/无公告 → 按表格现值。全部取页面显式数据，不猜测。
+      - 调价公告（生效日期在未来）→ 当日按公告的「由」值入账，并落结构化
+        `superseded_at`（旧值有效期到公告时刻）；已生效 → 现值 + `effective_from`。
+        公告识别走可复用层 parse_adjustment_notices（句式库，见其定义处）。
     """
     out = []
     lines = md.splitlines()
     # 预扫描：调价公告（归一化模型名 → 字段/旧值/新值/生效时间）。
-    # 公告句形如「Step 5 Preview 的缓存命中输入价格自北京时间 2026 年 10 月 14 日 00:30 起由 0.35
-    #   元／百万 tokens 调整为 0.70 元／百万 tokens」——模型名是显示名（有空格），与 API id
-    #   （step-5-preview）不同形，两边都去标点归一后对齐。
-    adjustments = {}
-    for ln in lines:
-        m = STEP_ADJ_RE.search(ln)
-        if not m:
-            continue
-        y, mo, d, hh, mm, old_v, new_v = m.groups()
-        nm_m = re.search(r'([A-Za-z][A-Za-z0-9 .\-]{2,40}?)\s*的\s*(缓存命中)?(输入|输出)价格', ln)
-        fld_m = re.search(r'的\s*(缓存命中)?(输入|输出)价格', ln)
-        names = set()
-        if nm_m:
-            names.add(re.sub(r'[\s_\-.]', '', nm_m.group(1).lower()))
-        for nm in re.findall(r'`(step-[0-9a-z.\-]+)`', ln):
-            names.add(re.sub(r'[\s_\-.]', '', nm.lower()))
-        if not names:
-            continue
-        field = 'cache' if (fld_m and fld_m.group(1)) else ('out' if (fld_m and fld_m.group(2) == '输出') else 'in')
-        for nk in names:
-            adjustments[nk] = {
-                'old': float(old_v), 'new': float(new_v),
-                'effective': '%04d-%02d-%02dT%02d:%02d' % (int(y), int(mo), int(d), int(hh), int(mm)),
-                'field': field,
-            }
+    # v3.62.0（外部审计 F-4）：抽成可复用层 parse_adjustment_notices（句式库 + 纯函数）——
+    #   原先整段内联在此，别的厂商要抄整套；现在补一条正则即可接公告检测。
+    adjustments = parse_adjustment_notices(md)
     i = 0
     while i < len(lines):
         ln = lines[i]
@@ -692,6 +738,13 @@ def parse_stepfun_md(md, drop_re=None, keep_over_re=None):
             if in_v is None and out_v is None:
                 continue  # 限时免费（—）等非计价行
             note = '阶跃官方定价页现行价（.md 源）'
+            # v3.62.0（外部审计 F-4）：**结构化生效时间**。改前公告只写进 tier_note 字符串
+            #   （下游无法据此重算/回溯）；现同时落两个机器可读字段：
+            #     effective_from —— 本条价格自何时起有效（公告已生效 = 公告生效时刻）；
+            #     superseded_at  —— 本条价格将被何时取代（公告在未来 = 当日按旧值，旧值的有效期到公告时刻）。
+            #   build_index 会把它们带进索引与每日价格快照（F-3 按当时价重算的判据之一）。
+            eff_from = None
+            superseded = None
             # 生效日期公告：仅当表格现值 == 公告新值时才判定「该公告针对此列」（防误伤）；
             #   未来生效 → 当日按公告旧值；已生效 → 表格现值。全部取页面显式数据。
             adj = adjustments.get(re.sub(r'[\s_\-.]', '', name.lower()))
@@ -699,7 +752,10 @@ def parse_stepfun_md(md, drop_re=None, keep_over_re=None):
                 cur = {'in': in_v, 'cache': cache_v, 'out': out_v}[adj['field']]
                 fld_label = ('缓存命中' if adj['field'] == 'cache' else '') + ('输出' if adj['field'] == 'out' else '输入')
                 if cur is not None and abs(cur - adj['new']) < 1e-9:
-                    now_iso = datetime.datetime.now().strftime('%Y-%m-%dT%H:%M')
+                    # v3.62.0（外部审计 F-4）：公告写的是「北京时间」，比对必须同口径。
+                    #   改前用 datetime.now()（机器本地）→ 非 UTC+8 机器整体偏移若干小时，
+                    #   会把未生效的公告判成已生效（提前采用新价）或反之，且零告警。
+                    now_iso = beijing_now().strftime('%Y-%m-%dT%H:%M')
                     if adj['effective'] > now_iso:
                         if adj['field'] == 'in':
                             in_v = adj['old']
@@ -707,12 +763,14 @@ def parse_stepfun_md(md, drop_re=None, keep_over_re=None):
                             cache_v = adj['old']
                         else:
                             out_v = adj['old']
+                        superseded = adj['effective']  # 旧值只有效到公告生效时刻
                         note += '；⚠官方公告：%s价 %s 起 %s→%s（生效前按 %s 计）' % (
                             fld_label, adj['effective'], adj['old'], adj['new'], adj['old'])
                     else:
+                        eff_from = adj['effective']  # 现值即公告新值，自公告时刻起生效
                         note += '；官方公告：%s价 %s 起 %s→%s（已生效）' % (
                             fld_label, adj['effective'], adj['old'], adj['new'])
-            out.append({
+            rec = {
                 'name': name,
                 'brand': 'stepfun',
                 'api_name': name.lower(),
@@ -723,7 +781,12 @@ def parse_stepfun_md(md, drop_re=None, keep_over_re=None):
                 'cache_hit': ['%s元' % cache_v] if cache_v is not None else [],
                 'tier_note': note,
                 'source': '阶跃官方定价页(platform.stepfun.com .md 源)',
-            })
+            }
+            if eff_from:
+                rec['effective_from'] = eff_from
+            if superseded:
+                rec['superseded_at'] = superseded
+            out.append(rec)
     return out
 
 
@@ -827,61 +890,13 @@ def parse_kimi():
     return uniq
 
 
-def parse_pricing_deepseek():
-    """DeepSeek 官方价由用户已在 pricing.json 校对（lock），不再重复抓取网页。
-    直接读 pricing.json 的 deepseek-* 条目作为库的 DeepSeek first_party 源。"""
-    if not os.path.exists(PRICING_PATH):
-        print('[WARN] 未找到 pricing.json: %s' % PRICING_PATH)
-        return []
-    p = json.load(open(PRICING_PATH, encoding='utf-8'))
-    out = []
-    for key, v in p.get('models', {}).items():
-        if not key.startswith('deepseek'):
-            continue
-        # v2.82.1（2026-09-01）：只合并 lock=True 的条目——本函数的语义是「用户已校对官方价」，
-        # 非 lock 的兜底价（如回填的 8-23 聚合源价）混进来会被标成 first_party「用户已校对」，
-        # 且官方已下线的模型（v3-1-volc）会以旧价永久冒充新鲜数据。非 lock 的 deepseek 模型
-        # 仍留在 pricing.json 兜底计费（loadPricing 合并层），只是不进本地库。
-        if not v.get('lock'):
-            continue
-        mult = v.get('peak_multiplier', 1)
-        # v3.48.0（审计 F2）：原实现用**下标**读这两个字段——lock 条目缺键时 KeyError 被外层
-        #   `except Exception` 吞掉 → 整个 deepseek 厂商**当轮 0 价**、摘要失真，且只留一行 stderr，
-        #   看不出是"缺键"还是"网络失败"。改为显式取 + 缺键跳过该条（其余厂商/模型不受影响），
-        #   并明确告警让人去补 pricing.json。
-        in_p = v.get('input_price')
-        out_p = v.get('output_price')
-        if in_p is None or out_p is None:
-            sys.stderr.write('[WARN] pricing.json lock 条目 %s 缺 input_price/output_price，已跳过该条（请手动补价）\n' % key)
-            continue
-        rec = {
-            'name': v.get('name', key),
-            'api_name': key,
-            'source_type': 'first_party',
-            'in_price': ['%s元' % in_p],
-            'out_price': ['%s元' % out_p],
-            'cache_hit': ['%s元' % v.get('cached_price', 0)],
-            'tier_note': v.get('tier_note', 'pricing.json 用户已校对官方价'),
-            'source': 'pricing.json(用户已校对官方价)',
-        }
-        # 峰谷：高峰价 = 基础价 × peak_multiplier（DeepSeek 原厂系）
-        # v3.48.0（审计 F2）：这里原来也是下标访问（与上面 in_p/out_p 同源）——能走到这里说明
-        #   in_p/out_p 都已取到，直接复用即可，别再碰一遍原始字典。
-        if mult and mult != 1:
-            rec['peak'] = {
-                'idle': {'in': in_p, 'out': out_p,
-                         'cache': v.get('cached_price', 0)},
-                'peak': {'in': in_p * mult, 'out': out_p * mult,
-                         'cache': v.get('cached_price', 0) * mult},
-            }
-        out.append(rec)
-    return out
-
-
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     result = {
-        'fetched_at': datetime.datetime.now().isoformat(timespec='seconds'),
+        # v3.62.0（外部审计 F-4）：带时区的北京时刻。改前是本地 naive 时间，
+        #   build_index 的 SOURCE_TTL_HOURS 校验只能按「假设是北京时间」解释，
+        #   非 UTC+8 机器上新鲜度判定整体偏移。aware 后无需假设。
+        'fetched_at': beijing_now().isoformat(timespec='seconds'),
         'currency': 'CNY',
         'unit': '元/百万 tokens',
         'region': 'CN',
@@ -889,34 +904,41 @@ def main():
         'vendors': {},
     }
     total = 0
+    skipped_vendors = {}   # v3.62.0（F-2）：设计上不抓的厂商（≠ 失败，不进 _fetch_summary.failed）
     for key, cfg in VENDORS.items():
         entry = {'name': cfg['name'], 'url': cfg['url'], 'mode': cfg['mode'],
                  'status': 'ok', 'models': [], 'error': None}
         try:
-            if cfg['mode'] == 'pricing':
-                # 不从网页抓，直接读用户已校对的 pricing.json
-                entry['models'] = parse_pricing_deepseek()
-            else:
-                # v3.52.0（审计批2·G3）：非 kimi 分支原走裸 fetch()（urllib）→ **绕过了 http_get 里
-                #   的解压与 TLS 降级开关**：只装了 requests 的机器上，若某厂商开始返回压缩页
-                #   （urllib 不自动解压）→ 拿到二进制垃圾 → 0 模型且退出码 0（最坏的静默失败）。
-                #   统一走 http_get：requests 优先（自动解压/跟随 301）+ 无 requests 回退 urllib。
-                html = http_get(cfg['url'])
-                if cfg['mode'] == 'tr':
-                    entry['models'] = parse_tr(html, cfg.get('keep'), cfg.get('keep_re'), cfg.get('drop_re'), cfg.get('require_re'),
-                                               cfg.get('order', ('in', 'out', 'cache')), cfg.get('keep_over_re'))
-                elif cfg['mode'] == 'minimax':
-                    entry['models'] = parse_minimax(html)
-                elif cfg['mode'] == 'zhipu_docs':
-                    entry['models'] = parse_zhipu_docs(html)
-                elif cfg['mode'] == 'kimi':
-                    entry['models'] = parse_kimi()
-                elif cfg['mode'] == 'stepfun_md':
-                    entry['models'] = parse_stepfun_md(html, cfg.get('drop_re'), cfg.get('keep_over_re'))
-                # v3.52.0（审计批2·L1）：结构指纹 —— 页面「长什么样」的可审计证据。
-                #   0 模型时两类根因（网络失败 vs 官网改版）在旧版输出里**长得一模一样**
-                #   （都是「0 个模型」），只能靠人重跑肉眼比对；指纹把它变成可比对的结构数据。
-                entry['fingerprint'] = scan_fingerprint(html)
+            if cfg['mode'] == 'external':
+                # v3.62.0（外部审计 F-2）：DeepSeek 走 Node 侧 deepseek-official.js → pricing.json，
+                #   本脚本明确不抓（原 mode:'pricing' 是「读回自己产物」的自我引用闭环，已拆）。
+                #   status='skipped'：**不算抓取失败**（否则每天假降级一次），只作显式记录。
+                entry['status'] = 'skipped'
+                entry['note'] = '官方价走 deepseek-official.js → pricing.json；进索引走 build_index 的 lock 覆盖层'
+                skipped_vendors[key] = entry['note']
+                print('[SKIP] %-22s 设计上不抓（%s）' % (cfg['name'], entry['note']))
+                result['vendors'][key] = entry
+                continue
+            # v3.52.0（审计批2·G3）：非 kimi 分支原走裸 fetch()（urllib）→ **绕过了 http_get 里
+            #   的解压与 TLS 降级开关**：只装了 requests 的机器上，若某厂商开始返回压缩页
+            #   （urllib 不自动解压）→ 拿到二进制垃圾 → 0 模型且退出码 0（最坏的静默失败）。
+            #   统一走 http_get：requests 优先（自动解压/跟随 301）+ 无 requests 回退 urllib。
+            html = http_get(cfg['url'])
+            if cfg['mode'] == 'tr':
+                entry['models'] = parse_tr(html, cfg.get('keep'), cfg.get('keep_re'), cfg.get('drop_re'), cfg.get('require_re'),
+                                           cfg.get('order', ('in', 'out', 'cache')), cfg.get('keep_over_re'))
+            elif cfg['mode'] == 'minimax':
+                entry['models'] = parse_minimax(html)
+            elif cfg['mode'] == 'zhipu_docs':
+                entry['models'] = parse_zhipu_docs(html)
+            elif cfg['mode'] == 'kimi':
+                entry['models'] = parse_kimi()
+            elif cfg['mode'] == 'stepfun_md':
+                entry['models'] = parse_stepfun_md(html, cfg.get('drop_re'), cfg.get('keep_over_re'))
+            # v3.52.0（审计批2·L1）：结构指纹 —— 页面「长什么样」的可审计证据。
+            #   0 模型时两类根因（网络失败 vs 官网改版）在旧版输出里**长得一模一样**
+            #   （都是「0 个模型」），只能靠人重跑肉眼比对；指纹把它变成可比对的结构数据。
+            entry['fingerprint'] = scan_fingerprint(html)
             # 补全 source 标注（解析器未设时回退到厂商名）
             # v3.51.0（审计批1·B）：补全契约字段 —— 本脚本只抓国内厂商官方人民币价页，
             #   unit/currency/region 由设计前提恒定（页面价格均以「X元」形式给出，见
@@ -951,8 +973,12 @@ def main():
     #   今天 4/5 家源挂了、价库悄悄少一大半数据，无人察觉。
     # 判定口径与流水线 M6 一致：status=error，或「成功但解析出 0 个模型」，都算失败
     #   （官网改版 / 软 404 常见于后者，旧版会把它静默算成功）。
+    # v3.62.0（外部审计 F-2）：status='skipped'（设计上不抓，如 DeepSeek 走 external）
+    #   **不算失败** —— 它每天都是 0 模型，若计入 failed 会天天假降级一次（A-8 永久噪音坑）。
     failed = {}
     for key, entry in result['vendors'].items():
+        if entry['status'] == 'skipped':
+            continue
         if entry['status'] != 'ok':
             failed[key] = entry.get('error') or '未知错误'
         elif not entry['models']:
@@ -961,7 +987,7 @@ def main():
 
     result['model_count'] = total
     # 供下游消费的失败摘要（本脚本 stdout 无 JSON 契约，此字段落在 cn-prices-*.json / latest.json）。
-    # ⚠需下游配合读取：目前 build_index.py 只读 result['vendors']，本字段为增量信息、向后兼容（不破坏解析）。
+    # ⚠需下游配合读取：build_index.py 自 v3.62.0 起消费 failed/stale（见 _fetch_degraded）。
     result['_fetch_summary'] = {
         'vendors_total': len(result['vendors']),
         'vendors_ok': len(ok_keys),
@@ -969,12 +995,15 @@ def main():
         'models_total': total,
         'ok': ok_keys,
         'failed': failed,
+        # v3.62.0（外部审计 F-2）：设计上不抓的厂商（≠ 失败）——让"今天只有 4 家在抓"这件事
+        #   在摘要里显式可见，而不是靠读者自己发现"第五家永远 0 模型"。
+        'skipped_vendors': skipped_vendors,
         # v3.52.0（审计批2·L1/L4）：0 模型厂商的结构指纹（区分「网络失败」vs「官网改版」）；
         #   S4 待确认清单（soft 快照样式被收录的型号，供人工确认是否为真型号）。
         'fingerprints': {k: v.get('fingerprint') for k, v in result['vendors'].items()
                          if k in failed and v.get('fingerprint')},
         'pending_confirm': sorted(set(PENDING_CONFIRM)),
-        'note': 'failed 非空表示当日这些厂商源未产出数据，价格可能沿用上版；需下游配合读取',
+        'note': 'failed 非空表示当日这些厂商源未产出数据，价格可能沿用上版；skipped_vendors 是设计上不抓（非失败）',
     }
     if failed:
         sys.stderr.write('[FAIL-SUMMARY] %d/%d 家厂商抓取失败（其余 %d 家成功，共 %d 个模型）：\n'
@@ -989,7 +1018,9 @@ def main():
     if PENDING_CONFIRM:
         sys.stderr.write('[WARN] %d 个「疑似快照别名」型号已收录（旧版会静默丢弃，漏收真型号 = 按未收录计价）：%s\n'
                          % (len(set(PENDING_CONFIRM)), ', '.join(sorted(set(PENDING_CONFIRM))[:20])))
-    stamp = datetime.datetime.now().strftime('%Y-%m-%d')
+    # v3.62.0（外部审计 F-4）：文件名是**数据归属日**，必须用北京日。改前用本地日 →
+    #   跨日边界（北京 0 点前后）落错文件名，之后按日回溯（价格历史快照）取不到当天数据。
+    stamp = beijing_today()
     path = os.path.join(OUT_DIR, 'cn-prices-%s.json' % stamp)
     # v2.82：原子写（唯一 tmp + os.replace）。多会话并发刷新时另一进程的 build_index.py
     # 可能正在读 latest.json，裸 open('w') 会写出半截 JSON，对方 json.load 直接崩。

@@ -107,7 +107,7 @@ const SPAWN_OK = canSpawn();
 //   否则"迁出去就没人扫了"会静默削弱 T33 的守卫面（裸 catch 基线是按这些文件的**总和**定的，当前值见 T33-a1）。
 const SYNTAX_FILES = ['token-tracker.js', 'refresh-prices.js', 'deepseek-official.js', 'refresh-holidays.js',
   'backfill.js', 'recalc-day.js', 'peak-rules.js', 'selftest.js', 'stop-handler.js', 'wb-root.js',
-  'transc-lines.js', 'ledger-merge.js'];
+  'transc-lines.js', 'ledger-merge.js', 'price-history.js'];
 
 // ── T0：语法检查 ───────────────────────────────────────────────────────────
 for (const f of SYNTAX_FILES) {
@@ -128,9 +128,11 @@ fs.mkdirSync(skillDir, { recursive: true });
 //   refresh-prices 四个文件顶层都 require 它；隔离目录缺它 = 全段 MODULE_NOT_FOUND（同上两坑的第三次）。
 // v3.61.0（审计 F2）：transc-lines.js 必须随行——主脚本与 backfill 顶层都 require 它（残行/行数口径
 //   单一实现），隔离目录缺它 = 全段 MODULE_NOT_FOUND（与前三个坑同因，第四次）。
+// v3.62.0（外部审计 F-3）：price-history.js 必须随行——recalc-day 与 backfill **顶层**都 require 它
+//   （当日快照取价单一实现），隔离目录缺它 = 整段 selftest 崩（与前四个坑同因，第五次）。
 const RUNTIME_COMPANIONS = ['refresh-prices.js', 'deepseek-official.js', 'refresh-holidays.js',
   'pricing.json', 'holidays.json', 'peak-rules.js', 'recalc-day.js', 'stop-handler.js', 'wb-root.js',
-  'ledger-merge.js', 'transc-lines.js'];
+  'ledger-merge.js', 'transc-lines.js', 'price-history.js'];
 for (const f of ['token-tracker.js', ...RUNTIME_COMPANIONS]) {
   fs.copyFileSync(path.join(SRC, f), path.join(skillDir, f));
 }
@@ -146,6 +148,12 @@ for (const f of ['backfill.js']) {
 const pricesDir = path.join(tmp, 'prices');
 fs.mkdirSync(pricesDir, { recursive: true });
 fs.writeFileSync(path.join(pricesDir, 'index.json'), JSON.stringify({ models: {} }));
+// v3.62.0（批4·续）：**孤儿轮对账的测试基线 = 仓库默认档（off）**。
+//   为什么必须显式钉住：该档位新增了"未设 env 时回落本机 local-config.json 的 orphan_scan"（本机已设 on），
+//   而下一行的 `env` 继承 process.env、`require` 主模块的组又与本进程共享 process.env —— 不钉住的话
+//   **本机跑测试 = on 档**、CI（无 local-config.json → off）却是 off：本机会因"配置生效"多弹窗 /
+//   多推水位线，染色无关断言（经典本地-CI 分叉）。各测试要其它档位时自行显式覆盖（T102-b/c 已如此）。
+process.env.WB_ORPHAN_SCAN = 'off';
 const env = Object.assign({}, process.env, {
   WB_ROOT: tmp, TOKEN_TRACKER_NO_TOAST: '1', CN_PRICE_DB_DIR: pricesDir,
 });
@@ -305,7 +313,12 @@ if (!SPAWN_OK) envSkip('T7-P2 recalc-day 写盘原子性/备份', SPAWN_SKIP_REA
 else {
   const d = { '2026-01-01': { models: { 'deepseek-v4-flash': { in: 1000000, cached: 0, out: 1000, cost: 0, hit: 0 } }, total: { cost: 0, in: 1000000, cached: 0, out: 1000 } } };
   fs.writeFileSync(path.join(skillDir, 'daily-usage.json'), '\uFEFF' + JSON.stringify(d, null, 2)); // 带 BOM（P2 崩溃场景）
-  const r = spawnSync(NODE, [path.join(skillDir, 'recalc-day.js'), '2026-01-01'], { env, timeout: 60000, windowsHide: true, encoding: 'utf8' });
+  // v3.62.0（外部审计 F-3/G-1）：recalc-day 默认 dry-run，写盘必须显式 --write。
+  //   本组断言的正是写盘三件套（备份 + 原子写 + 写后仍可解析），故必须带 --write 才测得到。
+  //   ⚠ v3.62.0（F-3）：再加 --current-price —— 2026-01-01 是历史日且隔离库无当日快照，
+  //     默认口径（当天快照价）会 fail-closed 拒绝（exit 1）。本组验的是**写盘路径**、与价格口径无关，
+  //     故显式声明按现价（口径拒绝/快照取价本身由 T100-c 专测）。
+  const r = spawnSync(NODE, [path.join(skillDir, 'recalc-day.js'), '2026-01-01', '--current-price', '--write'], { env, timeout: 60000, windowsHide: true, encoding: 'utf8' });
   ok('T7-P2a BOM 账本不再崩溃', r.status === 0, `exit=${r.status} ${String(r.stderr || '').slice(0, 120)}`);
   const parsed = (() => { try { return JSON.parse(fs.readFileSync(path.join(skillDir, 'daily-usage.json'), 'utf8')); } catch (e) { return null; } })();
   ok('T7-P2b 写盘后账本仍可解析', Boolean(parsed && parsed['2026-01-01']));
@@ -4770,6 +4783,7 @@ else {
   const srcRP58 = stripComments(fs.readFileSync(path.join(SRC, 'refresh-prices.js'), 'utf-8'));
   const srcPT58 = fs.readFileSync(path.join(SRC, 'parse_tokenhub.py'), 'utf-8').replace(/\r\n/g, '\n');
   const srcFC58 = fs.readFileSync(path.join(SRC, 'fetch-cn-prices.py'), 'utf-8').replace(/\r\n/g, '\n');
+  const srcBI58 = fs.readFileSync(path.join(SRC, 'build_index.py'), 'utf-8').replace(/\r\n/g, '\n');
 
   // a1 ★★S2：unpublished 重查窗口的**比较方向**。v3.39.0 A8 把方向写反了（`>=`），
   //   注释与 stderr 文案都写着"过了 30 天窗口才放行去查"，只有代码是反的 → 必须钉住 `<`。
@@ -4835,10 +4849,15 @@ else {
     && srcPT58.indexOf('sys.exit(2)') < srcPT58.indexOf('os.replace(tmp'),
     '0 模型仍覆盖 = 用好数据覆盖坏数据；退出码 0 = 假成功，CI/人都看不出');
 
-  // e1 ★F2：fetch-cn-prices 读 lock 价必须用 .get()（下标缺键的 KeyError 会被外层 except 吞掉）
-  ok('T58-e1 ★F2：fetch-cn-prices 读 lock 价必须用 .get()，不得再用 v[\'input_price\'] 下标',
-    /in_p = v\.get\('input_price'\)/.test(srcFC58) && /out_p = v\.get\('output_price'\)/.test(srcFC58)
-    && !/v\['input_price'\]/.test(srcFC58),
+  // e1 ★F2：读 lock 价必须用 .get()（下标缺键的 KeyError 会被外层 except 吞掉）
+  // v3.62.0（外部审计 F-2）：fetch-cn-prices 的 lock 回读环（parse_pricing_deepseek）已**整段拆除**
+  //   —— 它读回 pricing.json 冒充"当日新抓的 first_party 价"，正是审计点名的自我引用闭环。
+  //   拆除后**读 lock 价的唯一位置 = build_index.py 的 lock 覆盖层**，故本守卫的锚点随之迁移：
+  //   不变量本身（.get() 而非下标、两个脚本都不得出现 v['input_price'] 下标）一字未改。
+  ok('T58-e1 ★F2：读 lock 价必须用 .get()，不得再用 v[\'input_price\'] 下标 —— 下标缺键 → except 吞掉 → deepseek 厂商整轮 0 价、摘要失真，且看不出是缺键还是网络失败',
+    /in_p, out_p, cache_p = _num\(v\.get\('input_price'\)\), _num\(v\.get\('output_price'\)\)/.test(srcBI58)
+    && !/v\['input_price'\]/.test(srcBI58) && !/v\['input_price'\]/.test(srcFC58)
+    && !/v\['output_price'\]/.test(srcBI58) && !/v\['output_price'\]/.test(srcFC58),
     '下标缺键 → except 吞掉 → deepseek 厂商整轮 0 价、摘要失真，且看不出是缺键还是网络失败');
 
   // f1 ★F3：USD 缓存价聚合必须允许 0（"缓存免费"是真实策略，不是缺数据）
@@ -5184,8 +5203,11 @@ else {
     bi61.indexOf('skipped.append(') >= 0 && bi61.indexOf('[build_index][WARN] %d 个条目未进索引') >= 0);
   ok('T61-b4 ★TokenHub 来源串地域必须用解析值 th_region，不得硬编码「广州」',
     bi61.indexOf("th_region = th.get('region')") >= 0 && bi61.indexOf("'腾讯云TokenHub文档(广州,'") < 0);
+  // v3.62.0（外部审计 F-4）：元组新增 effective_from / superseded_at 后跨两行 —— 守卫改为
+  //   锚定首行 + 单独断言两个新字段在元组里（既容忍折行，又钉住 F-4 的透达不被回退）。
   ok('T61-b5 ★索引条目必须透出契约字段（下游 mergeLocalPriceDb 按白名单读、未知字段忽略 → 计费侧零影响）',
-    bi61.indexOf("for f in ('currency', 'unit', 'region', 'source_url', 'fetched_at')") >= 0);
+    bi61.indexOf("for f in ('currency', 'unit', 'region', 'source_url', 'fetched_at',") >= 0
+    && bi61.indexOf("'effective_from', 'superseded_at')") >= 0);
 
   // ── c. fetch-cn-prices：契约字段 + 阶跃 .md 语义解析（2026-10-12 页面改版活样例）──
   // v3.59.0（批12·S5）：unit 兜底从 setdefault 改为「WARN 留痕 + 仍兜底」——
@@ -6094,7 +6116,10 @@ else {
     };
     const runBf = (oIn) => {
       wj(path.join(skillDir, 'pricing.json'), JSON.stringify(PRICING67));
-      wj(path.join(skillDir, 'holidays.json'), '{}');
+      // v3.62.0（外部审计 S-6）：必须写**该年已确认**的假日表。改前写 '{}' 等于"该年数据未知"，
+      //   在保守开关（假日未知 → 不套高峰倍率）下会被判成降级 → 峰谷模型金额从 ¥2.00 变 ¥1.00。
+      //   生产环境 holidays.json 永远带真实年份（只有 2027 是 null），故这是夹具语义修正、非产品回归。
+      wj(path.join(skillDir, 'holidays.json'), JSON.stringify({ years: { 2026: ['2026-01-01'] } }));
       wj(path.join(skillDir, 'daily-usage.json'), mkDaily());
       wj(path.join(tmp, 'projects', 'proj1', 'sess-a.jsonl'), mkTrans());
       // rounds 明细一律覆写同一路径：oIn=null 时写空文件（peakSplitOf 读不到记录 → null），
@@ -6177,7 +6202,8 @@ else {
                           effective_at: null, updated_at: '2026-10-14' },
         usd_cny_rate: 7.2,
       }));
-      wj(path.join(sk68, 'holidays.json'), '{}');
+      // v3.62.0（外部审计 S-6）：同 T67 —— 该年已确认（见 T67 夹具注释）
+      wj(path.join(sk68, 'holidays.json'), JSON.stringify({ years: { 2026: ['2026-01-01'] } }));
       // v3.59.0（批15 · 测试网床）：**当日合计 total.cost 预置哨兵值 9999** ——
       //   e1/e3 的期望值（2.00）与夹具预置值**相同**，于是"recalc 根本没处理这一天"和
       //   "处理了并保留原额"**不可区分**（实测：recacl-day 在目标模型不存在时 stdout 与正常时逐字相同
@@ -6197,7 +6223,11 @@ else {
     };
     const runRecalc = () => {
       // 脚本本体跑 selftest tmp 副本（skillDir），数据根指向 fixture（wb68）——与 T67 同模式
-      const r = spawnSync(NODE, [path.join(skillDir, 'recalc-day.js'), D68, M68], {
+      // v3.62.0（外部审计 F-3/G-1）：默认 dry-run → 显式 --write（本组断言写盘后的账本值）
+      // ⚠ v3.62.0（F-3）：再加 --current-price —— D68=2026-10-15 是历史日、隔离库无当日快照，
+      //   默认口径会 fail-closed 拒绝；本组验的是"半套明细 → 保留原额"的计价逻辑（夹具 pricing.json
+      //   即"现价"），故显式按现价跑，避免 F-3 的口径拒绝干扰。
+      const r = spawnSync(NODE, [path.join(skillDir, 'recalc-day.js'), D68, M68, '--current-price', '--write'], {
         env: Object.assign({}, env, { WB_ROOT: wb68, WB_LEDGER_MAINT: '1' }),
         timeout: 120000, windowsHide: true, encoding: 'utf8',
       });
@@ -6305,7 +6335,8 @@ else {
                           effective_at: null, updated_at: '2026-10-13' },
         usd_cny_rate: 7.2,
       }));
-      wj(path.join(sk69, 'holidays.json'), '{}');
+      // v3.62.0（外部审计 S-6）：同 T67 —— 该年已确认（见 T67 夹具注释）
+      wj(path.join(sk69, 'holidays.json'), JSON.stringify({ years: { 2026: ['2026-01-01'] } }));
       // 生产布局：把技能脚本拷进 wb69/skills/token-usage-tracker（__dirname == SKILL_DIR）
       for (const f of fs.readdirSync(skillDir).filter((x) => x.endsWith('.js'))) {
         fs.copyFileSync(path.join(skillDir, f), path.join(sk69, f));
@@ -6489,8 +6520,13 @@ else {
   const fc71 = strip71(fs.readFileSync(path.join(SRC, 'fetch-cn-prices.py'), 'utf8'));
   const pt71 = strip71(fs.readFileSync(path.join(SRC, 'parse_tokenhub.py'), 'utf8'));
 
-  ok('T71-a1 ★M17 三脚本 json.dump 全部 allow_nan=False（build_index 2 + fetch-cn-prices 2 + parse_tokenhub 1）',
-    (bi71.match(/json\.dump[a-z]*\([^)]*allow_nan=False/g) || []).length === 2
+  // v3.62.0（外部审计 F-4）：build_index 新增 changes.jsonl 的 append 写点（`json.dumps(...allow_nan=False)`）
+  //   —— 旧价被取代的流水（effective_from/superseded_at）要可追溯，就得有一条结构化落盘。
+  //   该正则的 `json\.dump[a-z]*` 刻意含 `dumps`（历史写法），故计数 2 → 3。
+  //   fetch-cn-prices 仍为 2：F-2 拆掉的 parse_pricing_deepseek 里**没有** allow_nan dump 点
+  //   （那份是读回 pricing.json 的环，不写 latest.json），故计数不变。
+  ok('T71-a1 ★M17 三脚本 json.dump 全部 allow_nan=False（build_index 3 + fetch-cn-prices 2 + parse_tokenhub 1）',
+    (bi71.match(/json\.dump[a-z]*\([^)]*allow_nan=False/g) || []).length === 3
     && (fc71.match(/json\.dump[a-z]*\([^)]*allow_nan=False/g) || []).length === 2
     && (pt71.match(/json\.dump[a-z]*\([^)]*allow_nan=False/g) || []).length === 1);
   ok('T71-a2 ★M12 新条目闸门拒收半价（in/out 缺一半 → 计费静默归 0 且不告警）',
@@ -6555,9 +6591,15 @@ else {
     const M = (() => { try { return JSON.parse(fs.readFileSync(path.join(fpr, 'index.json'), 'utf8')).models || {}; } catch (e) { return {}; } })();
     ok('T71-b1 ★M16 `"cached_price":null` 不再崩 build_index（None*mult TypeError → 整段停产）',
       br.status === 0, `exit=${br.status} ${String(br.stderr || '').slice(0, 200)}`);
-    ok('T71-b2 ★M16 字符串价归一为 None（改前 ' + "'1'*2='11'" + ' 错峰价）',
-      !!M.lockstrprice && M.lockstrprice.in_price === null && !M.lockstrprice.peak,
-      `in_price=${JSON.stringify(M.lockstrprice && M.lockstrprice.in_price)}`);
+    // v3.62.0（外部审计 S-3）：本条期望被 S-3 **上修**并在此留痕，不是削弱守卫。
+    //   旧期望（M16）：字符串价归一成 None 后**仍写进索引**（in_price=null）——实测该形态正是
+    //   S-3 的病根：索引里出现主价为 None 的"权威条目" → JS 侧 None*tokens=0 → 静默少收。
+    //   新期望：in/out 任一非数值即**整条拒收**（fail-closed），保留抓取源原值、不入索引，
+    //   同时进 authoritative_issues（用户从 --report 的 ⚠价锁 看得见）。
+    ok('T71-b2 ★M16 字符串价归一为 None（改前 ' + "'1'*2='11'" + ' 错峰价）—— v3.62.0 S-3 上修为「整条拒收」',
+      !('lockstrprice' in M) && /lock 条目 lockstrprice[\s\S]{0,80}条目主价缺失或非数值/.test(String(br.stderr || '')),
+      `索引内含 lockstrprice=${'lockstrprice' in M}（应为 false：坏手工价不得进入索引）`
+      + ` stderr=[${String(br.stderr || '').split('\n').filter((l) => l.indexOf('lockstrprice') >= 0).join(' | ').slice(0, 200)}]`);
     ok('T71-b3 ★M16 正常 lock 的 peak 仍正确（1.0×2=2.0，不得被数值化误伤）',
       !!M.lockgood && !!M.lockgood.peak && M.lockgood.peak.peak.in === 2.0 && M.lockgood.peak.idle.in === 1.0);
     ok('T71-b4 ★M12 半价条目被闸门拒收（不进索引 → 按未收录计价，而非按 0 计）', !('halfprice' in M));
@@ -6579,10 +6621,15 @@ else {
     fs.writeFileSync(path.join(fsk2, 'pricing.json'), JSON.stringify({ models: {} }));   // 两个模型都查不到价 → 早退
     fs.writeFileSync(path.join(fsk2, 'holidays.json'), JSON.stringify({}));
     const e71 = Object.assign({}, process.env, { WB_ROOT: fw, TOKEN_TRACKER_NO_TOAST: '1' });
-    const ra = spawnSync(NODE, [path.join(SRC, 'recalc-day.js'), '2026-01-02'], { env: e71, encoding: 'utf8', timeout: 90000, windowsHide: true });
+    // v3.62.0（外部审计 F-3/G-1）：默认 dry-run → 必须显式 --write。
+    //   ⚠ 不加会**假绿**：dry-run 不写盘 → 账本保持预置的 12.8 → `t1===12.8` 恒真，
+    //     而本组要证的恰恰是"recalc 真跑了且没把脏串腐化成 0"。
+    // ⚠ v3.62.0（F-3）：再加 --current-price —— '2026-01-02' 是历史日、隔离库无快照，
+    //   默认口径 fail-closed 拒绝（exit 1、不写盘）→ 又会退化成"账本保持 12.8"的**同一种假绿**。
+    const ra = spawnSync(NODE, [path.join(SRC, 'recalc-day.js'), '2026-01-02', '--current-price', '--write'], { env: e71, encoding: 'utf8', timeout: 90000, windowsHide: true });
     const t1 = totalOf();
     fs.writeFileSync(DAILY_PATH, JSON.stringify(LED));
-    const rb = spawnSync(NODE, [path.join(SRC, 'recalc-day.js'), '2026-01-02', 'modelnormal'], { env: e71, encoding: 'utf8', timeout: 90000, windowsHide: true });
+    const rb = spawnSync(NODE, [path.join(SRC, 'recalc-day.js'), '2026-01-02', 'modelnormal', '--current-price', '--write'], { env: e71, encoding: 'utf8', timeout: 90000, windowsHide: true });
     const t2 = totalOf();
     ok('T71-c1 ★S1 无价早退分支：脏串 "0.5" + 正常 12.3 = 12.8（改前腐化成 "0.512.3" → 合计归 0、12.3 丢失）',
       t1 === 12.8, `got=${JSON.stringify(t1)} rc=${ra.status}`);
@@ -8210,6 +8257,1687 @@ const txInjectionComplete = (ttSrc, shSrc) => (
       'status=' + r90.status + ' stdout=[' + String(r90.stdout || '').replace(/\n/g, '\\n') + ']'
       + ' stderr=[' + String(r90.stderr || '').slice(0, 600) + ']');
     try { fs.rmSync(fw90, { recursive: true, force: true }); } catch (e) { /* 清理失败不影响断言 */ }
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// T91~T95（v3.62.0 · 外部审计 v3.61.0 第一批）：降级可见化 + recalc 止写 + 假日保守 + 时区
+//   本批共同主题：**把"看不见的降级"变成用户看得见，并停止静默改写账本**。
+//   ① F-1/S-4/S-7：`_fetch_summary` 写了没人读 / fetched_at 从不校验 / 单位缺失只进 stderr
+//      → build_index 产出顶层 `_fetch_degraded`，Node 侧挂到 toast + --report（用户可见出口）。
+//   ② F-3/G-1：recalc-day 默认直接写账本、且按**现价**重算 → 反转为默认 dry-run，写盘需 --write。
+//   ③ S-6：假日数据 fail-open（2027:null → 2027-01-01 起双向错）→ 保守开关 + 告警上 UI。
+//   ④ F-4：py 侧零时区概念 → 统一北京时间（公告比对 / 文件命名 / fetched_at）。
+//   ⚠ 每条源码守卫都配了行为守卫：源码断言只能证明"代码这么写"，证明不了"跑起来真的这样"。
+{
+  const S = (f) => fs.readFileSync(path.join(SRC, f), 'utf-8').replace(/\r\n/g, '\n');
+  const biRaw = S('build_index.py');
+  const stripPy = (s) => s.split('\n').map((line) => {
+    let out = ''; let q = null;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (q) { out += c; if (c === '\\') out += line[++i] || ''; else if (c === q) q = null; continue; }
+      if (c === '"' || c === "'") { q = c; out += c; continue; }
+      if (c === '#') break;
+      out += c;
+    }
+    return out;
+  }).join('\n');
+  const bi = stripPy(biRaw);
+  const tt = S('token-tracker.js');
+  const ttCode = stripComments(tt);
+  const rd = S('recalc-day.js');
+  const rdCode = stripComments(rd);
+  const pr = S('peak-rules.js');
+  const fcp = stripPy(S('fetch-cn-prices.py'));
+
+  // ── T91：build_index 产出 _fetch_degraded（F-1/S-4/S-7 的产出侧 + F-4 的北京日期）──
+  ok('T91-a1 ★build_index 必须读 latest.json 的 _fetch_summary（此前整条通道悬空）',
+    /d\.get\('_fetch_summary'\)/.test(bi) && /failed/.test(bi),
+    '未见 _fetch_summary 读取 —— F-1「写了没人读」会复发');
+  ok('T91-a2 ★输入源必须有 TTL 新鲜度校验（fetched_at 此前只写不读）',
+    /SOURCE_TTL_HOURS\s*=\s*36/.test(bi) && /_age_hours/.test(bi) && /age\s*>\s*SOURCE_TTL_HOURS/.test(bi),
+    '未见 fetched_at 年龄校验 —— S-4 停更无感会复发');
+  ok('T91-a3 ★index.json 顶层必须写 _fetch_degraded（Node 侧的唯一数据来源）',
+    /'_fetch_degraded':\s*_degraded_state\(/.test(bi) && /def _degraded_state/.test(bi));
+  ok('T91-a4 ★tokenhub 必须被单独判陈旧（它不受流水线日期约束，停更时完全无感）',
+    /TOKENHUB/.test(bi) && /腾讯云 TokenHub 文档陈旧/.test(bi));
+  ok('T91-a5 ★单位/契约缺失必须汇成厂商级降级（S-7：整厂停更此前只进 stderr）',
+    /契约字段缺失/.test(bi) && /页面可能改了单位/.test(bi));
+  ok('T91-a6 ★built_at 必须用北京日期（F-4：非 UTC+8 机器跨日边界会标错天）',
+    /'built_at':\s*beijing_today\(\)/.test(bi) && /CN_TZ\s*=\s*datetime\.timezone\(datetime\.timedelta\(hours=8\)/.test(bi));
+
+  // ── T92：Node 侧两个出口（toast 短标签 + 报表提示行）+ 防落盘 ──
+  ok('T92-a1 ★mergeLocalPriceDb 必须把 _fetch_degraded 挂到 pricing（否则 toast 无从显示）',
+    /pricing\._fetch_degraded\s*=\s*_deg/.test(ttCode) && /db\._fetch_degraded/.test(ttCode));
+  ok('T92-a2 ★stripLocalDbEntries 必须剥离 _fetch_degraded（它由 index.json 每日重建，落盘会变永不更新的陈旧告警）',
+    /delete out\._fetch_degraded/.test(ttCode));
+  // ⚠ 两条正则都必须锚到**使用点**（periodNote 里那一行 tag 数组），不能只写函数名——
+  //   `fetchDegradedTag(pricing)` / `holidayDegradedTag(stat, pricing)` 在函数定义处同样出现，
+  //   回退"数组里不接"时定义处仍命中 → 假绿（v3.62.0 反向验证实测踩到）。
+  //   故用相邻调用序列 + 收尾 `\]` 把匹配唯一钉在 5255 行。
+  ok('T92-a3 ★periodNote 必须接入 fetchDegradedTag（行2 末尾，同 ⚠价库 机制）',
+    /peakRuleTag\(pricing\), fetchDegradedTag\(pricing\)/.test(ttCode) && /⚠\$\{nv\}家价旧/.test(ttCode));
+  ok('T92-a4 ★三个报表出口都必须接入 fetchDegradedNotice（--report 是用户对界的第二通道）',
+    (ttCode.match(/fetchDegradedNotice\(\)/g) || []).length >= 4, // 定义 1 次 + 三个出口各 1 次
+    '接入点不足 3 个（reportTxt / reportRangeTxt / reportSummaryTxt）');
+  ok('T92-a5 ★报表提示必须只读 index.json（--report 不得触发价库刷新副作用）',
+    /function fetchDegradedNotice\(\)[\s\S]{0,400}readFileSync\(CN_PRICE_DB/.test(ttCode),
+    'fetchDegradedNotice 未直读 CN_PRICE_DB —— 可能挂上了 loadPricing 的联网副作用');
+
+  // ── T93：recalc-day 默认 dry-run、写盘需 --write（F-3/G-1）──
+  ok('T93-a1 ★必须存在 parseWriteFlag 纯函数并导出（行为守卫要能真跑）',
+    /function parseWriteFlag\(rawArgv\)/.test(rdCode) && /module\.exports = \{[^}]*parseWriteFlag/.test(rdCode));
+  ok('T93-a2 ★默认必须 dry-run：doWrite 只在显式 --write 时为真',
+    /doWrite:\s*flags\.includes\('--write'\)/.test(rdCode) && /if \(doWrite\) \{/.test(rdCode) && /\} else \{/.test(rdCode),
+    '未见 doWrite 分支 —— 默认写盘的行为会复发');
+  // v3.62.0（F-3）：dry-run 的"价差来源"说明由「固定文案 现价 vs 当天价」升级为
+  //   动态口径行 `价格口径：${priceBasis}`（默认当天快照价 / --current-price / 今天无快照三态）。
+  //   断言意图不变：dry-run 必须同时说清「没写盘」和「这份报告是按什么价算的」。
+  ok('T93-a3 ★dry-run 必须显式告知「未写盘」+ 价格口径来源（否则用户以为账本已改）',
+    /dry-run：未写盘/.test(rd) && /价格口径：\$\{priceBasis\}/.test(rd) && /let priceBasis = ''/.test(rd));
+  ok('T93-a4 ★无法识别的 flag 必须报错（fail-closed，不静默忽略）',
+    /无法识别的参数/.test(rd) && /process\.exit\(2\)/.test(rdCode));
+  ok('T93-a5 ★README/SKILL 必须警示「会写回账本」并给出 --write 写法',
+    /recalc-day\.js 2026-10-02 --write/.test(S('README.md')) && /默认 dry-run（只报告、不写账本）/.test(S('SKILL.md')));
+
+  // ── T94：假日数据保守开关 + 两个 UI 出口（S-6）──
+  ok('T94-a1 ★peak-rules 必须有 holidayYearDegraded（表在但该年不可信才算降级）',
+    /function holidayYearDegraded\(tsMs, holidaysPath\)/.test(pr) && /fs\.statSync\(holidaysPath\)/.test(pr)
+    && /module\.exports = \{[^}]*holidayYearDegraded/.test(pr));
+  ok('T94-a2 ★isPeakAt 必须保守分支：假日不可信 → 不判高峰（fail-closed）',
+    /if \(conservative && holidayYearDegraded\(tsMs, holidaysPath\)\) return false;/.test(pr)
+    && /opts\.holidayUnknownNoPeak !== false/.test(pr));
+  // 逃逸口的真实形态是「4 参签名 + 默认表达式」——显式传 { holidayUnknownNoPeak: false } 即回到
+  // v3.61.0 的 fail-open。行为级证明见 T94-b3（源码里没有 `: false` 字面量，那不是缺陷）。
+  ok('T94-a3 ★必须保留 fail-open 逃逸口（4 参签名 + 可被显式关掉）',
+    /function isPeakAt\(tsMs, pricing, holidaysPath, opts\)/.test(pr)
+    && /conservative = !opts \|\| opts\.holidayUnknownNoPeak !== false/.test(pr));
+  // v3.62.0（F-2/S-3）：tag 数组新增 authoritativeErrTag（⚠价锁）—— 相邻序列随之改写，
+  //   断言意图不变（holidayDegradedTag 必须在数组里、且新标签不得插在它前面打乱既有顺序）。
+  ok('T94-a4 ★toast 必须接入 holidayDegradedTag，且只在本轮有峰谷模型时才标（避免纯噪音）',
+    /fetchDegradedTag\(pricing\), holidayDegradedTag\(stat, pricing\), authoritativeErrTag\(pricing\)\]/.test(ttCode) && /peakMultOf\(hit\.m, n\) > 1/.test(ttCode));
+  ok('T94-a5 ★报表必须接入 holidayDegradedNotice，且只读 holidays.json（不触发刷新）',
+    (ttCode.match(/holidayDegradedNotice\(\)/g) || []).length >= 4 && /readFileSync\(HOLIDAYS_FILE/.test(ttCode));
+
+  // ── T95：Python 侧统一北京时间（F-4）──
+  ok('T95-a1 ★fetch-cn-prices 必须有 CN_TZ/beijing_now/beijing_today',
+    /CN_TZ = datetime\.timezone\(datetime\.timedelta\(hours=8\)/.test(fcp)
+    && /def beijing_now\(\)/.test(fcp) && /def beijing_today\(\)/.test(fcp));
+  ok('T95-a2 ★阶跃公告生效比对必须用北京时间（公告写的就是「北京时间」）',
+    /now_iso = beijing_now\(\)\.strftime/.test(fcp));
+  ok('T95-a3 ★每日快照文件名必须用北京日（数据归属日，跨日边界不能落错名）',
+    /stamp = beijing_today\(\)/.test(fcp));
+  ok('T95-a4 ★fetched_at 必须是带时区的北京时刻（build_index 的 TTL 校验直接读它）',
+    /'fetched_at': beijing_now\(\)\.isoformat/.test(fcp));
+  ok('T95-a5 ★parse_tokenhub 的 fetched_at 同样必须北京时间（它单独产出一份不受日期约束的文件）',
+    /timezone\(__import__\('datetime'\)\.timedelta\(hours=8\)/.test(stripPy(S('parse_tokenhub.py'))));
+  ok('T95-a6 ★三个 py 脚本不得再有无时区的 datetime.now() 用于价格语义',
+    !/datetime\.datetime\.now\(\)\.strftime\('%Y-%m-%d'\)/.test(fcp)
+    && !/datetime\.datetime\.now\(\)\.isoformat/.test(fcp)
+    && !/datetime\.datetime\.now\(\)\.isoformat/.test(stripPy(S('parse_tokenhub.py'))));
+
+  // ── 行为组：真跑，证明"代码这么写"之外"跑起来真的这样" ──
+  const pyCands = [];
+  if (process.env.CN_PYTHON) pyCands.push(process.env.CN_PYTHON);
+  pyCands.push('python', 'python3');
+  let PY = null;
+  for (const c of pyCands) {
+    const t = spawnSync(c, ['-V'], { encoding: 'utf8', windowsHide: true, timeout: 20000 });
+    if (t.status === 0) { PY = c; break; }
+  }
+  if (!PY) envSkip('T91-b/T95-b 行为组（python 不可用）', 'python 不可用');
+  else {
+    const fw = path.join(tmp, 'b91');
+    const sk = path.join(fw, 'skills', 'token-usage-tracker');
+    const pd = path.join(fw, 'prices');
+    fs.mkdirSync(sk, { recursive: true });
+    fs.mkdirSync(pd, { recursive: true });
+    try { fs.copyFileSync(path.join(SRC, 'pricing.json'), path.join(sk, 'pricing.json')); } catch (e) { /* 缺则下面暴露 */ }
+    // 行为脚本：① 纯函数 _degraded_state 四种形态；② TZ 偏移后北京时刻仍正确；③ 端到端 main() 落字段
+    const py = [
+      '# -*- coding: utf-8 -*-',
+      'import json, os, sys, datetime, importlib.util',
+      'sys.stdout.reconfigure(encoding="utf-8")',
+      'SRC = ' + JSON.stringify(SRC.replace(/\\/g, '/')),
+      'spec = importlib.util.spec_from_file_location("bi", SRC + "/build_index.py")',
+      'm = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)',
+      'def say(tag, ok, detail=""):',
+      // 用 | 分隔而非空格：标签里含空格与箭头（如 "T91-b1 failed→vendors"），
+      // 空格分隔会让 JS 侧把第二个 token 当成 OK/FAIL 位 → 全行匹配不上（v3.62.0 实测 matched=0）。
+      '    print("CASE|%s|%s|%s" % (tag, "OK" if ok else "FAIL", detail))',
+      // ① 四种降级信号
+      'old = (datetime.datetime.now(m.CN_TZ) - datetime.timedelta(hours=80)).isoformat(timespec="seconds")',
+      'fresh = datetime.datetime.now(m.CN_TZ).isoformat(timespec="seconds")',
+      'd = {"vendors": {"minimax": {"name": "M", "models": []}},',
+      '     "_fetch_summary": {"failed": {"kimi": "解析出 0 个模型"}}, "fetched_at": old}',
+      'r = m._degraded_state(d, [("minimax/minimaxm3", "契约字段缺失: unit")], {"models": {}})',
+      'say("T91-b1 failed→vendors", r["vendors"].get("kimi") == "抓取失败：解析出 0 个模型", json.dumps(r["vendors"], ensure_ascii=False))',
+      'say("T91-b2 陈旧→stale_sources", len(r["stale_sources"]) == 1 and r["stale_sources"][0]["age_hours"] > 36, json.dumps(r["stale_sources"], ensure_ascii=False))',
+      'say("T91-b3 契约缺失→厂商级降级", "契约字段缺失" in (r["vendors"].get("minimax") or ""), "")',
+      'd2 = {"vendors": {}, "_fetch_summary": {"failed": {}}, "fetched_at": fresh}',
+      'r2 = m._degraded_state(d2, [], {"models": {}})',
+      'say("T91-b4 全干净→vendors 空且 stale 空", r2["vendors"] == {} and r2["stale_sources"] == [], json.dumps(r2, ensure_ascii=False))',
+      // since 继承
+      'prev = {"models": {}, "_fetch_degraded": {"generated_at": "2026-10-14T03:00:00+08:00", "vendors": {"kimi": "x"}, "since": {"kimi": "2026-10-14"}}}',
+      'r3 = m._degraded_state(d, [], prev)',
+      'say("T91-b5 since 继承上一版", r3["since"].get("kimi") == "2026-10-14", json.dumps(r3["since"], ensure_ascii=False))',
+      // ② TZ 偏移后北京时刻仍正确（F-4 的核心保证）
+      'now_bj = m.beijing_now()',
+      'say("T95-b1 北京时刻偏移恒为 +8（与机器时区无关）", now_bj.utcoffset() == datetime.timedelta(hours=8), str(now_bj.isoformat()))',
+      'say("T95-b2 北京日期是合法 ISO", len(m.beijing_today()) == 10 and m.beijing_today()[4] == "-", m.beijing_today())',
+      // 跨时区的真正不变量：naive 旧时间戳必须按北京时间解释（否则非 UTC+8 机器上
+      // "8 小时前的数据"会被算成 0 小时前或 16 小时前）；aware 时间戳按绝对时刻算。
+      // ⚠ 不用 time.tzset() 造"另一种机器时区"——那是 Unix-only，Windows 上直接
+      //   AttributeError（v3.62.0 实测踩到）。不变量本身与机器时区无关，故无需模拟。
+      'naive80 = (datetime.datetime.now() - datetime.timedelta(hours=80)).isoformat(timespec="seconds")',
+      'aware80 = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=80)).isoformat(timespec="seconds")',
+      'a1 = m._age_hours(naive80)',
+      'a2 = m._age_hours(aware80)',
+      'say("T95-b3 naive 时间戳按北京解释（≈80h，容差 2h）", a1 is not None and abs(a1 - 80) < 2, str(a1))',
+      'say("T95-b4 aware(UTC) 时间戳按绝对时刻算（≈80h，容差 2h）", a2 is not None and abs(a2 - 80) < 2, str(a2))',
+      'say("T95-b5 坏/空时间戳返回 None（不猜）", m._age_hours(None) is None and m._age_hours("not-a-time") is None, "")',
+      // ③ 端到端：main() 真写 index.json 且带 _fetch_degraded
+      'os.environ["CN_PRICES_DIR"] = m.PRICES_DIR',   // 仅作自文档；真正的隔离来自下方 spawn env
+      'os.environ["WB_ROOT"] = m.WB_ROOT',
+      'json.dump(d, open(m.PRICES_DIR + "/latest.json", "w", encoding="utf-8"), ensure_ascii=False)',
+      'json.dump({"built_at": "2026-10-14", "models": {}}, open(m.OUT, "w", encoding="utf-8"), ensure_ascii=False)',
+      'try:',
+      '    m.main()',
+      '    out = json.load(open(m.OUT, encoding="utf-8"))',
+      '    say("T91-b6 端到端：index.json 顶层有 _fetch_degraded", "_fetch_degraded" in out and bool(out["_fetch_degraded"]["vendors"]), json.dumps(out.get("_fetch_degraded", {}), ensure_ascii=False)[:200])',
+      '    say("T91-b7 端到端：built_at 是北京日期", len(out.get("built_at") or "") == 10, str(out.get("built_at")))',
+      'except Exception as e:',
+      '    say("T91-b6 端到端", False, repr(e))',
+      '    say("T91-b7 端到端", False, repr(e))',
+    ].join('\n');
+    const pyPath = path.join(fw, 'b91.py');
+    fs.writeFileSync(pyPath, py, 'utf8');
+    const r = spawnSync(PY, [pyPath], {
+      // CN_PRICES_DIR / WB_ROOT 必须在 python 进程**启动时**就在环境里（build_index 的
+      // PRICES_DIR/OUT/WB_ROOT 都是模块级常量，import 时即求值）—— 这正是 T90 同款隔离手法。
+      env: Object.assign({}, env, {
+        PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1', WB_LEDGER_MAINT: '1',
+        // WB_ROOT 必须是**数据根**（fw），不是技能目录（sk）—— build_index 用它拼
+        // `skills/token-usage-tracker/pricing.json`，传错会读到不存在的路径（实测即 T91-b6 崩因）。
+        CN_PRICES_DIR: pd, WB_ROOT: fw,
+      }),
+      encoding: 'utf8', windowsHide: true, timeout: 120000,
+    });
+    const lines = String(r.stdout || '').split('\n');
+    let matched = 0;
+    for (const ln0 of lines) {
+      // ⚠ Windows 上 python 的 stdout 是 CRLF：split('\n') 后每行尾部带 \r，而 JS 的 `.`
+      //   不匹配 \r、`$` 又要求串尾 → 整行失配（v3.62.0 实测 matched=0，而 stdout 里明明有 12 行）。
+      //   必须先剥掉行尾 \r 再匹配。这也是"本地绿 / CI 也绿"必须显式处理的一处环境分叉。
+      const ln = ln0.replace(/\r$/, '');
+      const mm = ln.match(/^CASE\|([^|]*)\|(OK|FAIL)\|?(.*)$/);
+      if (mm) { matched++; ok(mm[1] + (mm[3] ? '  ' + mm[3] : ''), mm[2] === 'OK'); }
+    }
+    ok('T91-b0 行为组断言行被识别（python 输出格式/编码异常时此处暴露原文）', matched >= 10,
+      'matched=' + matched + '（应为 12：T91-b1~b7 + T95-b1~b5）'
+      + 'status=' + r.status + ' stdout=[' + String(r.stdout || '').replace(/\n/g, '\\n').slice(0, 900) + ']'
+      + ' stderr=[' + String(r.stderr || '').slice(0, 2500) + ']');
+    try { fs.rmSync(fw, { recursive: true, force: true }); } catch (e) { /* 清理失败不影响断言 */ }
+  }
+
+  // ── T92-b / T93-b / T94-b：JS 侧行为（require 真身，不跑 main）──
+  {
+    const rdMod = require(path.join(SRC, 'recalc-day.js'));
+    // v3.62.0（F-3）：新增 `--current-price`（现价回算逃逸口）—— want 扩为三元组
+    //   [doWrite, currentPrice, argv]，覆盖「默认当天价 / --write / --current-price / 二者叠加」。
+    const cases = [[], ['--write'], ['--dry-run'], ['2026-09-10'], ['2026-09-10', '--write'],
+      ['--write', '2026-09-10'], ['2026-09-10', 'm1', '--write'], ['--bogus'],
+      ['--current-price'], ['2026-09-10', '--current-price'], ['--current-price', '--write', '2026-09-10']];
+    const want = [[false, false, []], [true, false, []], [false, false, []], [false, false, ['2026-09-10']],
+      [true, false, ['2026-09-10']], [true, false, ['2026-09-10']], [true, false, ['2026-09-10', 'm1']],
+      [false, false, []], [false, true, []], [false, true, ['2026-09-10']], [true, true, ['2026-09-10']]];
+    let bad = [];
+    cases.forEach((c, i) => {
+      const p = rdMod.parseWriteFlag(c);
+      if (p.doWrite !== want[i][0] || p.currentPrice !== want[i][1] || JSON.stringify(p.argv) !== JSON.stringify(want[i][2])) {
+        bad.push(JSON.stringify(c) + '→' + JSON.stringify(p));
+      }
+    });
+    ok('T93-b1 ★parseWriteFlag 十一形态全对（默认 false = dry-run；--write/--current-price 前后置都认）', bad.length === 0, bad.join(' | '));
+    ok('T93-b2 ★未知 flag 必须进 unknown（调用方据此 exit 2，不静默忽略）',
+      rdMod.parseWriteFlag(['--bogus']).unknown.length === 1 && rdMod.parseWriteFlag(['2026-01-01', '--x', '--write']).unknown.length === 1);
+  }
+  {
+    const ttMod = require(path.join(skillDir, 'token-tracker.js'));
+    const deg2 = { vendors: { kimi: '抓取失败', minimax: '契约缺失' }, stale_sources: [], since: { kimi: '2026-10-14', minimax: '2026-10-16' } };
+    ok('T92-b1 ★fetchDegradedTag：N 家降级 → ⚠N家价旧', ttMod.fetchDegradedTag({ _fetch_degraded: deg2 }) === '⚠2家价旧',
+      JSON.stringify(ttMod.fetchDegradedTag({ _fetch_degraded: deg2 })));
+    ok('T92-b2 ★fetchDegradedTag：仅源级陈旧 → ⚠价旧（不虚报"几家"）',
+      ttMod.fetchDegradedTag({ _fetch_degraded: { vendors: {}, stale_sources: [{ source: 'latest.json', age_hours: 80 }] } }) === '⚠价旧');
+    ok('T92-b3 ★fetchDegradedTag：无降级/无字段/坏类型 → 空串（不得变常驻噪音）',
+      ttMod.fetchDegradedTag({ _fetch_degraded: { vendors: {}, stale_sources: [] } }) === ''
+      && ttMod.fetchDegradedTag({}) === '' && ttMod.fetchDegradedTag(null) === ''
+      && ttMod.fetchDegradedTag({ _fetch_degraded: 'bad' }) === '');
+    ok('T92-b4 ★fetchDegradedNotice：无降级 → 空串（保证既有报表出口逐字节不变）',
+      ttMod.fetchDegradedNotice() === '', JSON.stringify(ttMod.fetchDegradedNotice()).slice(0, 200));
+    ok('T92-b5 ★mergeLocalPriceDb 真挂载 + stripLocalDbEntries 真剥离（防落盘）',
+      (() => {
+        const db = { built_at: '2026-10-16', models: {}, _fetch_degraded: { vendors: { kimi: 'x' }, stale_sources: [] } };
+        const p = ttMod.mergeLocalPriceDb({ models: {}, _fakeDb: db }) || {};
+        // mergeLocalPriceDb 读的是 CN_PRICE_DB，故这里只验证剥离函数对挂载字段生效
+        const stripped = ttMod.stripLocalDbEntries({ models: {}, local_db: {}, _fetch_degraded: { vendors: { kimi: 'x' } } });
+        return stripped._fetch_degraded === undefined && stripped.local_db === undefined;
+      })());
+  }
+  {
+    const ttMod = require(path.join(skillDir, 'token-tracker.js'));
+    const prMod = require(path.join(SRC, 'peak-rules.js'));
+    const H = path.join(SRC, 'holidays.json');
+    const t26 = Date.UTC(2026, 9, 16, 2, 0);   // 北京 2026-10-16 周五 10:00（已确认年）
+    const t27 = Date.UTC(2027, 4, 5, 2, 0);    // 北京 2027-05-05 周三 10:00（2027: null → 不可信）
+    const rules = { peak_schedule: '9:00-12:00,14:00-18:00', weekend_off_peak: true };
+    ok('T94-b1 ★已确认年（2026）行为零变化：仍判高峰', prMod.isPeakAt(t26, { deepseek_rules: rules }, H) === true);
+    ok('T94-b2 ★不可信年（2027）转保守：不判高峰', prMod.isPeakAt(t27, { deepseek_rules: rules }, H) === false);
+    ok('T94-b3 ★显式 fail-open 逃逸口仍可用（对照测试/排障）',
+      prMod.isPeakAt(t27, { deepseek_rules: rules }, H, { holidayUnknownNoPeak: false }) === true);
+    ok('T94-b4 ★holidayYearDegraded：无表/表不存在不算降级（不误伤测试与首装）',
+      prMod.holidayYearDegraded(t26, null) === false && prMod.holidayYearDegraded(t26, path.join(tmp, 'no-such-holidays.json')) === false
+      && prMod.holidayYearDegraded(t27, H) === true && prMod.holidayYearDegraded(t26, H) === false);
+    ok('T94-b5 ★holidayDegradedTag：只在「本轮有峰谷模型」时才可能标（否则纯噪音）',
+      ttMod.holidayDegradedTag({ model: 'hy4-preview' }, { models: { 'hy4-preview': { input_price: 1 } } }) === ''
+      && ttMod.holidayDegradedTag({ model: 'deepseek-v4.1-flash' },
+        { models: { 'deepseek-v4.1-flash': { input_price: 1, peak_multiplier: 2 } } }) === '');
+    ok('T94-b6 ★holidayDegradedNotice：当前 2026 已确认 → 空串（今天零噪音）',
+      ttMod.holidayDegradedNotice() === '', JSON.stringify(ttMod.holidayDegradedNotice()).slice(0, 200));
+  }
+}
+
+// ===== T96（外部审计 v3.61.0 · 文档三连：G-6 / G-7 / G-8 / S-5）=====
+// 背景：本轮审计 4 条纯文档缺陷，共同病根是「README / KNOWN-ISSUES 这两份用户第一眼看的文件没有守卫」
+//   （T66-d 系列只守了 docs/pricing-refresh.md 一侧）：
+//   - G-6：KNOWN-ISSUES 两个条目同时编号 KI-24（v3.57.0 的 H5 与 v3.61.0 的审计条目撞号，后者已改 KI-30）；
+//   - G-7：头注自相矛盾——「v3.22.0 复核行号」vs「行号按 v3.23.0 标注」（git 史实：复核发生在 v3.22.0，
+//     v3.23.0 是零代码改动的纯文档重构，两戳本就同代却写成两个版本；均已统一到 v3.22.0 并加漂移警告）；
+//   - G-8：README 文件清单 peak-rules.js 重复列了两行，且 stop-handler / wb-root / ledger-merge /
+//     transc-lines 四个运行时模块完全漏列（五次拆模块，表一次都没同步——用户按表配 hooks 时根本不知道它们存在）；
+//   - S-5：README「7 个公开价格源」裸奔缺独立性口径（llm-prices-cn 是 llmabacus 每日镜像、Portkey×3 同平台
+//     → ≠7 独立，去重后实为 4 个）。
+// 全部按**自动提取**写（不手写清单——手写清单正是 T12-i6a 修过的假绿之源）。
+{
+  const rd96 = fs.readFileSync(path.join(SRC, 'README.md'), 'utf-8');
+  const ki96 = fs.readFileSync(path.join(SRC, 'KNOWN-ISSUES.md'), 'utf-8');
+
+  // a1（G-6）：KI 编号唯一性。只扫 `## KI-<n>` 标题（正文里引用旧编号是史实，不算撞号）。
+  const kiNums96 = (ki96.match(/^## KI-(\d+)/gm) || []).map((s) => s.replace('## KI-', ''));
+  const kiDup96 = kiNums96.filter((n, i) => kiNums96.indexOf(n) !== i);
+  ok('T96-a1 ★KNOWN-ISSUES 的 KI 编号不得重复（自动提取全部标题判重）',
+    kiDup96.length === 0, kiDup96.length ? '撞号：' + [...new Set(kiDup96)].join(', ') : kiNums96.length + ' 个编号全唯一');
+
+  // a2（G-7）：头注「复核行号」版本 == 「行号按…标注」版本。两边分别捕获版本号判等——
+  //   修前一个写 v3.22.0 复核、一个写按 v3.23.0 标注，自相矛盾。
+  const mRev96 = ki96.match(/(v3\.\d+\.\d+) 复核行号/);
+  const mAnn96 = ki96.match(/按 \*\*(v3\.\d+\.\d+) 的/);
+  ok('T96-a2 ★KNOWN-ISSUES 头注两处版本戳一致（复核版本 == 行号标注版本）',
+    !!mRev96 && !!mAnn96 && mRev96[1] === mAnn96[1],
+    '复核=' + (mRev96 && mRev96[1]) + ' 标注=' + (mAnn96 && mAnn96[1]));
+
+  // a3/a4（G-8）：README「文件清单」表格——① 必须列全技能目录全部 .js（readdir 自动提取反向核对）；
+  //   ② 表格内不得重复列同一文件（peak-rules.js 曾重复两行）。只扫表格区域的第一列，避免误伤正文正常提及。
+  const tbl96 = (() => {
+    const i = rd96.indexOf('### 文件清单');
+    if (i < 0) return '';
+    const j = rd96.indexOf('\n## ', i);
+    return rd96.slice(i, j < 0 ? undefined : j);
+  })();
+  const listed96 = [];
+  (tbl96.match(/^\| [^|]+\|/gm) || []).forEach((r) => {
+    const cell = r.slice(2, r.indexOf('|', 2));   // 只取第一列（文件名列）
+    (cell.match(/`([^`]+)`/g) || []).forEach((t) => listed96.push(t.slice(1, -1)));
+  });
+  const jsFiles96 = fs.readdirSync(SRC).filter((f) => f.endsWith('.js')).sort();
+  const missJs96 = jsFiles96.filter((f) => listed96.indexOf(f) < 0);
+  ok('T96-a3 ★README 文件清单列全全部运行时 .js（按目录自动提取，只核对表格第一列）',
+    missJs96.length === 0, missJs96.length ? '漏列：' + missJs96.join(', ') : jsFiles96.length + ' 个全列');
+  const dupRow96 = listed96.filter((f, i) => listed96.indexOf(f) !== i);
+  ok('T96-a4 ★README 文件清单表格内不得重复列同一文件（peak-rules.js 曾重复两行）',
+    dupRow96.length === 0, dupRow96.length ? '重复：' + [...new Set(dupRow96)].join(', ') : listed96.length + ' 个文件无重复');
+
+  // a5（S-5）：「7 源」必须附独立性口径，且文件表里的源计数不得再写旧的 5。T66-d4 守的是「7 源」字面
+  //   存在，本条守的是**不误导**：llm-prices-cn = llmabacus 每日镜像（同源不互证）、Portkey×3 同平台
+  //   → 去重后独立源 4 个。v3.56.0 扩源时只同步了 182 行的源清单表，438 行文件表的「（5 源）」漏改
+  //   （同类漂移第三次）——故计数一致性也并入本条。
+  //   ⚠ literal 必须与 README 正文逐字一致（含「」直角引号）——v3.62.0 首版守卫写成无引号形态 → 假红。
+  ok('T96-a5 ★README「7 源」必须附独立性口径（「7 源」≠ 7 个独立数据源）且文件表计数同步',
+    rd96.indexOf('**7 个公开价格源**') >= 0 && rd96.indexOf('「7 源」≠ 7 个独立数据源') >= 0
+    && rd96.indexOf('llm-prices-cn') >= 0 && rd96.indexOf('源的独立性口径') >= 0
+    && rd96.indexOf('价格刷新策略（7 源）') >= 0);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// T97~T99（v3.62.0 · 外部审计 v3.61.0 第二批：单价可信度 + 历史可复现）
+//   本批共同主题：**让"最该可信的那一层"自己也可信，且两端永远算出同一个答案**。
+//   ① S-1：数据根探测在 py/node 两端曾经**不一致**（wb-root.js v3.58.0 加了「目录存在性第二轮」，
+//      build_index.py 没跟上）→ 同机可能算出不同的根 → pricing.json(lock) 权威覆盖层静默失效。
+//      修法 = 补齐 py 侧第二轮 + 契约测试（T99）把等价性钉成行为断言。
+//   ② S-3/F-2：pricing.json 的 lock 覆盖层此前**零校验**（in/out 缺失或非数值也会照写）、
+//      且伪造 fetched_at=today 冒充新鲜 → 补 fail-closed 校验 + 诚实新鲜度 + 两个用户出口。
+//   ③ A-4：审计判断「阶跃抓取无计费消费者」→ 实测证伪（index.json 6 个 step-* 有效条目经
+//      mergeLocalPriceDb 进内存、findModel 命中、calcCost 出非零金额）→ 拍板保留 + T98 钉住。
+//   ⚠ 每条源码守卫都配行为守卫（源码只能证明"代码这么写"，证明不了"跑起来真的这样"）。
+{
+  const S = (f) => fs.readFileSync(path.join(SRC, f), 'utf-8').replace(/\r\n/g, '\n');
+  // 行级剥 py 注释（与 T91~T95 块同款；源码守卫必须只看代码，注释里同文本会造成假绿）
+  const stripPy = (s) => s.split('\n').map((line) => {
+    let out = ''; let q = null;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (q) { out += c; if (c === '\\') out += line[++i] || ''; else if (c === q) q = null; continue; }
+      if (c === '"' || c === "'") { q = c; out += c; continue; }
+      if (c === '#') break;
+      out += c;
+    }
+    return out;
+  }).join('\n');
+  const bi = stripPy(S('build_index.py'));
+  const fcp = stripPy(S('fetch-cn-prices.py'));
+  const wr = stripComments(S('wb-root.js'));
+  const tt = stripComments(S('token-tracker.js'));
+
+  // ── T97：数据根探测 py/node 等价（S-1）──
+  // 锚点必须**唯一到那一处**：`for c in cands:` 在 build_index.py 里出现 3 次（detect_workbuddy_root
+  //   两轮 + cross_check 一轮），整文件计数会恒为 3（v3.58.0「锚点必须唯一」教训的同型复现）。
+  //   故先按函数名切片，只在函数体内数轮次。
+  const fnStart = bi.indexOf('def detect_workbuddy_root');
+  const fnEnd = bi.indexOf('WB_ROOT = detect_workbuddy_root()');
+  const fnBody = (fnStart >= 0 && fnEnd > fnStart) ? bi.slice(fnStart, fnEnd) : '';
+  const iMarker = fnBody.indexOf("if os.path.exists(os.path.join(c, 'traces'))");
+  const iExists = fnBody.indexOf('if os.path.exists(c):');
+  const nRounds = (fnBody.match(/for c in cands:/g) || []).length;
+  ok('T97-a1 ★build_index 必须先 marker 轮、后目录存在性轮（顺序反了会选到错的根）',
+    iMarker >= 0 && iExists > iMarker && nRounds === 2,
+    `marker@${iMarker} exists@${iExists} 轮数=${nRounds}（应恰好 2 轮且 marker 在前）`);
+  ok('T97-a2 ★py 侧两轮都不命中仍兜底 ~/.workbuddy（返回 None 会让调用方全线抛错）',
+    /return os\.path\.join\(h, '\.workbuddy'\)/.test(fnBody));
+  ok('T97-a3 ★Node 侧（wb-root.js）同形态两轮 + 硬兜底（py 侧补齐的对齐基准不得被改弱）',
+    /for \(const c of cands\)[\s\S]{0,400}?existsSync\(path\.join\(c, 'traces'\)\)/.test(wr)
+    && /for \(const c of cands\)[\s\S]{0,400}?existsSync\(c\)/.test(wr)
+    && /return path\.join\(h, '\.workbuddy'\);/.test(wr));
+  ok('T97-a4 ★fetch-cn-prices.py 不得再复制第三份根探测（F-2 已拆；根判据只留 build_index + wb-root 两处）',
+    !/def detect_workbuddy_root/.test(fcp) && !/WB_ROOT/.test(fcp));
+
+  // ── T97-b：F-2 自我引用闭环拆除（fetch-cn-prices 不再读回 pricing.json）──
+  // 病根（审计原话）：`mode:'pricing'` 读回 pricing.json——流水线**自己的最终汇**——冒充
+  // "当日新抓的 first_party 官方价"。官方调价后只要 deepseek-official.js 那一轮失败，本地价
+  // 就永久停在旧值，而 latest.json 仍带 fetched_at=今天，下游无条件信任（源=汇 闭环）。
+  ok('T97-b1 ★DeepSeek 必须显式 external（不得再读回 pricing.json 冒充当日新抓 first_party 价）',
+    /'deepseek': \{[\s\S]{0,700}?'mode': 'external',/.test(fcp) && !/'mode': 'pricing'/.test(fcp));
+  ok('T97-b2 ★parse_pricing_deepseek 必须不存在（闭环的落点，整段拆除）',
+    !/def parse_pricing_deepseek/.test(fcp));
+  ok('T97-b3 ★external 必须 status=skipped 且不计入 failed（否则每天假降级一次 = A-8 永久噪音）',
+    /entry\['status'\] = 'skipped'/.test(fcp)
+    && /if entry\['status'\] == 'skipped':\n\s*continue/.test(fcp)
+    && /'skipped_vendors': skipped_vendors,/.test(fcp));
+  ok('T97-b4 ★lock 覆盖层必须保留官方对照/人工核录两张查找表（F-2 诚实新鲜度的数据来源）',
+    /official_ref\[str\(r\['model'\]\)\] = str\(r\['ref_at'\]\)/.test(bi)
+    && /manual_at\[str\(r\['model'\]\)\] = r\.get\('adopted_at'\) or r\.get\('manual_at'\)/.test(bi));
+
+  // ── T98：S-3 fail-closed + F-2 诚实新鲜度 + 两个用户出口（源码侧）──
+  // 锚点必须钉到**拒收那一处**：`in_p is None or out_p is None` 在下方 peak 段的 elif 里
+  // 也出现一次（缺 peak 只跳过 peak 段、不拒收条目），只匹配关键词会同时命中 → 假绿。
+  ok('T98-a1 ★lock 覆盖层 in/out 主价缺失/非数值必须拒收（S-3：fail-closed，不覆盖不注入）',
+    /if in_p is None or out_p is None:\n\s*why = \('pricing\.json\(lock\) 条目主价缺失或非数值/.test(bi)
+    && /auth_issues\.append\(\{'model': key, 'kind': 'invalid_lock'/.test(bi));
+  ok('T98-a2 ★拒收必须 continue 而非 break/pass（fail-closed：坏手工价不得进入索引）',
+    /auth_issues\.append\(\{'model': key, 'kind': 'invalid_lock'[\s\S]{0,400}?\n\s*continue/.test(bi));
+  ok('T98-a3 ★拒收必须留痕：changes.jsonl 的 authoritative_invalid（不能只 stderr 一行）',
+    /'kind': 'authoritative_invalid'/.test(bi));
+  ok('T98-a4 ★lock 条目不伪造 fetched_at=today（F-2：挂官方对照/人工核录时刻，没有就不写）',
+    /honest_ts = official_ref\.get\(key\) or manual_at\.get\(key\)/.test(bi)
+    && /contract\['fetched_at'\] = honest_ts/.test(bi));
+  ok('T98-a5 ★官方对照过期必须报 stale_lock（对照停更 = 权威价可能已变，不能装作新鲜）',
+    /'kind': 'stale_lock'/.test(bi) && /SOURCE_TTL_HOURS/.test(bi));
+  ok('T98-a6 ★mergeLocalPriceDb 必须把 authoritative_issues 也算进挂载条件（漏这路 → ⚠价锁 永不显示）',
+    /Array\.isArray\(_deg\.authoritative_issues\) && _deg\.authoritative_issues\.length > 0/.test(tt));
+  ok('T98-a7 ★periodNote 必须接入 authoritativeErrTag（行2 末尾，同 ⚠价库 机制）',
+    /holidayDegradedTag\(stat, pricing\), authoritativeErrTag\(pricing\)\]/.test(tt)
+    && /return '⚠价锁';/.test(tt));
+  ok('T98-a8 ★三个报表出口都必须接入 authoritativeIssuesNotice（--report 是用户对界第二通道）',
+    (tt.match(/authoritativeIssuesNotice\(\)/g) || []).length >= 4,
+    '接入点不足 3 个（reportTxt / reportRangeTxt / reportSummaryTxt）');
+  ok('T98-a9 ★报表提示必须只读 index.json（--report 不得触发价库刷新副作用）',
+    /function authoritativeIssuesNotice\(\)[\s\S]{0,400}readFileSync\(CN_PRICE_DB/.test(tt),
+    'authoritativeIssuesNotice 未直读 CN_PRICE_DB —— 可能挂上了 loadPricing 的联网副作用');
+}
+
+// ── T98-b：A-4 拍板的行为证据 + 价锁两个出口真跑 ──
+//   A-4 事实：pricing.json 里没有 step-*，但 index.json 有 6 个 step-* 有效条目 →
+//   mergeLocalPriceDb 并入内存 pricing → findModel 命中 → calcCost 非零 = **有消费者**
+//   （审计原判断「阶跃抓取无计费消费者」的前提被证伪）。故处置 = 保留抓取 + 本条钉住。
+{
+  const ttMod = require(path.join(skillDir, 'token-tracker.js'));
+  const dbPath = path.join(pricesDir, 'index.json');
+  const fakeDb = {
+    built_at: '2026-10-16',
+    models: {
+      'step-3': { name: '阶跃 Step-3', in_price: 1.5, out_price: 6, cache_hit: 0.3, primary_source: '阶跃星辰官网' },
+    },
+    _fetch_degraded: {
+      vendors: {}, stale_sources: [],
+      authoritative_issues: [
+        { model: 'deepseek-v4-pro', kind: 'stale_lock', reason: '官方对照时刻 45 天前', since: '2026-10-01' },
+        { model: 'hy4-preview', kind: 'invalid_lock', reason: 'input_price=None', since: '2026-10-16' },
+      ],
+    },
+  };
+  fs.writeFileSync(dbPath, JSON.stringify(fakeDb));
+  let merged = null;
+  try {
+    merged = ttMod.mergeLocalPriceDb({ models: {} });
+    const hit = ttMod.findModel(merged, 'step-3', 'price');
+    const cost = hit ? ttMod.calcCost({ model: 'step-3', in: 1000, out: 500, cached: 0 }, merged, 0) : null;
+    ok('T98-b1 ★A-4 拍板：index.json 的 step-* 条目确有计费消费者（merge→findModel→calcCost 非零）',
+      !!hit && typeof cost === 'number' && cost > 0,
+      `hit=${!!hit} cost=${cost}`);
+    ok('T98-b2 ★authoritativeErrTag：authoritative_issues 非空 → ⚠价锁（含"仅价锁坏"这一路）',
+      ttMod.authoritativeErrTag(merged) === '⚠价锁', JSON.stringify(ttMod.authoritativeErrTag(merged)));
+    ok('T98-b3 ★authoritativeIssuesNotice：明细含模型名/两种 kind/后果与修复指引',
+      (() => {
+        const n = ttMod.authoritativeIssuesNotice();
+        return n.indexOf('deepseek-v4-pro') >= 0 && n.indexOf('hy4-preview') >= 0
+          && n.indexOf('官方对照时刻已过期') >= 0 && n.indexOf('条目主价缺失或非数值') >= 0
+          && n.indexOf('修复') >= 0;
+      })(), ttMod.authoritativeIssuesNotice().slice(0, 300));
+    ok('T98-b4 ★干净库（无 authoritative_issues）→ 标签与报表提示都为空（不变成常驻噪音）',
+      (() => {
+        fs.writeFileSync(dbPath, JSON.stringify({ models: {}, _fetch_degraded: { vendors: {}, stale_sources: [], authoritative_issues: [] } }));
+        const clean = ttMod.mergeLocalPriceDb({ models: {} });
+        return ttMod.authoritativeErrTag(clean) === '' && ttMod.authoritativeIssuesNotice() === '';
+      })());
+  } finally {
+    // 还原空库：本块写在共享隔离目录里，必须留下与进场时一致的状态
+    fs.writeFileSync(dbPath, JSON.stringify({ models: {} }));
+  }
+}
+
+// ── T99：S-1 契约测试 —— 同一合成目录树，py 与 node 必须算出同一个根 ──
+//   为什么必须是行为断言而非注释约定：两个实现分居两种语言、无共享模块，历史上正是靠
+//   "docstring 声称逐字等价"维持的——而 wb-root.js v3.58.0 加了第二轮、py 侧没跟上，
+//   等价性在长达两个版本的时间里是**假的**（审计 S-1 原文）。
+//   ⚠ 两侧的 env 覆盖**分层不同**（这不是缺陷，是既有约定）：
+//     · py：env 判断做进 `detect_workbuddy_root()` 函数体内（docstring 明写"对应 Node 的 ||"）；
+//     · js：`detectWorkBuddyRoot()` 只做目录探测，env 覆盖在**调用方**
+//       （`process.env.WB_ROOT || detectWorkBuddyRoot()`，见 backfill/recalc-day/refresh-*.js）。
+//     故契约的正确形态是 py 函数 ≡ node 的 `WB_ROOT || detectWorkBuddyRoot()`，
+//     直接拿两个裸函数比会在 WB_ROOT 场景下假红（v3.62.0 首版即如此，已修）。
+//   隔离手法：HOME/USERPROFILE 都指向沙箱 home（node 的 os.homedir 与 py 的 expanduser
+//   两个平台都认这两个变量，本地实测过）→ 不碰真实 ~/.workbuddy。
+//   输出口径：两端路径分隔符不同（node 反斜杠 / py 保留传入的正斜杠）→ 归一化后再比。
+{
+  const pyCands = [];
+  if (process.env.CN_PYTHON) pyCands.push(process.env.CN_PYTHON);
+  pyCands.push('python', 'python3');
+  let PY99 = null;
+  for (const c of pyCands) {
+    const t = spawnSync(c, ['-V'], { encoding: 'utf8', windowsHide: true, timeout: 20000 });
+    if (t.status === 0) { PY99 = c; break; }
+  }
+  if (!PY99 || !SPAWN_OK) envSkip('T99 数据根探测契约测试', 'python 不可用或沙箱禁 spawn');
+  else {
+    const norm = (p) => String(p == null ? '' : p).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+    const scen = [
+      { id: 'b1', name: 'T99-b1 两个候选都有 marker → 取 .workbuddy-ai（marker 轮）',
+        mk: (h) => {
+          fs.mkdirSync(path.join(h, '.workbuddy-ai', 'traces'), { recursive: true });
+          fs.mkdirSync(path.join(h, '.workbuddy'), { recursive: true });
+          fs.writeFileSync(path.join(h, '.workbuddy', 'settings.json'), '{}');
+        },
+        wbRoot: null, want: '.workbuddy-ai' },
+      { id: 'b2', name: 'T99-b2 只有 .workbuddy 有 marker → 取 .workbuddy',
+        mk: (h) => { fs.mkdirSync(path.join(h, '.workbuddy'), { recursive: true }); fs.writeFileSync(path.join(h, '.workbuddy', 'settings.json'), '{}'); },
+        wbRoot: null, want: '.workbuddy' },
+      { id: 'b3', name: 'T99-b3 都无 marker 但目录都在 → 取 .workbuddy-ai（目录存在性第二轮，S-1 补齐的那一轮）',
+        mk: (h) => { fs.mkdirSync(path.join(h, '.workbuddy-ai'), { recursive: true }); fs.mkdirSync(path.join(h, '.workbuddy'), { recursive: true }); },
+        wbRoot: null, want: '.workbuddy-ai' },
+      { id: 'b4', name: 'T99-b4 两个候选都不存在 → 硬兜底 .workbuddy（不许返回空/None）',
+        mk: () => {}, wbRoot: null, want: '.workbuddy' },
+      { id: 'b5', name: 'T99-b5 WB_ROOT 非空即用（不校验存在性，对应 Node 的 ||）',
+        mk: () => {}, wbRoot: path.join(tmp, 't99-custom-root'), wantAbs: path.join(tmp, 't99-custom-root') },
+      { id: 'b6', name: 'T99-b6 WB_ROOT 空串等同未设置（回到目录存在性轮，不得返回空路径）',
+        mk: (h) => { fs.mkdirSync(path.join(h, '.workbuddy-ai'), { recursive: true }); },
+        wbRoot: '', want: '.workbuddy-ai' },
+    ];
+    const pyCode = [
+      '# -*- coding: utf-8 -*-',
+      'import importlib.util, sys',
+      'sys.stdout.reconfigure(encoding="utf-8")',
+      'SRC = ' + JSON.stringify(SRC.replace(/\\/g, '/')),
+      'spec = importlib.util.spec_from_file_location("bi", SRC + "/build_index.py")',
+      'm = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)',
+      'print(m.detect_workbuddy_root())',
+    ].join('\n');
+    const pyPath = path.join(tmp, 't99.py');
+    fs.writeFileSync(pyPath, pyCode, 'utf8');
+    const bad = [];
+    for (const sc of scen) {
+      const h = path.join(tmp, 't99-home-' + sc.id);
+      try { fs.rmSync(h, { recursive: true, force: true }); } catch (e) { /* 首轮不存在 */ }
+      fs.mkdirSync(h, { recursive: true });
+      sc.mk(h);
+      const cenv = Object.assign({}, env, PY_IO_ENV, { HOME: h, USERPROFILE: h, WB_ROOT: sc.wbRoot == null ? '' : sc.wbRoot });
+      // 空串 WB_ROOT 必须**设置但为空**（校验"空串等同未设置"这条语义），故不能简单 delete
+      // node 侧必须复刻调用方的 env 优先语义（见块首注释：分层不同不是缺陷）
+      const rn = spawnSync(NODE, ['-e',
+        'process.stdout.write(process.env.WB_ROOT || require(' + JSON.stringify(path.join(SRC, 'wb-root.js').replace(/\\/g, '/')) + ').detectWorkBuddyRoot())'],
+        { env: cenv, encoding: 'utf8', windowsHide: true, timeout: 30000 });
+      const rp = spawnSync(PY99, [pyPath], { env: cenv, encoding: 'utf8', windowsHide: true, timeout: 60000 });
+      const nn = norm(String(rn.stdout || '').trim());
+      const np = norm(String(rp.stdout || '').trim());
+      // b5 用绝对 want（WB_ROOT 非空即用，与 home 无关）；其余相对 home
+      const want = norm(sc.wantAbs || path.join(h, sc.want));
+      if (nn !== want || np !== want) {
+        bad.push(`${sc.name}: node=${nn} py=${np} want=${want}`
+          + ` (node status=${rn.status} err=${String(rn.stderr).slice(0, 120)}; py status=${rp.status} err=${String(rp.stderr).slice(0, 120)})`);
+      }
+      try { fs.rmSync(h, { recursive: true, force: true }); } catch (e) { /* 清理失败不影响断言 */ }
+    }
+    try { fs.rmSync(pyPath, { force: true }); } catch (e) { /* 同上 */ }
+    ok('T99-b0 ★六种目录形态下 py 与 node 必须算出同一个根（S-1 等价性契约）', bad.length === 0, bad.join(' | '));
+  }
+}
+
+// ── T99-c：py 侧行为组（F-2 厂商模式 + F-4 公告解析纯函数）──
+//   为什么必须行为级：T97-b 的源码断言只能证明"代码这么写"。F-2 的 external 分支与
+//   F-4 的 parse_adjustment_notices 都是**可单测的纯逻辑**，没有理由只靠注释自证。
+//   隔离：importlib 按文件路径加载模块（不 cd、不改 sys.path），喂合成文本，不联网。
+{
+  const pyCands = [];
+  if (process.env.CN_PYTHON) pyCands.push(process.env.CN_PYTHON);
+  pyCands.push('python', 'python3');
+  let PY99C = null;
+  for (const c of pyCands) {
+    const t = spawnSync(c, ['-V'], { encoding: 'utf8', windowsHide: true, timeout: 20000 });
+    if (t.status === 0) { PY99C = c; break; }
+  }
+  if (!PY99C || !SPAWN_OK) envSkip('T99-c py 行为组（F-2 厂商模式 / F-4 公告解析）', 'python 不可用或沙箱禁 spawn');
+  else {
+    const py = [
+      '# -*- coding: utf-8 -*-',
+      'import importlib.util, sys',
+      'sys.stdout.reconfigure(encoding="utf-8")',
+      'SRC = ' + JSON.stringify(SRC.replace(/\\/g, '/')),
+      "_spec = importlib.util.spec_from_file_location('fcp', SRC + '/fetch-cn-prices.py')",
+      'F = importlib.util.module_from_spec(_spec)',
+      '_spec.loader.exec_module(F)',
+      'fails = []',
+      'def chk(n, c, d=""):',
+      '    print("CASE|%s|%s|%s" % (n, "OK" if c else "FAIL", d))',
+      '    if not c: fails.append(n)',
+      // ① F-2：厂商模式
+      'chk("T99-c1 deepseek 模式为 external（不再读回 pricing.json）", F.VENDORS["deepseek"]["mode"] == "external", str(F.VENDORS["deepseek"]["mode"]))',
+      'chk("T99-c2 全库不得再有 mode=pricing 的厂商（自我引用闭环的任何残留）", all(v.get("mode") != "pricing" for v in F.VENDORS.values()), str([k for k, v in F.VENDORS.items() if v.get("mode") == "pricing"]))',
+      'chk("T99-c3 parse_pricing_deepseek 已拆除", not hasattr(F, "parse_pricing_deepseek"), "")',
+      // ② F-4：公告解析纯函数（未来生效 / 已生效 / 无公告 / 缓存列 / 认不出模型名不猜）
+      'FUT = "自北京时间 2027 年 3 月 1 日 00:00 起由 1 元/百万 tokens 调整为 2 元/百万 tokens，`step-5-preview` 的输入价格"',
+      'r = F.parse_adjustment_notices(FUT)',
+      'chk("T99-c4 未来公告被解析出 effective/old/new/field", r.get("step5preview", {}).get("old") == 1.0 and r.get("step5preview", {}).get("new") == 2.0 and r.get("step5preview", {}).get("effective") == "2027-03-01T00:00" and r.get("step5preview", {}).get("field") == "in", str(r))',
+      'OUT = "自北京时间 2026 年 9 月 1 日 00:00 起由 8 元/百万 tokens 调整为 6 元/百万 tokens，Step 5 Preview 的输出价格"',
+      'r2 = F.parse_adjustment_notices(OUT)',
+      'chk("T99-c5 显示名（含空格）与 api 名归一后同键", r2.get("step5preview", {}).get("field") == "out" and r2.get("step5preview", {}).get("new") == 6.0, str(r2))',
+      'CACHE = "自北京时间 2026 年 9 月 1 日 00:00 起由 0.1 元/百万 tokens 调整为 0.2 元/百万 tokens，step-5-preview 的缓存命中价格"',
+      'r3 = F.parse_adjustment_notices(CACHE)',
+      'chk("T99-c6 缓存命中列识别为 cache", r3.get("step5preview", {}).get("field") == "cache", str(r3))',
+      'chk("T99-c7 无公告文本 → 空 dict（不猜）", F.parse_adjustment_notices("今天天气不错") == {}, "")',
+      'NOMODEL = "自北京时间 2027 年 3 月 1 日 00:00 起由 1 元/百万 tokens 调整为 2 元/百万 tokens"',
+      'chk("T99-c8 认不出模型名的公告 → 不收（漏认代价 < 误认）", F.parse_adjustment_notices(NOMODEL) == {}, str(F.parse_adjustment_notices(NOMODEL)))',
+      'print("RESULT %d" % len(fails))',
+      'sys.exit(1 if fails else 0)',
+    ].join('\n');
+    const fw = path.join(tmp, 't99c');
+    fs.mkdirSync(fw, { recursive: true });
+    const pf = path.join(fw, 't99c.py');
+    fs.writeFileSync(pf, py, 'utf8');
+    const r = spawnSync(PY99C, [pf], { encoding: 'utf8', timeout: 120000, windowsHide: true, env: Object.assign({}, env, PY_IO_ENV, { WB_LEDGER_MAINT: '1' }) });
+    let matched = 0;
+    for (const ln of String(r.stdout || '').split(/\r?\n/)) {
+      const m = /^CASE\|([^|]*)\|(OK|FAIL)\|?(.*)$/.exec(ln);
+      if (m) { matched++; ok(m[1] + (m[3] ? '  ' + m[3] : ''), m[2] === 'OK'); }
+    }
+    ok('T99-c0 行为组断言行被识别（python 输出格式/编码异常时此处暴露原文）', matched >= 8,
+      'matched=' + matched + '（应为 8：T99-c1~c8）'
+      + 'status=' + r.status + ' stdout=[' + String(r.stdout || '').replace(/\n/g, '\\n').slice(0, 600) + ']'
+      + ' stderr=[' + String(r.stderr || '').slice(0, 800) + ']');
+    try { fs.rmSync(fw, { recursive: true, force: true }); } catch (e) { /* 清理失败不影响断言 */ }
+  }
+}
+
+// ===== T100（v3.62.0 · 外部审计 F-3）：历史可复现 —— recalc / backfill 按「当时价」而非「现价」=====
+//   病根（审计 F-3「历史不可复现」）：recalc-day / backfill 都按 pricing.json 的**现价**回算历史。
+//   厂商调价后跑一次 `node recalc-day.js 2026-09-10` 或 `node backfill.js --write`，那天的金额就被按
+//   **今天**的单价改写 —— 账本失去"可回放"这个最值钱的属性，而命令看起来像"查看历史 / 重建账本"，
+//   README/SKILL 从未警示。本项目三条独立计价路径（主链增量 / recalc 回溯 / backfill 重建）里两条中招。
+//   修法：价库流水线每日落**当日快照**（build_index.py 的 write_price_history →
+//   prices/history/prices-<北京日>.json = 那天索引的最终形态，含 pricing.json 的 lock 权威覆盖层），
+//   回溯工具按"目标日"取快照计价；快照的目录解析 / 读取 / 形态转换抽成 price-history.js 单点
+//   （A3「复制实现靠注释同步」在本仓已翻车三次：峰谷倍率 / 行数口径 / dayTotalOf，不许再有第四处）。
+//   两条路径的处置**刻意相反**（为什么，逐条说清）：
+//     · recalc 面向"某一日复核金额" → 缺快照就 **fail-closed 拒绝**（exit 1）：没有那天的价格材料，
+//       任何"回算"都是按今天的价编历史。逃逸口 = 显式 `--current-price`（报告里标注该口径）。
+//     · backfill 面向"重建整本历史" → 绝大多数日期发生在快照机制上线**之前**，硬拒绝会让这把最常用的
+//       刀完全不可用 → 缺快照 **降级为现价 + 逐日 stderr WARN**（不静默，让用户知道这段历史不是当时价）。
+//   ⚠ 已知残留（两端一致，如实标注、不装作没有）：峰谷规则（deepseek_rules）不在快照里（它是
+//     pricing.json 顶层字段、由 deepseek-official 每日刷新）→ 历史某天规则与今天不同时，峰谷判定
+//     仍按今天的规则。价格才是金额主项，规则的时态差异留待快照格式扩展。
+//   反向验证要求：实现侧任一处回退（recalc 默认退回现价 / 移除拒绝 / backfill 不按日取价 / 去掉 WARN）
+//   → 对应断言必红；其余断言不得误伤。
+{
+  const S100 = (f) => fs.readFileSync(path.join(SRC, f), 'utf-8').replace(/\r\n/g, '\n');
+  const phSrc = (() => { try { return S100('price-history.js'); } catch (e) { return ''; } })();
+  const rdRaw = S100('recalc-day.js');
+  const rd100 = stripComments(rdRaw);
+  const bfRaw = S100('backfill.js');
+  const bf100 = stripComments(bfRaw);
+  const bi100 = S100('build_index.py');
+
+  // ── a. 源码守卫 ──
+  ok('T100-a1 ★必须存在 price-history.js 单点模块并导出五个函数（目录解析 / 读取 / 形态转换只此一处）',
+    /function historyDirOf\(explicitDir\)/.test(phSrc) && /function snapshotPath\(dir, date\)/.test(phSrc)
+    && /function readSnapshot\(dir, date\)/.test(phSrc) && /function listSnapshotDates\(dir\)/.test(phSrc)
+    && /function pricingFromSnapshot\(snap\)/.test(phSrc)
+    && /module\.exports\s*=\s*\{[\s\S]{0,200}?pricingFromSnapshot/.test(phSrc));
+  ok('T100-a2 ★两个消费端都必须 require 它（不得各自再写一份快照读取 = A3 的第四处）',
+    /require\('\.\/price-history\.js'\)/.test(rd100) && /require\('\.\/price-history\.js'\)/.test(bf100));
+  ok('T100-a3 ★historyDirOf 优先级与主脚本 env 级一致（显式 > CN_PRICE_DB_DIR > CN_PRICES_DIR > 同级 prices）',
+    /explicitDir\s*\|\|\s*process\.env\.CN_PRICE_DB_DIR\s*\|\|\s*process\.env\.CN_PRICES_DIR\s*\|\|\s*path\.join\(__dirname,\s*'prices'\)/.test(phSrc));
+  ok('T100-a4 ★pricingFromSnapshot 必须只收 in/out 均为数值的条目（与索引侧 S-3 拒收同口径，坏价不进历史材料）',
+    /typeof rec\.in !== 'number' \|\| typeof rec\.out !== 'number'/.test(phSrc));
+  ok('T100-a5 ★缓存价缺失必须按输入价保守计（与 mergeLocalPriceDb 逐字同口径；按 0 计 = 占 ~97% 的缓存 token 被免单）',
+    /cached_price: \(typeof rec\.cache === 'number'\) \? rec\.cache : rec\.in/.test(phSrc));
+  ok('T100-a6 ★recalc 默认口径必须读当日快照（不得直接拿 pricing 现价回算历史 —— F-3 的病根）',
+    /priceHistory\.readSnapshot\(histDir, date\)/.test(rd100)
+    && /pricingUsed = priceHistory\.pricingFromSnapshot\(snap\)/.test(rd100));
+  ok('T100-a7 ★recalc 缺快照必须 fail-closed 拒绝（exit 1）+ 给出 --current-price 逃逸口与现有快照范围',
+    /没有价格快照/.test(rdRaw) && /process\.exit\(1\)/.test(rd100) && /--current-price/.test(rdRaw)
+    && /listSnapshotDates\(histDir\)/.test(rd100));
+  ok('T100-a8 ★recalc「今天缺快照」按现价（今天的现价即当天价）—— 不得把"今天"也一刀切拒掉',
+    /今天尚无快照/.test(rdRaw) && /isToday/.test(rd100));
+  // backfill：三处取价调用必须**都**按行日期（rowCost×2 + at-time 切分×1），用三条独立锚点分别钉，
+  //   避免"删掉其中一处、另一处同名调用让计数仍达标"的通病（本项目硬教训：锚点必须唯一到那一处）。
+  ok('T100-a9 ★backfill 的三处取价都必须按**行所属日期**（中断补偿 / 行级 / at-time 切分各一）',
+    /rowCost\(pricingForDate\(date\), model, u, ts\)/.test(bfRaw)
+    && /rowCost\(pricingForDate\(date\), name, u, ts\)/.test(bfRaw)
+    && /findModel\(pricingForDate\(date\), name, 'price'\)/.test(bfRaw));
+  ok('T100-a10 ★backfill 缺快照必须逐日 WARN（降级可见，不许静默退回现价）',
+    /无价格快照/.test(bfRaw) && /_snapWarnedDates/.test(bf100));
+  ok('T100-a11 ★build_index.py 必须每日落快照（否则 recalc/backfill 永远无"当时价"可读）',
+    /def write_price_history\(merged\)/.test(bi100)
+    && /HISTORY_DIR = os\.path\.join\(PRICES_DIR, 'history'\)/.test(bi100)
+    && /if not isinstance\(in_p, \(int, float\)\) or not isinstance\(out_p, \(int, float\)\)/.test(bi100)
+    && /write_price_history\(merged\)/.test(bi100));
+
+  // ── b. price-history.js 纯函数（require 真身；显式目录，不依赖 env / 网络）──
+  let PH = null;
+  try { PH = require(path.join(SRC, 'price-history.js')); } catch (e) { PH = null; }
+  if (!PH || typeof PH.readSnapshot !== 'function') {
+    ok('T100-b0 price-history.js 可被 require（纯模块、无副作用）', false, 'require 失败');
+  } else {
+    ok('T100-b0 price-history.js 可被 require（纯模块、无副作用）', true);
+    const hd100 = path.join(tmp, 't100hist');
+    fs.mkdirSync(hd100, { recursive: true });
+    ok('T100-b1 historyDirOf 显式目录 → 其下 history/；snapshotPath 用 prices-<日期>.json 命名',
+      PH.historyDirOf(hd100) === path.join(hd100, 'history')
+      && PH.snapshotPath(hd100, '2026-09-10') === path.join(hd100, 'prices-2026-09-10.json'),
+      PH.historyDirOf(hd100));
+    fs.writeFileSync(path.join(hd100, 'prices-2026-09-10.json'), JSON.stringify({ date: '2026-09-10', models: { m: { in: 1, out: 2 } } }));
+    fs.writeFileSync(path.join(hd100, 'prices-2026-09-11.json'), '{"models":');                 // 半截 JSON
+    fs.writeFileSync(path.join(hd100, 'prices-2026-09-12.json'), JSON.stringify({ date: '2026-09-12' })); // 无 models
+    fs.writeFileSync(path.join(hd100, 'prices-bad.json'), '{}');                                 // 非日期名 → 不进列表
+    let b2 = false;
+    try {
+      const s = PH.readSnapshot(hd100, '2026-09-10');
+      b2 = !!s && !!s.models && s.models.m.in === 1
+        && PH.readSnapshot(hd100, '2026-09-09') === null
+        && PH.readSnapshot(hd100, '2026-09-11') === null
+        && PH.readSnapshot(hd100, '2026-09-12') === null
+        && PH.readSnapshot(hd100, 'bad') === null;
+    } catch (e) { b2 = false; }
+    ok('T100-b2 ★readSnapshot：合法 → 对象；不存在 / 坏 JSON / 形状不对 / 坏日期名 → null（不抛）', b2);
+    ok('T100-b3 listSnapshotDates 只收 prices-YYYY-MM-DD.json 且升序（坏名不进）',
+      JSON.stringify(PH.listSnapshotDates(hd100)) === JSON.stringify(['2026-09-10', '2026-09-11', '2026-09-12']),
+      JSON.stringify(PH.listSnapshotDates(hd100)));
+    const p100 = PH.pricingFromSnapshot({ date: '2026-09-10', models: {
+      m1: { in: 1, out: 2 },
+      m2: { in: 3, out: 4, cache: 0.5, peak_mult: 2, effective_from: '2026-09-01', superseded_at: '2026-10-01' },
+      m3: { in: null, out: 5 },
+    } });
+    ok('T100-b4 ★pricingFromSnapshot：in/out→input/output_price，cache 缺失按输入价，peak_mult→peak_multiplier，坏条目丢弃',
+      p100.models.m1.input_price === 1 && p100.models.m1.output_price === 2 && p100.models.m1.cached_price === 1
+      && p100.models.m2.cached_price === 0.5 && p100.models.m2.peak_multiplier === 2
+      && p100.models.m2.effective_from === '2026-09-01' && p100.models.m2.superseded_at === '2026-10-01'
+      && !p100.models.m3,
+      JSON.stringify(p100.models));
+  }
+
+  // ── c. recalc 端到端：有快照 → 用它算；缺快照 → 拒绝；--current-price → 现价 ──
+  //   为什么必须真跑：源码守卫只能证明"调了 readSnapshot"，「取到的价到底进了金额没有」只有端到端能证。
+  //   夹具刻意让**快照价(1) 与现价(10) 差 10 倍** —— 金额落在哪个数上，一眼分清走的是哪条口径。
+  if (!SPAWN_OK) {
+    envSkip('T100-c 端到端：recalc 按当天快照价 / 缺快照拒绝 / --current-price 逃逸口', SPAWN_SKIP_REASON);
+  } else {
+    const D100 = '2026-09-10';
+    const fw = path.join(tmp, 't100c');
+    const fsk = path.join(fw, 'skills', 'token-usage-tracker');
+    const fpd = path.join(fw, 'cnprices');
+    fs.mkdirSync(fsk, { recursive: true });
+    fs.mkdirSync(path.join(fpd, 'history'), { recursive: true });
+    fs.writeFileSync(path.join(fsk, 'pricing.json'), JSON.stringify({ models: {
+      m1: { input_price: 10, output_price: 20, cached_price: 5, currency: 'CNY', unit: 'per_1m_tokens', region: 'CN' },
+    } }));
+    fs.writeFileSync(path.join(fsk, 'holidays.json'), JSON.stringify({}));
+    fs.writeFileSync(path.join(fsk, 'daily-usage.json'), JSON.stringify({ [D100]: {
+      models: { m1: { in: 1000000, out: 0, cached: 0, total: 1000000, cost: 0, hit: 0 } },
+      total: { in: 1000000, out: 0, cached: 0, total: 1000000, cost: 0, hit: 0 },
+    } }));
+    fs.writeFileSync(path.join(fpd, 'index.json'), JSON.stringify({ models: {} }));
+    const snap100 = path.join(fpd, 'history', 'prices-' + D100 + '.json');
+    fs.writeFileSync(snap100, JSON.stringify({ date: D100, models: { m1: { in: 1, out: 2, cache: 0.5 } } }));
+    const e100 = Object.assign({}, env, { WB_ROOT: fw, CN_PRICE_DB_DIR: fpd, WB_LEDGER_MAINT: '1' });
+    const runRc100 = (args) => {
+      const o = path.join(fw, 'o.txt'); const e = path.join(fw, 'e.txt');
+      const ofd = fs.openSync(o, 'w'); const efd = fs.openSync(e, 'w');
+      // stdio 重定向到文件（不用管道）：主脚本 require 时可能 detach 派生刷新子进程持有管道 → 干等超时
+      const r = spawnSync(NODE, [path.join(skillDir, 'recalc-day.js')].concat(args),
+        { stdio: ['ignore', ofd, efd], windowsHide: true, timeout: 90000, env: e100 });
+      try { fs.closeSync(ofd); } catch (x) { /* 异常路径下可能已关 */ }
+      try { fs.closeSync(efd); } catch (x) { /* 同上 */ }
+      const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (x) { return ''; } };
+      return { rc: r.status, out: read(o), err: read(e) };
+    };
+    const c1 = runRc100([D100]);
+    // ⚠ 只断言**金额**，不断言 dry-run 那一行口径文案：那行只在 `if (!doWrite)` 分支打印，
+    //   会被"默认改为写盘"这类回退（反向验证 R4）连同 dry-run 提示一起打掉 → 变成与价格口径无关的
+    //   假红（本轮实测踩到）。口径文案本身由 T93-a3（源码 `价格口径：${priceBasis}`）与
+    //   T100-c2（缺快照时给 `--current-price` 逃逸口）各自钉住。
+    ok('T100-c1 ★有快照 → 金额按**当天快照价**（in=1 → ¥1.0000），不是 pricing.json 现价（10 → ¥10.0000）',
+      c1.rc === 0 && c1.out.indexOf('¥1.0000') >= 0 && c1.out.indexOf('¥10.0000') < 0,
+      'rc=' + c1.rc + ' out=' + c1.out.replace(/\n/g, '~').slice(0, 300));
+    fs.renameSync(snap100, snap100 + '.bak');
+    const c2 = runRc100([D100]);
+    ok('T100-c2 ★缺快照 → fail-closed 拒绝（exit 1 + 明确文案 + 指出 --current-price 逃逸口）',
+      c2.rc === 1 && c2.err.indexOf('没有价格快照') >= 0 && c2.err.indexOf('--current-price') >= 0,
+      'rc=' + c2.rc + ' err=' + c2.err.replace(/\n/g, '~').slice(0, 320));
+    const c3 = runRc100([D100, '--current-price']);
+    ok('T100-c3 ★--current-price 逃逸口 → 按现价算（in=10 → ¥10.0000）',
+      c3.rc === 0 && c3.out.indexOf('¥10.0000') >= 0,
+      'rc=' + c3.rc + ' out=' + c3.out.replace(/\n/g, '~').slice(0, 300));
+  }
+
+  // ── d. backfill 端到端：按**行所属日期**取快照价；缺快照 → 现价 + 逐日 WARN ──
+  if (!SPAWN_OK) {
+    envSkip('T100-d 端到端：backfill 按当日快照价 / 缺快照降级告警', SPAWN_SKIP_REASON);
+  } else {
+    const D100b = '2026-09-10';
+    const ts100b = Date.UTC(2026, 8, 10, 4, 0, 0); // +8h = 北京 12:00 → 归属日 2026-09-10
+    const mkBf100 = (root, withSnap) => {
+      const sk = path.join(root, 'skills', 'token-usage-tracker');
+      const pd = path.join(root, 'cnprices');
+      const pj = path.join(root, 'projects', 'projA');
+      fs.mkdirSync(sk, { recursive: true }); fs.mkdirSync(pd, { recursive: true }); fs.mkdirSync(pj, { recursive: true });
+      fs.writeFileSync(path.join(sk, 'pricing.json'), JSON.stringify({ models: {
+        m1: { input_price: 10, output_price: 20, cached_price: 5, currency: 'CNY', unit: 'per_1m_tokens', region: 'CN' },
+      } }));
+      fs.writeFileSync(path.join(sk, 'holidays.json'), JSON.stringify({}));
+      fs.writeFileSync(path.join(pd, 'index.json'), JSON.stringify({ models: {} }));
+      if (withSnap) {
+        fs.mkdirSync(path.join(pd, 'history'), { recursive: true });
+        fs.writeFileSync(path.join(pd, 'history', 'prices-' + D100b + '.json'),
+          JSON.stringify({ date: D100b, models: { m1: { in: 1, out: 2, cache: 0.5 } } }));
+      }
+      fs.writeFileSync(path.join(pj, 'sid-bf.jsonl'), JSON.stringify({ type: 'message', id: 'b1', timestamp: ts100b, status: 'completed',
+        providerData: { model: 'm1', messageId: 'b1', usage: { input_tokens: 1000000, output_tokens: 0 } } }) + '\n');
+    };
+    const runBf100 = (root) => {
+      const o = path.join(root, 'o.txt'); const e = path.join(root, 'e.txt');
+      const ofd = fs.openSync(o, 'w'); const efd = fs.openSync(e, 'w');
+      const r = spawnSync(NODE, [path.join(skillDir, 'backfill.js'), '--write'],
+        { stdio: ['ignore', ofd, efd], windowsHide: true, timeout: 90000,
+          env: Object.assign({}, env, { WB_ROOT: root, CN_PRICE_DB_DIR: path.join(root, 'cnprices'), WB_LEDGER_MAINT: '1' }) });
+      try { fs.closeSync(ofd); } catch (x) { /* 同上 */ }
+      try { fs.closeSync(efd); } catch (x) { /* 同上 */ }
+      const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (x) { return ''; } };
+      let cost = null;
+      try { cost = JSON.parse(read(path.join(root, 'skills', 'token-usage-tracker', 'daily-usage.json')))[D100b].models.m1.cost; }
+      catch (x) { cost = null; }
+      return { rc: r.status, cost, out: read(o), err: read(e) };
+    };
+    const rootA = path.join(tmp, 't100bf-snap'); mkBf100(rootA, true);
+    const d1 = runBf100(rootA);
+    ok('T100-d1 ★有当日快照 → 金额按快照价（in=1 → ¥1），不是现价（10 → ¥10）',
+      d1.rc === 0 && typeof d1.cost === 'number' && Math.abs(d1.cost - 1) < 1e-9,
+      'rc=' + d1.rc + ' cost=' + JSON.stringify(d1.cost) + ' err=' + d1.err.replace(/\n/g, '~').slice(0, 220));
+    ok('T100-d2 ★报告必须写明「按当日快照价」的天数（口径可见，不靠猜）',
+      d1.out.indexOf('价格口径') >= 0 && d1.out.indexOf('当日快照价') >= 0,
+      d1.out.replace(/\n/g, '~').slice(0, 220));
+    const rootB = path.join(tmp, 't100bf-nosnap'); mkBf100(rootB, false);
+    const d2 = runBf100(rootB);
+    ok('T100-d3 ★缺快照 → 降级为现价（10）但**必须逐日 WARN**（不静默退回，日期要出现在告警里）',
+      d2.rc === 0 && typeof d2.cost === 'number' && Math.abs(d2.cost - 10) < 1e-9
+      && d2.err.indexOf('无价格快照') >= 0 && d2.err.indexOf(D100b) >= 0,
+      'rc=' + d2.rc + ' cost=' + JSON.stringify(d2.cost) + ' err=' + d2.err.replace(/\n/g, '~').slice(0, 260));
+  }
+}
+
+// ===== T101（v3.62.0 · 审计后续）：Stop「静默丢轮」的可观测化 + 辅助步骤隔离 =====
+//   背景（2026-10-16 23:43:55Z / pid 26324 实证，详见 token-tracker-审计裁决-2026-10-16.md 三更）：
+//   一次团队轮只落了 stop-transcript 一条、rounds 无该轮记录、**守卫的降级 toast 也从未出现** ——
+//   说明这**不是**被顶层守卫捕获的同步异常（v3.61.0 S1 的 try/catch 当时已在位、未触发）。
+//   当时的结论只能靠"rounds 少一条"这种间接对账把死亡窗口缩到 `stop-handler.js:148→189`（41 行），
+//   无法定位到具体调用。本组做两件**不依赖"是哪一次失败"**的事：
+//     ① 可观测化：顶层守卫补落**持久** stop-crash（含 step + stack）；主链路补 stop-step 步进标记，
+//        把 41 行切成可定位段；agg 为空这条**原先零留痕**的路径补 stop-agg-null。
+//     ② 辅助步骤隔离：`estimateInterrupted` / `shortModelName` / `ensureNewModelPricing` 都是**旁路增强**
+//        （估算补数 / 显示短名 / 价格补录），任一失败都不得带走 `incrementalRecord`（记账）与弹窗分支。
+//        ⚠ 刻意**不对称**：主链路 `aggregateTranscript` / `incrementalRecord` **不吞**（由①的 stop-crash 留证）。
+//   ⚠ 锚点唯一性（项目硬教训）：只用 `stopStep('pre-price')` 这类全文件唯一的调用行做锚，避免
+//      "同一形态在别处也写了一份"导致删掉目标仍恒绿。
+{
+  const shRaw101 = fs.readFileSync(path.join(SRC, 'stop-handler.js'), 'utf-8');
+  const strip101 = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+  const i101a = shRaw101.indexOf('function handleStopEnd(ctx) {');
+  const i101b = shRaw101.indexOf('function handleStopEndInner(ctx) {');
+  const guard101 = (i101a >= 0 && i101b > i101a) ? shRaw101.slice(i101a, i101b) : '';
+
+  ok('T101-a1 ★顶层守卫的 catch 必须落**持久**日志 stop-crash（含 step + stack）'
+    + '——hook 场景 stderr 无接收方（实测本机不进任何日志），旧守卫只写 stderr ⇒ 出事时 0 处可诊断',
+    guard101.indexOf("appendCompactionLog('stop-crash'") >= 0
+    && guard101.indexOf('step: LAST_STOP_STEP') >= 0 && guard101.indexOf('stack') >= 0,
+    guard101 ? 'guard 段缺 stop-crash / LAST_STOP_STEP / stack' : '未取到守卫段（锚点被改？）');
+
+  ok('T101-a2 ★必须存在模块级 LAST_STOP_STEP，且守卫从它读取"死在哪个调用"',
+    /let LAST_STOP_STEP = '/.test(shRaw101) && /step: LAST_STOP_STEP/.test(guard101));
+
+  ok('T101-a3 ★必须存在 stopStep 步进辅助（落 stop-step），且自身失败不外抛',
+    /const stopStep = \(name, extra\) => \{/.test(shRaw101)
+    && /appendCompactionLog\('stop-step'/.test(shRaw101));
+
+  // 锚点必须唯一到那一处：`stopStep('pre-price')` 全文件仅一处。
+  const pre101 = shRaw101.indexOf("stopStep('pre-price')");
+  const seg101 = pre101 >= 0 ? strip101(shRaw101.slice(pre101, pre101 + 460)) : '';
+  ok('T101-a4 ★价格补录必须被 try 包住（本段唯一**联网 + 读写价库**的调用）——它挂掉绝不能带走记账',
+    seg101.length > 0
+    && seg101.indexOf('try { nmNote = ensureNewModelPricing(pricing, agg).note; }') > 0
+    && seg101.indexOf("stopStep('price-failed'") > 0,
+    seg101 ? 'pre-price 之后未紧跟 try{ensureNewModelPricing}' : "未找到唯一锚点 stopStep('pre-price')");
+
+  const est101 = shRaw101.indexOf('let estByModel0 = {};');
+  const segEst101 = est101 >= 0 ? strip101(shRaw101.slice(est101, est101 + 340)) : '';
+  ok('T101-a5 ★估算补数（旁路增强）必须被 try 包住——失败只是少显示被中断段，不得带走整轮',
+    segEst101.indexOf('try { estByModel0 = estimateInterrupted(') > 0
+    && segEst101.indexOf("stopStep('estimate-failed'") > 0,
+    segEst101 ? 'estByModel0 未按 try 包裹' : '未找到锚点 let estByModel0 = {};');
+
+  ok('T101-a6 ★模型短名（纯显示）必须被 try 包住且带回落值（否则一次显示层异常会整轮丢弹窗）',
+    shRaw101.indexOf('try { modelShort = shortModelName(agg, pricing); }') > 0
+    && /modelShort = \(agg\.modelMain \|\| agg\.model\) \|\| '';/.test(shRaw101));
+
+  ok('T101-a7 ★聚合三轮仍为空必须留痕 stop-agg-null（该路径原先零留痕 → 尾巴也无 trace 时 = 整轮静默丢失）',
+    /appendCompactionLog\('stop-agg-null'/.test(shRaw101));
+
+  const ip101 = shRaw101.indexOf("stopStep('pre-price')");
+  const id101 = shRaw101.indexOf("stopStep('priced')");
+  const ir101 = shRaw101.indexOf("stopStep('recorded'");
+  ok('T101-a8 ★三段步进标记顺序必须 pre-price → priced → recorded（把 41 行死亡窗口切成可定位段）',
+    ip101 > 0 && id101 > ip101 && ir101 > id101 && ir101 < shRaw101.lastIndexOf('return false;'));
+
+  // 刻意不对称：主链路（记账）不得被吞 —— 否则"辅助失败不带走记账"会退化成"连记账失败也吞"。
+  ok('T101-a9 ★incrementalRecord（记账 = 主链路）**不得**被 try 吞掉（剥注释后不得出现 try { incrementalRecord）',
+    strip101(shRaw101).indexOf('try { incrementalRecord') < 0);
+
+  // ── b. 行为（单元级：直接 require 模块 + 注入桩 tx）──
+  //   为什么走单元而非端到端：要让"某个辅助步骤必抛"**确定性**发生，端到端只能靠坏价库 / 断网等间接手段。
+  const shMod101 = (() => { try { return require(path.join(SRC, 'stop-handler.js')); } catch (e) { return null; } })();
+  if (!shMod101) envSkip('T101-b1~b6 Stop 辅助步骤隔离行为组', 'stop-handler.js require 失败');
+  else {
+    const run101 = (over) => {
+      const logs = [], calls = [];
+      const tx = {};
+      for (const n of shMod101.STOP_TX_NAMES) tx[n] = function () { return undefined; };
+      // 最小可用桩：让流程走完 148→189 段并进入"普通轮同步弹窗"分支（isPlainRound=true）。
+      tx.transcriptPathFromPayload = () => 'C:/fixture101/main.jsonl';
+      tx.captureTranscShape = () => ({ exists: true });
+      tx.loadSnapshot = () => ({ file: 'C:/fixture101/main.jsonl', stat: null, lastUserMsgAt: 1000, lastStopAt: 0 });
+      tx.saveSnapshot = () => {};
+      tx.aggregateTranscript = () => ({ in: 10, out: 5, cached: 0, total: 15, model: 'k101-m', modelMain: 'k101-m',
+        subModels: [], subCount: 0, teamActive: false, models: { 'k101-m': { in: 10, out: 5, cached: 0, total: 15 } }, durMs: 1000 });
+      tx.aggregatePerModel = () => ({});
+      tx.readTranscLines = () => [];
+      tx.estimateInterrupted = () => ({});
+      tx.traceWallDurMs = () => ({ source: 'none' });
+      tx.latestTraceFile = () => null;
+      tx.shortModelName = (s) => (s && (s.modelMain || s.model)) || 'x';
+      tx.ledgerKey = () => 'sid101';
+      tx.subagentsAllSettled = () => true;
+      tx.hasSubagentsRecentlyActive = () => false;
+      tx.lineFor = () => 'line101';
+      tx.toastLine1 = () => 'l1'; tx.toastLine2 = () => 'l2'; tx.toastLineTagged = () => 'l3';
+      tx.periodNote = () => ''; tx.balanceText = () => ''; tx.todayUsageTxt = () => ''; tx.noPriceTag1 = () => '';
+      tx.showToastsSplitByModel = () => false;
+      tx.showToast = (...a) => { calls.push('toast:' + a[2]); };
+      tx.clearCoalesce = () => {}; tx.writeCoalesce = () => {}; tx.coalescePath = () => 'C:/fixture101/c.json';
+      tx.readCoalesceInfo = () => null;
+      tx.incrementalRecord = () => { calls.push('incrementalRecord'); };
+      tx.ensureNewModelPricing = () => ({ status: 'none', note: '' });
+      tx.appendCompactionLog = (ev, d) => { logs.push(Object.assign({ ev }, d || {})); };
+      tx.writeProbe = () => {};
+      Object.assign(tx, over || {});
+      const outCalls = [];
+      const origErr = process.stderr.write;
+      process.stderr.write = () => true; // 守卫的 stderr 留痕在测试里静音（否则污染"失败样本"的美观）
+      let ret, threw = null;
+      try {
+        ret = shMod101.handleStopEnd({ sid: 'sid101', payloadRaw: {}, pricing: { models: {} }, out: (o) => outCalls.push(o), tx });
+      } catch (e) { threw = e; } finally { process.stderr.write = origErr; }
+      return { ret, threw, logs, calls, outCalls, steps: logs.filter((l) => l.ev === 'stop-step').map((l) => l.step) };
+    };
+
+    // b1/b2：价格补录（唯一联网 + 读写价库）抛错 → 记账照跑 + 落 price-failed + 仍弹窗
+    const r1 = run101({ ensureNewModelPricing: () => { throw new Error('boom-price'); } });
+    ok('T101-b1 ★ensureNewModelPricing 抛错时：记账照跑（incrementalRecord 被调用）+ 落 price-failed + 不抛异常'
+      + '——这才是"辅助步骤失败不得带走弹窗/记账"的行为级证据',
+      !r1.threw && r1.ret === true && r1.calls.indexOf('incrementalRecord') >= 0
+      && r1.steps.indexOf('price-failed') >= 0 && r1.steps.indexOf('priced') >= 0 && r1.steps.indexOf('recorded') >= 0,
+      `threw=${r1.threw && r1.threw.message} ret=${r1.ret} calls=${r1.calls.join(',')} steps=${r1.steps.join(',')}`);
+    ok('T101-b2 ★价格补录抛错后仍必须走到弹窗分支（辅助失败绝不吞掉用户可见的弹窗）',
+      !r1.threw && r1.calls.some((c) => c.indexOf('toast:') === 0) && r1.logs.some((l) => l.ev === 'stop-plain-immediate'),
+      `calls=${r1.calls.join(',')} logs=${r1.logs.map((l) => l.ev).join(',')}`);
+
+    const r2 = run101({ estimateInterrupted: () => { throw new Error('boom-est'); } });
+    ok('T101-b3 ★estimateInterrupted 抛错时：记账照跑 + 落 estimate-failed',
+      !r2.threw && r2.ret === true && r2.calls.indexOf('incrementalRecord') >= 0
+      && r2.steps.indexOf('estimate-failed') >= 0 && r2.steps.indexOf('recorded') >= 0,
+      `threw=${r2.threw && r2.threw.message} steps=${r2.steps.join(',')}`);
+
+    const r3 = run101({ shortModelName: () => { throw new Error('boom-name'); } });
+    ok('T101-b4 ★shortModelName 抛错时：记账照跑 + 落 shortname-failed',
+      !r3.threw && r3.ret === true && r3.calls.indexOf('incrementalRecord') >= 0
+      && r3.steps.indexOf('shortname-failed') >= 0 && r3.steps.indexOf('recorded') >= 0,
+      `threw=${r3.threw && r3.threw.message} steps=${r3.steps.join(',')}`);
+
+    const r4 = run101({ aggregateTranscript: () => { throw new Error('boom-agg'); } });
+    ok('T101-b5 ★主链路（聚合）抛错时顶层守卫兜底：返回 true + 落持久 stop-crash（含 stack）+ 仍 out() 收口'
+      + '——"静默丢轮"变成"可查的降级"',
+      !r4.threw && r4.ret === true && r4.outCalls.length > 0
+      && r4.logs.some((l) => l.ev === 'stop-crash' && String(l.err).indexOf('boom-agg') >= 0 && !!l.stack),
+      `threw=${r4.threw && r4.threw.message} ret=${r4.ret} out=${r4.outCalls.length} logs=${r4.logs.map((l) => l.ev).join(',')}`);
+
+    const r5 = run101({ aggregateTranscript: () => null });
+    ok('T101-b6 ★聚合三轮为空（agg=null）必须落 stop-agg-null（原先零留痕路径 → 尾巴无声即整轮静默丢失）',
+      !r5.threw && r5.logs.some((l) => l.ev === 'stop-agg-null'),
+      `threw=${r5.threw && r5.threw.message} logs=${r5.logs.map((l) => l.ev).join(',')}`);
+
+    // ===== T105（v3.63 · 2026-10-17）：「记账优先」——钱先落盘，显示后置 =====
+    //   病根（实测量化）：宿主在"任务完成"后约 **200ms** 就回收会话 runtime，而 Stop 钩子要 ~650ms
+    //   （node 冷启动 300ms + 聚合 24ms + 记账 41ms + 弹窗/watcher 530ms）。
+    //   旧顺序把 estimateInterrupted / traceWallDurMs / shortModelName（**只影响弹窗显示**）摆在
+    //   `incrementalRecord` 之前 → 被砍在显示步骤上时**硬账一起丢**（2026-10-17 10:20:42 实证：
+    //   水位线停在 567 行、6 次调用 29.5 万 tokens 未记账，只能手工补）。
+    //   本组守：记账必须排在三个显示增强之前，且时长有 transcript 口径兜底（不依赖 trace 先跑）。
+    {
+      const raw105 = fs.readFileSync(path.join(SRC, 'stop-handler.js'), 'utf-8');
+      const strip105 = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+      const iA105 = raw105.indexOf('if (agg) {');
+      const iB105 = raw105.indexOf('const byModel = aggregatePerModel(');
+      const fn105 = (iA105 >= 0 && iB105 > iA105) ? raw105.slice(iA105, iB105) : '';
+      const fs105 = strip105(fn105);
+      const iRec105 = fs105.indexOf('incrementalRecord(');
+      ok('T105-a1 ★源码顺序：incrementalRecord（记账）必须早于 estimateInterrupted / traceWallDurMs / shortModelName'
+        + '（三者只影响弹窗显示；排在记账前 = 钩子被砍时把硬账一起带走）',
+        fn105.length > 0 && iRec105 >= 0
+        && iRec105 < fs105.indexOf('estimateInterrupted(')
+        && iRec105 < fs105.indexOf('traceWallDurMs(')
+        && iRec105 < fs105.indexOf('shortModelName('),
+        fn105 ? `rec=${iRec105} est=${fs105.indexOf('estimateInterrupted(')} trace=${fs105.indexOf('traceWallDurMs(')} name=${fs105.indexOf('shortModelName(')}` : '未取到 agg 分支体（锚点被改？）');
+
+      ok('T105-a2 ★记账用的 durMs 必须有零成本兜底（各模型 lastTs − 轮起点），不能依赖 traceWallDurMs 先跑'
+        + '（否则"先记账"就只能记 0 时长，或又得把 trace 挪回去）',
+        /agg\.durMs = lastTs0 - roundStart0;/.test(raw105));
+
+      // 行为：三个显示增强全部抛错时，记账仍必须**早已完成**（顺序 + 不中断双重证据）
+      const seq105 = [];
+      let metaDur105 = -1;
+      const r6 = run101({
+        aggregateTranscript: () => ({ in: 10, out: 5, cached: 0, total: 15, model: 'k105-m', modelMain: 'k105-m',
+          subModels: [], subCount: 0, teamActive: false,
+          models: { 'k105-m': { in: 10, out: 5, cached: 0, total: 15, lastTs: 5000 } }, durMs: 0 }),
+        incrementalRecord: (p, s, meta) => { seq105.push('record'); metaDur105 = (meta && meta.durMs); },
+        estimateInterrupted: () => { seq105.push('estimate'); throw new Error('boom-est-order'); },
+        traceWallDurMs: () => { seq105.push('trace'); throw new Error('boom-trace-order'); },
+        shortModelName: () => { seq105.push('name'); throw new Error('boom-name-order'); },
+        readTranscLines: () => [],
+      });
+      ok('T105-b1 ★行为：estimate/trace/name 三个显示增强全部抛错时，incrementalRecord 仍**先于它们**被调用'
+        + '（= 被砍在显示步骤上也已落账），且不抛异常',
+        !r6.threw && r6.ret === true && seq105.indexOf('record') === 0
+        && seq105.indexOf('estimate') > 0 && seq105.indexOf('trace') > 0 && seq105.indexOf('name') > 0,
+        `threw=${r6.threw && r6.threw.message} seq=${seq105.join('→')}`);
+
+      ok('T105-b2 ★行为：durMs 兜底真生效（roundStart=1000、各模型 lastTs=5000 → 记账收到 4000）',
+        metaDur105 === 4000, `metaDur=${metaDur105}`);
+    }
+  }
+}
+
+// ===== T102（v3.62.0 · 批4）：孤儿轮对账（跨会话补弹）=====
+//   背景（2026-10-16 23:43:54 实证）：宿主主线程重复风暴 → 会话 CLI **整树被杀**，Stop 钩子被连带带走
+//   → 该轮 `lastStopAt` 从未推进 = 孤儿轮（token 已产生、永不弹窗），下一轮 Stop 把两轮**合并**弹出。
+//   既有三条兜底（hook-fallback / cancelled-round-flush / stale-coalesce-settled）**全部以"死前写下的
+//   标记"为前提**（coalesce 文件 / 取消标记 / coalesce 残留时长）→ 整树杀什么都不留 ⇒ 三条全失活。
+//   本组守的是新判据：`快照.lastStopAt < 快照.lastUserMsgAt`（**状态**，不是死前标记），
+//   以及"先弹后推 + 认领文件幂等 + 只补别的会话"这三条正确性约束。
+{
+  const SRC_T102 = 'token-tracker.js';
+  const raw102 = fs.readFileSync(path.join(SRC, SRC_T102), 'utf-8');
+  const strip102 = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+
+  // ── a. 源码结构 ──
+  const iFn102 = raw102.indexOf('function scanOrphanRounds(opts) {');
+  const iEnd102 = raw102.indexOf('function loadSnapshot(sid) {');
+  const fn102 = (iFn102 >= 0 && iEnd102 > iFn102) ? raw102.slice(iFn102, iEnd102) : '';
+  const fnStrip102 = strip102(fn102);
+
+  ok('T102-a1 ★三档开关：仓库默认 off（与旧版逐字节一致，observe 只记不弹、on 才补弹）；'
+    + '取值 **env 显式优先**（空串视为未设 → 回落配置）、未设才读 local-config.json 的 orphan_scan',
+    fn102.length > 0
+    && /process\.env\.WB_ORPHAN_SCAN/.test(raw102)
+    && /\(envV != null && envV !== ''\) \? envV : loadLocalStr\('orphan_scan', 'off', 'on'\)/.test(raw102)
+    && /return \(v === 'observe' \|\| v === 'on'\) \? v : 'off';/.test(raw102),
+    fn102 ? '未取到 scanOrphanRounds 体（锚点被改？）' : '函数不存在');
+
+  ok('T102-a2 ★判据必须是**状态**（lastStopAt < lastUserMsgAt），不得退回"死前写入的标记"'
+    + '——那正是三条旧兜底全失活的根因',
+    /const lastStop = Number\(S\.lastStopAt\) \|\| 0;/.test(fnStrip102)
+    && /if \(lastStop >= R\) continue;/.test(fnStrip102)
+    && /const R = Number\(S\.lastUserMsgAt\) \|\| 0;/.test(fnStrip102));
+
+  ok('T102-a3 ★"本轮确实静止"三重证据缺一不可：轮起点龄期 / 主转录 mtime / 子代理活跃',
+    fnStrip102.indexOf('if (now - R < ORPHAN_MIN_AGE_MS) continue;') > 0
+    && fnStrip102.indexOf('if (now - st.mtimeMs < ORPHAN_IDLE_MS) continue;') > 0
+    && fnStrip102.indexOf('if (hasSubagentsRecentlyActive(tsPath, ORPHAN_IDLE_MS)) continue;') > 0);
+
+  // a4：先弹后推 —— 顺序在源码里可验（"先推后弹"一旦在弹之前崩 = 静默丢失，比重复更坏）
+  const iToast102 = fnStrip102.indexOf('showToastsSplitByModel(agg, {');
+  const iSave102 = fnStrip102.indexOf('saveSnapshot(Object.assign({}, c.snap, { lastStopAt: Date.now() }), c.sid);');
+  ok('T102-a4 ★**先弹后推**：弹窗必须在推进 lastStopAt 之前（顺序反了 = 弹之前崩就静默丢失）',
+    iToast102 > 0 && iSave102 > iToast102,
+    `toast@${iToast102} save@${iSave102}`);
+
+  ok('T102-a5 ★幂等由"认领文件原子创建"承担（并发双钩子互斥），且**成功时保留**、失败才释放'
+    + '（保留 = 快照推进万一没落盘也能挡住重复弹）',
+    /fs\.writeFileSync\(p, JSON\.stringify\(\{ at: Date\.now\(\), pid: process\.pid \}\), \{ flag: 'wx' \}\)/.test(raw102)
+    && fnStrip102.indexOf('if (failed) orphanRelease(c.sid, c.roundStart);') > 0);
+
+  ok('T102-a6 ★只补**别的会话**（curSid 跳过）——对本会话下手会把"本轮正在跑"误判成孤儿'
+    + '（v2.27 守卫正是靠保留旧起点保护"专家团中途插话"，实测曾漏 409.3 万 tokens）',
+    fnStrip102.indexOf("if (curSid && sid === curSid) continue;") > 0);
+
+  ok('T102-a7 ★对账只挂 --hook、**不挂 --stop**（Stop 预算仅 ~650ms，实测 126MB 会话聚合 1438ms、'
+    + '8 个候选上限 ≈11.5s ⇒ 真命中候选时会把本轮记账与弹窗一起拖死，反被兜底制造漏弹）',
+    /if \(asHook\) scanOrphanRounds\(\{ curSid: sid, pricing \}\);/.test(raw102)
+    && !/asHook \|\| asStop\)\s*scanOrphanRounds/.test(raw102));
+
+  ok('T102-a8 ★scanOrphanRounds 自带最外层 try/catch（它挂在提交/Stop 必经路径上，绝不外抛）'
+    + '——函数体剖去注释后必须以 try { 起手',
+    /function scanOrphanRounds\(opts\) \{[\s\S]*?if \(mode === 'off'\) return res;\s*try \{/.test(strip102(raw102)));
+
+  // a9（v3.62.0 批4·续）：**年龄上限**。开 on 当天实测本机 50 个快照含 10 个"欠账态"
+  //   （5 个历史测试残留 + 4 个 6~16 天前的陈年会话）——无上限则首次钩子会一口气补满 8 条垃圾弹窗。
+  ok('T102-a9 ★必须有**年龄上限**（ORPHAN_MAX_AGE_MS，默认 72h）挡住陈年旧账；'
+    + '超龄要记入 skipped（才能区分"没检测到"与"检测到但没补"）',
+    /const ORPHAN_MAX_AGE_MS = Number\(process\.env\.WB_ORPHAN_MAX_AGE_MS\) \|\| 72 \* 3600 \* 1000;/.test(raw102)
+    && fnStrip102.indexOf("if (now - R > ORPHAN_MAX_AGE_MS) { res.skipped.push({ sid, why: 'too-old', ageMs: now - R }); continue; }") > 0);
+
+  // ── b. 行为（隔离沙箱：真读写快照 / 转录 / toast 日志；不 spawn）──
+  const savedRoot102 = process.env.WB_ROOT;
+  const savedScan102 = process.env.WB_ORPHAN_SCAN;
+  const savedNoToast102 = process.env.TOKEN_TRACKER_NO_TOAST;
+  process.env.WB_ROOT = tmp;
+  process.env.TOKEN_TRACKER_NO_TOAST = '1';
+  const mod102 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  // 安全闸：确认该实例的快照目录确实在 tmp 里。不在就整组跳过 —— 绝不让测试写进真实技能目录。
+  const snapOk102 = !!(mod102 && typeof mod102.orphanClaimPath === 'function'
+    && String(mod102.orphanClaimPath('probe', 1)).indexOf(tmp) === 0);
+  if (!snapOk102) envSkip('T102-b1~b11 孤儿轮对账行为组', '主模块缺失或快照目录不在隔离沙箱内');
+  else {
+    const proj102 = path.join(tmp, 'projects', 'orphanA');
+    fs.mkdirSync(proj102, { recursive: true });
+    const A102 = 'orph102a', B102 = 'orph102b';
+    const aPath102 = path.join(proj102, A102 + '.jsonl');
+    const snapA102 = path.join(skillDir, `.snapshot-${A102}.json`);
+    const snapB102 = path.join(skillDir, `.snapshot-${B102}.json`);
+    const toast102 = path.join(tmp, 'token-tracker-toast.log');
+    const comp102 = path.join(tmp, 'token-tracker-compaction.log');
+    const ROUND102 = Date.now() - 10 * 60 * 1000;   // A 的轮起点：10 分钟前（> MIN_AGE 60s）
+    let seq102 = 0;
+    const mrow102 = (ts, i, o, model) => JSON.stringify({
+      type: 'assistant', id: 'o' + (seq102++), timestamp: ts,
+      providerData: { model: model || 'orph-model', messageId: 'oid-' + seq102, usage: { input_tokens: i, output_tokens: o } },
+    });
+    const toastTexts102 = () => {
+      const raw = fs.existsSync(toast102) ? fs.readFileSync(toast102, 'utf-8') : '';
+      return raw.trim() ? raw.trim().split('\n').map((l) => { try { return JSON.parse(l); } catch (e) { return {}; } }) : [];
+    };
+    const compEvents102 = () => {
+      const raw = fs.existsSync(comp102) ? fs.readFileSync(comp102, 'utf-8') : '';
+      return raw.trim() ? raw.trim().split('\n').map((l) => { try { return JSON.parse(l); } catch (e) { return {}; } }) : [];
+    };
+    const readSnap102 = (p) => JSON.parse(fs.readFileSync(p, 'utf-8'));
+    const writeOrphanA102 = () => fs.writeFileSync(snapA102, JSON.stringify({
+      file: aPath102, stat: { total: 3850, model: 'orph-model' }, lastUserMsgAt: ROUND102, lastStopAt: 0,
+    }));
+    const pricing102 = (() => { try { return mod102.loadPricing(); } catch (e) { return { date: '', models: {} }; } })();
+
+    // 夹具：A = 孤儿（轮已静止 5 分钟、快照未结算）；B = 当前会话（已正常结算 = 负样本）
+    fs.writeFileSync(aPath102, [mrow102(ROUND102 + 1000, 1000, 100), mrow102(ROUND102 + 2000, 2000, 200),
+      mrow102(ROUND102 + 3000, 500, 50)].join('\n') + '\n');
+    fs.utimesSync(aPath102, new Date(Date.now() - 300000), new Date(Date.now() - 300000));
+    writeOrphanA102();
+    fs.writeFileSync(snapB102, JSON.stringify({ file: path.join(proj102, B102 + '.jsonl'), stat: null,
+      lastUserMsgAt: Date.now() - 120000, lastStopAt: Date.now() - 60000 }));
+    const bBefore102 = readSnap102(snapB102);
+    // 清掉可能影响断言的历史认领文件（同 sid 是本次新建，不会与既有测试相撞，仅求断言干净）
+    for (const f of fs.readdirSync(skillDir)) if (f.startsWith('.orphan-' + A102 + '-')) fs.unlinkSync(path.join(skillDir, f));
+
+    process.env.WB_ORPHAN_SCAN = 'on';
+    const toastN0 = toastTexts102().length;
+    const r1 = mod102.scanOrphanRounds({ curSid: B102, pricing: pricing102 });
+
+    ok('T102-b1 ★别的会话（B）触发 → 命中 A 的孤儿轮并补弹一条（这正是"不回原会话也能补上"）',
+      r1.mode === 'on' && r1.candidates.length === 1 && r1.candidates[0].sid === A102 && r1.capped.length === 1,
+      `mode=${r1.mode} cand=${JSON.stringify(r1.candidates)} capped=${JSON.stringify(r1.capped)}`);
+
+    const toastNew102 = toastTexts102();
+    ok('T102-b2 ★补弹弹窗必须带**来源标注**「（补弹 …）」+ reason=orphan-cap（否则用户分不清这条哪来的）',
+      toastNew102.length === toastN0 + 1
+      && toastNew102[toastNew102.length - 1].reason === 'orphan-cap'
+      && String(toastNew102[toastNew102.length - 1].toastText).indexOf('（补弹') >= 0,
+      `新增 ${toastNew102.length - toastN0} 条：${JSON.stringify(toastNew102.slice(toastN0).map((t) => t.toastText))}`);
+
+    ok('T102-b3 ★补弹后必须**推进目标会话水位线**（lastStopAt ≥ lastUserMsgAt）——这是"下次回原会话不再弹"的根',
+      readSnap102(snapA102).lastStopAt > readSnap102(snapA102).lastUserMsgAt
+      && readSnap102(snapA102).file === aPath102,
+      JSON.stringify(readSnap102(snapA102)));
+
+    ok('T102-b4 ★补弹必须落持久日志 orphan-capped（含 sid/roundStart/total，便于事后对账）',
+      compEvents102().some((e) => e.event === 'orphan-capped' && e.sid === A102 && e.total === 3850),
+      JSON.stringify(compEvents102().filter((e) => String(e.event).indexOf('orphan') === 0)));
+
+    ok('T102-b5 ★补弹不得改动**当前会话（B）**的快照（跨会话对账不能污染触发方）',
+      JSON.stringify(readSnap102(snapB102)) === JSON.stringify(bBefore102));
+
+    // b6/b7：幂等（这是用户点名的场景：弹回来之后又回原会话继续，不能再弹一次）
+    const r2 = mod102.scanOrphanRounds({ curSid: B102, pricing: pricing102 });
+    const r3 = mod102.scanOrphanRounds({ curSid: A102, pricing: pricing102 });
+    ok('T102-b6 ★幂等：补弹后再扫（无论由 B 还是由 A 自己触发）零新增弹窗 —— "回原会话继续"不得重弹',
+      r2.capped.length === 0 && r3.capped.length === 0 && r2.candidates.length === 0 && r3.candidates.length === 0
+      && toastTexts102().length === toastNew102.length,
+      `r2=${JSON.stringify(r2)} r3=${JSON.stringify(r3)} toast=${toastTexts102().length}/${toastNew102.length}`);
+
+    ok('T102-b7 ★认领文件在**成功**后保留（快照推进万一没落盘，它仍能挡住重复补弹）+ 认领是原子创建',
+      fs.readdirSync(skillDir).some((f) => f.startsWith('.orphan-' + A102 + '-')));
+
+    // b8：只补别的会话 —— 把"孤儿"换成当前会话自己 → 一律不动（自身欠账由既有分支处理）
+    writeOrphanA102();
+    for (const f of fs.readdirSync(skillDir)) if (f.startsWith('.orphan-' + A102 + '-')) fs.unlinkSync(path.join(skillDir, f));
+    const r4 = mod102.scanOrphanRounds({ curSid: A102, pricing: pricing102 });
+    ok('T102-b8 ★目标会话 == 当前会话（curSid）→ 绝不补弹（避免把"本轮正在跑"误判成孤儿）',
+      r4.candidates.length === 0 && r4.capped.length === 0 && readSnap102(snapA102).lastStopAt === 0,
+      JSON.stringify(r4));
+
+    // b9：三重静止证据各拦一次（转录仍在写 / 子代理活跃 / 太新）
+    fs.utimesSync(aPath102, new Date(), new Date());
+    const r5 = mod102.scanOrphanRounds({ curSid: B102, pricing: pricing102 });
+    fs.utimesSync(aPath102, new Date(Date.now() - 300000), new Date(Date.now() - 300000));
+    const subDir102 = path.join(proj102, A102, 'subagents');
+    fs.mkdirSync(subDir102, { recursive: true });
+    fs.writeFileSync(path.join(subDir102, 'agent-x.jsonl'), mrow102(ROUND102 + 1500, 700, 70) + '\n');
+    const r6 = mod102.scanOrphanRounds({ curSid: B102, pricing: pricing102 });
+    fs.rmSync(path.join(proj102, A102), { recursive: true, force: true });
+    fs.writeFileSync(snapA102, JSON.stringify({ file: aPath102, stat: null, lastUserMsgAt: Date.now() - 1000, lastStopAt: 0 }));
+    const r7 = mod102.scanOrphanRounds({ curSid: B102, pricing: pricing102 });
+    writeOrphanA102();
+    ok('T102-b9 ★"本轮确实静止"三重证据各自能独立拦下误弹：主转录仍在写 / 子代理仍活跃 / 轮起点太新',
+      r5.candidates.length === 0 && r6.candidates.length === 0 && r7.candidates.length === 0
+      && readSnap102(snapA102).lastStopAt === 0,
+      `r5=${JSON.stringify(r5.capped)} r6=${JSON.stringify(r6.capped)} r7=${JSON.stringify(r7.capped)}`);
+
+    // b10：observe 只记不弹、不推水位
+    process.env.WB_ORPHAN_SCAN = 'observe';
+    const toastN10 = toastTexts102().length;
+    const r8 = mod102.scanOrphanRounds({ curSid: B102, pricing: pricing102 });
+    ok('T102-b10 ★observe 档：只写 orphan-candidate 候选日志，**零弹窗、不推水位**（影子模式先跑）',
+      r8.mode === 'observe' && r8.candidates.length === 1 && r8.capped.length === 1 && r8.capped[0].observe === true
+      && toastTexts102().length === toastN10 && readSnap102(snapA102).lastStopAt === 0
+      && compEvents102().some((e) => e.event === 'orphan-candidate' && e.sid === A102),
+      `mode=${r8.mode} capped=${JSON.stringify(r8.capped)} toast=${toastTexts102().length}/${toastN10} lastStopAt=${readSnap102(snapA102).lastStopAt}`);
+
+    // b11：off 档零副作用；损坏快照 / 转录缺失 一律跳过且不抛。
+    //   ⚠先**移除** A 的快照而不是"置为已结算"：b10（observe 档不推水位）留下的仍是合法孤儿，
+    //     若只置为已结算，本步就隐式依赖了"已结算"判据 → 反向验证 R38 会连带染红本项（判别度被稀释）。
+    try { fs.unlinkSync(snapA102); } catch (e) { /* silent-ok:清理 — 夹具移除 */ }
+    process.env.WB_ORPHAN_SCAN = 'off';
+    const toastN11 = toastTexts102().length;
+    const r9 = mod102.scanOrphanRounds({ curSid: B102, pricing: pricing102 });
+    process.env.WB_ORPHAN_SCAN = 'on';
+    fs.writeFileSync(path.join(skillDir, '.snapshot-orph102bad.json'), '{ 这不是 JSON');
+    fs.writeFileSync(path.join(skillDir, '.snapshot-orph102gone.json'), JSON.stringify({
+      file: path.join(proj102, 'never-existed.jsonl'), stat: null, lastUserMsgAt: ROUND102, lastStopAt: 0 }));
+    let threw11 = null;
+    let r10 = null;
+    try { r10 = mod102.scanOrphanRounds({ curSid: B102, pricing: pricing102 }); } catch (e) { threw11 = e; }
+    ok('T102-b11 ★off 档零副作用；快照损坏 / 转录已不存在 → 静默跳过且**绝不外抛**（挂在必经路径上的函数）',
+      r9.scanned === 0 && r9.capped.length === 0 && toastTexts102().length === toastN11
+      && !threw11 && r10 && r10.candidates.length === 0 && r10.capped.length === 0,
+      `off(scanned=${r9.scanned}) threw=${threw11 && threw11.message} r10=${JSON.stringify(r10 && { cand: r10.candidates, cap: r10.capped })}`);
+
+    // b14：最外层 try/catch 的**行为配对**（a8）——扫描阶段任何意外异常都不得外抛到钩子主流程。
+    //   注入手法：curSid 传一个 toString() 抛错的对象（生产里 curSid 恒为字符串，这里只是把
+    //   "函数最外层那道防线"变成可观测的：没有它 → 异常直接冒到 main() → 整个 --hook 崩掉）。
+    const evil102 = { toString() { throw new Error('boom-curSid'); } };
+    let threw14 = null;
+    let r12 = null;
+    try { r12 = mod102.scanOrphanRounds({ curSid: evil102, pricing: pricing102 }); } catch (e) { threw14 = e; }
+    ok('T102-b14 ★scanOrphanRounds 必须吃掉扫描阶段的任何意外异常（连入参 toString 抛错也不得外抛）'
+      + '——挂载点在 main() 里**没有** try 包着，外抛 = 整个 --hook 崩掉',
+      !threw14 && r12 && r12.mode === 'on', `threw=${threw14 && threw14.message} mode=${r12 && r12.mode}`);
+    try { fs.unlinkSync(path.join(skillDir, '.snapshot-orph102bad.json')); } catch (e) { /* silent-ok:清理 — 测试夹具清理 */ }
+    try { fs.unlinkSync(path.join(skillDir, '.snapshot-orph102gone.json')); } catch (e) { /* silent-ok:清理 — 测试夹具清理 */ }
+    for (const f of fs.readdirSync(skillDir)) if (/^\.orphan-orph102/.test(f)) { try { fs.unlinkSync(path.join(skillDir, f)); } catch (e) { /* silent-ok:清理 */ } }
+
+    // b12：认领的原子互斥（'wx'）—— a5 的行为配对。并发双钩子靠它互斥，否则同一轮弹两次。
+    const cl1 = mod102.orphanClaim('orph102c', 12345);
+    const cl2 = mod102.orphanClaim('orph102c', 12345);
+    ok('T102-b12 ★认领原子互斥：对同一 (sid, 轮起点) 的第二次认领必须失败（回退成普通写入 → c2 会变 true）',
+      cl1 === true && cl2 === false, `c1=${cl1} c2=${cl2}`);
+    try { fs.unlinkSync(mod102.orphanClaimPath('orph102c', 12345)); } catch (e) { /* silent-ok:清理 */ }
+
+    // b13：弹窗阶段抛错 → **绝不推进水位线**（"先弹后推"的行为配对）+ 认领释放（下次钩子可重试）。
+    //   注入手法：pricing 的 models 用 getter 抛错 —— 弹窗文案生成必经它，等价于"价格库读取异常"。
+    writeOrphanA102();
+    for (const f of fs.readdirSync(skillDir)) if (f.startsWith('.orphan-' + A102 + '-')) fs.unlinkSync(path.join(skillDir, f));
+    const poisoned102 = {};
+    Object.defineProperty(poisoned102, 'models', { get() { throw new Error('boom-pricing'); } });
+    let threw13 = null;
+    let r11 = null;
+    try { r11 = mod102.scanOrphanRounds({ curSid: B102, pricing: poisoned102 }); } catch (e) { threw13 = e; }
+    ok('T102-b13 ★弹窗阶段抛错 → 水位线**不推进**（先弹后推的语义）+ 认领文件被释放（可重试）+ 不抛'
+      + '——若回退成"先推后弹"，这里会变成"弹窗没出、水位已推 = 静默丢失"',
+      !threw13 && r11 && r11.capped.length === 0 && r11.skipped.some((s) => /^error:/.test(s.why))
+      && readSnap102(snapA102).lastStopAt === 0
+      && !fs.readdirSync(skillDir).some((f) => f.startsWith('.orphan-' + A102 + '-')),
+      `threw=${threw13 && threw13.message} capped=${JSON.stringify(r11 && r11.capped)} skipped=${JSON.stringify(r11 && r11.skipped)} lastStopAt=${readSnap102(snapA102).lastStopAt}`);
+
+    // b15（v3.62.0 批4·续）：**年龄上限的行为配对**（a9）—— 陈年欠账（> ORPHAN_MAX_AGE_MS）不得补弹。
+    //   为什么必须有它：开 on 当天实测本机 50 个快照含 10 个"欠账态"（5 个历史测试残留 + 4 个 6~16 天前
+    //   的陈年会话），无此闸 → 首次钩子会一口气补满 8 条垃圾弹窗。断言里同时要求记 skipped=too-old，
+    //   否则"超龄跳过"与"根本没扫到"在日志上无法区分。
+    writeOrphanA102();
+    fs.writeFileSync(snapA102, JSON.stringify({
+      file: aPath102, stat: null, lastUserMsgAt: Date.now() - 100 * 3600 * 1000, lastStopAt: 0 }));
+    for (const f of fs.readdirSync(skillDir)) if (f.startsWith('.orphan-' + A102 + '-')) fs.unlinkSync(path.join(skillDir, f));
+    const toastN15 = toastTexts102().length;
+    const r13 = mod102.scanOrphanRounds({ curSid: B102, pricing: pricing102 });
+    ok('T102-b15 ★陈年欠账（超年龄上限）不得补弹：候选为空 + 记 skipped=too-old + 零弹窗 + 水位不动'
+      + '——开 on 当天本机有 4 个 6~16 天前的陈年会话 + 5 个测试残留，无此闸会一次性弹 8 条',
+      r13.candidates.length === 0 && r13.capped.length === 0
+      && r13.skipped.some((s) => s.why === 'too-old' && s.sid === A102)
+      && toastTexts102().length === toastN15 && readSnap102(snapA102).lastStopAt === 0,
+      `cand=${r13.candidates.length} skipped=${JSON.stringify(r13.skipped)} toast=${toastTexts102().length}/${toastN15}`);
+
+    // ── c. 端到端（真 spawn --hook 入口）：钉住"挂载点真的会在用户提交时触发"这条链 ──
+    //   单元组验的是函数正确性；挂载点只有走真入口才能验。SAWN_OK=false 的沙箱跳过（不假装跑过）。
+    if (!SPAWN_OK) envSkip('T102-c1~c3 端到端（真 --hook 触发跨会话补弹）', SPAWN_SKIP_REASON);
+    else {
+      const countOrphanCap102 = () => toastTexts102().filter((t) => t.reason === 'orphan-cap').length;
+      const env102c = Object.assign({}, process.env, {
+        WB_ROOT: tmp, TOKEN_TRACKER_NO_TOAST: '1', CN_PRICE_DB_DIR: pricesDir, WB_NO_NET: '1',
+        WB_ORPHAN_SCAN: 'on', WB_ORPHAN_MIN_AGE_MS: '1000', WB_ORPHAN_IDLE_MS: '1000',
+      });
+      // 重新把 A 摆成孤儿（b11 已把它置为已结算），清掉认领文件
+      writeOrphanA102();
+      for (const f of fs.readdirSync(skillDir)) if (f.startsWith('.orphan-' + A102 + '-')) fs.unlinkSync(path.join(skillDir, f));
+      const n0c = countOrphanCap102();
+      const runHook102 = (sid) => spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'], {
+        input: JSON.stringify({ session_id: sid, prompt: 't', cwd: tmp }),
+        env: env102c, timeout: 60000, windowsHide: true, encoding: 'utf8',
+      });
+      // c1：在**别的会话**里提交一次 → 真入口应当补弹 A 的孤儿轮
+      const rc1 = runHook102(B102);
+      const n1c = countOrphanCap102();
+      ok('T102-c1 ★端到端：在别的会话（B）里 `--hook` 提交一次 → 真入口补弹出 A 的孤儿轮'
+        + '（"不回原会话、不再发消息也能补上"这条链的终极证据）',
+        rc1.status === 0 && n1c === n0c + 1 && readSnap102(snapA102).lastStopAt > readSnap102(snapA102).lastUserMsgAt,
+        `status=${rc1.status} err=${String(rc1.stderr || '').slice(0, 120)} orphanCap ${n0c}→${n1c} snapA=${JSON.stringify(readSnap102(snapA102))}`);
+      // c2：补弹后回原会话 A 提交 → 不得再弹（幂等，用户点名场景）
+      runHook102(A102);
+      const n2c = countOrphanCap102();
+      ok('T102-c2 ★端到端：补弹后**回到原会话 A** 再提交一次 → 零新增补弹（不得把之前那条又弹一遍）',
+        n2c === n1c, `orphanCap ${n1c}→${n2c}`);
+      // c3：再回 B 提交 → 同样零新增（跨会话侧也不重复）
+      runHook102(B102);
+      const n3c = countOrphanCap102();
+      ok('T102-c3 ★端到端：再切回 B 提交 → 同上零新增（两侧都不重复）', n3c === n2c, `orphanCap ${n2c}→${n3c}`);
+    }
+  }
+  if (savedScan102 === undefined) delete process.env.WB_ORPHAN_SCAN; else process.env.WB_ORPHAN_SCAN = savedScan102;
+  if (savedNoToast102 === undefined) delete process.env.TOKEN_TRACKER_NO_TOAST; else process.env.TOKEN_TRACKER_NO_TOAST = savedNoToast102;
+  if (savedRoot102 === undefined) delete process.env.WB_ROOT; else process.env.WB_ROOT = savedRoot102;
+}
+
+// ===== T103（v3.62.0 · 批7）：取消轮补弹不得重弹已结算段（外部审计 AUD-C-01）=====
+//   生产实证（toast.log 2026-10-16T07:09:46.057Z → 07:17:10.333Z）：同一批数字先以
+//   `plain-immediate` 弹了一次「输入 3322万…¥30.33」，取消后又以 `cancelled-round-flush`
+//   把**一字不差**的同批数字重弹一遍，还错标「（手动取消）」。
+//   根因：flush 守卫只保证「取消标记比 lastStopAt 新」，聚合起点却仍吃旧 roundStartH；
+//   而同步弹窗结算后 stop-handler 把 lastUserMsgAt 写回**上次结算点**
+//   （`Math.max(psnapP.lastUserMsgAt, aggStart0)`）→ 「已结算轮之后再取消」时起点落在已弹过的轮上。
+{
+  const code103 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8'));
+  const flush103 = (() => {
+    const i = code103.indexOf("note: 'cancelled-round-flush'");
+    return i < 0 ? '' : code103.slice(Math.max(0, i - 5000), i);
+  })();
+  ok('T103-a1 ★取消轮聚合起点必须钳到上次结算点（cancelledFlushStart(roundStartH, lastStopAt)）'
+    + ' —— 起点留在旧 roundStartH 会把**已弹过的整轮**原样重弹并错标「（手动取消）」',
+    /const flushStartH = cancelledFlushStart\(roundStartH, snapPre\.lastStopAt\)/.test(flush103)
+    && /let aggC = aggregateTranscript\(tsPathH, flushStartH\)/.test(flush103),
+    '锚点未命中：flush 分支起点又吃回 roundStartH');
+  ok('T103-a2 ★被中断估算与时长必须与聚合同一起点（三处口径分叉 = 数字对不上文案）',
+    /const estByModelC = estimateInterrupted\(transcRowsH, 0, flushStartH\)/.test(flush103)
+    && /const durC = Math\.max\(0, intrInfo\.ts - flushStartH\)/.test(flush103));
+  const h103 = code103.indexOf('function cancelledFlushStart(');
+  const m103 = code103.indexOf('function main()');
+  ok('T103-a3 ★钳位实现必须是 main() **外部**的独立函数（main 有 950 行硬闸 T37-b1；判据也要能被单点复核）',
+    h103 > 0 && m103 > h103
+    && /return Math\.max\(roundStartMs \|\| 0, lastStopAtMs \|\| 0\)/.test(code103.slice(h103, h103 + 220)),
+    `helper@${h103} main@${m103}`);
+
+  if (!SPAWN_OK) envSkip('T103-b1~b3 取消轮补弹端到端', SPAWN_SKIP_REASON);
+  else {
+    const proj103 = path.join(tmp, 'c103', 'projects');
+    fs.mkdirSync(proj103, { recursive: true });
+    // --hook 在 latestTraceFile() 为空时会提前 return（「暂无 trace 数据」）→ 必须摆一个有效 trace
+    const trd103 = path.join(tmp, 'traces', 'c103');
+    fs.mkdirSync(trd103, { recursive: true });
+    fs.writeFileSync(path.join(trd103, 'trace_c103.json'), JSON.stringify({
+      trace: { sessionId: 'c103', startedAt: Date.now() - 3600000, endedAt: Date.now() - 1800000,
+        totalTokens: 3000, modelInfo: { totalInputTokens: 3000, totalOutputTokens: 300 } },
+    }));
+    const toast103 = path.join(tmp, 'token-tracker-toast.log');
+    const flushes103 = () => {
+      const raw = fs.existsSync(toast103) ? fs.readFileSync(toast103, 'utf-8') : '';
+      if (!raw.trim()) return [];
+      return raw.trim().split('\n').map((l) => { try { return JSON.parse(l); } catch (e) { return {}; } })
+        .filter((t) => t.reason === 'cancelled-round-flush');
+    };
+    const T0_103 = Date.now() - 3 * 3600 * 1000;   // 轮起点
+    const T1_103 = Date.now() - 2 * 3600 * 1000;   // 已结算点
+    const T2_103 = Date.now() - 1 * 3600 * 1000;   // 取消时刻
+    let seq103 = 0;
+    const urow103 = (ts, i, o) => JSON.stringify({ type: 'assistant', id: 'c103u' + (seq103++), timestamp: ts,
+      providerData: { model: 'probe-model', messageId: 'c103m' + seq103, usage: { input_tokens: i, output_tokens: o } } });
+    const crow103 = (ts) => JSON.stringify({ type: 'message', role: 'assistant', status: 'incomplete', timestamp: ts,
+      content: 'Interrupted by user', providerData: { model: 'probe-model', error: { message: 'Interrupted by user' } } });
+    const run103 = (name, rows, lastStopAt) => {
+      seq103 = 0;
+      const sid = 'c103-' + name;
+      const tsPath = path.join(proj103, sid + '.jsonl');
+      fs.writeFileSync(tsPath, rows.join('\n') + '\n');
+      fs.writeFileSync(path.join(skillDir, '.snapshot-' + sid + '.json'), JSON.stringify({
+        file: tsPath, stat: { total: 0, model: 'probe-model' }, lastUserMsgAt: T0_103, lastStopAt,
+      }));
+      const before = flushes103().length;
+      const r = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'], {
+        input: JSON.stringify({ session_id: sid, transcript_path: tsPath, prompt: 't', cwd: tmp }),
+        env, timeout: 90000, windowsHide: true, encoding: 'utf8',
+      });
+      const after = flushes103();
+      return { r, delta: after.length - before, last: after[after.length - 1] || {} };
+    };
+    const FULL103 = [urow103(T0_103 + 1000, 1000, 100), urow103(T1_103 - 60000, 2000, 200), crow103(T2_103)];
+    // b1：已结算（lastStopAt = T1）之后再取消 → 不得重弹已结算段（生产缺陷形态）
+    const s1 = run103('settled', FULL103, T1_103);
+    ok('T103-b1 ★已结算轮之后再取消 → **零新增**取消弹窗（不得把已弹过的整轮重弹一遍）',
+      s1.r.status === 0 && s1.delta === 0,
+      `exit=${s1.r.status} 新增=${s1.delta} 末条=${JSON.stringify(String(s1.last.toastText || ''))}`
+      + ` err=${String(s1.r.stderr || '').slice(0, 120)}`);
+    // b2（对照，防"钳过头"）：未结算轮取消 → 必须照旧弹整轮
+    const s2 = run103('unsettled', FULL103, 0);
+    ok('T103-b2 ★未结算轮取消 → 照旧弹**整轮**（钳位不得把真取消也钳死）',
+      s2.r.status === 0 && s2.delta === 1 && /输入 3000/.test(String(s2.last.toastText || '')),
+      `exit=${s2.r.status} 新增=${s2.delta} 末条=${JSON.stringify(String(s2.last.toastText || ''))}`);
+    // b3：已结算后又有真实尾段用量再取消 → 只弹尾段
+    const s3 = run103('tail', [urow103(T0_103 + 1000, 1000, 100), urow103(T1_103 - 60000, 2000, 200),
+      urow103(T1_103 + 60000, 5000, 500), crow103(T2_103)], T1_103);
+    const txt3 = String(s3.last.toastText || '');
+    ok('T103-b3 ★已结算后又真跑了新用量再取消 → 只弹**尾段**（输入 5000，不得是 8000/6000）',
+      s3.r.status === 0 && s3.delta === 1 && /输入 5000/.test(txt3) && !/输入 (8000|6000)/.test(txt3),
+      `exit=${s3.r.status} 新增=${s3.delta} 末条=${JSON.stringify(txt3)}`);
+  }
+}
+
+// ===== T104（v3.62.0 · 批7）：每日价格快照 == 当天计费面（外部审计 AUD-F-01）=====
+//   生产实证：快照 51 个模型 vs 计费面 57 个 → deepseek-v4.1-flash（用户主用）等 6 个整体缺席，
+//   recalc 判「当天无价」永久跳过（实测「处理模型 3/4 个」），backfill --write 静默记 ¥0。
+//   守卫分三层：①源码（必须读 pricing.json、只补索引未覆盖的、lock 覆盖索引）
+//   ②行为（夹具三条规则各按预期落快照）③对账（用**真实** mergeLocalPriceDb 逐模型比价，零缺价零价差）。
+{
+  const pyCode104 = fs.readFileSync(path.join(SRC, 'build_index.py'), 'utf-8')
+    .replace(/\r\n/g, '\n').split('\n').map((l) => l.replace(/#.*$/, '')).join('\n');
+  const i104 = pyCode104.indexOf('def write_price_history(');
+  const j104 = i104 >= 0 ? pyCode104.indexOf('\ndef ', i104 + 10) : -1;
+  const wph104 = i104 >= 0 ? pyCode104.slice(i104, j104 > 0 ? j104 : pyCode104.length) : '';
+  ok('T104-a1 ★快照必须读 pricing.json，且**只补索引未覆盖的条目**'
+    + '（规则①：索引已赢的非 lock 条目不得被反向覆盖，否则制造"快照价≠当天计费价"新分叉）',
+    /with open\(PRICING, 'r', encoding='utf-8'\)/.test(wph104)
+    && /if tgt and not locked:\s*\n\s*continue/.test(wph104),
+    '红 = 快照又退回"只落索引层" → pricing.json 自有模型整体缺席');
+  ok('T104-a2 ★lock 条目必须覆盖索引值（规则②：lock 永远赢，与 mergeLocalPriceDb 同口径）',
+    /locked = bv\.get\('lock'\) is True/.test(wph104) && /models\[key_b\] = rec/.test(wph104));
+  ok('T104-a3 ★读 pricing.json 失败必须 WARN（快照静默缺一层 = AUD-F-01 的病根形态）',
+    /价格历史快照：读取 pricing\.json 失败/.test(wph104));
+
+  const pyCands104 = [];
+  try {
+    const pvDir104 = 'C:/Users/14779/.workbuddy/binaries/python/versions';
+    for (const v of fs.readdirSync(pvDir104)) pyCands104.push(path.join(pvDir104, v, 'python.exe'));
+  } catch (e) { /* 目录不存在就走 PATH */ }
+  pyCands104.push('python', 'python3');
+  let PY104 = null;
+  for (const c of pyCands104) {
+    const t = spawnSync(c, ['-V'], { encoding: 'utf8', windowsHide: true, timeout: 20000 });
+    if (t.status === 0) { PY104 = c; break; }
+  }
+  if (!SPAWN_OK || !PY104) envSkip('T104-b1~b2 快照==计费面对账', SPAWN_OK ? 'python 不可用' : SPAWN_SKIP_REASON);
+  else {
+    const fx104 = path.join(tmp, 'c104');
+    const wb104 = path.join(fx104, 'wb');
+    const sk104 = path.join(wb104, 'skills', 'token-usage-tracker');
+    const pr104 = path.join(fx104, 'prices');
+    fs.mkdirSync(sk104, { recursive: true });
+    fs.mkdirSync(pr104, { recursive: true });
+    fs.writeFileSync(path.join(sk104, 'pricing.json'), JSON.stringify({
+      currency: 'CNY', unit: '元/百万 tokens', models: {
+        // ① 只在 pricing.json、索引没有 → 必须进快照
+        baselocal: { name: '基础库独有', input_price: 2.0, output_price: 8.0, cached_price: 0.4, peak_multiplier: 1, region: 'CN' },
+        // ② 索引有、非 lock → 索引值胜（快照必须 3.0，不得写成 99）
+        idxwin: { name: '索引赢', input_price: 99.0, output_price: 99.0, cached_price: 9.0, region: 'CN' },
+        // ③ 索引有、但 pricing.json 标了 lock → pricing.json 值胜（快照必须 7.0，不得写成 5）
+        lockwin: { name: '锁赢', input_price: 7.0, output_price: 14.0, cached_price: 1.4, peak_multiplier: 2, region: 'CN', lock: true },
+      },
+    }));
+    fs.writeFileSync(path.join(pr104, 'latest.json'), JSON.stringify({ vendors: { vA: { models: [
+      { name: '索引赢', api_name: 'idxwin', in_price: 3.0, out_price: 9.0, cache_hit: 0.5, currency: 'CNY', unit: '元/百万 tokens', region: 'CN', source_url: 'http://x', fetched_at: '2026-10-17' },
+      { name: '锁赢', api_name: 'lockwin', in_price: 5.0, out_price: 10.0, cache_hit: 1.0, currency: 'CNY', unit: '元/百万 tokens', region: 'CN', source_url: 'http://x', fetched_at: '2026-10-17' },
+    ] } } }));
+    fs.writeFileSync(path.join(pr104, 'index.json'), JSON.stringify({ built_at: '2026-10-16', models: {} }));
+    const bi104 = spawnSync(PY104, [path.join(SRC, 'build_index.py')], {
+      env: Object.assign({}, process.env, PY_IO_ENV, { WB_ROOT: wb104, CN_PRICES_DIR: pr104 }),
+      encoding: 'utf8', timeout: 180000, windowsHide: true,
+    });
+    const n104 = new Date();
+    const today104 = `${n104.getFullYear()}-${String(n104.getMonth() + 1).padStart(2, '0')}-${String(n104.getDate()).padStart(2, '0')}`;
+    let snap104 = null;
+    try { snap104 = JSON.parse(fs.readFileSync(path.join(pr104, 'history', 'prices-' + today104 + '.json'), 'utf-8')); } catch (e) { snap104 = null; }
+    const M104 = (snap104 && snap104.models) || {};
+    ok('T104-b1 ★行为：快照必须含「只在 pricing.json 有」的模型，且索引已覆盖的模型保持**当天计费值**'
+      + '（lock 条目不被抓取价覆盖 —— 构建侧注入 + 规则② 双重保证）',
+      bi104.status === 0 && !!snap104
+      && (M104.baselocal || {}).in === 2.0 && (M104.baselocal || {}).out === 8.0
+      && (M104.idxwin || {}).in === 3.0      // 索引赢（不是 99）
+      && (M104.lockwin || {}).in === 7.0,    // lock 赢（不是 5）
+      `exit=${bi104.status} 模型=${JSON.stringify(Object.keys(M104))}`
+      + ` baselocal=${JSON.stringify(M104.baselocal)} idxwin=${JSON.stringify(M104.idxwin)} lockwin=${JSON.stringify(M104.lockwin)}`
+      + ` err=${String(bi104.stderr || '').slice(0, 160)}`);
+    // b2：对账 —— 调**真实实现**（mergeLocalPriceDb / pricingFromSnapshot）逐模型比价，
+    //     测试里不得另写一套合并逻辑（那正是 A3「复制实现靠注释同步」的病根）
+    const parity104 = path.join(fx104, 'parity.js');
+    fs.writeFileSync(parity104, [
+      "'use strict';",
+      'const fs = require("fs");',
+      'const tt = require(process.env.TT_SRC);',
+      'const ph = require(process.env.PH_SRC);',
+      'const dir = process.env.CN_PRICE_DB_DIR;',
+      'const snap = ph.readSnapshot(dir + "/history", process.env.SNAP_DATE);',
+      'if (!snap) { console.log(JSON.stringify({ err: "no-snapshot" })); process.exit(0); }',
+      'const sp = ph.pricingFromSnapshot(snap);',
+      'const base = JSON.parse(fs.readFileSync(process.env.BASE_PRICING, "utf8"));',
+      'const face = tt.mergeLocalPriceDb(base);',
+      'const tri = (h) => { const m = h.m; const c = (typeof m.cached_price === "number") ? m.cached_price : m.input_price;',
+      '  return [m.input_price, m.output_price, c].join("/"); };',
+      'const diffs = [];',
+      'for (const k of Object.keys(face.models)) {',
+      '  const a = tt.findModel(face, k, "price");',
+      '  const b = tt.findModel(sp, k, "price");',
+      '  if (!a) continue;',
+      '  if (!b) { diffs.push(k + ":快照无价"); continue; }',
+      '  if (tri(a) !== tri(b)) diffs.push(k + ":" + tri(a) + "≠" + tri(b));',
+      '}',
+      'console.log(JSON.stringify({ n: Object.keys(face.models).length, diffs: diffs }));',
+    ].join('\n'));
+    const rp104 = spawnSync(NODE, [parity104], {
+      env: Object.assign({}, process.env, {
+        TT_SRC: path.join(skillDir, 'token-tracker.js'), PH_SRC: path.join(skillDir, 'price-history.js'),
+        CN_PRICE_DB_DIR: pr104, BASE_PRICING: path.join(sk104, 'pricing.json'),
+        SNAP_DATE: today104, WB_ROOT: wb104, TOKEN_TRACKER_NO_TOAST: '1', WB_NO_NET: '1',
+      }), encoding: 'utf8', timeout: 90000, windowsHide: true,
+    });
+    let rep104 = {};
+    try { rep104 = JSON.parse(String(rp104.stdout || '').trim().split('\n').pop()); } catch (e) { rep104 = {}; }
+    ok('T104-b2 ★行为：快照面逐模型 == 当天计费面（真实 mergeLocalPriceDb 对账，零缺价零价差）',
+      rp104.status === 0 && rep104.n === 3 && Array.isArray(rep104.diffs) && rep104.diffs.length === 0,
+      `n=${rep104.n} diffs=${JSON.stringify(rep104.diffs)} err=${String(rp104.stderr || '').slice(0, 200)}`);
+  }
+}
+
+// ===== T106（v3.63.0 · 批10）：Stop 被宿主回收窗口砍断 → 下次 `--hook` 补账补弹 ================
+//   病根（2026-10-17 10:20:42 实证）：宿主在「任务完成」后约 200ms 就 `launch-spec resolved` 重建
+//   会话 runtime，把 --stop 子进程连同 Job Object 一起树杀（KI-13：detached 也逃不掉）。Stop 冷启
+//   动就要 300ms，命中窗口时死在中途 —— 而 `writeCoalesce` 在聚合之后，于是既无弹窗、也没有
+//   `hook-fallback` 可兜。历史 157 次「压缩后续跑」里命中 3 次（09-11 / 10-08 / 10-17）。
+//   修法：Stop 在**聚合之前**先写一笔极小的「在飞标记」（~1ms），下次 `--hook` 读到它补账补弹。
+//   为什么不是"死前写标记"那种已被证伪的兜底：整树杀什么都不留，标记必须**早于**高风险段落盘。
+//   为什么不会重复弹/重复记账：状态闸（lastStopAt）+ 水位闸（记账前后比对）+ 记账本身幂等，三重。
+//   ★ 必须的行为配对：只验源码等于"写了但没跑通"；只验行为等于"跑通了但哪天被挪回聚合之后"。
+{
+  const code106 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8'));
+  const codeH106 = stripComments(fs.readFileSync(path.join(SRC, 'stop-handler.js'), 'utf-8'));
+  ok('T106-a1 ★`--hook` 必须挂 recoverKilledStop（main 里一行；不挂 = 整套兜底是死代码）',
+    /if \(asHook\) recoverKilledStop\(\{ sid, pricing \}\);/.test(code106));
+  const mk106 = codeH106.indexOf('writeStopMark(sid, { tsPath, roundStart: roundStart0, aggStart: aggStart0 })');
+  const ag106 = codeH106.indexOf('let agg = aggregateTranscript(tsPath, aggStart0)');
+  ok('T106-a2 ★在飞标记必须**早于** aggregateTranscript 落盘（写晚了 = 被砍时同样什么都没有，'
+    + '这正是三条旧兜底集体失活的根因）',
+    mk106 > 0 && ag106 > mk106, `mark@${mk106} agg@${ag106}`);
+  const rc106 = code106.indexOf('function recoverKilledStop(');
+  const body106 = rc106 > 0 ? code106.slice(rc106, rc106 + 4000) : '';
+  ok('T106-a3 ★三重闸齐全：状态闸(lastStopAt) + 水位闸(记账前后比对) + 清理标记',
+    /if \(\(snap\.lastStopAt \|\| 0\) >= mk\.at\)/.test(body106)
+    && /if \(after <= before\)/.test(body106)
+    && /clearStopMark\(sid\);/.test(body106));
+  const wc106 = code106.indexOf('function writeCoalesce(');
+  ok('T106-a4 ★写 coalesce 时必须就地清掉在飞标记（4 处调用点统一覆盖，漏一处 = 永久残留标记）',
+    wc106 > 0 && code106.slice(wc106, wc106 + 2400).indexOf('clearStopMark(sid);') > 0);
+  ok('T106-a5 ★不得挂到 `--stop`（Stop 预算仅 ~650ms，补账补弹要重聚合一遍转录，会反噬本轮）',
+    !/asStop[^\n]*recoverKilledStop/.test(code106));
+  // a6：正常同步弹窗收口时必须清掉在飞标记 —— 否则每个「最后一次 Stop 后再无事件」的会话
+  //   都会在技能目录留一个含**本地绝对路径**的 .stopmark-*.json（实测 89eb68b8 会话残留）。
+  ok('T106-a6 ★正常同步弹窗收口时必须清掉在飞标记（否则每个会话留一个含绝对路径的残留文件）',
+    codeH106.indexOf('clearStopMark(sid);') > codeH106.indexOf("stopStep('recorded'"),
+    `clear@${codeH106.indexOf('clearStopMark(sid);')} recorded@${codeH106.indexOf("stopStep('recorded'")}`);
+
+  if (!SPAWN_OK) envSkip('T106-b1~b3 被砍轮补账补弹端到端', SPAWN_SKIP_REASON);
+  else {
+    const proj106 = path.join(tmp, 'c106', 'projects');
+    fs.mkdirSync(proj106, { recursive: true });
+    const toast106 = path.join(tmp, 'token-tracker-toast.log');
+    const recs106 = () => {
+      const raw = fs.existsSync(toast106) ? fs.readFileSync(toast106, 'utf-8') : '';
+      if (!raw.trim()) return [];
+      return raw.trim().split('\n').map((l) => { try { return JSON.parse(l); } catch (e) { return {}; } })
+        .filter((t) => t.reason === 'stop-killed-recover');
+    };
+    const env106 = Object.assign({}, process.env, {
+      WB_ROOT: tmp, TOKEN_TRACKER_NO_TOAST: '1', WB_NO_NET: '1', WB_ORPHAN_SCAN: 'off',
+    });
+    const T0_106 = Date.now() - 3 * 3600 * 1000;   // 本轮起点
+    const T1_106 = Date.now() - 2 * 3600 * 1000;   // 被砍那一次 Stop 的聚合起点
+    let seq106 = 0;
+    const urow106 = (ts, i, o) => JSON.stringify({ type: 'assistant', id: 'c106u' + (seq106++), timestamp: ts,
+      providerData: { model: 'probe-model', messageId: 'c106m' + seq106, usage: { input_tokens: i, output_tokens: o } } });
+    // rows 固定：T1 之后 6 次调用（对齐 10:20 那次的形态：被砍前最后一次结算点之后仍在产出）
+    const rows106 = [urow106(T1_106 + 1000, 1000, 100), urow106(T1_106 + 2000, 2000, 200),
+      urow106(T1_106 + 3000, 500, 50)];
+    // 跑一次真 `--hook` 入口；markAt=null → 不放标记（负样本）
+    const run106 = (name, lastStopAt, markAt) => {
+      const sid = 'c106-' + name;
+      const tsPath = path.join(proj106, sid + '.jsonl');
+      fs.writeFileSync(tsPath, rows106.join('\n') + '\n');
+      fs.writeFileSync(path.join(skillDir, '.snapshot-' + sid + '.json'), JSON.stringify({
+        file: tsPath, stat: { total: 0, model: 'probe-model' }, lastUserMsgAt: T0_106, lastStopAt,
+      }));
+      const mk = path.join(skillDir, '.stopmark-' + sid + '.json');
+      if (markAt) fs.writeFileSync(mk, JSON.stringify({ at: markAt, tsPath, roundStart: T0_106, aggStart: T1_106 }));
+      else { try { fs.unlinkSync(mk); } catch (e) { /* 不存在则忽略 */ } }
+      const before = recs106().length;
+      const r = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'], {
+        input: JSON.stringify({ session_id: sid, transcript_path: tsPath, prompt: 't', cwd: tmp }),
+        env: env106, timeout: 90000, windowsHide: true, encoding: 'utf8',
+      });
+      return { r, sid, delta: recs106().length - before, markLeft: fs.existsSync(mk),
+        last: recs106()[recs106().length - 1] || {} };
+    };
+
+    // b1：标记在 + lastStopAt 早于标记（= 那次 Stop 真被砍在记账之前）→ 必须补一条 + 标记被清
+    const wm106 = () => {
+      try { return JSON.parse(fs.readFileSync(path.join(skillDir, '.ledger-watermark.json'), 'utf-8')); }
+      catch (e) { return {}; }
+    };
+    const r1 = run106('killed', T1_106 - 60000, T1_106 + 60000);
+    const wm1 = (wm106()['c106-killed'] || {}).main || 0;
+    ok('T106-b1 ★端到端：真 `--hook` 入口必须补弹出被砍那一轮，**且这笔钱真落进水位线**'
+      + '（这正是"压缩后续跑丢弹窗 + 6 次调用未记账"的正解）',
+      r1.r.status === 0 && r1.delta === 1 && !r1.markLeft && wm1 === 3,
+      `status=${r1.r.status} delta=${r1.delta} wm.main=${wm1} markLeft=${r1.markLeft} toast=${String(r1.last.toastText || '').replace(/\n/g, ' | ').slice(0, 120)} err=${String(r1.r.stderr || '').slice(0, 120)}`);
+
+    // b2：同一夹具再来一次（标记重新摆上）→ 水位闸挡住，零新增（幂等，绝不重复计费/重复弹）
+    const r2 = run106('killed', T1_106 - 60000, T1_106 + 60000);
+    ok('T106-b2 ★再跑一次 → 零新增弹窗（水位闸：那几行早已入账，不得重复计费、不得重弹）',
+      r2.r.status === 0 && r2.delta === 0 && !r2.markLeft, `delta=${r2.delta} markLeft=${r2.markLeft}`);
+
+    // b3：lastStopAt 晚于标记（Stop 其实正常收口过，标记只是没清）→ 状态闸挡住，且不白跑一次聚合
+    const r3 = run106('settled', T1_106 + 120000, T1_106 + 60000);
+    ok('T106-b3 ★Stop 已正常收口（lastStopAt 晚于标记）→ 零新增弹窗 + 标记被就地清掉（废标记不得常驻）',
+      r3.r.status === 0 && r3.delta === 0 && !r3.markLeft, `delta=${r3.delta} markLeft=${r3.markLeft}`);
+
+    // b4：负样本 —— 完全没有标记（= 正常轮次）→ 零新增（不能变成"每次提交都补一条"的新噪声源）
+    const r4 = run106('nomark', T1_106 - 60000, null);
+    ok('T106-b4 ★无标记的正常轮次 → 零新增（兜底不得变成每次提交都弹的新噪声）',
+      r4.r.status === 0 && r4.delta === 0, `delta=${r4.delta}`);
   }
 }
 

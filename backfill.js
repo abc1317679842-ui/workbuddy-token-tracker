@@ -17,7 +17,8 @@
 // - usage 提取：extractUsage 同口径（usage / rawUsage / message.usage 三处落点 + 数值钳制取整）
 // - 去重：同文件内按 messageId/conversationRequestId/id 去重（perModelFromRows 同口径）
 // - 日期归属：行 timestamp + 8h 的北京时间日期（与 v2.39「本地时间日界」一致）
-// - 费用：pricing.json 精确匹配模型名；行级按**行时间**判峰谷（工作日 9-12/14-18 北京时间 ×
+// - 费用：按**行所属日期**的价格匹配模型名（v3.62.0/F-3：优先当日快照 prices/history/prices-<日期>.json，
+//   缺快照退回现价并逐日 stderr 告警）；行级按**行时间**判峰谷（工作日 9-12/14-18 北京时间 ×
 //   peak_multiplier；周末与法定假日全天低峰——v3.15 同口径）。v3.57.0（H5）起：对主链路落有
 //   at-time peakSplit 明细且六桶全覆盖的 (日期,模型)，改按**当时规则**的切分计价（详见组装循环
 //   处注释）；明细缺失/部分覆盖 → 保持行级现值。匹配不到价的模型只记 token 不记钱
@@ -42,6 +43,7 @@ const os = require('os');
 const { detectWorkBuddyRoot } = require('./wb-root.js'); // v3.42.0（plan-B B1）：数据根探测单点实现，已抽到 wb-root.js
 const { mergeDailyLedger } = require('./ledger-merge.js'); // v3.55.0（S3）：账本合并抽成可单测纯函数
 const { measureTranscriptLines } = require('./transc-lines.js'); // v3.61.0（审计 F2）：行数/残行口径单一实现（与主链共用）
+const priceHistory = require('./price-history.js'); // v3.62.0（外部审计 F-3）：当日快照取价单点（与 recalc-day 共用同一实现）
 
 const WB = process.env.WB_ROOT || detectWorkBuddyRoot();
 const SKILL_DIR = path.join(WB, 'skills', 'token-usage-tracker');
@@ -221,7 +223,7 @@ function estimateInterruptedToDate(rows, acc) {
     const b = dAcc[model] || (dAcc[model] = { in: 0, out: 0, cached: 0, total: 0, cost: 0 });
     b.in += estIn; b.out += estOut; b.cached += estCached; b.total += estIn + estOut;
     const u = { in: estIn, out: estOut, cached: estCached };
-    const cst = rowCost(_pricing, model, u, ts);
+    const cst = rowCost(pricingForDate(date), model, u, ts); // v3.62.0（F-3）：按该行所属日期的价格
     if (cst != null) b.cost = Math.round((b.cost + cst) * 1e6) / 1e6;
   }
 }
@@ -245,7 +247,7 @@ function scanFile(fp, acc, modelNames) {
     const dAcc = acc[date] || (acc[date] = {});
     const m = dAcc[name] || (dAcc[name] = { in: 0, out: 0, cached: 0, total: 0, cost: 0 });
     m.in += u.in; m.out += u.out; m.cached += u.cached; m.total += u.in + u.out;
-    const c = rowCost(_pricing, name, u, ts);
+    const c = rowCost(pricingForDate(date), name, u, ts); // v3.62.0（F-3）：按该行所属日期的价格
     if (c != null) m.cost = Math.round((m.cost + c) * 1e6) / 1e6;
     // v3.27.0：无公开价模型（pricing_status:'unpublished'）留痕 no_price —— 与主脚本
     //   addModelUsage 同口径。漏了它，backfill --write 重建出来的账本会把无公开价模型显示成
@@ -259,8 +261,52 @@ function scanFile(fp, acc, modelNames) {
 
 let _pricing = { models: {} };
 
+// ── v3.62.0（外部审计 F-3）：回溯按**行所属那天**的价格计价 ──────────────────────────────
+//   病根（与 recalc-day 同源）：rowCost / at-time 切分此前一律用 `_pricing`（= pricing.json 现价
+//   合并本地价库）。厂商调价后跑一次 `node backfill.js --write`，全历史金额被按**今天**的单价
+//   重建 —— 账本失去"可回放"这个最值钱的属性，且与 recalc-day 的日级重算各自为政、零报错。
+//   修法：按行日期取**当日快照**（build_index.py 每日落 prices/history/prices-<日期>.json）。
+//   与 recalc 的差别（为什么这里**降级**而不是**拒绝**）：backfill 的职责是"重建整本历史"，
+//   其中绝大多数日期发生在快照机制上线**之前**，硬拒绝会让这把最常用的刀完全不可用。故缺快照 →
+//   退回现价并在 stderr **每个日期大声 WARN 一次**（不静默），让用户明确知道这段历史不是按当时价
+//   算的。recalc 面向"某一日复核金额"，语义恰好相反（没有那天的材料就该拒绝、别拿今天的价编）。
+//   ⚠ 已知残留（与 recalc 一致）：峰谷规则（deepseek_rules）不在快照里（它是 pricing.json 顶层
+//      字段、由 deepseek-official 每日刷新），这里把**当前**规则透传给当日快照价 —— 历史某天规则
+//      与今天不同时，峰谷判定仍按今天的规则。价格才是金额主项，规则的时态差异留待快照格式扩展。
+//   ⚠ `no_price` 标记（isNoPublicPrice）仍读现价：它是**模型级元数据**（厂商有没有公布单价），
+//      快照只收价格数字、不含 pricing_status；且该标记只影响"显示成 ¥0 还是 无公开价"，不进金额硬账。
+const _pricingByDate = new Map();  // date -> pricing（快照派生时带 _fromSnapshot 标记）
+const _snapWarnedDates = new Set(); // 每日期至多一条缺失告警（本函数在扫描循环里是热路径）
+function pricingForDate(date) {
+  if (_pricingByDate.has(date)) return _pricingByDate.get(date);
+  let p = null;
+  try {
+    const snap = priceHistory.readSnapshot(priceHistory.historyDirOf(tt.CN_PRICE_DIR), date);
+    if (snap) p = priceHistory.pricingFromSnapshot(snap);
+  } catch (e) { p = null; } // 读取/转换失败一律按"无快照"处理，退回现价并告警
+  if (p) {
+    // 峰谷规则透传（快照不含规则，见上方残留说明）：只补当前规则，价格一律用当日快照值
+    if (_pricing && _pricing.deepseek_rules) p.deepseek_rules = _pricing.deepseek_rules;
+    p._fromSnapshot = true;
+  } else {
+    if (!_snapWarnedDates.has(date)) {
+      _snapWarnedDates.add(date);
+      process.stderr.write(`[backfill] ⚠ ${date} 无价格快照 → 该日按**现价**回算（不是当天价）：厂商若在此日后调过价，这天金额会偏离当日实付。快照自 v3.62.0 起每日生成、历史日期不会补建。\n`);
+    }
+    p = _pricing; // 退回现价（宁可标注不静默）
+  }
+  _pricingByDate.set(date, p);
+  return p;
+}
+// 报告用：某日是否走了当日快照（scan 阶段已把 acc 里每个日期都过了一遍 pricingForDate）
+function dateHadSnapshot(date) {
+  const p = _pricingByDate.get(date);
+  return !!(p && p._fromSnapshot);
+}
+
 // v3.27.0：该模型在价库中是否标了「厂商未公布按 token 单价」。走 findModel 宽松匹配，
 //   与主脚本 toastLine2 / addModelUsage 的判定口径一致（避免同一模型两处结论不同）。
+//   ⚠ v3.62.0（F-3）：刻意**不**改成按日快照查 —— 快照只收价格数字、不含 pricing_status（见上方）。
 function isNoPublicPrice(name) {
   try {
     const hit = tt.findModel(_pricing, name, 'price');
@@ -396,6 +442,12 @@ function main() {
   try { oldDaily = JSON.parse(fs.readFileSync(DAILY, 'utf-8')); } catch (e) {} // silent-ok:降级 — 旧账本读取失败即视为空（上面已确认存在才进这里）
   const newDaily = {};
   const dates = Object.keys(acc).sort();
+  // v3.62.0（外部审计 F-3）：对**每个覆盖日期**显式过一次价格口径判定 —— 三件事都靠它：
+  //   ① 报告里的「X 天按当日快照价 / Y 天退回现价」计数要准；
+  //   ② 「缺快照逐日 WARN」不能只在"该日确实有行被计价"时才发声 —— 某日若只落了无价模型
+  //      （rowCost 早退）、或行级/at-time 两条路都没走到，就不会触发 WARN → 该日静默按现价算；
+  //   ③ 顺带把 `_pricingByDate` 预热满，报告里的 dateHadSnapshot 才有据可依。
+  for (const date of dates) pricingForDate(date);
   // v3.57.0（审计批7·H5 修复）：**历史日按当时规则计价**（at-time peak split）
   //   病根：rowCost 逐行用 isPeakBeijingTs(ts) 判峰谷——那是**当前** pricing.deepseek_rules 的
   //   口径。厂商调整峰谷时段后，拿它重算全部历史行，同一历史日的金额会与 recalc-day.js（读 rounds
@@ -415,7 +467,9 @@ function main() {
       if (split.pIn + split.oIn !== st.in
        || split.pOut + split.oOut !== st.out
        || split.pCached + split.oCached !== st.cached) continue; // 非全覆盖 → 行级现值
-      const hit = findModel(_pricing, name, 'price');
+      // v3.62.0（F-3）：at-time 切分也按**该日快照价**换算（与行级 rowCost 同口径），
+      //   否则同一 (日,模型) 会「切分用现价、兜底用当价」两套价并存 → 与 recalc 再次分叉。
+      const hit = findModel(pricingForDate(date), name, 'price');
       if (!hit || typeof hit.m.input_price !== 'number') continue; // 无价模型只记 token 不记钱
       const c = tt.costFromPeakSplit(hit.m, split, tt.peakMultOf(hit.m, name));
       if (c != null) st.cost = Math.round(c * 1e6) / 1e6;
@@ -427,6 +481,12 @@ function main() {
   const fmt = (v) => (v >= 1e8 ? (v / 1e8).toFixed(2) + '亿' : v >= 1e4 ? (v / 1e4).toFixed(1) + '万' : String(v));
   console.log(`===== backfill ${WRITE ? '--write（写入模式）' : 'dry-run（默认，不落盘）'} =====`);
   console.log(`扫描：主 transcript ${filesMain} 个，子代理 ${filesSub} 个，覆盖日期 ${dates.length} 天`);
+  // v3.62.0（F-3）：把「这份重建是按什么价算的」放在报告里（缺快照的日期另有 stderr 逐日告警）。
+  {
+    const snapN = dates.filter(dateHadSnapshot).length;
+    console.log(`价格口径：${snapN} 天按**当日快照价**（prices/history/prices-<日期>.json）`
+      + (dates.length - snapN > 0 ? `，${dates.length - snapN} 天无快照 → 退回**现价**（已在 stderr 逐日告警）` : ''));
+  }
   console.log('');
   let gTok = 0, gCost = 0, gOldCost = 0;
   for (const date of dates) {
@@ -439,7 +499,13 @@ function main() {
   }
   console.log('');
   console.log(`回填合计：${fmt(gTok)} tokens / ¥${gCost.toFixed(2)}（现账本同期合计 ¥${gOldCost.toFixed(2)}）`);
-  console.log(`无价模型（只记 token 不记钱）：${[...modelNames].filter((n) => n !== 'unknown' && !findModel(_pricing, n, 'price')).join(', ') || '（无）'}`);
+  // v3.62.0（外部审计 AUD-F-01）：这份清单必须按**成本实际用到的那份价**判定 ——
+  //   旧实现用 `_pricing`（现价 + 本地库），而成本是按 `pricingForDate(date)`（当日快照）逐日算的：
+  //   「只在某天快照里有价」的模型会被错报成无价（唯一按模型归因的可见信号指错），
+  //   「仅某几天无价」的模型则被一并列为无价（看不到是哪几天）。改成"所有覆盖日期都查不到价"才算无价。
+  const noPriceNames = [...modelNames]
+    .filter((n) => n !== 'unknown' && !dates.some((d) => findModel(pricingForDate(d), n, 'price')));
+  console.log(`无价模型（只记 token 不记钱）：${noPriceNames.join(', ') || '（无）'}`);
   if (!WRITE) {
     console.log('');
     console.log('这是 dry-run，未写任何文件。确认无误后执行：node backfill.js --write');
