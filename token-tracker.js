@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.63.0 (2026-10-17)
+// token-usage-tracker v3.63.1 (2026-10-17)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -295,7 +295,9 @@ function clearCoalesce(sid) {
 //   而不是等算完再写 —— 这是本项目唯一能对抗树杀的放置点。
 // 为什么不会重复弹/重复记账（三重闸）：
 //   ① 状态闸 —— 只认 `lastStopAt < 标记时间`（Stop 正常收口必然推进 lastStopAt）；
-//   ② 水位闸 —— 调 incrementalRecord 前后比对水位线，没涨就说明那轮早已入账 → 静默清标记；
+//   ② 记账状态闸 —— 只认 incrementalRecord 的**返回状态**（v3.63.1）：
+//       nothing=无欠账→清标记；recorded=成功→可弹；其余（corrupt/lock-busy/record-failed/wm-failed/error）
+//       =**本次失败**→保留标记 + 下次重试。⚠ 不能用"水位线没涨"当判据，那会把失败误判成已入账（K25）；
 //   ③ 幂等闸 —— incrementalRecord 本身按水位线去重，重复调用绝不重复计费。
 // 触发点：只在 `--hook`（用户下次提交 / 下次 Stop 都是新 Job），零常驻、零轮询。
 function stopMarkPath(sid) {
@@ -318,32 +320,80 @@ function clearStopMark(sid) {
   if (!p) return;
   try { fs.unlinkSync(p); } catch (e) { /* 不存在则忽略 */ }
 }
-// 返回 true = 本次确实补了一笔（调用方无需再做任何事）；false = 无事可做（正常路径）。
+// v3.63.1（K25 补偿失败不得销毁待补偿凭据）：标记的「重试 / 放弃」策略
+//   病根：旧实现把「记账失败」与「早已入账」都判成 `after <= before` → 一律 clearStopMark，
+//     于是**补偿一失败就等于永久放弃**（recoverKilledStop 只挂 --hook，标记一删再无入口补账）。
+//   两个上限都是为了 --hook 的输入阻塞预算（跑在 UserPromptSubmit 上，失败重试要重新聚合整份转录，
+//     实测 126MB ≈1438ms，不能让一个永久失败的标记让你每次发消息都卡 1.4s）：
+//     ① 重试用尽（STOPMARK_MAX_TRIES）② 标记过期（STOPMARK_MAX_AGE_MS）
+//   ⚠ 达到上限**只置 giveUp，绝不删文件** —— 那个文件是人工核对的唯一线索（K25）。
+const STOPMARK_MAX_TRIES = 3;
+const STOPMARK_MAX_AGE_MS = 24 * 3600 * 1000;
+function stopMarkBump(sid, mk, reason) {
+  const tries = (Number(mk && mk.tries) || 0) + 1;
+  const giveUp = tries >= STOPMARK_MAX_TRIES;
+  try {
+    writeStopMark(sid, {
+      at: mk.at, tsPath: mk.tsPath, roundStart: mk.roundStart, aggStart: mk.aggStart,
+      tries, lastErr: String(reason || '').slice(0, 120), giveUp: giveUp || undefined,
+    });
+  } catch (e) { /* silent-ok:诊断 — 计数写不进去不影响主链路 */ }
+  try { appendCompactionLog(giveUp ? 'stop-killed-recover-giveup' : 'stop-killed-recover-retry', { sid, reason: String(reason || '').slice(0, 120), tries }); }
+  catch (e) { /* silent-ok:诊断 */ }
+  return giveUp;
+}
+// 过期 / 协议不符：直接放弃重试，但**文件保留**（人工核对用），不 unlink。
+function stopMarkGiveUp(sid, mk, reason) {
+  try {
+    writeStopMark(sid, {
+      at: mk.at, tsPath: mk.tsPath, roundStart: mk.roundStart, aggStart: mk.aggStart,
+      tries: Number(mk.tries) || 0, lastErr: String(reason || '').slice(0, 120), giveUp: true,
+    });
+  } catch (e) { /* silent-ok:诊断 */ }
+  try { appendCompactionLog('stop-killed-recover-giveup', { sid, reason: String(reason || '').slice(0, 120) }); }
+  catch (e) { /* silent-ok:诊断 */ }
+}
+// 返回 true = 本次确实补了一笔；false = 无事可做（正常路径 / 已放弃 / 待下次事件重试）。
+// ⚠ 判「是否真入账」只认 incrementalRecord 的**返回状态**，不认水位线涨没涨：
+//   水位线不涨有**两种**含义（早已入账 / 本次失败），混为一谈 = 把失败当成功 + 销毁凭据（K25）。
 function recoverKilledStop(o) {
   const sid = o && o.sid;
   const mk = readStopMark(sid);
   if (!mk || !mk.at || !mk.tsPath) return false;
+  if (mk.giveUp) return false;                 // 已放弃：文件留作证据，不再花 --hook 的预算
   try {
     const snap = loadSnapshot(sid) || {};
     // 闸①：Stop 已收口（推进过 lastStopAt）→ 标记是正常残留，清掉即可。
     if ((snap.lastStopAt || 0) >= mk.at) { clearStopMark(sid); return false; }
+    if ((Date.now() - mk.at) > STOPMARK_MAX_AGE_MS) { stopMarkGiveUp(sid, mk, 'mark-too-old'); return false; }
     const aggStart = mk.aggStart || mk.roundStart || 0;
     let agg = null;
     try { agg = aggregateTranscript(mk.tsPath, aggStart); } catch (e) { agg = null; }
-    if (!agg || !agg.total) { clearStopMark(sid); return false; }
-    // 闸②：记账前后水位线比对 —— 没涨 ⇒ 那轮其实已入账（Stop 死在记账之后），不重复弹。
+    // 聚合**失败**（null）与"真·空轮"（total=0）必须分开：前者重试，后者无欠账。
+    if (!agg) { stopMarkBump(sid, mk, 'aggregate-failed'); return false; }
+    if (!agg.total) { clearStopMark(sid); return false; }
+    // 闸②：记账状态判定 —— 不再拿"水位线涨没涨"当唯一判据。
     const key = ledgerKey(sid, mk.tsPath);
-    const before = ((loadLedgerWatermarkSafe().wm[key] || {}).main) || 0;
-    try {
-      incrementalRecord(mk.tsPath, sid, {
-        sid, roundStart: mk.roundStart || 0, durMs: agg.durMs,
-        model: agg.modelMain || agg.model, subModels: agg.subModels,
-        subCount: agg.subCount, teamActive: agg.teamActive === true,
-        source: 'stop-killed-recover',
-      });
-    } catch (e) { /* silent-ok:降级 — 记账失败就不弹（没有硬账就没有可信数字），留给下一次事件重试 */ }
-    const after = ((loadLedgerWatermarkSafe().wm[key] || {}).main) || 0;
-    if (after <= before) { clearStopMark(sid); return false; }
+    const lw0 = loadLedgerWatermarkSafe();
+    // v3.63.1（洞 A2）：水位线损坏时旧代码走 (null[key]) → TypeError → 外层 catch 清标记 = 永久丢账。
+    //   现在显式分流：损坏 = 本次失败（保留标记），不是"已入账"。
+    if (lw0.corrupt) { stopMarkBump(sid, mk, 'watermark-corrupt'); return false; }
+    const before = (((lw0.wm || {})[key]) || {}).main || 0;
+    const st = incrementalRecord(mk.tsPath, sid, {
+      sid, roundStart: mk.roundStart || 0, durMs: agg.durMs,
+      model: agg.modelMain || agg.model, subModels: agg.subModels,
+      subCount: agg.subCount, teamActive: agg.teamActive === true,
+      source: 'stop-killed-recover',
+    });
+    const lw1 = loadLedgerWatermarkSafe();
+    const after = lw1.corrupt ? null : ((((lw1.wm || {})[key]) || {}).main || 0);
+    // ① 无欠账：本轮没有任何新用量（Stop 死在记账之后，水位线已覆盖）→ 清标记收工。
+    if (st === 'nothing') { clearStopMark(sid); return false; }
+    // ② 本次失败（水位线坏 / 抢锁失败 / 写盘失败 / 回调异常）→ **保留标记**，下次事件重试。
+    //    这是本次修复的核心：旧代码在这里清标记，等于"补偿失败一次 = 永久放弃"。
+    if (st !== 'recorded') { stopMarkBump(sid, mk, 'record-' + String(st || 'unknown')); return false; }
+    // ③ 并发路径已把这批行入账（水位线的推进来自别人）→ 不重复弹，清标记。
+    if (after !== null && after <= before) { clearStopMark(sid); return false; }
     // 闸③ 之后的展示段：与正常 Stop 同口径（子代理标注 / 分模型分条）
     const subsMap = subagentModelSet(mk.tsPath, mk.roundStart || 0);
     const baseName = shortModelName(agg, o.pricing);
@@ -357,16 +407,71 @@ function recoverKilledStop(o) {
     })) {
       showToast(toastLine1(agg, model, periodNote(agg, o.pricing), bal, todayTxt, noPriceTag1(agg, o.pricing)), toastLine2(agg, o.pricing), 'stop-killed-recover');
     }
-    appendCompactionLog('stop-killed-recover', { sid, aggStart, linesBefore: before, linesAfter: after, total: agg.total, markAgeMs: Date.now() - mk.at });
+    appendCompactionLog('stop-killed-recover', { sid, aggStart, linesBefore: before, linesAfter: after === null ? -1 : after, total: agg.total, markAgeMs: Date.now() - mk.at });
     saveSnapshot({ file: mk.tsPath, stat: agg, lastUserMsgAt: (snap.lastUserMsgAt || 0), lastStopAt: Date.now() }, sid);
     clearStopMark(sid);
     return true;
   } catch (e) {
+    // v3.63.1（洞 A2）：失败分支**绝不清标记** —— 清掉就是把"偶发失败"放大成"永久丢账"。
     try { appendCompactionLog('stop-killed-recover-failed', { sid, err: String((e && e.message) || e).slice(0, 200) }); }
     catch (e2) { /* silent-ok:诊断 — 留痕自身失败无从可写，放弃 */ }
-    clearStopMark(sid);
+    stopMarkBump(sid, mk, 'exception');
     return false;
   }
+}
+// ── v3.63.1（批14）：同轮同内容弹窗去重 ─────────────────────────────────────────────
+// 现象：宿主把**同一个 Stop 事件**投递给两个 pid，两个进程各自聚合、各自弹窗 → 用户看到两条完全相同
+//   （10-15 实测两条都 "step-5-preview … ¥1.90 / 今日¥86.32"；10-17 两条都 "本轮无 token"）。
+// 定量（compaction.log，排除测试夹具 sid）：可判弹窗 1688 条里「同会话 ≤10s 出 2 条」共 3 组 = 0.18%，
+//   跨度 1.2~4.3s，约 20 天一次。三次分别是 10-09 19:49 / 10-15 15:19 / 10-17 16:52。
+// 为什么既有 v2.86 闸没挡住：它用 `settledAt0 > roundStart0` 比较**两个不同来源的时钟**
+//   （快照里 recoverKilledStop 写的 Date.now() vs 转录推断出的轮起点）。10-17 实测
+//   `lastStopAt=…170183` < `roundStart0=…170269`，只差 86ms ⇒ 判「本轮还没结算」⇒ 两边都走弹窗。
+//   并发投递下「本轮第一次」有两个，任何基于时间先后的闸都会失效 ⇒ 换成"这份内容是否已弹过"的记录。
+// 判据（四条件同时成立才静默）：同 sid + 同 roundStart + 同内容指纹 + 60s 内。
+//   · 指纹不同 = 本轮真有新增（T103-b3 语义：先结算整轮、之后又跑尾段）→ **照弹**，绝不吞。
+//   · roundStart<=0 = 取不到轮起点 → **完全不启用**（否则退化成"按 sid 去重" = 跨轮误吞）。
+// ⚠ 记录**必须在弹窗成功之后**写（见 markToastShown 的调用点，紧跟 showToast 之后）。
+//   写在之前 = "没弹成也算弹过"：批9 记账优先后，被宿主砍在弹窗前的轮次会被下一次 Stop 永久吞掉，
+//   等于把批10 才修好的丢弹问题原样复活。
+// ⚠ 载体必须是**独立文件**：`.stopmark-<sid>.json` 会被 writeCoalesce 内部的 clearStopMark 删掉，
+//   且 writeStopMark 是覆盖写；snapshot 被 13 处显式构造对象整体覆盖（10-17 审计已踩过）。
+//   只存 roundStart/fp/at 三个字段，**不存 tsPath**（避免把本地绝对路径落进工作目录）。
+const TOAST_DEDUPE_WINDOW_MS = 60 * 1000;
+function toastDedupePath(sid) {
+  const safe = String(sid || '').replace(/[^a-zA-Z0-9_-]/g, '');
+  return safe ? path.join(SNAP_DIR, `.toasted-${safe}.json`) : null;
+}
+// 内容指纹：总量 + 各模型 in/out/cached（排序，与弹窗展示口径同源）。空聚合 → 'null'。
+function toastFingerprint(agg) {
+  if (!agg || !agg.total) return 'null';
+  const parts = Object.keys(agg.models || {}).sort().map((k) => {
+    const b = agg.models[k] || {};
+    return k + ':' + Math.round(Number(b.in) || 0) + '/' + Math.round(Number(b.out) || 0) + '/' + Math.round(Number(b.cached) || 0);
+  });
+  return Math.round(Number(agg.total) || 0) + '|' + parts.join(',');
+}
+// true = 本次应当**静默**（同轮同内容刚刚弹过）；false = 应当弹。
+// 任何读取异常一律返回 false —— 宁可多弹一条，绝不因为读不到记录就吞掉真实数据。
+function toastAlreadyShown(sid, roundStart, fp) {
+  if (!(roundStart > 0)) return false;
+  const p = toastDedupePath(sid);
+  if (!p) return false;
+  try {
+    const rec = JSON.parse(fs.readFileSync(p, 'utf-8'));
+    if (!rec || Number(rec.roundStart) !== Number(roundStart)) return false;
+    if (String(rec.fp || '') !== String(fp == null ? '' : fp)) return false;
+    if ((Date.now() - (Number(rec.at) || 0)) > TOAST_DEDUPE_WINDOW_MS) return false;
+    return true;
+  } catch (e) { return false; }
+}
+// 弹窗**已发出**之后调用。写失败只是下次可能多弹一条，绝不影响本次已弹内容。
+function markToastShown(sid, roundStart, fp) {
+  if (!(roundStart > 0)) return;
+  const p = toastDedupePath(sid);
+  if (!p) return;
+  try { fs.writeFileSync(p, JSON.stringify({ roundStart: Number(roundStart), fp: String(fp == null ? '' : fp), at: Date.now() })); }
+  catch (e) { /* silent-ok:去重 — 写不进去只丢去重，不影响硬账与已发出的弹窗 */ }
 }
 // 多子回合时起一个 detached 后台 watcher：延迟 DELAY_TOAST_MS 后复查，无新 trace 则弹汇总。
 // 父进程是 Stop hook（同步短生命周期），必须 unref 让 watcher 独立存活；Windows 下 detached
@@ -4303,7 +4408,11 @@ function rollbackLedgerAfterWatermarkFailure(snap) {
 // 各记一遍 = 账本重复计费（专家团 6s 确认窗 ∩ 新 Stop 真实可触发）。串行化后：后到者读到
 // 先到者推进的新水位线，只记增量。锁获取失败 → 本轮跳过（下轮 Stop 补记，不丢不重）。
 function incrementalRecord(tsPath, sid, meta) {
-  if (!tsPath || !fs.existsSync(tsPath)) return;
+  if (!tsPath || !fs.existsSync(tsPath)) return 'no-file';
+  // v3.63.1（K25）：返回**状态**而不是 undefined —— 调用方必须能区分
+  //   「早已入账（nothing）」与「本次失败（corrupt / record-failed / wm-failed / lock-busy / error）」，
+  //   否则只能靠"水位线涨没涨"猜，而"没涨"两种含义都会被误读成"已入账" → 补偿凭据被销毁 → 永久丢账。
+  let recStatus = 'unknown';
   const lockRes = withFileLock(LEDGER_WATERMARK_FILE + '.lock', () => {
   // v3.46.0（审计 S-5）：回调体整体包 try/catch —— 下面三个变量**刻意声明在 try 之外**：
   //   catch 分支要靠它们判断「账本是否已经写进去」，才能决定要不要回滚（详见最下方 catch 注释）。
@@ -4313,7 +4422,7 @@ function incrementalRecord(tsPath, sid, meta) {
   try {
   // 修复1 补充：水位线损坏时跳过记账，宁可少记也不重复计费
   const lw = loadLedgerWatermarkSafe();
-  if (lw.corrupt) return;
+  if (lw.corrupt) { recStatus = 'corrupt'; return; }
   const wm = lw.wm;
   // 修复3：键统一由 ledgerKey(sid, tsPath) 生成——有 session_id 用 session_id，
   // 没有则退化为 transcript 完整路径的哈希（跨项目同名文件不再撞键）。
@@ -4464,6 +4573,7 @@ function incrementalRecord(tsPath, sid, meta) {
   }
   if (willRecord) recorded = recordUsage({}, loadPricing(), byModel, peakTs || undefined, meta);
   if (!recorded) {
+    recStatus = 'record-failed';
     // 记账失败（账本损坏 / 锁获取失败 / 写盘失败）→ 绝不推进水位线，
     // 否则这些用量再也不会被补记 = 永久丢失。保持旧水位线，下轮重新记账。
     process.stderr.write(`[token-tracker] 本轮用量未落盘，水位线保持 ${entry.main} 不推进（下轮重试，避免用量永久丢失）\n`);
@@ -4491,9 +4601,12 @@ function incrementalRecord(tsPath, sid, meta) {
   //   回滚本轮账本（+轮次明细），水位线保持旧值 → 下轮重记（少记可恢复，重复不可恢复）。
   if (willRecord && !wmOk) {
     const rb = rollbackLedgerAfterWatermarkFailure(snap);
+    recStatus = 'wm-failed';
     process.stderr.write(`[token-tracker] ⚠ 水位线落盘失败，已回滚本轮账本${rb.ledger ? '' : '（回滚失败！请人工核对 daily-usage.json）'}，水位线保持 ${prevMain} 不推进（下轮重记，避免重复计费）\n`);
     return;
   }
+  // 走到这里 = 该推进的都推进了：有用量 → recorded，无用量 → nothing（两种情况都"无欠账"）。
+  recStatus = willRecord ? 'recorded' : 'nothing';
   } catch (e) {
     // v3.46.0（审计 S-5）：回调体此前**完全没有异常保护** —— 异常一路冒到 withFileLock 之外，
     //   而真正致命的不是"崩"，是**崩在哪个时点**：
@@ -4501,6 +4614,7 @@ function incrementalRecord(tsPath, sid, meta) {
     //     → 水位线保持旧值 → 下轮从旧偏移重读同一批行再累加 = **重复计费**。
     //   v3.39.0 的 A2 反向闸门只盯「水位线写盘失败」这一条退出路径，**覆盖不到异常这条**。
     //   现在补上：已记账 → 回滚账本 + 轮次明细，水位线不动 → 下轮重记（少记可恢复，重复不可恢复）。
+    recStatus = 'error';
     const msg55 = (e && e.message) ? String(e.message) : String(e);
     if (recorded && willRecord && snap) {
       const rb = rollbackLedgerAfterWatermarkFailure(snap);
@@ -4521,7 +4635,9 @@ function incrementalRecord(tsPath, sid, meta) {
     const why = (lockRes && lockRes.skipped) ? '抢锁失败（可能并发 watcher 或孤儿锁）' : '锁返回异常';
     process.stderr.write(`[token-tracker] ⚠ 本轮未记账：${why}；水位线未推进，下轮 Stop 会补记（不丢不重）\n`);
     try { appendCompactionLog('ledger-lock-skip', { sid: String(sid || '').slice(0, 40), reason: why }); } catch (e) {} // silent-ok:诊断 — 诊断日志写失败不得影响记账主流程
+    return 'lock-busy';
   }
+  return recStatus;
 }
 
 // ===== v3.32.0（P1-1 兜底）：金额格「该显示什么」的唯一判定 =====
@@ -6621,7 +6737,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.63.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.63.1'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -6845,7 +6961,6 @@ function main() {
     const wantCsv = rest.includes('--csv');           // v3.20.0：CSV 导出血开关
     const pos = rest.filter((a) => !a.startsWith('--')); // 位置参数（剥掉 --csv）
     const rArg = pos[0] || '';
-
     // v3.20.0：--report forecast —— 纯 token 外推（不含金额，理由见 reportForecastTxt 注释）
     if (rArg === 'forecast') { process.stdout.write(reportForecastTxt() + '\n'); return; }
     // v3.20.0：区间模式（week / month / <起>..<止>）—— 全新分支，不影响下方既有四个入口
@@ -7061,11 +7176,9 @@ function main() {
       if (ts > lastTailTs) { lastTailTs = ts; return true; }
       return false;
     };
-
     // 首轮记录尾部时间戳基线
     const baseR = lastTranscLine(tsPath);
     if (baseR) lastTailTs = Number(baseR.timestamp) || 0;
-
     // v2.42：记录已知子代理文件集合，用于检测确认期内主模型是否派了新子代理（新 agent 文件出现 = 刚派活 = 未结束）
     const knownAgents = () => {
       if (!tsPath) return new Set();
@@ -7073,7 +7186,6 @@ function main() {
       catch (e) { return new Set(); }
     };
     let prevAgents = knownAgents();
-
     // v2.57（第一阶段修复）：watcher 调试日志——detached watcher 的 stdio 被丢弃（stdio:'ignore'），
     // 以往发生问题后无法知道内部状态。这里把每轮轮询判定落盘到 .watch-debug-<sid>.jsonl。
     // 清理策略：只保留最近 2000 行（约 100 分钟轮询），超出的旧行截断，避免无限增长。
@@ -7414,6 +7526,9 @@ function main() {
     toastLine2,
     toastLineTagged,
     todayUsageTxt,
+    toastAlreadyShown,
+    toastFingerprint,
+    markToastShown,
     traceWallDurMs,
     transcriptPathFromPayload,
     writeCoalesce,
@@ -7791,6 +7906,8 @@ module.exports = {
   interruptedRowsAfter,
   userCancelKind, // v3.60.0（批A）：用户取消标记的统一判定（按 error.message 形态），selftest 可直接单测
   incrementalRecord, loadLedgerWatermark, saveLedgerWatermark,
+  // v3.63.1（批14）：同轮同内容弹窗去重（selftest 直接单测指纹与四条件，不必每次真 spawn 弹窗）
+  toastDedupePath, toastFingerprint, toastAlreadyShown, markToastShown,
   // v3.39.0（A2）：「记账成功但水位线没落盘」的回滚（纯文件层、可单测，避免只能靠注释自证）
   rollbackLedgerAfterWatermarkFailure,
   estimateInterrupted, estimateInterruptedInc,

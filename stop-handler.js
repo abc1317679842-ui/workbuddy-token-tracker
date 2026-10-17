@@ -121,6 +121,10 @@ function handleStopEndInner(ctx) {
     toastLine2,
     toastLineTagged,
     todayUsageTxt,
+    // v3.63.1（批14）：同轮同内容弹窗去重（四条件：sid+roundStart+指纹+60s）
+    toastAlreadyShown,
+    toastFingerprint,
+    markToastShown,
     traceWallDurMs,
     transcriptPathFromPayload,
     writeCoalesce,
@@ -424,6 +428,15 @@ function handleStopEndInner(ctx) {
             //   reason 恒为裸值。保留裸值（与 watcher 路径的 idle-timeout 等同形，也是长期实际行为，
             //   弹窗计数守卫不会翻）；若日后想要诊断前缀，正确做法是把它加进 tx 注入名单。
             const syncReason = isPlainRound ? 'plain-immediate' : 'team-sync';
+            // v3.63.1（批14）：同轮同内容去重 —— 宿主把**同一个 Stop** 投递给两个 pid 时，第二个必须静默。
+            //   四条件全中才算重复：同 sid + 同 roundStart + 同内容指纹 + 60s 内。
+            //   本轮真有新增（T103-b3：先结算整轮、之后又跑尾段）→ 指纹不同 → 照弹，绝不吞。
+            //   ⚠ 只影响「弹不弹」：记账早已在本函数开头完成（记账优先），下方 lastStopAt 推进照常执行。
+            const dedupeFp = toastFingerprint(agg);
+            const dupShown = toastAlreadyShown(effSid, roundStart0, dedupeFp);
+            if (dupShown) {
+              appendCompactionLog('toast-dedupe-skip', { sid: effSid, roundStart: roundStart0, fp: dedupeFp, kind: syncReason });
+            }
             // v3.48.0（审计 N1）：去掉 `!isPlainRound &&` 前置条件——**普通轮也可能多模型**。
             //   原假设"普通轮无子代理 → models 必然单桶"已被实测证伪：用户在同一轮里切换模型
             //   （2026-10-12 03:54 轮同时含 step-5-preview 与 hy4-preview）时 isPlainRound=true，
@@ -431,19 +444,23 @@ function handleStopEndInner(ctx) {
             //   （该轮 30.2万 里 21.8万 实际是 hy4），用户无法从弹窗看出真实构成。
             //   改为统一先试按模型分条：≥2 模型才分条，单模型时该函数返回 false → 回落原单条
             //   路径（逐字节不变）。它只遍历已聚合的 agg.models，不额外扫盘，"白扫盘"的顾虑不存在。
-            if (showToastsSplitByModel(agg, {
+            if (!dupShown && showToastsSplitByModel(agg, {
               pricing, tsPath, roundStart: aggStart0,
               bal: balanceText(), firstToday: todayUsageTxt(),
               reason: syncReason,
             })) {
+              // ⚠ 记录必须在弹窗**成功之后**写：写在前面 = "没弹成也算弹过" → 被砍在弹窗前的轮次
+              //   会被下一次 Stop 永久吞掉（抵消批10 修复）。
+              markToastShown(effSid, roundStart0, dedupeFp);
               appendCompactionLog(isPlainRound ? 'stop-plain-immediate-split' : 'stop-team-sync-split', { sid: effSid, parts: Object.keys((agg && agg.models) || {}) });
-            } else {
+            } else if (!dupShown) {
               showToast(
                 toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), balanceText(), todayUsageTxt(), noPriceTag1(agg, pricing)),
                 toastLine2(agg, pricing),
                 syncReason,
                 tsPath
               );
+              markToastShown(effSid, roundStart0, dedupeFp);
             }
             clearCoalesce(effSid);
             // v3.03（蝴蝶效应修复）：**普通轮必须自己推进 lastStopAt**。
@@ -644,7 +661,17 @@ function handleStopEndInner(ctx) {
           out({ hookSpecificOutput: {} });
           return true;
         }
+        // v3.63.1（批14）：同轮同内容去重 —— 10-17 16:52 实测两个 pid 并发各弹一条「本轮无 token」
+        //   （pid 13208 与 27068，间隔 1.2s，同 roundStart0）。空聚合的指纹恒为 'null'，故同轮第二次
+        //   判空必然指纹相同 → 静默。本轮若真有新增用量，走的是上面 agg 分支，不经过这里。
+        //   ⚠ 本分支上方（v3.08 修复2）已推进 lastStopAt，静默 return 不会让轮边界停在旧位置。
+        if (toastAlreadyShown(sid, roundStart0, 'null')) {
+          appendCompactionLog('toast-dedupe-skip', { sid, roundStart: roundStart0, fp: 'null', kind: 'no-token' });
+          out({ hookSpecificOutput: {} });
+          return true;
+        }
         showToast('本轮无 token 消耗记录', body0, 'no-token');
+        markToastShown(sid, roundStart0, 'null');
         out({ hookSpecificOutput: {} });
         return true;
       }
@@ -652,4 +679,4 @@ function handleStopEndInner(ctx) {
   return false;
 }
 
-module.exports = { handleStopEnd, STOP_TX_NAMES: ["SUBAGENT_IDLE_MS","TOAST_LINE_MAX_W","aggregateMainOnly","aggregatePerModel","aggregateTranscript","allInRoundSubFilesTerminal","appendCompactionLog","balanceText","captureTranscShape","clearCoalesce","clearStopMark","coalescePath","dispWidth","ensureNewModelPricing","estimateInterrupted","freshCompactionMarker","hasSubagentsRecentlyActive","incrementalRecord","inferRoundStartFromText","interruptedRowsAfter","lastWatcherSpawnError","latestTraceFile","ledgerKey","lineFor","loadSnapshot","mergeEstIntoModels","noPriceTag1","periodNote","readCoalesceInfo","readTranscLines","roundLabel","saveSnapshot","shortModelName","showToast","showToastsSplitByModel","sleep","sleepSync","startWatcherVerified","subagentPending","subagentsAllSettled","summarizePayload","terminalError","toastLine1","toastLine2","toastLineTagged","todayUsageTxt","traceWallDurMs","transcriptPathFromPayload","writeCoalesce","writeProbe","writeStopMark"] };
+module.exports = { handleStopEnd, STOP_TX_NAMES: ["SUBAGENT_IDLE_MS","TOAST_LINE_MAX_W","aggregateMainOnly","aggregatePerModel","aggregateTranscript","allInRoundSubFilesTerminal","appendCompactionLog","balanceText","captureTranscShape","clearCoalesce","clearStopMark","coalescePath","dispWidth","ensureNewModelPricing","estimateInterrupted","freshCompactionMarker","hasSubagentsRecentlyActive","incrementalRecord","inferRoundStartFromText","interruptedRowsAfter","lastWatcherSpawnError","latestTraceFile","ledgerKey","lineFor","loadSnapshot","mergeEstIntoModels","noPriceTag1","periodNote","readCoalesceInfo","readTranscLines","roundLabel","saveSnapshot","shortModelName","showToast","showToastsSplitByModel","sleep","sleepSync","startWatcherVerified","subagentPending","subagentsAllSettled","summarizePayload","terminalError","toastLine1","toastLine2","toastLineTagged","todayUsageTxt","toastAlreadyShown","toastFingerprint","markToastShown","traceWallDurMs","transcriptPathFromPayload","writeCoalesce","writeProbe","writeStopMark"] };

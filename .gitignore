@@ -15,6 +15,8 @@ coalesce-*.json
 # v3.63.0：Stop「在飞标记」—— 内含**会话转录的本地绝对路径**，入库即泄露，且每个
 #   「最后一次 Stop 后再无事件」的会话都会留一个（不会自清）→ 必须忽略。
 .stopmark-*.json
+# v3.63.2（批14）：弹窗去重记录（同 sess 一个文件，只存 roundStart/fp/at，不含路径）
+.toasted-*.json
 .transcript-*.jsonl
 .snapshot-dbg*.json
 .stop-probe*.json

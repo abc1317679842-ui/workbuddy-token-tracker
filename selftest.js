@@ -8376,6 +8376,16 @@ const txInjectionComplete = (ttSrc, shSrc) => (
     !/datetime\.datetime\.now\(\)\.strftime\('%Y-%m-%d'\)/.test(fcp)
     && !/datetime\.datetime\.now\(\)\.isoformat/.test(fcp)
     && !/datetime\.datetime\.now\(\)\.isoformat/.test(stripPy(S('parse_tokenhub.py'))));
+  // ⚠ AUD-TZ-01（v3.63.1）：T95-b3 的夹具必须与**机器时区**无关。CI(GitHub Actions) runner
+  //   是 UTC，裸 datetime.now() 取的是 runner 墙钟，而 _age_hours 把 naive 按北京时间解释
+  //   ⇒ 恒偏 8h（实测 88.0002h，run 39011545481 job20/job22 双败）。本机 UTC+8 两种写法
+  //   都绿，行为守卫抓不住 → 只能靠源码守卫钉写法。模式串都做拼接，避免守卫自匹配。
+  const t95Self = fs.readFileSync(__filename, 'utf-8');
+  const t95Bad = 'naive80 = (datetime.datetime.now(' + ') - datetime.timedelta';
+  const t95Good = 'naive80 = (datetime.datetime.now(m.CN_' + 'TZ).replace(tzinfo=None)';
+  ok('T95-a7 ★T95-b3 的 naive 夹具必须用 m.CN_TZ 构造（裸 now() 在 CI 的 UTC runner 上恒偏 8h → 每次发版 CI 都红）',
+    t95Self.indexOf(t95Bad) < 0 && t95Self.indexOf(t95Good) > 0,
+    'bad=' + (t95Self.indexOf(t95Bad) >= 0) + ' good=' + (t95Self.indexOf(t95Good) > 0));
 
   // ── 行为组：真跑，证明"代码这么写"之外"跑起来真的这样" ──
   const pyCands = [];
@@ -8430,7 +8440,11 @@ const txInjectionComplete = (ttSrc, shSrc) => (
       // "8 小时前的数据"会被算成 0 小时前或 16 小时前）；aware 时间戳按绝对时刻算。
       // ⚠ 不用 time.tzset() 造"另一种机器时区"——那是 Unix-only，Windows 上直接
       //   AttributeError（v3.62.0 实测踩到）。不变量本身与机器时区无关，故无需模拟。
-      'naive80 = (datetime.datetime.now() - datetime.timedelta(hours=80)).isoformat(timespec="seconds")',
+      // ⚠ v3.63.1（AUD-TZ-01）：夹具**必须**用 CN_TZ 构造，不能用机器墙钟 now()。
+      //   CI runner = UTC，裸 now() 产出的 naive 会被 _age_hours 当北京时间解释 → 差 8h
+      //   （实测 88.0002h）⇒ T95-b3 在 CI 恒红、真实回归被淹没。本机 UTC+8 永远看不见
+      //   这个偏差 → 由源码守卫 T95-a7 钉住写法（方向等价验证见审计报告 AUD-TZ-01）。
+      'naive80 = (datetime.datetime.now(m.CN_TZ).replace(tzinfo=None) - datetime.timedelta(hours=80)).isoformat(timespec="seconds")',
       'aware80 = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=80)).isoformat(timespec="seconds")',
       'a1 = m._age_hours(naive80)',
       'a2 = m._age_hours(aware80)',
@@ -9855,9 +9869,12 @@ const txInjectionComplete = (ttSrc, shSrc) => (
     mk106 > 0 && ag106 > mk106, `mark@${mk106} agg@${ag106}`);
   const rc106 = code106.indexOf('function recoverKilledStop(');
   const body106 = rc106 > 0 ? code106.slice(rc106, rc106 + 4000) : '';
-  ok('T106-a3 ★三重闸齐全：状态闸(lastStopAt) + 水位闸(记账前后比对) + 清理标记',
+  // v3.63.1：闸② 判据换了 —— 不再拿"水位线涨没涨"当唯一依据（那会把"记账失败"误判成"早已入账"），
+  //   改为只认 incrementalRecord 的返回状态。断言随之改锚 **状态分流**，而不是锚某个比较表达式。
+  ok('T106-a3 ★三重闸齐全：状态闸(lastStopAt) + 记账状态闸(nothing/recorded 分流) + 清理标记',
     /if \(\(snap\.lastStopAt \|\| 0\) >= mk\.at\)/.test(body106)
-    && /if \(after <= before\)/.test(body106)
+    && /if \(st === 'nothing'\)/.test(body106)
+    && /if \(st !== 'recorded'\)/.test(body106)
     && /clearStopMark\(sid\);/.test(body106));
   const wc106 = code106.indexOf('function writeCoalesce(');
   ok('T106-a4 ★写 coalesce 时必须就地清掉在飞标记（4 处调用点统一覆盖，漏一处 = 永久残留标记）',
@@ -9938,6 +9955,257 @@ const txInjectionComplete = (ttSrc, shSrc) => (
     const r4 = run106('nomark', T1_106 - 60000, null);
     ok('T106-b4 ★无标记的正常轮次 → 零新增（兜底不得变成每次提交都弹的新噪声）',
       r4.r.status === 0 && r4.delta === 0, `delta=${r4.delta}`);
+  }
+}
+
+// ===== T107（v3.63.1 · K25）：补偿失败**不得销毁待补偿凭据** ===============================
+//   病根（发版后自查发现，K25 正是为此而设）：T106 的闸② 用「记账前后水位线有没有涨」当判据。
+//   但 incrementalRecord 有四条**静默失败**路径（水位线损坏 / 抢锁失败 / 写盘失败 / 回调异常），
+//   它们都**故意不推进水位线**（这个设计本身是对的），落到闸② 一律变成 after <= before = "早已入账"
+//   → clearStopMark → **补偿失败一次就永久丢账**；而 recoverKilledStop 只挂 --hook，标记一删再无入口。
+//   更糟的一条：水位线损坏时 wm 为 null，(wm[key]) 直接抛 TypeError → 被外层 catch 接住 →
+//   同样 clearStopMark ⇒ **水位线一坏，所有被砍轮的账全部直接丢弃**。
+//   修法：incrementalRecord 返回状态；recoverKilledStop 只认状态 ——
+//     nothing = 无欠账（清标记）｜recorded = 成功（可弹）｜其余 = **本次失败（保留标记 + 计数 + 上限 giveUp）**；
+//     giveUp 只置位、**绝不删文件**（那个文件是人工核对的唯一线索）。
+{
+  const code107 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8'));
+  // 切片必须**截止到本函数末尾**：先按 6000 字取窗口会越界到下一个函数，于是 lastIndexOf('} catch (e) {')
+  //   抓到的是别人的 catch → 断言恒红（v3.63.1 首跑踩过：catch 段长度=398，实际是 resolveWorkspaceLogFile 的）。
+  const ir107 = (() => { const i = code107.indexOf('function incrementalRecord('); if (i < 0) return ''; const j = code107.indexOf('function ', i + 10); return code107.slice(i, j > 0 ? j : i + 9000); })();
+  const rc107 = (() => { const i = code107.indexOf('function recoverKilledStop('); if (i < 0) return ''; const j = code107.indexOf('function ', i + 10); return code107.slice(i, j > 0 ? j : i + 6000); })();
+
+  ok('T107-a1 ★incrementalRecord 必须**返回状态**而非 undefined（否则调用方只能靠"水位线涨没涨"猜，'
+    + '而"没涨"有四种含义 → 必然把失败当已入账 → 销毁凭据）',
+    /return 'no-file';/.test(ir107) && /return recStatus;/.test(ir107)
+    && /recStatus = 'corrupt';/.test(ir107) && /recStatus = 'record-failed';/.test(ir107)
+    && /recStatus = 'wm-failed';/.test(ir107) && /recStatus = 'error';/.test(ir107)
+    && /return 'lock-busy';/.test(ir107)
+    && /recStatus = willRecord \? 'recorded' : 'nothing';/.test(ir107));
+
+  const failBranch107 = (() => {
+    const i = rc107.indexOf("if (st !== 'recorded')");
+    return i > 0 ? rc107.slice(i, rc107.indexOf('return false;', i) + 12) : '';
+  })();
+  ok('T107-a2 ★记账失败分支必须**保留标记**（不许 clearStopMark）—— 否则"补偿失败一次"= "永久丢账"',
+    /if \(st !== 'recorded'\) \{ stopMarkBump\(sid, mk,/.test(failBranch107)
+    && failBranch107.indexOf('clearStopMark') < 0,
+    `branch=${failBranch107.replace(/\s+/g, ' ').slice(0, 120)}`);
+
+  const catch107 = (() => {
+    const i = rc107.lastIndexOf('} catch (e) {');
+    return i > 0 ? rc107.slice(i) : '';
+  })();
+  ok('T107-a3 ★外层 catch 也必须**保留标记**（旧代码在此 clearStopMark → 任何异常都放大成永久丢账）',
+    /stopMarkBump\(sid, mk, 'exception'\);/.test(catch107) && catch107.indexOf('clearStopMark') < 0,
+    `catch 段长度=${catch107.length}`);
+
+  ok('T107-a4 ★水位线损坏必须**显式分流**（旧代码 (null[key]) 抛 TypeError → 清标记 → 全部丢弃）',
+    /if \(lw0\.corrupt\) \{ stopMarkBump\(sid, mk, 'watermark-corrupt'\); return false; \}/.test(rc107)
+    && /const before = \(\(\(lw0\.wm \|\| \{\}\)\[key\]\) \|\| \{\}\)\.main \|\| 0;/.test(rc107)
+    && !/loadLedgerWatermarkSafe\(\)\.wm\[key\]/.test(rc107));
+
+  ok('T107-a5 ★重试必须有上限，且**放弃时不删文件**（--hook 阻塞用户输入，永久失败标记会每次发消息卡 1.4s；'
+    + '但删了就失去人工核对线索）',
+    /const STOPMARK_MAX_TRIES = 3;/.test(code107)
+    && /if \(mk\.giveUp\) return false;/.test(rc107)
+    && (() => {
+      const i = code107.indexOf('function stopMarkGiveUp(');
+      if (i < 0) return false;
+      const body = code107.slice(i, code107.indexOf('\n}', i));
+      return body.indexOf('writeStopMark') > 0 && body.indexOf('unlink') < 0 && body.indexOf('clearStopMark') < 0;
+    })());
+
+  ok('T107-a6 ★聚合失败(null) 与 真·空轮(total=0) 必须分开：前者重试、后者清标记',
+    /if \(!agg\) \{ stopMarkBump\(sid, mk, 'aggregate-failed'\); return false; \}/.test(rc107)
+    && /if \(!agg\.total\) \{ clearStopMark\(sid\); return false; \}/.test(rc107));
+
+  if (!SPAWN_OK) envSkip('T107-b1~b2 补偿失败保留标记端到端', SPAWN_SKIP_REASON);
+  else {
+    const proj107 = path.join(tmp, 'c107', 'projects');
+    fs.mkdirSync(proj107, { recursive: true });
+    const wmPath107 = path.join(skillDir, '.ledger-watermark.json');
+    let wmBak107 = null;
+    try { wmBak107 = fs.existsSync(wmPath107) ? fs.readFileSync(wmPath107, 'utf-8') : null; } catch (e) { wmBak107 = null; }
+    const T0_107 = Date.now() - 5 * 3600 * 1000;
+    const T1_107 = Date.now() - 4 * 3600 * 1000;
+    const rows107 = [
+      JSON.stringify({ type: 'assistant', id: 'c107a', timestamp: T1_107 + 1000, providerData: { model: 'probe-model', messageId: 'c107m1', usage: { input_tokens: 700, output_tokens: 70 } } }),
+      JSON.stringify({ type: 'assistant', id: 'c107b', timestamp: T1_107 + 2000, providerData: { model: 'probe-model', messageId: 'c107m2', usage: { input_tokens: 300, output_tokens: 30 } } }),
+    ];
+    // 跑一次真 --hook；wmCorrupt=true → 先把水位线写成垃圾（模拟损坏）
+    const run107 = (sid, markObj, wmCorrupt) => {
+      const tsPath = path.join(proj107, sid + '.jsonl');
+      fs.writeFileSync(tsPath, rows107.join('\n') + '\n');
+      fs.writeFileSync(path.join(skillDir, '.snapshot-' + sid + '.json'), JSON.stringify({
+        file: tsPath, stat: { total: 0, model: 'probe-model' }, lastUserMsgAt: T0_107, lastStopAt: T1_107 - 120000,
+      }));
+      const mkp = path.join(skillDir, '.stopmark-' + sid + '.json');
+      fs.writeFileSync(mkp, JSON.stringify(markObj(tsPath)));
+      if (wmCorrupt) fs.writeFileSync(wmPath107, '{ this is not json');
+      const r = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'], {
+        input: JSON.stringify({ session_id: sid, transcript_path: tsPath, prompt: 't', cwd: tmp }),
+        env: Object.assign({}, process.env, { WB_ROOT: tmp, TOKEN_TRACKER_NO_TOAST: '1', WB_NO_NET: '1', WB_ORPHAN_SCAN: 'off' }),
+        timeout: 90000, windowsHide: true, encoding: 'utf8',
+      });
+      let got = null;
+      try { got = JSON.parse(fs.readFileSync(mkp, 'utf-8')); } catch (e) { got = null; }
+      return { r, markLeft: fs.existsSync(mkp), mk: got };
+    };
+
+    // b1：水位线损坏 + 待补偿标记 → 标记必须**还在**且 tries 涨到 1（旧代码会把它清掉 = 永久丢账）
+    const b1 = run107('c107-corrupt', (ts) => ({ at: T1_107, tsPath: ts, roundStart: T0_107, aggStart: T1_107 }), true);
+    ok('T107-b1 ★端到端（真 --hook）：水位线损坏 → 记账失败 → 待补偿标记**必须保留**并记一次重试'
+      + '（旧行为：清标记 → 那笔账再无入口可补）',
+      b1.r.status === 0 && b1.markLeft && !!b1.mk && Number(b1.mk.tries) === 1 && !b1.mk.giveUp,
+      `status=${b1.r.status} markLeft=${b1.markLeft} tries=${b1.mk && b1.mk.tries} giveUp=${b1.mk && b1.mk.giveUp} err=${String(b1.r.stderr || '').slice(0, 100)}`);
+
+    // b2：已重试 2 次 + 仍失败 → 达到上限 → 置 giveUp 但**文件仍在**（不删，留作人工核对线索）
+    const b2 = run107('c107-giveup', (ts) => ({ at: T1_107, tsPath: ts, roundStart: T0_107, aggStart: T1_107, tries: 2 }), true);
+    ok('T107-b2 ★端到端：重试用尽 → giveUp=true 且**文件仍然存在**（放弃 ≠ 销毁凭据；--hook 也不能永远卡住）',
+      b2.r.status === 0 && b2.markLeft && !!b2.mk && b2.mk.giveUp === true,
+      `status=${b2.r.status} markLeft=${b2.markLeft} tries=${b2.mk && b2.mk.tries} giveUp=${b2.mk && b2.mk.giveUp}`);
+
+    // 复原沙箱水位线，避免影响（未来新增的）后续用例
+    try {
+      if (wmBak107 === null) fs.unlinkSync(wmPath107);
+      else fs.writeFileSync(wmPath107, wmBak107);
+    } catch (e) { /* silent-ok:测试收尾，删除失败不影响断言结论 */ }
+  }
+}
+
+// ===== T108（v3.63.1 · 批14）：同轮同内容弹窗去重 ===========================================
+//   现象：宿主把**同一个 Stop 事件**投递给两个 pid（10-09 19:49 span2.7s / 10-15 15:19 span4.1s /
+//   10-17 16:52 span1.2s），两个进程各自聚合、各自弹窗 → 用户看到两条完全相同。
+//   定量：可判弹窗 1688 条中同会话 ≤10s 双弹 3 组 = 0.18%（约 20 天一次）。
+//   既有 v2.86 闸用 `settledAt0 > roundStart0` 比较两个**不同来源**的时钟，10-17 实测差 86ms
+//   ⇒ 判「本轮未结算」⇒ 两边都弹。并发投递下「本轮第一次」有两个，时间闸天然失效。
+//   判据改成四条件：同 sid + 同 roundStart(>0) + 同内容指纹 + 60s 内。
+//   ★ 最危险的失败形态是**吞掉本该弹的窗**（沉默失败）：同轮先结算整轮、之后又真跑尾段
+//     （T103-b3 语义）时指纹不同 → 必须照弹。b2 就是这条的保底，缺了它这个改动等于没被验证。
+//   ★ 第二危险：记录写在弹窗之前 = 「没弹成也算弹过」→ 被砍在弹窗前的轮次会被下一次 Stop
+//     永久吞掉，直接抵消批10 的丢弹修复。a2 用**顺序断言**钉死。
+{
+  const tt108raw = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8');
+  const sh108raw = fs.readFileSync(path.join(SRC, 'stop-handler.js'), 'utf-8');
+  const strip108 = (s) => s.replace(/\r\n/g, '\n').split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+  const tt108 = strip108(tt108raw);
+  const sh108 = strip108(sh108raw);
+
+  const iNoShow = sh108.indexOf("showToast('本轮无 token 消耗记录', body0, 'no-token');");
+  const iNoMark = sh108.indexOf("markToastShown(sid, roundStart0, 'null');");
+  ok('T108-a1 ★no-token 路径必须「先判重 → 再弹 → 弹完写记录」三件齐全'
+    + '（只判不写 = 永远判不中；写完再弹 = 没弹成也算弹过，下次永久吞掉）',
+    /if \(toastAlreadyShown\(sid, roundStart0, 'null'\)\)/.test(sh108) && iNoShow > 0 && iNoMark > 0,
+    `判重=${/if \(toastAlreadyShown\(sid, roundStart0, 'null'\)\)/.test(sh108)} show@${iNoShow} mark@${iNoMark}`);
+  ok('T108-a2 ★记录必须写在弹窗**之后**（顺序断言；写反 = 复活批10 才修好的丢弹问题）',
+    iNoShow > 0 && iNoMark > iNoShow,
+    `show@${iNoShow} mark@${iNoMark}（要求 mark > show）`);
+
+  ok('T108-a3 ★完整统计路径也必须受保护（3 次双弹里 2 次是"完整+完整"，只做 no-token = 白做 2/3）',
+    /const dupShown = toastAlreadyShown\(effSid, roundStart0, dedupeFp\);/.test(sh108)
+    && /if \(!dupShown && showToastsSplitByModel\(agg/.test(sh108)
+    && /else if \(!dupShown\) \{/.test(sh108)
+    && /markToastShown\(effSid, roundStart0, dedupeFp\);/.test(sh108));
+
+  ok('T108-a4 ★roundStart<=0 必须**完全不启用**去重（否则退化成"按 sid 去重" = 跨轮误吞真实弹窗）',
+    /function toastAlreadyShown\(sid, roundStart, fp\) \{\s*\n\s*if \(!\(roundStart > 0\)\) return false;/.test(tt108)
+    && /function markToastShown\(sid, roundStart, fp\) \{\s*\n\s*if \(!\(roundStart > 0\)\) return;/.test(tt108));
+
+  ok('T108-a5 ★去重记录必须是**独立文件**且不含 tsPath'
+    + '（.stopmark 会被 writeCoalesce 的 clearStopMark 删；snapshot 被 13 处显式构造整体覆盖）',
+    /\.toasted-/.test(tt108) && /function toastDedupePath/.test(tt108)
+    && !/function markToastShown[\s\S]{0,400}tsPath/.test(tt108));
+
+  ok('T108-a6 ★静默分支**不得提前 return**（必须继续走 lastStopAt 推进，否则取消标记会复活成误判"手动取消"）',
+    !/if \(dupShown\) \{[\s\S]{0,260}return true;/.test(sh108)
+    && !/if \(toastAlreadyShown\(sid, roundStart0, 'null'\)\) \{[\s\S]{0,200}saveSnapshot/.test(sh108));
+
+  if (!SPAWN_OK) envSkip('T108-b1~b4 弹窗去重端到端', SPAWN_SKIP_REASON);
+  else {
+    const proj108 = path.join(tmp, 'c108', 'projects');
+    fs.mkdirSync(proj108, { recursive: true });
+    const toastLog108 = path.join(tmp, 'token-tracker-toast.log');
+    const compLog108 = path.join(tmp, 'token-tracker-compaction.log');
+    const off108 = () => { try { return fs.statSync(toastLog108).size; } catch (e) { return 0; } };
+    const slice108 = (o) => { try { return fs.readFileSync(toastLog108).slice(o).toString('utf8'); } catch (e) { return ''; } };
+    // ⚠ 去重留痕走 appendCompactionLog → 写的是 compaction.log，**不是** toast.log（两个文件别混）
+    const offC108 = () => { try { return fs.statSync(compLog108).size; } catch (e) { return 0; } };
+    const sliceC108 = (o) => { try { return fs.readFileSync(compLog108).slice(o).toString('utf8'); } catch (e) { return ''; } };
+    const T0_108 = Date.now() - 6 * 3600 * 1000;
+    let seq108 = 0;
+    const urow108 = (ts, i, o) => JSON.stringify({ type: 'assistant', id: 'c108u' + (seq108++), timestamp: ts,
+      providerData: { model: 'probe-model', messageId: 'c108m' + seq108, usage: { input_tokens: i, output_tokens: o } } });
+    const uhead108 = (ts) => JSON.stringify({ type: 'message', role: 'user', id: 'c108h' + ts, timestamp: ts,
+      content: [{ type: 'text', text: 'hi' }] });
+    const rows108 = [uhead108(T0_108), urow108(T0_108 + 1000, 1000, 100), urow108(T0_108 + 2000, 2000, 200)];
+    // ⚠ 每次跑前把快照 lastStopAt 重置回「本轮之前」—— 真实并发时两个进程都读到**旧快照**，
+    //   不重置的话第二次会被 v2.86 旧闸抢先挡住，测不到本闸（假绿）。
+    // ⚠ headTs 必须与转录里的 user 行**同源**：生产里 roundStart0 优先取 `prevSnap0.lastUserMsgAt`
+    //   （stop-handler.js:171），转录只是兜底。第一版固定写 T0_108 → b4 换轮时 roundStart0 没跟着换，
+    //   R66 反向验证因此把 b4 误判成"误伤"（实为夹具缺陷）。
+    const run108 = (sid, rows, headTs) => {
+      const tsPath = path.join(proj108, sid + '.jsonl');
+      fs.writeFileSync(tsPath, rows.join('\n') + '\n');
+      fs.writeFileSync(path.join(skillDir, '.snapshot-' + sid + '.json'), JSON.stringify({
+        file: tsPath, stat: { total: 0, model: 'probe-model' },
+        lastUserMsgAt: headTs == null ? T0_108 : headTs, lastStopAt: T0_108 - 60000,
+      }));
+      const off = off108();
+      const offC = offC108();
+      const r = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--stop'], {
+        input: JSON.stringify({ session_id: sid, transcript_path: tsPath, cwd: tmp }),
+        env: Object.assign({}, process.env, { WB_ROOT: tmp, TOKEN_TRACKER_NO_TOAST: '1', WB_NO_NET: '1', WB_LEDGER_MAINT: '1' }),
+        timeout: 120000, windowsHide: true, encoding: 'utf8',
+      });
+      const txt = slice108(off);
+      const ctxt = sliceC108(offC);
+      const dedupeSkip = (ctxt.match(/"event":"toast-dedupe-skip"/g) || []).length;
+      const toastN = (txt.match(/"reason":"plain-immediate"/g) || []).length;
+      // ⚠ 必须精确匹配 "no-token"：`cancelled-no-token` 也含该子串，宽松匹配会把取消文案算进来
+      const noToastN = (txt.match(/"reason":"no-token"/g) || []).length;
+      let snap = {};
+      try { snap = JSON.parse(fs.readFileSync(path.join(skillDir, '.snapshot-' + sid + '.json'), 'utf-8')); } catch (e) { snap = {}; }
+      return { rc: r.status, toastN, noToastN, dedupeSkip, snap, err: String(r.stderr || '').slice(0, 120) };
+    };
+
+    const SID108 = 'c108-dup';
+    const p1 = run108(SID108, rows108);
+    ok('T108-b1 ★端到端：同轮第一次 Stop → 正常弹一条（去重不得把第一次也吞掉）',
+      p1.rc === 0 && p1.toastN === 1, `exit=${p1.rc} toast=${p1.toastN} dedupe=${p1.dedupeSkip} err=${p1.err}`);
+
+    // b2：**同内容**再来一次（快照重置 = 模拟第二个并发进程都读到旧快照）→ 必须静默
+    const p2 = run108(SID108, rows108);
+    ok('T108-b2 ★端到端：同轮+同指纹+60s 内第二次 Stop → **静默**（10-15/10-17 那种双弹的正解）'
+      + '且 lastStopAt 仍被推进（静默 ≠ 不推进水位线）',
+      p2.rc === 0 && p2.toastN === 0 && p2.dedupeSkip === 1 && Number(p2.snap.lastStopAt || 0) > T0_108,
+      `exit=${p2.rc} toast=${p2.toastN} dedupe=${p2.dedupeSkip} lastStopAt=${p2.snap.lastStopAt} err=${p2.err}`);
+
+    // b3：同轮但**真有新增用量** → 指纹不同 → 必须照弹（T103-b3 语义的保底；缺这条 = 改动没被验证）
+    const rows108b = rows108.concat([urow108(T0_108 + 3000, 5000, 500)]);
+    const p3 = run108(SID108, rows108b);
+    ok('T108-b3 ★端到端：同轮又有新用量 → 指纹变化 → **必须照弹**'
+      + '（绝不吞真实尾段；这是本改动唯一可能造成"沉默失败"的方向）',
+      p3.rc === 0 && p3.toastN === 1, `exit=${p3.rc} toast=${p3.toastN} dedupe=${p3.dedupeSkip} err=${p3.err}`);
+
+    // b4：不同轮（新 user 行 = 新 roundStart）+ 内容恰好相同 → 必须照弹（防跨轮误吞）
+    const T0b_108 = T0_108 + 30 * 60 * 1000;
+    const rows108c = [uhead108(T0b_108), urow108(T0b_108 + 1000, 1000, 100), urow108(T0b_108 + 2000, 2000, 200)];
+    const p4 = run108(SID108, rows108c, T0b_108);
+    ok('T108-b4 ★端到端：换轮（roundStart 变了）且内容恰好相同 → **必须照弹**（去重不得跨轮误吞）',
+      p4.rc === 0 && p4.toastN === 1, `exit=${p4.rc} toast=${p4.toastN} dedupe=${p4.dedupeSkip} err=${p4.err}`);
+
+    // b5：**no-token 路径**同样要去重 —— 10-17 16:52 的双弹正是这条（两个 pid 各弹一条「本轮无 token」）。
+    //   没有这条，R63 只能红源码守卫 a1，行为层等于没被验证（源码改了注释也能骗过正则的历史教训）。
+    const rowsE108 = [uhead108(T0_108), JSON.stringify({ type: 'message', role: 'assistant', status: 'completed',
+      timestamp: T0_108 + 1000, content: [{ type: 'text', text: 'ok' }] })];
+    const SIDE108 = 'c108-empty';
+    const e1 = run108(SIDE108, rowsE108);
+    const e2 = run108(SIDE108, rowsE108);
+    ok('T108-b5 ★端到端：空轮同轮第二次 Stop → **只弹一条 no-token**'
+      + '（10-17 实测 pid 13208/27068 各弹一条；这是本批次唯一有生产日志直接对应的一条）',
+      e1.rc === 0 && e1.noToastN === 1 && e2.rc === 0 && e2.noToastN === 0 && e2.dedupeSkip === 1,
+      `第一次 exit=${e1.rc} no=${e1.noToastN} ｜ 第二次 exit=${e2.rc} no=${e2.noToastN} dedupe=${e2.dedupeSkip} err=${e2.err}`);
   }
 }
 

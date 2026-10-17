@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
 ![Node](https://img.shields.io/badge/Node.js-%3E%3D20-green)
-![Version](https://img.shields.io/badge/version-v3.63.0-blue)
+![Version](https://img.shields.io/badge/version-v3.63.1-blue)
 
 > 在每次回答后显示 **Token 消耗 / 耗时 / 折算费用** 的 WorkBuddy 技能（Skill + Hook）
 
@@ -160,6 +160,7 @@ WorkBuddy 客户端 **不显示每轮对话的 token 用量**：
 | 🕘 **历史按当日快照计价**（v3.62.0） | `recalc-day.js` / `backfill.js` 回算历史时读**当日价格快照**（`prices/history/prices-<日期>.json`），不再拿今天的现价改写昨天的金额；`recalc` 缺快照直接拒绝（`--current-price` 才走现价），`backfill` 缺快照降级现价并**逐日告警**。`recalc-day.js` 默认只报告不写账本，加 `--write` 才落盘 |
 | 🛡️ **被砍轮补账补弹**（v3.63.0）| WorkBuddy 在任务完成后 ~200ms 就回收进程，Stop 钩子有被判半路的窄窗口（历史 157 次里 3 次，1.9%）。现在 Stop **开跑即写待结算标记**（~1ms），下一次任何事件由 `--hook` 按水位线**补记账 + 补弹窗**（弹窗标「补」）；记不住的钱不再依赖"钩子能跑完" |
 | ⚡ **钩子减负**（v3.63.0） | 跨会话孤儿轮对账只挂 `--hook`、不再挂 `--stop`（命中候选要聚合整份转录，实测最坏 ≈11.5s，而 Stop 预算仅 ~650ms）；记账步骤排到所有"只影响显示"的增强之前，被中断也**钱先落盘** |
+| 🔁 **重复弹窗去重**（v3.63.1） | 宿主偶尔把**同一个 Stop 投递两次**（落到两个进程），会弹两条一模一样的窗（历史 1688 条弹窗里 3 组 = 0.18%，约 20 天一次）。判据取**同会话 + 同轮起点 + 同内容指纹 + 60 秒内**四条同时成立才静默；只要有一点不同（例如续跑又真跑了新用量）**照弹**，不会吞掉真实尾段。静默不影响记账，账本一分不差 |
 
 ## 🏪 本地官方价格库（v2.81 起）
 
