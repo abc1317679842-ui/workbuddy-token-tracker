@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.63.1 (2026-10-17)
+// token-usage-tracker v3.63.2 (2026-10-18)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -296,8 +296,10 @@ function clearCoalesce(sid) {
 // 为什么不会重复弹/重复记账（三重闸）：
 //   ① 状态闸 —— 只认 `lastStopAt < 标记时间`（Stop 正常收口必然推进 lastStopAt）；
 //   ② 记账状态闸 —— 只认 incrementalRecord 的**返回状态**（v3.63.1）：
-//       nothing=无欠账→清标记；recorded=成功→可弹；其余（corrupt/lock-busy/record-failed/wm-failed/error）
-//       =**本次失败**→保留标记 + 下次重试。⚠ 不能用"水位线没涨"当判据，那会把失败误判成已入账（K25）；
+//       nothing / recorded-但-main-未涨 = 无欠账 → **再过弹窗记录闸**（v3.63.2：已入账 ≠ 已弹窗，
+//       Stop 完全可能死在「记账成功之后、弹窗发出之前」）；其余（corrupt/lock-busy/record-failed/
+//       wm-failed/error）=**本次失败**→保留标记 + 下次重试。⚠ 不能用"水位线没涨"当判据，
+//       那会把失败误判成已入账（K25）；
 //   ③ 幂等闸 —— incrementalRecord 本身按水位线去重，重复调用绝不重复计费。
 // 触发点：只在 `--hook`（用户下次提交 / 下次 Stop 都是新 Job），零常驻、零轮询。
 function stopMarkPath(sid) {
@@ -353,9 +355,27 @@ function stopMarkGiveUp(sid, mk, reason) {
   try { appendCompactionLog('stop-killed-recover-giveup', { sid, reason: String(reason || '').slice(0, 120) }); }
   catch (e) { /* silent-ok:诊断 */ }
 }
-// 返回 true = 本次确实补了一笔；false = 无事可做（正常路径 / 已放弃 / 待下次事件重试）。
+// v3.63.2（T110-b3 暴露的注释/代码分裂）：判定「轮内有转录行但聚合不出用量」= 真空轮（无欠账）。
+// 为什么需要它：aggregateTranscript 在 main/sub 均 null（轮内无用量行）时返回 null（:1821），
+// 与「文件读不到 / 行全坏」同形 → recoverKilledStop 分不清"真空轮"与"聚合失败"，
+// 旧代码把真空轮一律 bump 到 giveUp，而 `!agg.total` 空轮早清路径**永远走不到**（total=0 不可达）。
+// ⚠ 只认"有行"：读不出任何行（文件缺失/全坏）时保守返回 false（走失败重试路径）——
+//   绝不把"可能还有未记账用量"的场景清标记，那才是真丢账。
+function roundHasRowsNoUsage(tsPath, roundStartMs) {
+  try {
+    const rows = readTranscLines(tsPath);
+    for (const r of rows) {
+      const ts = numTs(r.timestamp);
+      if (Number.isFinite(ts) && ts > roundStartMs) return true;
+    }
+    return false;
+  } catch (e) { return false; }
+}
+// 返回 true = 本次补了弹窗（可能同时补了一笔账）；false = 无事可做（正常路径 / 已放弃 / 待下次事件重试）。
 // ⚠ 判「是否真入账」只认 incrementalRecord 的**返回状态**，不认水位线涨没涨：
 //   水位线不涨有**两种**含义（早已入账 / 本次失败），混为一谈 = 把失败当成功 + 销毁凭据（K25）。
+// ⚠ 判「弹窗是否已发过」只认 `.toasted-<sid>.json` 记录（批14 同源）—— 绝不拿任何"死前写下的标记"
+//   当判据（丢弹判据铁律：整树杀下它同样不可靠；三条旧兜底就是这么集体失活的）。
 function recoverKilledStop(o) {
   const sid = o && o.sid;
   const mk = readStopMark(sid);
@@ -370,7 +390,15 @@ function recoverKilledStop(o) {
     let agg = null;
     try { agg = aggregateTranscript(mk.tsPath, aggStart); } catch (e) { agg = null; }
     // 聚合**失败**（null）与"真·空轮"（total=0）必须分开：前者重试，后者无欠账。
-    if (!agg) { stopMarkBump(sid, mk, 'aggregate-failed'); return false; }
+    if (!agg) {
+      // v3.63.2（T110-b3）：aggregateTranscript 对「轮内无用量行」同样返回 null（main/sub 均 null），
+      //   与读取失败同形 —— 旧代码一律当聚合失败，真空轮被 bump 到 giveUp，
+      //   而上面的空轮早清路径实际不可达（aggregateTranscript 从不返回 total=0 的对象）。
+      //   区分判据：轮内**有行**（只是提不出 usage）= 真空轮 = 无欠账 → 清标记；
+      //   读不出任何行 = 保守当失败重试（不把"可能还有未记账用量"的场景清掉）。
+      if (roundHasRowsNoUsage(mk.tsPath, aggStart)) { clearStopMark(sid); return false; }
+      stopMarkBump(sid, mk, 'aggregate-failed'); return false;
+    }
     if (!agg.total) { clearStopMark(sid); return false; }
     // 闸②：记账状态判定 —— 不再拿"水位线涨没涨"当唯一判据。
     const key = ledgerKey(sid, mk.tsPath);
@@ -387,13 +415,38 @@ function recoverKilledStop(o) {
     });
     const lw1 = loadLedgerWatermarkSafe();
     const after = lw1.corrupt ? null : ((((lw1.wm || {})[key]) || {}).main || 0);
-    // ① 无欠账：本轮没有任何新用量（Stop 死在记账之后，水位线已覆盖）→ 清标记收工。
-    if (st === 'nothing') { clearStopMark(sid); return false; }
-    // ② 本次失败（水位线坏 / 抢锁失败 / 写盘失败 / 回调异常）→ **保留标记**，下次事件重试。
-    //    这是本次修复的核心：旧代码在这里清标记，等于"补偿失败一次 = 永久放弃"。
-    if (st !== 'recorded') { stopMarkBump(sid, mk, 'record-' + String(st || 'unknown')); return false; }
-    // ③ 并发路径已把这批行入账（水位线的推进来自别人）→ 不重复弹，清标记。
-    if (after !== null && after <= before) { clearStopMark(sid); return false; }
+    // v3.63.2（外部审计 S7）：**已入账 ≠ 已弹窗** —— Stop 完全可能死在「记账成功之后、弹窗发出之前」。
+    //   旧代码在两个"无欠账"分支里直接 clearStopMark ⇒ 这条弹窗**永久不出现**，且标记一删再无补救入口
+    //   （recoverKilledStop 只挂 --hook；这正是设计期标记为 R1 的风险，当时结论"判据只能取弹窗已经
+    //   成功发出过的记录"，但只在批14 的 .toasted 去重层实现了，recoverKilledStop 本身没接上）。
+    //   走到这里 agg.total>0（真空轮已在上面清掉）⇒ 两个分支都只说明「账已记」，不说明「窗已弹」。
+    //   修法：判据只认 `.toasted-<sid>.json`（批14 同源同口径：同 roundStart + 同内容指纹 + 60s）——
+    //     · 已弹过 → 真无事可做，清标记收工；
+    //     · 没弹过 → 落进下方展示段补弹（弹成功后才写记录，绝不写在前）。
+    const dedupeFp = toastFingerprint(agg);
+    const toastDone = () => {
+      if (toastAlreadyShown(sid, mk.roundStart || 0, dedupeFp)) {
+        appendCompactionLog('stop-killed-recover-toast-already', { sid, roundStart: mk.roundStart || 0, fp: dedupeFp });
+        clearStopMark(sid);
+        return true;
+      }
+      return false;
+    };
+    if (st === 'nothing') {
+      // ① 无欠账：这批行早已入账（Stop 死在记账之后，或并发路径已记）→ 弹过就清标记，没弹过就补弹。
+      if (toastDone()) return false;
+      // 没弹过 → 继续往下走展示段补弹（与 recorded 共用同一出口）
+    } else if (st !== 'recorded') {
+      // ② 本次失败（水位线坏 / 抢锁失败 / 写盘失败 / 回调异常）→ **保留标记**，下次事件重试。
+      //    这是 K25 修复的核心：旧代码在这里清标记，等于"补偿失败一次 = 永久放弃"。
+      stopMarkBump(sid, mk, 'record-' + String(st || 'unknown'));
+      return false;
+    } else if (after !== null && after <= before) {
+      // ③ main 水位线没涨 = 纯子代理用量轮（主转录零新行，用量全在子代理文件；ledgerKey 的 main
+      //    只跟主转录行数）。与 ① 同型：账已记、窗未必弹过 → 同一判据分流。
+      //    （旧注释写"并发路径已入账"是对 K25 之前代码的误述——st==='recorded' 时记账方就是本进程。）
+      if (toastDone()) return false;
+    }
     // 闸③ 之后的展示段：与正常 Stop 同口径（子代理标注 / 分模型分条）
     const subsMap = subagentModelSet(mk.tsPath, mk.roundStart || 0);
     const baseName = shortModelName(agg, o.pricing);
@@ -407,7 +460,10 @@ function recoverKilledStop(o) {
     })) {
       showToast(toastLine1(agg, model, periodNote(agg, o.pricing), bal, todayTxt, noPriceTag1(agg, o.pricing)), toastLine2(agg, o.pricing), 'stop-killed-recover');
     }
-    appendCompactionLog('stop-killed-recover', { sid, aggStart, linesBefore: before, linesAfter: after === null ? -1 : after, total: agg.total, markAgeMs: Date.now() - mk.at });
+    // v3.63.2（S7）：补弹成功后同样写「已弹过」记录 —— 与批14 正常 Stop 路径同口径
+    //   （记录**只在弹窗成功后**写；写在前面 = "没弹成也算弹过"）。挡住并发双投的第二次。
+    markToastShown(sid, mk.roundStart || 0, dedupeFp);
+    appendCompactionLog('stop-killed-recover', { sid, aggStart, st, linesBefore: before, linesAfter: after === null ? -1 : after, total: agg.total, markAgeMs: Date.now() - mk.at });
     saveSnapshot({ file: mk.tsPath, stat: agg, lastUserMsgAt: (snap.lastUserMsgAt || 0), lastStopAt: Date.now() }, sid);
     clearStopMark(sid);
     return true;
@@ -6737,7 +6793,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.63.1'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.63.2'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

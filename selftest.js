@@ -2243,9 +2243,9 @@ else {
 // a1/a2 锁口径统一与不可回退，b1-b4 锁行为（含 null/''/ISO 语义**不变**）。
 {
   const src29 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
-  ok('T29-a1 ★两个记账入口都改走 numTs（不再各自硬判 typeof）',
-    (src29.match(/const ts = numTs\(r\.timestamp\);/g) || []).length === 2,
-    'numTs 调用点数=' + (src29.match(/const ts = numTs\(r\.timestamp\);/g) || []).length + '（应为 2）');
+  ok('T29-a1 ★记账入口 + 恢复路径空轮判据都走 numTs（不再各自硬判 typeof）',
+    (src29.match(/const ts = numTs\(r\.timestamp\);/g) || []).length === 3,
+    'numTs 调用点数=' + (src29.match(/const ts = numTs\(r\.timestamp\);/g) || []).length + '（应为 3：两个记账入口 + v3.63.2 roundHasRowsNoUsage）');
   ok('T29-a2 ★记账入口内不得再出现 `typeof ts === \'number\'` 硬判（防回退）',
     !/if \(!\(typeof ts === 'number'\) \|\| ts <= fromTs\) continue;/.test(src29));
   ok('T29-a3 ★决策类站点未被顺手改动（hasTeamActivity / hasNewTranscSince 仍保守硬判）',
@@ -2543,8 +2543,13 @@ else {
   //   ②③ spawn 后关两个 stdio fd（`silent-ok:清理`——spawn 异常路径下 fd 可能已被关，重复 close 不致命）；
   //   ④ 读回水位线文件失败（`silent-ok:降级`——缺失/损坏即视为"键不对"，由上一条断言报红，不需要静默续跑）。
   //   四处全部带标记且类别落在白名单；T33-a2/a3 仍守"必须带标记 + 类别合法"，改数字不削弱守卫生效面。
-  ok('T33-a1 ★裸 catch 总数与基线一致（44；新增/删除必须显式改这里，防"顺手吞一个错"）',
-    nAll === 44, `实测 ${nAll} 处`);
+  // v3.63.2（外部审计 N3 修复）：基线 44 → 43。backfill 的「旧账本读取失败即视为空」那一处
+  //   `catch (e) {} // silent-ok:降级` 被删 —— 它不是无害降级：--write 路径上同一形态会让
+  //   锁内合并拿到空账本 → 用重放值整本替换、抹掉重放范围外的历史日期（N3）。
+  //   改为 readLedgerStrict 统一入口（读不懂就中止），静默总数因此净减 1。
+  //   方向是"更少的静默"，且 T109-a1~a5 + b1~b4 已把新行为钉死，不是靠删 catch 掩盖问题。
+  ok('T33-a1 ★裸 catch 总数与基线一致（43；新增/删除必须显式改这里，防"顺手吞一个错"）',
+    nAll === 43, `实测 ${nAll} 处`);
   ok('T33-a2 ★每一处裸 catch 都带 silent-ok:<类别> — <理由>（无标记即红）',
     nBad === 0, nBad ? `${nBad} 处无标记：${badSamples.join(', ')}` : '');
   ok('T33-a3 ★类别必须落在白名单四类（诊断/清理/探测/降级）内——写个别的不算数',
@@ -9987,8 +9992,10 @@ const txInjectionComplete = (ttSrc, shSrc) => (
     const i = rc107.indexOf("if (st !== 'recorded')");
     return i > 0 ? rc107.slice(i, rc107.indexOf('return false;', i) + 12) : '';
   })();
+  // v3.63.2（S7）：正则放宽为 `\{\s*` —— 恢复路径的 if 链从三个平行 if 改成 if/else-if 链后，
+  //   `{` 与 stopMarkBump 之间允许换行（旧单行形态仍然匹配，反向验证不受影响）。
   ok('T107-a2 ★记账失败分支必须**保留标记**（不许 clearStopMark）—— 否则"补偿失败一次"= "永久丢账"',
-    /if \(st !== 'recorded'\) \{ stopMarkBump\(sid, mk,/.test(failBranch107)
+    /if \(st !== 'recorded'\) \{\s*stopMarkBump\(sid, mk,/.test(failBranch107)
     && failBranch107.indexOf('clearStopMark') < 0,
     `branch=${failBranch107.replace(/\s+/g, ' ').slice(0, 120)}`);
 
@@ -10016,9 +10023,18 @@ const txInjectionComplete = (ttSrc, shSrc) => (
       return body.indexOf('writeStopMark') > 0 && body.indexOf('unlink') < 0 && body.indexOf('clearStopMark') < 0;
     })());
 
-  ok('T107-a6 ★聚合失败(null) 与 真·空轮(total=0) 必须分开：前者重试、后者清标记',
-    /if \(!agg\) \{ stopMarkBump\(sid, mk, 'aggregate-failed'\); return false; \}/.test(rc107)
-    && /if \(!agg\.total\) \{ clearStopMark\(sid\); return false; \}/.test(rc107));
+  // v3.63.2（T110-b3 暴露）：`!agg` 分支拆成「轮内有行无用量=真空轮→清标记」+「读不出行=失败重试」。
+  //   旧正则要求单行紧凑形态，现改为窗口断言 + 纳入新判据（防未来回退成"一律 bump"）。
+  const aggNullWin107 = (() => {
+    const i = rc107.indexOf('if (!agg) {');
+    return i > 0 ? rc107.slice(i, rc107.indexOf('if (!agg.total)', i)) : '';
+  })();
+  ok('T107-a6 ★聚合失败(null) 与 真空轮(有行无用量) 必须分开：前者 stopMarkBump 重试、后者清标记',
+    /stopMarkBump\(sid, mk, 'aggregate-failed'\)/.test(aggNullWin107)
+    && /roundHasRowsNoUsage\(mk\.tsPath, aggStart\)/.test(aggNullWin107)
+    && /clearStopMark\(sid\)/.test(aggNullWin107)
+    && /if \(!agg\.total\) \{ clearStopMark\(sid\); return false; \}/.test(rc107),
+    `!agg 窗口=${aggNullWin107.replace(/\s+/g, ' ').slice(0, 200)}`);
 
   if (!SPAWN_OK) envSkip('T107-b1~b2 补偿失败保留标记端到端', SPAWN_SKIP_REASON);
   else {
@@ -10206,6 +10222,264 @@ const txInjectionComplete = (ttSrc, shSrc) => (
       + '（10-17 实测 pid 13208/27068 各弹一条；这是本批次唯一有生产日志直接对应的一条）',
       e1.rc === 0 && e1.noToastN === 1 && e2.rc === 0 && e2.noToastN === 0 && e2.dedupeSkip === 1,
       `第一次 exit=${e1.rc} no=${e1.noToastN} ｜ 第二次 exit=${e2.rc} no=${e2.noToastN} dedupe=${e2.dedupeSkip} err=${e2.err}`);
+  }
+}
+
+// ===== T109：v3.63.2 外部审计 N3 —— backfill 账本读不懂就中止，绝不按空账本合并 =====
+//   病根（审计报告 N3，P1）：锁内 `try { cur = JSON.parse(...) } catch (e) { cur = {}; }`
+//   → 账本损坏（半写/截断/手改）时 cur = {} → mergeDailyLedger({}, newDaily) = 用重放值**整本替换**，
+//   重放范围外的日期（transcript 已删除/归档、更早的历史）被静默抹掉，且**零告警**。
+//   :656-660 的指纹比对只比 size/mtime，防的是"扫描期间被改"，管不了"起始即损坏"这一路。
+//   修法：readLedgerStrict 单一入口 —— ENOENT 仍是合法空账本（首跑必须能写），
+//   解析失败 / 形状非法（[]、标量、null）→ --write 中止；dry-run 只告警不写盘。
+//   ⚠ 行为夹具必须**真 spawn backfill --write**：源码守卫只能证明"写了这几行"，
+//     证明不了"损坏时账本逐字节不变、合法时旧日期仍在、首跑仍可写"。
+{
+  const bf = fs.readFileSync(path.join(SRC, 'backfill.js'), 'utf-8');
+  const iMerge = bf.indexOf('mergeDailyLedger(cur');
+  const win = iMerge > 0 ? bf.slice(Math.max(0, iMerge - 600), iMerge) : '';
+  ok('T109-a1 ★锁内合并点之前必须走严格读取（窗口内不得出现 `cur = {}` 回落；N3 病根）',
+    iMerge > 0 && /readLedgerStrict\('锁内重读'\)/.test(win) && !/cur = \{\}/.test(win));
+  ok('T109-a2 ★对比展示的 oldDaily 同样走严格读取（dry-run 的「现账本」列不许静默按空算）',
+    /oldDaily = oldDailyRead\.cur/.test(bf) && !/oldDaily = JSON\.parse/.test(bf));
+  ok('T109-a3 ★--write 前有预检中止，且中止点**早于任何副作用**（备份/水位线都不该动）',
+    (() => {
+      // 必须按"块"找：锁内复检的告警文案里也含「不按空账本合并」，只按子串断言会分不清
+      // 预检与锁内复检（反向验证 R70 实测：删掉预检后旧断言仍绿 = 守卫失效）。
+      const L = bf.split('\n');
+      let iAbort = -1;
+      for (let i = 0; i < L.length; i++) {
+        if (L[i].indexOf('if (ledgerReadError) {') < 0) continue;
+        for (let j = i + 1; j < i + 7 && j < L.length; j++) {
+          if (L[j].indexOf('process.exit(1);') >= 0) { iAbort = i; break; }
+        }
+        if (iAbort > 0) break;
+      }
+      let iBak = -1;
+      for (let i = 0; i < L.length; i++) {
+        if (L[i].indexOf('.bak-backfill-') >= 0) { iBak = i; break; }
+      }
+      return iAbort > 0 && iBak > iAbort && /\u4e0d\u6309\u7a7a\u8d26\u672c\u5408\u5e76/.test(bf);
+    })(), `iAbort=${bf.split('\n').findIndex((l) => l.includes('if (ledgerReadError) {'))}`);
+  ok('T109-a4 ★ENOENT 仍算合法空账本（首跑/删档后必须还能写，否则修复把工具变成一次性）',
+    /code === 'ENOENT'/.test(bf) && /missing: true/.test(bf));
+  ok('T109-a5 ★形状校验：JSON.parse("[]")/"123"/"null" 不抛错但不是账本 → 同样按损坏处理',
+    /typeof parsed !== 'object'/.test(bf) && /Array\.isArray\(parsed\)/.test(bf));
+
+  if (!SPAWN_OK) { envSkip('T109-b1~b4 backfill 账本损坏端到端', SPAWN_SKIP_REASON); }
+  else {
+    // 每个用例独立沙箱（互不污染）：<tmp>/bfN3-<tag>/{skills/token-usage-tracker,projects/<proj>/}
+    const mkSandbox = (tag) => {
+      const root = path.join(tmp, 'bfN3-' + tag);
+      const sd = path.join(root, 'skills', 'token-usage-tracker');
+      fs.mkdirSync(sd, { recursive: true });
+      for (const f of ['token-tracker.js', 'backfill.js', ...RUNTIME_COMPANIONS]) {
+        fs.copyFileSync(path.join(SRC, f), path.join(sd, f));
+      }
+      const proj = path.join(root, 'projects', 'p-n3');
+      fs.mkdirSync(proj, { recursive: true });
+      // 一条真实用量行：backfill 只认「数字 timestamp + providerData.usage + providerData.model」
+      const row = JSON.stringify({
+        type: 'assistant', timestamp: Date.UTC(2026, 9, 18, 3, 0, 0),
+        providerData: { model: 'deepseek-v4.1-flash', messageId: 'm-n3-1', usage: { inputTokens: 1234, outputTokens: 56 } },
+      });
+      fs.writeFileSync(path.join(proj, 'sess-n3.jsonl'), row + '\n');
+      return { root, sd, ledger: path.join(sd, 'daily-usage.json') };
+    };
+    const runBf = (sb) => spawnSync(NODE, [path.join(sb.sd, 'backfill.js'), '--write'], {
+      cwd: sb.root,
+      env: Object.assign({}, env, { WB_ROOT: sb.root, WB_NO_NET: '1', WB_LEDGER_MAINT: '1' }),
+      timeout: 180000, windowsHide: true, encoding: 'utf8',
+    });
+    const noBak = (sb) => fs.readdirSync(sb.sd).filter((f) => f.indexOf('.bak-backfill-') >= 0).length === 0;
+
+    // b1：账本截断/半写 → 必须中止，且账本逐字节不变、连备份都不该留下（中止早于步骤 A）
+    const sb1 = mkSandbox('b1');
+    const corrupt1 = '{"2026-10-18": {"models": {"deepseek-v4.1-flash": {"in": 999';
+    fs.writeFileSync(sb1.ledger, corrupt1);
+    const r1 = runBf(sb1);
+    ok('T109-b1 ★端到端：账本截断/半写 + --write → 必须中止且账本逐字节不变'
+      + '（N3 旧行为：静默按空账本合并 → 重放值整本替换、历史日期被抹）',
+      r1.status === 1 && fs.readFileSync(sb1.ledger, 'utf8') === corrupt1 && noBak(sb1)
+      && !fs.existsSync(path.join(sb1.sd, '.ledger-watermark.json'))
+      && /账本解析失败/.test(String(r1.stderr)) && /不按空账本合并/.test(String(r1.stderr)),
+      `exit=${r1.status} 逐字节不变=${fs.readFileSync(sb1.ledger, 'utf8') === corrupt1} 无备份=${noBak(sb1)} err=${String(r1.stderr).slice(0, 150)}`);
+
+    // b2：合法账本 + 重放范围外的旧日期 → --write 成功且旧日期仍在（证明没把既有保留语义改坏）
+    const sb2 = mkSandbox('b2');
+    const oldDate = '2020-01-01';
+    const valid2 = JSON.stringify({
+      [oldDate]: {
+        models: { 'deepseek-v4.1-flash': { in: 777, out: 88, cached: 0, total: 865, cost: 0.5 } },
+        total: { in: 777, out: 88, cached: 0, total: 865, cost: 0.5 },
+      },
+    }, null, 2) + '\n';
+    fs.writeFileSync(sb2.ledger, valid2);
+    const r2 = runBf(sb2);
+    let m2 = null;
+    try { m2 = JSON.parse(fs.readFileSync(sb2.ledger, 'utf8')); } catch (e) { /* 断言里判 */ }
+    ok('T109-b2 ★端到端：合法账本 + --write → 成功，且重放范围外的旧日期原样保留'
+      + '（反 N3 断言：修复不得把"保留扫描不到的历史"这个语义改坏）',
+      r2.status === 0 && !!m2 && !!m2[oldDate] && m2[oldDate].models['deepseek-v4.1-flash'].in === 777
+      && Object.keys(m2).indexOf('2026-10-18') >= 0,
+      `exit=${r2.status} 旧日期=${m2 && m2[oldDate] ? m2[oldDate].models['deepseek-v4.1-flash'].in : '丢失'} keys=${m2 ? Object.keys(m2).join(',') : 'PARSE-FAIL'} err=${String(r2.stderr).slice(0, 120)}`);
+
+    // b3：数组/标量（JSON.parse 不抛错但不是账本）→ 同样中止、不改写
+    const sb3 = mkSandbox('b3');
+    fs.writeFileSync(sb3.ledger, '[]');
+    const r3 = runBf(sb3);
+    ok('T109-b3 ★端到端：账本是数组/标量（parse 不抛错但形状不对）→ 同样中止、不改写',
+      r3.status === 1 && fs.readFileSync(sb3.ledger, 'utf8') === '[]' && noBak(sb3)
+      && /账本形状非法/.test(String(r3.stderr)),
+      `exit=${r3.status} 未改写=${fs.readFileSync(sb3.ledger, 'utf8') === '[]'} err=${String(r3.stderr).slice(0, 150)}`);
+
+    // b4：账本不存在（首跑）→ 必须照常可写（修复不得把 ENOENT 也挡死）
+    const sb4 = mkSandbox('b4');
+    const r4 = runBf(sb4);
+    let m4 = null;
+    try { m4 = JSON.parse(fs.readFileSync(sb4.ledger, 'utf8')); } catch (e) { /* 断言里判 */ }
+    ok('T109-b4 ★端到端：账本不存在（首跑）→ --write 必须成功（ENOENT 是合法空账本）',
+      r4.status === 0 && !!m4 && Object.keys(m4).indexOf('2026-10-18') >= 0,
+      `exit=${r4.status} keys=${m4 ? Object.keys(m4).join(',') : 'PARSE-FAIL'} err=${String(r4.stderr).slice(0, 150)}`);
+  }
+}
+
+// ===== T110（v3.63.2 · 外部审计 S7）：已入账 ≠ 已弹窗 —— 恢复路径的弹窗记录闸 ==================
+//   病根（用户写文档时自查查出，P2）：`recoverKilledStop` 里旧代码
+//     `if (st === 'nothing') { clearStopMark(sid); return false; }`
+//   Stop 死在「记账成功之后、弹窗发出之前」时，下次 --hook 拿到 nothing → 清标记 →
+//   这条弹窗**永久不出现**，且标记一删再无补救入口（recoverKilledStop 只挂 --hook）。
+//   这正是设计期标记为 R1 的风险（当时结论"判据只能取弹窗已经成功发出过的记录"），
+//   但批14 只在 .toasted 去重层实现了"弹后才写"，recoverKilledStop 本身没接上。
+//   ⚠ 能走到 nothing 的前提：`!agg.total` 已在函数前段清掉真空轮 ⇒ nothing 只说明「账已记」。
+//   同函数 ③ 分支（st==='recorded' 但 main 水位线不涨 = 纯子代理用量轮，ledgerKey 的 main
+//   只跟主转录行数）同型吞弹，一并收敛到同一判据。
+//   ★ 行为夹具的关键：预写水位线（key=sid，main=3=总行数）让 incrementalRecord 返回 nothing
+//     （= 模拟"记账已成功"），且 lastStopAt 保持早于标记（= Stop 被砍、从未收口）——
+//     两个条件缺任何一个都进不了目标分支，夹具就成了假测。
+{
+  const code110 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8'));
+  // 切片截止到本函数末尾（T107 同款教训：取固定窗口会越界抓到下一个函数的 catch）
+  const rc110 = (() => { const i = code110.indexOf('function recoverKilledStop('); if (i < 0) return ''; const j = code110.indexOf('function ', i + 10); return code110.slice(i, j > 0 ? j : i + 6000); })();
+  ok('T110-a1 ★「已入账」分支（st===\'nothing\'）不得直接清标记：必须过弹窗记录闸'
+    + '（toastAlreadyShown，批14 同源同口径）—— 旧代码直接 clearStopMark = 死在记账后'
+    + '弹窗前的轮次永久丢弹',
+    rc110.indexOf('toastAlreadyShown(sid, mk.roundStart || 0, dedupeFp)') > 0
+    && (() => {
+      const i = rc110.indexOf("if (st === 'nothing')");
+      const win = i > 0 ? rc110.slice(i, i + 220) : '';
+      return win.indexOf('clearStopMark(sid); return false;') < 0;
+    })(), `nothing 分支窗口=${(() => { const i = rc110.indexOf("if (st === 'nothing')"); return i > 0 ? rc110.slice(i, i + 220).replace(/\s+/g, ' ') : '(未找到)'; })()}`);
+  const iShow110 = rc110.indexOf('showToast(');
+  const iMark110 = rc110.indexOf('markToastShown(sid, mk.roundStart || 0, dedupeFp)');
+  ok('T110-a2 ★补弹成功后必须写「已弹过」记录（markToastShown 在 showToast 之后、'
+    + '最后一次 clearStopMark 之前）—— 不写 = 并发双投时第二次照样弹，批14 去重层覆盖不到恢复路径',
+    iShow110 > 0 && iMark110 > iShow110 && rc110.lastIndexOf('clearStopMark(sid)') > iMark110,
+    `show@${iShow110} mark@${iMark110} clear@${rc110.lastIndexOf('clearStopMark(sid)')}`);
+  ok('T110-a3 ★③ 分支（main 水位线没涨 = 纯子代理用量轮）同样不得直接清标记 —— 与 ① 同型，'
+    + '收敛到同一弹窗记录判据（旧代码在此吞掉 sub-only 轮的弹窗）',
+    (() => {
+      const i = rc110.indexOf('after !== null && after <= before');
+      const win = i > 0 ? rc110.slice(i, i + 300) : '';
+      return i > 0 && win.indexOf('toastDone()') > 0 && win.indexOf('clearStopMark(sid); return false;') < 0;
+    })(), `③ 分支窗口=${(() => { const i = rc110.indexOf('after !== null && after <= before'); return i > 0 ? rc110.slice(i, i + 300).replace(/\s+/g, ' ') : '(未找到)'; })()}`);
+
+  if (!SPAWN_OK) envSkip('T110-b1~b3 恢复路径弹窗记录闸端到端', SPAWN_SKIP_REASON);
+  else {
+    const proj110 = path.join(tmp, 'c110', 'projects');
+    fs.mkdirSync(proj110, { recursive: true });
+    const toast110 = path.join(tmp, 'token-tracker-toast.log');
+    const wmPath110 = path.join(skillDir, '.ledger-watermark.json');
+    let wmBak110 = null;
+    try { wmBak110 = fs.existsSync(wmPath110) ? fs.readFileSync(wmPath110, 'utf-8') : null; } catch (e) { wmBak110 = null; }
+    const recs110 = () => {
+      const raw = fs.existsSync(toast110) ? fs.readFileSync(toast110, 'utf-8') : '';
+      if (!raw.trim()) return [];
+      return raw.trim().split('\n').map((l) => { try { return JSON.parse(l); } catch (e) { return {}; } })
+        .filter((t) => t.reason === 'stop-killed-recover');
+    };
+    const T0_110 = Date.now() - 3 * 3600 * 1000;   // 本轮起点（写入快照 lastUserMsgAt / 标记 roundStart）
+    const T1_110 = Date.now() - 2 * 3600 * 1000;   // 被砍那一次 Stop 的聚合起点
+    let seq110 = 0;
+    const urow110 = (ts, i, o) => JSON.stringify({ type: 'assistant', id: 'c110u' + (seq110++), timestamp: ts,
+      providerData: { model: 'probe-model', messageId: 'c110m' + seq110, usage: { input_tokens: i, output_tokens: o } } });
+    // 恰好 3 行 → 预写水位线 main=3 即"已全部入账"（incrementalRecord 返回 nothing）
+    const rows110 = [urow110(T1_110 + 1000, 1000, 100), urow110(T1_110 + 2000, 2000, 200), urow110(T1_110 + 3000, 500, 50)];
+    // opts.toasted：预写「已弹过」记录（b2 用）；不传 = 从未弹过（b1 用）
+    const run110 = (name, opts) => {
+      const sid = 'c110-' + name;
+      const tsPath = path.join(proj110, sid + '.jsonl');
+      fs.writeFileSync(tsPath, rows110.join('\n') + '\n');
+      fs.writeFileSync(path.join(skillDir, '.snapshot-' + sid + '.json'), JSON.stringify({
+        file: tsPath, stat: { total: 0, model: 'probe-model' }, lastUserMsgAt: T0_110, lastStopAt: T1_110 - 60000,
+      }));
+      const mk = path.join(skillDir, '.stopmark-' + sid + '.json');
+      fs.writeFileSync(mk, JSON.stringify({ at: T1_110 + 60000, tsPath, roundStart: T0_110, aggStart: T1_110 }));
+      // 水位线预置「已入账」（ledgerKey 有 session_id 时键 = sid 原样）
+      let wm = {};
+      try { wm = JSON.parse(fs.readFileSync(wmPath110, 'utf-8')); } catch (e) { wm = {}; }
+      wm[sid] = { main: 3 };
+      fs.writeFileSync(wmPath110, JSON.stringify(wm));
+      const tp = path.join(skillDir, '.toasted-' + sid + '.json');
+      if (opts && opts.toasted) fs.writeFileSync(tp, JSON.stringify(opts.toasted));
+      else { try { fs.unlinkSync(tp); } catch (e) { /* 不存在则忽略 */ } }
+      const before = recs110().length;
+      const r = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'], {
+        input: JSON.stringify({ session_id: sid, transcript_path: tsPath, prompt: 't', cwd: tmp }),
+        env: Object.assign({}, process.env, { WB_ROOT: tmp, TOKEN_TRACKER_NO_TOAST: '1', WB_NO_NET: '1', WB_ORPHAN_SCAN: 'off' }),
+        timeout: 90000, windowsHide: true, encoding: 'utf8',
+      });
+      let toastRec = null;
+      try { toastRec = JSON.parse(fs.readFileSync(tp, 'utf-8')); } catch (e) { toastRec = null; }
+      return { r, sid, delta: recs110().length - before, markLeft: fs.existsSync(mk), toastRec };
+    };
+
+    // b1：账已记（nothing）+ 无弹窗记录 → 必须补弹出那一轮；记录只能在弹成功后写；标记就地清掉
+    const b1 = run110('pending', null);
+    ok('T110-b1 ★端到端：Stop 死在「记账后、弹窗前」（nothing + 无弹窗记录）→ 必须补弹出那一轮，'
+      + '且「已弹过」记录在弹**成功之后**写入（roundStart/指纹齐全）、在飞标记清掉',
+      b1.r.status === 0 && b1.delta === 1 && !b1.markLeft
+      && !!b1.toastRec && Number(b1.toastRec.roundStart) === T0_110
+      && !!b1.toastRec.fp && b1.toastRec.fp !== 'null' && Number(b1.toastRec.at) > 0,
+      `status=${b1.r.status} delta=${b1.delta} markLeft=${b1.markLeft} rec=${JSON.stringify(b1.toastRec)} err=${String(b1.r.stderr || '').slice(0, 120)}`);
+
+    // b2：同样 nothing，但弹窗记录已在（同 roundStart + 同指纹 + 60s 内）→ 静默收工、绝不重弹
+    //   指纹从 b1 实际写入的记录里取（与产品同源，避免测试侧另算一套口径）
+    const b2 = run110('shown', { toasted: { roundStart: T0_110, fp: b1.toastRec ? b1.toastRec.fp : 'x', at: Date.now() } });
+    ok('T110-b2 ★端到端：已入账 + 已弹过（记录在）→ 静默收工（绝不重弹）、标记清掉',
+      b2.r.status === 0 && b2.delta === 0 && !b2.markLeft,
+      `status=${b2.r.status} delta=${b2.delta} markLeft=${b2.markLeft} err=${String(b2.r.stderr || '').slice(0, 120)}`);
+
+    // b3：真空轮（agg.total=0）→ 老路径：`!agg.total` 早清（不弹、标记清）——
+    //   修复不得把空轮也补弹出来；水位线同样预置，早清失效时本用例必须变红
+    const sid3 = 'c110-empty';
+    const tsPath3 = path.join(proj110, sid3 + '.jsonl');
+    fs.writeFileSync(tsPath3, JSON.stringify({ type: 'user', id: 'c110u0', timestamp: T1_110 + 500, message: { role: 'user', content: 'hi' } }) + '\n');
+    fs.writeFileSync(path.join(skillDir, '.snapshot-' + sid3 + '.json'), JSON.stringify({
+      file: tsPath3, stat: { total: 0, model: 'probe-model' }, lastUserMsgAt: T0_110, lastStopAt: T1_110 - 60000,
+    }));
+    const mk3 = path.join(skillDir, '.stopmark-' + sid3 + '.json');
+    fs.writeFileSync(mk3, JSON.stringify({ at: T1_110 + 60000, tsPath: tsPath3, roundStart: T0_110, aggStart: T1_110 }));
+    let wm3 = {};
+    try { wm3 = JSON.parse(fs.readFileSync(wmPath110, 'utf-8')); } catch (e) { wm3 = {}; }
+    wm3[sid3] = { main: 1 };
+    fs.writeFileSync(wmPath110, JSON.stringify(wm3));
+    const before3 = recs110().length;
+    const r3 = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'], {
+      input: JSON.stringify({ session_id: sid3, transcript_path: tsPath3, prompt: 't', cwd: tmp }),
+      env: Object.assign({}, process.env, { WB_ROOT: tmp, TOKEN_TRACKER_NO_TOAST: '1', WB_NO_NET: '1', WB_ORPHAN_SCAN: 'off' }),
+      timeout: 90000, windowsHide: true, encoding: 'utf8',
+    });
+    ok('T110-b3 ★端到端：真空轮 → 仍走 `!agg.total` 早清路径（不弹、标记清）'
+      + '—— 修复不得把空轮也补弹出来',
+      r3.status === 0 && recs110().length - before3 === 0 && !fs.existsSync(mk3),
+      `status=${r3.status} delta=${recs110().length - before3} markLeft=${fs.existsSync(mk3)}`);
+
+    // 复原沙箱水位线，避免影响后续用例（T107 同款收尾）
+    try {
+      if (wmBak110 === null) fs.unlinkSync(wmPath110);
+      else fs.writeFileSync(wmPath110, wmBak110);
+    } catch (e) { /* silent-ok:测试收尾，还原失败不影响断言结论 */ }
   }
 }
 

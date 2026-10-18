@@ -53,6 +53,34 @@ const HOLIDAYS = path.join(SKILL_DIR, 'holidays.json');
 const WATERMARK = path.join(SKILL_DIR, '.ledger-watermark.json');
 const PROJECTS = path.join(WB, 'projects');
 
+// v3.63.2（外部审计 N3 修复）：账本读取的**唯一入口** —— 读不懂就明说，绝不静默按空账本合并。
+//   旧实现有两处 `try { cur = JSON.parse(...) } catch (e) { cur = {}; }`（对比展示 / 锁内合并前）。
+//   锁内那处的病态路径：解析失败 → cur = {} → mergeDailyLedger({}, newDaily) = 用重放值**整本替换**，
+//   重放范围外的日期（transcript 已删除/归档、更早的历史）被静默抹掉，且**零告警**。
+//   :656-660 的指纹比对只比 size/mtime，防的是"扫描期间被改"，管不了"起始即损坏"这一路。
+//   ENOENT（账本不存在）仍是**合法空账本**：首次运行必须能写。
+function readLedgerStrict(tag) {
+  let raw;
+  try {
+    raw = fs.readFileSync(DAILY, 'utf-8');
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return { ok: true, cur: {}, missing: true };
+    return { ok: false, error: `[backfill] 账本读取失败（${tag}）：${e && e.message}` };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    return { ok: false, error: `[backfill] 账本解析失败（${tag}，JSON 语法错误，文件可能被半写/截断）：${e && e.message}` };
+  }
+  // 形状校验：`JSON.parse('[]')` / `'123'` / `'null'` 都不抛错，但 Object.assign 之后会把数字键/
+  //   空值带进「日期 → 用量」结构 → 同样按损坏处理，不合并。
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, error: `[backfill] 账本形状非法（${tag}）：顶层不是「日期 → 用量」对象` };
+  }
+  return { ok: true, cur: parsed };
+}
+
 // v3.19.2（B5）：复用主脚本，不再自带价库合并 / findModel 镜像。
 // 「复制实现靠注释约束同步」正是 P1（峰谷口径分裂）的病根——镜像缺了并发半写重读、tier_note 等
 // 三处逻辑，且此后每次改主实现都要人肉同步。这里在主脚本 require **之前**显式对齐两个路径口径
@@ -439,7 +467,11 @@ function main() {
   // 组装新账本（v3.19.0/P4：不再继承 _instructions——M3 已关闭"数据→指令"通道，旧账本残留字段
   // 会被原样带进新账本，等于把通道又开回来）
   let oldDaily = {};
-  try { oldDaily = JSON.parse(fs.readFileSync(DAILY, 'utf-8')); } catch (e) {} // silent-ok:降级 — 旧账本读取失败即视为空（上面已确认存在才进这里）
+  // v3.63.2（N3）：旧账本读取失败不再静默视为空 —— dry-run 告警、--write 中止（见下方预检）。
+  let ledgerReadError = null;
+  const oldDailyRead = readLedgerStrict('对比读取');
+  if (oldDailyRead.ok) oldDaily = oldDailyRead.cur;
+  else ledgerReadError = oldDailyRead.error;
   const newDaily = {};
   const dates = Object.keys(acc).sort();
   // v3.62.0（外部审计 F-3）：对**每个覆盖日期**显式过一次价格口径判定 —— 三件事都靠它：
@@ -507,9 +539,22 @@ function main() {
     .filter((n) => n !== 'unknown' && !dates.some((d) => findModel(pricingForDate(d), n, 'price')));
   console.log(`无价模型（只记 token 不记钱）：${noPriceNames.join(', ') || '（无）'}`);
   if (!WRITE) {
+    if (ledgerReadError) {
+      console.error(ledgerReadError);
+      console.error('[backfill] dry-run 不写盘，继续执行；但上表「现账本」列是按空账本对比的，仅供参考');
+    }
     console.log('');
     console.log('这是 dry-run，未写任何文件。确认无误后执行：node backfill.js --write');
     return;
+  }
+
+  // v3.63.2（外部审计 N3 修复）：写入前必须完整读懂现账本 —— 读不懂就中止，
+  //   绝不按空账本合并（那会用重放值整本替换，抹掉重放范围外的历史日期且零告警）。
+  if (ledgerReadError) {
+    console.error(ledgerReadError);
+    console.error('[backfill] 已中止：不按空账本合并。请先修复 daily-usage.json'
+      + '（或用最近的 .corrupt-* / .bak-backfill-* 备份还原）后重试');
+    process.exit(1);
   }
 
   // --write：先备份，再落账本 + 水位线（原子写）
@@ -658,8 +703,11 @@ function main() {
     } else if (postStat === null || postStat.size !== baseStat.size || postStat.mtimeMs !== baseStat.mtimeMs) {
       return { aborted: true };
     }
-    let cur = {};
-    try { cur = JSON.parse(fs.readFileSync(DAILY, 'utf-8')); } catch (e) { cur = {}; }
+    // v3.63.2（N3）：锁内重读同样不许静默回落空账本。预检之后、锁内之前被改坏的窗口极小，
+    //   但真发生时必须中止 —— 拿空账本去合并 = 用重放值整本替换、抹掉重放范围外的历史日期。
+    const rd = readLedgerStrict('锁内重读');
+    if (!rd.ok) return { aborted: true, reason: 'ledger-unreadable', error: rd.error };
+    const cur = rd.cur;
     // v3.55.0（审计批5·S3）：日期级整块替换 → **模型级 merge**（纯函数已抽到 ledger-merge.js，可单测）。
     //   旧式 `Object.assign({}, cur, newDaily)` 的 key 是日期 → 同日期整块被 newDaily 顶掉：
     //   某模型的用量只存在于已删除/归档的 transcript（重放抓不到）时，账本里该模型当天的量被抹掉。
@@ -679,7 +727,14 @@ function main() {
     process.exit(1);
   }
   if (lockRes.result && lockRes.result.aborted) {
-    rollbackWatermark('写入前账本又被其他进程修改');
+    if (lockRes.result.reason === 'ledger-unreadable') {
+      // v3.63.2（N3）：账本在锁内读不懂 → 中止。水位线已在步骤 B 前推，主链按推高的水位线
+      //   跳过这些行 = **少记**方向、可恢复（与 v3.48.0 提交顺序倒置同一哲学：宁可少记，不重记）。
+      console.error(lockRes.result.error);
+      rollbackWatermark('账本读取失败，写入已中止');
+    } else {
+      rollbackWatermark('写入前账本又被其他进程修改');
+    }
     process.exit(1);
   }
   // v3.33.0（第四轮审计 B 系列）：`.bak-backfill-*` **有界保留**。
