@@ -1514,3 +1514,79 @@ if (st === 'nothing') { clearStopMark(sid); return false; }
   sub-only 轮需要子代理目录夹具，黑盒行为侧造不出，与 T109-a1 的竞态窄窗同性质；
   R77（删 `!agg.total` 早清行）只红 T107-a6 —— 该行**行为不可达**（`total=0` 不可达），
   真正兜住真空轮的是 R78 对应的 `roundHasRowsNoUsage` 判据。
+
+## KI-42 toast 失败仍写「已弹过」毒记录 → 弹窗永久丢失 + 恢复路径被全断（2026-10-19 外部审计 AUD-B-01【P1】，**已修 v3.63.3**）
+
+### 现象（另一会话按审计规范 v3 审出，主代理逐条实证）
+
+`showToast` 全出口**裸 return**（测试静默开关 / 同文案去重跳过 / 非 win32 / 成功与 catch 同形），
+`showToastsSplitByModel` 也无脑 `return true`（`parts<=1` 除外）⇒ 4 处 `markToastShown`
+**无条件执行**：toast 调用失败（`execFileSync('powershell.exe')` 抛异常，如 PATH 缺失 /
+PowerShell 被策略拦）时照样写「已弹过」= 毒记录 —— 下次同轮判重直接静默，这条弹窗
+**永久不再出现**。
+
+比报告写的更深一层：`stop-handler.js` 收口三件事（推进 `lastStopAt` / `clearStopMark` /
+写「已完成」日志）也无条件执行 ⇒ `recoverKilledStop` 的闸①（`lastStopAt < lastUserMsgAt`）
+被全断，**不是只丢一条弹窗**。
+
+⚠ 这架空的是 **v3.63.2（KI-41/S7）自身的前提**——注释白纸黑字「记录只在弹窗成功后写」，
+但实现里**根本没有成功信号可依赖**。本项目第二起「注释与代码分裂」（第一起：`!agg.total`
+早清路径实际不可达，同批修掉）。且 v3.61.0 已存在的正确失败路径（catch 里「lastStopAt 保持
+不推进、轮保持开放 → 下轮补弹」）被 showToast 内部吞异常架空。
+
+### 已修（v3.63.3）
+
+- **`showToast` 返回 boolean = 是否可视为已呈现**：三个等价出口（测试静默开关 / 同文案去重
+  跳过 / 非 win32）与成功路径返 `true`；**catch 返 `false`**（调用方唯一可依赖的失败信号）。
+- **`showToastsSplitByModel`**：任一条 toast 失败即整体返 `false`，且**首败即停**
+  （execFileSync 失败通常是整机性，剩余条必然同样失败）；`parts<=1` 早退 false 保留。
+- **4 处 `markToastShown` 全部条件化**（split / 单条 / no-token / recover 四条路径）。
+- **`stop-handler` 收口**：toast 失败时三件事一件不办 —— 不推进 `lastStopAt`、不清
+  stopmark、不写已完成日志；留痕 `stop-sync-toast-show-failed`。轮保持开放，下次 `--hook`
+  从原轮起点重新聚合补弹。**不造新机制**：收敛到 v3.61.0 既有失败路径。
+- **`recoverKilledStop`**：弹窗失败 → 保留 stopmark + `stopMarkBump(sid, mk, 'toast-failed')`
+  + 留痕 `stop-killed-recover-toast-failed`，绝不写记录（写了 = KI-41 要修的东西复活）。
+- 判据边界（刻意不回滚）：no-token 分支上方（v3.08）已推进 `lastStopAt`，本轮无用量、
+  纯提示条丢了只是少一条提示；回滚会让起点刷新守卫失效、下轮弹窗数值偏大（v3.03 蝴蝶效应）。
+
+### 验收
+
+- 守卫 **T111-a1~a5**（源码：showToast 出口形态 / split 汇总返回 / 三处 mark 条件化 /
+  收口三不办 / recover 失败分支在记录之前）+ **T111-b1~b3**（真 spawn：`--stop` 普通轮
+  PATH 剥离注入 toast 失败 → 不写记录、保留标记、不推进 lastStopAt、留痕；**对照组**同夹具
+  正常环境 → 全部相反，证明断言有鉴别力不是恒真；`--hook` 恢复路径同注入）。
+- T101-b2 桩适配（`tx.showToast` 必须返 true）；T108-a1 锚点适配（no-token 改 if 包裹，
+  顺序断言继续守护「先弹后写」）。
+- 反向 **R80~R84** 逐项染红、零误伤。首轮跑出三处**守卫空洞**，已修并复跑（细节如下，
+  这几条比"全中"本身更有价值）：
+  - **R80 变异前两版都不合格**：首版 `if (true && showToast(…)` 与原文**语义等价**（空变异，
+    只红源码守卫）；改成 `true ||` 又把 toast 调用本身短路掉，多红 T82-b7/T83-b3/T101-b2/
+    T108-b1~b5（那是"根本没弹"，不是本缺陷形态）。最终用**最小变异**：toast 照常调用，
+    只把 `markToastShown` 挪出成功判定 → 精确红 a3+b1。
+    **教训：变异必须语义真有差，且只差在被测的那一点上。**
+  - **R81 暴露行为夹具覆盖不到分条分支**：b1/b3 原为**单模型轮**，`splitByModelStats` 只出
+    1 条 → `showToastsSplitByModel` 早退 false → 永远走单条路径，"任一条失败整体 false"
+    无人覆盖。夹具改为**两模型轮**（b1/b2 与 b3 都改），R81 才连红 b1+b3。
+    **教训：行为夹具必须命中被守护的那个分支，不是"跑到了附近"。**
+  - **R84 暴露 T111-a5 锚点不唯一**：`if (!recoverShown) {` 在该函数出现两次
+    （① split 失败回落单条 ② 单条也失败＝真失败分支），旧断言 `indexOf` 命中的是 ①，
+    把 ② 改不可达照样绿。改为锚 `stopMarkBump(sid, mk, 'toast-failed')` 并回看它必须被
+    `if (!recoverShown)` 直接包裹。**教训：源码守卫的锚点必须唯一到那一处。**
+  - **R82 只有源码守卫**（如实标注，不假装有行为覆盖）：`return;` 与 `return false;` 在调用方
+    `if (showToast(…))` 里同为假，落地行为完全一致，差别只在接口契约是否显式 —— 结构上
+    行为侧测不出，由 T111-a1（无裸 return）守。
+  - 首轮 R82/R83 曾额外红 `T12-j0/j1/j2`（`--hook` spawn 速度断言），单跑与次轮均不复现
+    → 按既定纪律判为**连跑压机器的 spawn 假红**，不计误伤。
+- 失效边界（如实说明）：split 多模型弹到一半失败 → 调用方回落单条组合 toast → 已成功的
+  几条被重复覆盖一次。**取「多重弹一次」而非「永久丢一条」**（丢弹不可恢复，重复可恢复）。
+  toast 失败后该会话再无任何事件（用户关电脑走人）→ 补弹依然不发生，批10 起既有边界。
+
+## KI-43 `.toasted-<sid>.json` 无清理路径（2026-10-19 外部审计 G-03【P3】，**有意不加，仅登记**）
+
+`.toasted-*`（v3.63.1 批14 引入的弹窗去重记录）没有任何 unlink 路径，长期运行会堆积
+（单文件只存 3 字段，约几百 KB 量级）。
+
+**决定不加清理**：清了就丢 KI-41/S7 的判据（「这个 round 弹过没有」的唯一真相源），
+而判据要求「记录永久可查」——60s 时间窗只约束「同轮静默」，不授权删除。按 60s 窗 +
+体积实测（几百 KB / 月）评估为可接受；若将来单文件体积或数量成为问题，优先收窄写入条件
+（如只对真实用量轮写记录），不做定时清理。

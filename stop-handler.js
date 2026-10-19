@@ -444,6 +444,10 @@ function handleStopEndInner(ctx) {
             //   （该轮 30.2万 里 21.8万 实际是 hy4），用户无法从弹窗看出真实构成。
             //   改为统一先试按模型分条：≥2 模型才分条，单模型时该函数返回 false → 回落原单条
             //   路径（逐字节不变）。它只遍历已聚合的 agg.models，不额外扫盘，"白扫盘"的顾虑不存在。
+            // v3.63.3（AUD-B-01）：split / showToast 现在返回「是否可视为已呈现」。
+            //   toast 真失败（execFileSync 抛异常）时**不写**「已弹过」记录 —— 旧版无条件写，
+            //   失败与成功同形，正是 KI-42 的毒记录（v3.63.2 的 S7 修复在这里被架空）。
+            let toastFailed = false;
             if (!dupShown && showToastsSplitByModel(agg, {
               pricing, tsPath, roundStart: aggStart0,
               bal: balanceText(), firstToday: todayUsageTxt(),
@@ -454,15 +458,27 @@ function handleStopEndInner(ctx) {
               markToastShown(effSid, roundStart0, dedupeFp);
               appendCompactionLog(isPlainRound ? 'stop-plain-immediate-split' : 'stop-team-sync-split', { sid: effSid, parts: Object.keys((agg && agg.models) || {}) });
             } else if (!dupShown) {
-              showToast(
+              if (showToast(
                 toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), balanceText(), todayUsageTxt(), noPriceTag1(agg, pricing)),
                 toastLine2(agg, pricing),
                 syncReason,
                 tsPath
-              );
-              markToastShown(effSid, roundStart0, dedupeFp);
+              )) {
+                markToastShown(effSid, roundStart0, dedupeFp);
+              } else {
+                toastFailed = true; // v3.63.3（AUD-B-01）：失败 → 下面三件收口全部不办
+              }
             }
             clearCoalesce(effSid);
+            if (toastFailed) {
+              // v3.63.3（AUD-B-01）：toast 失败时收口三件事**一件都不办**：
+              //   不推进 lastStopAt / 不清 stopmark / 不写「已完成」日志。
+              //   → 轮保持开放，下次 --hook 从原轮起点重新聚合补弹（收敛到 v3.61.0 既有失败路径，
+              //   不造新机制）。⚠ 不清 stopmark 是 KI-41/S7 的前提：标记在，recoverKilledStop
+              //   才有机会补弹；标记一删，Stop 再被杀就连入口都没了。
+              try { appendCompactionLog('stop-sync-toast-show-failed', { sid: effSid, isPlainRound }); }
+              catch (e3) { /* silent-ok:诊断 — 留痕自身失败无从可写，放弃 */ }
+            } else {
             // v3.03（蝴蝶效应修复）：**普通轮必须自己推进 lastStopAt**。
             //   原设计里 lastStopAt 由 watcher 弹窗完成后推进（见 --flush-delayed 内注释）。
             //   本分支改为同步弹窗、不启动 watcher 后，若此处不推进，则：
@@ -484,6 +500,7 @@ function handleStopEndInner(ctx) {
             //   .stopmark-*.json（实测 89eb68b8 会话残留），虽被状态闸兜住但会永久堆积。
             clearStopMark(sid);
             appendCompactionLog(isPlainRound ? 'stop-plain-immediate' : 'stop-team-sync', { sid: effSid, subCount: agg && agg.subCount, teamActive: !!(agg && agg.teamActive), teamDataReady });
+            } // v3.63.3（AUD-B-01）：toastFailed 分支的 else 收口
           } catch (e) {
             process.stderr.write(`[token-tracker] 同步弹窗失败(${isPlainRound ? '普通轮' : '团队轮'}): ${e.message}\n`);
             // v3.61.0（审计 S1/S4）：toast 失败**不能再静默**。
@@ -670,8 +687,16 @@ function handleStopEndInner(ctx) {
           out({ hookSpecificOutput: {} });
           return true;
         }
-        showToast('本轮无 token 消耗记录', body0, 'no-token');
-        markToastShown(sid, roundStart0, 'null');
+        // v3.63.3（AUD-B-01）：toast 失败不写「已弹过」记录（否则下次同轮直接静默 = 丢弹）。
+        //   ⚠ 本分支上方（v3.08 修复2）**已推进 lastStopAt**，此处刻意不回滚：本轮无用量，
+        //   「本轮无 token」纯提示条丢了只是少一条提示；回滚 lastStopAt 会让起点刷新守卫失效、
+        //   下轮弹窗数值偏大（v3.03 蝴蝶效应）。判据边界记入 KI-42。
+        if (showToast('本轮无 token 消耗记录', body0, 'no-token')) {
+          markToastShown(sid, roundStart0, 'null');
+        } else {
+          try { appendCompactionLog('no-token-toast-show-failed', { sid, roundStart: roundStart0 }); }
+          catch (e6) { /* silent-ok:诊断 — 留痕自身失败无从可写，放弃 */ }
+        }
         out({ hookSpecificOutput: {} });
         return true;
       }

@@ -9236,7 +9236,9 @@ const txInjectionComplete = (ttSrc, shSrc) => (
       tx.toastLine1 = () => 'l1'; tx.toastLine2 = () => 'l2'; tx.toastLineTagged = () => 'l3';
       tx.periodNote = () => ''; tx.balanceText = () => ''; tx.todayUsageTxt = () => ''; tx.noPriceTag1 = () => '';
       tx.showToastsSplitByModel = () => false;
-      tx.showToast = (...a) => { calls.push('toast:' + a[2]); };
+      // v3.63.3（AUD-B-01）：桩必须返 true —— showToast 现在返回「是否可视为已呈现」，
+      //   返 undefined 会被产品代码判成 toast 失败 → 走失败收口（不写 stop-plain-immediate）。
+      tx.showToast = (...a) => { calls.push('toast:' + a[2]); return true; };
       tx.clearCoalesce = () => {}; tx.writeCoalesce = () => {}; tx.coalescePath = () => 'C:/fixture101/c.json';
       tx.readCoalesceInfo = () => null;
       tx.incrementalRecord = () => { calls.push('incrementalRecord'); };
@@ -10108,7 +10110,9 @@ const txInjectionComplete = (ttSrc, shSrc) => (
   const tt108 = strip108(tt108raw);
   const sh108 = strip108(sh108raw);
 
-  const iNoShow = sh108.indexOf("showToast('本轮无 token 消耗记录', body0, 'no-token');");
+  // v3.63.3（AUD-B-01）：锚点去掉行尾分号 —— no-token 路径已改为 if(showToast(...)) 包裹
+  //   （弹窗失败不写记录），但「先弹后写」的顺序断言必须继续守护。
+  const iNoShow = sh108.indexOf("showToast('本轮无 token 消耗记录', body0, 'no-token')");
   const iNoMark = sh108.indexOf("markToastShown(sid, roundStart0, 'null');");
   ok('T108-a1 ★no-token 路径必须「先判重 → 再弹 → 弹完写记录」三件齐全'
     + '（只判不写 = 永远判不中；写完再弹 = 没弹成也算弹过，下次永久吞掉）',
@@ -10479,6 +10483,217 @@ const txInjectionComplete = (ttSrc, shSrc) => (
     try {
       if (wmBak110 === null) fs.unlinkSync(wmPath110);
       else fs.writeFileSync(wmPath110, wmBak110);
+    } catch (e) { /* silent-ok:测试收尾，还原失败不影响断言结论 */ }
+  }
+}
+
+// ===== T111（v3.63.3 · 外部审计 AUD-B-01，P1）：toast 失败不得写「已弹过」毒记录 ==========
+//   病根（另一会话按审计规范 v3 审出，主代理逐条实证）：`showToast` 全出口**裸 return**，
+//   `showToastsSplitByModel` 也无脑 `return true` ⇒ 4 处 `markToastShown` 无条件执行 ——
+//   toast 调用失败（execFileSync 抛异常）时照样写「已弹过」= 毒记录：下次同轮判重直接静默，
+//   这条弹窗**永久不再出现**。更深一层：stop-handler 收口三件事（推进 lastStopAt /
+//   clearStopMark / 写已完成日志）也无条件执行 ⇒ 恢复路径 recoverKilledStop 的闸①被全断。
+//   ⚠ 这架空的是 v3.63.2（KI-41/S7）自身的前提 —— 注释白纸黑字「记录只在弹窗成功后写」，
+//     但实现里**根本没有成功信号可依赖**。本项目第二起「注释与代码分裂」（第一起：!agg.total 不可达）。
+//   ⚠ 修复不造新机制：v3.61.0 :488 catch 早已写明正确失败路径（lastStopAt 不推进、轮保持开放、
+//     下轮补弹），只是被 showToast 内部吞异常架空。本次只是把失败信号传出来。
+//   ★ 行为侧注入方式：**PATH 剥离**（execFileSync('powershell.exe') ENOENT）——
+//     唯一依赖 PATH 的外部调用就是它（其余全用 process.execPath 绝对路径，实测已核）。
+//     同时必须删掉 TOKEN_TRACKER_NO_TOAST（该开关会提前 return true，注入就失效）。
+//     绝不能用「真跑一次失败弹窗」——硬规矩：测试禁止真弹窗。
+{
+  const src111 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8'));
+  const sh111 = stripComments(fs.readFileSync(path.join(SRC, 'stop-handler.js'), 'utf-8'));
+  const fnBody111 = (code, name) => {
+    const i = code.indexOf('function ' + name + '(');
+    if (i < 0) return '';
+    const j = code.indexOf('\nfunction ', i + 10);
+    return code.slice(i, j > 0 ? j : i + 6000);
+  };
+  const toastFn = fnBody111(src111, 'showToast');
+  const splitFn = fnBody111(src111, 'showToastsSplitByModel');
+
+  ok("T111-a1 ★showToast 必须返回「是否可视为已呈现」：三个等价出口（测试静默/同文案去重跳过/非 win32）"
+    + "与成功路径返 true、异常路径返 false、**无裸 return** —— 旧版全出口裸 return，失败与成功同形，"
+    + "调用方只能无条件写记录（KI-42 毒记录的直接来源）",
+    (toastFn.match(/return true;/g) || []).length >= 4
+    && /catch \(e\) \{[\s\S]{0,240}return false;/.test(toastFn)
+    && (toastFn.match(/return;/g) || []).length === 0,
+    `true 出口数=${(toastFn.match(/return true;/g) || []).length} 裸 return=${(toastFn.match(/return;/g) || []).length}`);
+
+  ok('T111-a2 ★showToastsSplitByModel 任一条 toast 失败即整体返 false（且首败即停）'
+    + '—— 旧版无脑 return true；⚠ parts<=1 的早退 false 必须保留（调用方靠它回落单条路径）',
+    /if \(parts\.length <= 1\) return false;/.test(splitFn)
+    && /if \(!allOk\) break;/.test(splitFn)
+    && /return allOk;/.test(splitFn)
+    && (splitFn.match(/return true;/g) || []).length === 0,
+    `早退=${/if \(parts\.length <= 1\) return false;/.test(splitFn)} 首败即停=${/if \(!allOk\) break;/.test(splitFn)} 结尾=${/return allOk;/.test(splitFn)}`);
+
+  ok('T111-a3 ★stop-handler 三处 markToastShown 全部条件化（每次调用都落在 showToast/split 的'
+    + '成功判定 if 之内）—— 无条件写 = 弹窗失败也记「已弹过」= 下次同轮直接静默丢弹',
+    (() => {
+      if ((sh111.match(/markToastShown\(/g) || []).length !== 3) return false;
+      let idx = -1;
+      for (let k = 0; k < 3; k++) {
+        idx = sh111.indexOf('markToastShown(', idx + 1);
+        if (idx < 0) return false;
+        // 判据要求「if (showToast(」/「if (!dupShown && showToastsSplitByModel(」紧贴在前——
+        // 无条件写法（showToast(...); markToastShown(...)）不匹配该形态，会被抓红。
+        const win = sh111.slice(Math.max(0, idx - 520), idx);
+        if (!/if \(showToast\(|if \(!dupShown && showToastsSplitByModel\(/.test(win)) return false;
+      }
+      return true;
+    })(), `调用点数=${(sh111.match(/markToastShown\(/g) || []).length}（应为 3）`);
+
+  ok('T111-a4 ★toast 失败时收口三件事**一件都不办**：不推进 lastStopAt、不清 stopmark、'
+    + '不写「已完成」日志 —— 轮保持开放等下次 --hook 补弹（收敛到 v3.61.0 既有失败路径）',
+    (() => {
+      const i = sh111.indexOf('if (toastFailed) {');
+      if (i < 0) return false;
+      const j = sh111.indexOf('} else {', i);
+      const blk = j > i ? sh111.slice(i, j) : '';
+      return /stop-sync-toast-show-failed/.test(blk)
+        && blk.indexOf('clearStopMark') < 0
+        && blk.indexOf('lastStopAt: Date.now()') < 0
+        && blk.indexOf("'stop-plain-immediate'") < 0;
+    })());
+
+  ok('T111-a5 ★恢复路径（recoverKilledStop）弹窗失败 → 保留 stopmark + 不写记录 + 留痕 + bump 重试'
+    + '—— 标记一删，Stop 再被杀就连补弹入口都没了（KI-41 的前提）',
+    /stop-killed-recover-toast-failed/.test(src111)
+    && /stopMarkBump\(sid, mk, 'toast-failed'\)/.test(src111)
+    && (() => {
+      // ⚠ 锚点必须**唯一到那一处**：`if (!recoverShown) {` 在本函数出现两次
+      //   （① split 失败→回落单条 ② 单条也失败→真失败分支）。旧写法 indexOf 命中的是 ①，
+      //   把 ② 改成不可达它也照样绿（R84 暴露的守卫空洞）。改为锚 bump 语句本身，
+      //   再回看它必须被 `if (!recoverShown)` 直接包裹。
+      const iBump = src111.indexOf("stopMarkBump(sid, mk, 'toast-failed')");
+      if (iBump < 0) return false;
+      // 只看 bump **最近的那个** if —— 取 300 字窗口再用 lastIndexOf('if (') 定位，
+      //   窗口开大一点没关系（多含了上游代码也无所谓），关键是不能把上一个同形 if 也算进来。
+      const before = src111.slice(Math.max(0, iBump - 300), iBump);
+      const lastIf = before.lastIndexOf('if (');
+      const guard = lastIf >= 0 ? before.slice(lastIf) : '';
+      const iMark = src111.indexOf('markToastShown(sid, mk.roundStart || 0, dedupeFp)');
+      return guard.indexOf('if (!recoverShown) {') === 0 && iMark > iBump;
+    })(), `bump@${src111.indexOf("stopMarkBump(sid, mk, 'toast-failed')")} 记录@${src111.indexOf('markToastShown(sid, mk.roundStart || 0, dedupeFp)')}`);
+
+  if (!SPAWN_OK) envSkip('T111-b1~b3 toast 失败信号端到端', SPAWN_SKIP_REASON);
+  else {
+    const proj111 = path.join(tmp, 'c111', 'projects');
+    fs.mkdirSync(proj111, { recursive: true });
+    const toastLog111 = path.join(tmp, 'token-tracker-toast.log');
+    const compLog111 = path.join(tmp, 'token-tracker-compaction.log');
+    const off111 = () => { try { return fs.statSync(toastLog111).size; } catch (e) { return 0; } };
+    const offC111 = () => { try { return fs.statSync(compLog111).size; } catch (e) { return 0; } };
+    const slice111 = (o) => { try { return fs.readFileSync(toastLog111).slice(o).toString('utf8'); } catch (e) { return ''; } };
+    const sliceC111 = (o) => { try { return fs.readFileSync(compLog111).slice(o).toString('utf8'); } catch (e) { return ''; } };
+    // PATH 剥离注入：空目录里没有任何可执行文件 → execFileSync('powershell.exe') 抛 ENOENT
+    //   → showToast 走 catch 返 false。唯一影响的就是 toast（其余调用全用 process.execPath）。
+    const emptyBin = path.join(tmp, 'c111-emptybin');
+    fs.mkdirSync(emptyBin, { recursive: true });
+    const failEnv = Object.assign({}, process.env, {
+      WB_ROOT: tmp, WB_NO_NET: '1', WB_LEDGER_MAINT: '1', PATH: emptyBin, Path: emptyBin,
+    });
+    delete failEnv.TOKEN_TRACKER_NO_TOAST;   // 该开关会提前 return true，注入即失效
+    const okEnv = Object.assign({}, process.env, {
+      WB_ROOT: tmp, WB_NO_NET: '1', WB_LEDGER_MAINT: '1', TOKEN_TRACKER_NO_TOAST: '1',
+    });
+    const T0_111 = Date.now() - 6 * 3600 * 1000;
+    let seq111 = 0;
+    const urow111 = (ts, i, o, mdl) => JSON.stringify({ type: 'assistant', id: 'c111u' + (seq111++), timestamp: ts,
+      providerData: { model: mdl || 'probe-model', messageId: 'c111m' + seq111, usage: { input_tokens: i, output_tokens: o } } });
+    const uhead111 = (ts) => JSON.stringify({ type: 'message', role: 'user', id: 'c111h' + ts, timestamp: ts,
+      content: [{ type: 'text', text: 'hi' }] });
+    // ⚠ 必须**两个模型**：只有 ≥2 模型才会走 showToastsSplitByModel 分条路径。
+    //   单模型时 split 早退 false → 只测到单条分支，分条分支「任一条失败整体 false」无人覆盖
+    //   （R81 暴露：变异后 b1/b3 全绿）。
+    const rows111 = [uhead111(T0_111), urow111(T0_111 + 1000, 1000, 100),
+      urow111(T0_111 + 2000, 2000, 200, 'probe-model-b'), urow111(T0_111 + 2500, 300, 30)];
+    // ⚠ 每次跑前把快照 lastStopAt 重置回「本轮之前」——与 T108 同款教训：不重置会被旧闸抢先挡住（假绿）
+    const runStop111 = (name, env) => {
+      const sid = 'c111-' + name;
+      const tsPath = path.join(proj111, sid + '.jsonl');
+      fs.writeFileSync(tsPath, rows111.join('\n') + '\n');
+      fs.writeFileSync(path.join(skillDir, '.snapshot-' + sid + '.json'), JSON.stringify({
+        file: tsPath, stat: { total: 0, model: 'probe-model' }, lastUserMsgAt: T0_111, lastStopAt: T0_111 - 60000,
+      }));
+      const off = off111();
+      const offC = offC111();
+      const r = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--stop'], {
+        input: JSON.stringify({ session_id: sid, transcript_path: tsPath, cwd: tmp }),
+        env, timeout: 120000, windowsHide: true, encoding: 'utf8',
+      });
+      let snap = {};
+      try { snap = JSON.parse(fs.readFileSync(path.join(skillDir, '.snapshot-' + sid + '.json'), 'utf8')); } catch (e) { snap = {}; }
+      return {
+        rc: r.status, err: String(r.stderr || '').slice(0, 160),
+        diag: slice111(off), ctxt: sliceC111(offC),
+        toastRec: (() => { try { return JSON.parse(fs.readFileSync(path.join(skillDir, '.toasted-' + sid + '.json'), 'utf8')); } catch (e) { return null; } })(),
+        markLeft: fs.existsSync(path.join(skillDir, '.stopmark-' + sid + '.json')),
+        stopAt: Number(snap.lastStopAt || 0),
+      };
+    };
+
+    // b1：普通轮 Stop + toast 失败注入 → 四件必须同时成立（缺任何一件 = KI-42 复活）
+    const b1 = runStop111('fail', failEnv);
+    ok('T111-b1 ★端到端：toast 失败（PATH 剥离注入）→ 不写「已弹过」记录、保留在飞标记、'
+      + '不推进 lastStopAt、留痕 stop-sync-toast-show-failed',
+      b1.rc === 0 && b1.toastRec === null && b1.markLeft && b1.stopAt === T0_111 - 60000
+      && /"event":"stop-sync-toast-show-failed"/.test(b1.ctxt),
+      `rc=${b1.rc} rec=${JSON.stringify(b1.toastRec)} markLeft=${b1.markLeft} stopAt推进=${b1.stopAt !== T0_111 - 60000} 留痕=${/"event":"stop-sync-toast-show-failed"/.test(b1.ctxt)} err=${b1.err}`);
+
+    // b2（对照组）：同夹具 + 正常环境 → 必须全部相反。
+    //   ⚠ 没有这个对照组，b1 的断言可能「恒真」（比如 toast 路径根本没走到）——行为守卫的鉴别力证明。
+    const b2 = runStop111('ok', okEnv);
+    ok('T111-b2 ★对照组：同夹具 + 正常环境 → 记录写入、标记清掉、lastStopAt 推进'
+      + '（证明 b1 断言有鉴别力，不是恒真）',
+      b2.rc === 0 && !!b2.toastRec && !b2.markLeft && b2.stopAt > T0_111
+      && !/"event":"stop-sync-toast-show-failed"/.test(b2.ctxt),
+      `rc=${b2.rc} rec=${JSON.stringify(b2.toastRec)} markLeft=${b2.markLeft} stopAt=${b2.stopAt} err=${b2.err}`);
+
+    // b3：恢复路径（--hook + stopmark + 水位线预置 nothing）+ toast 失败注入
+    //   → 不写记录、保留 stopmark、留痕 stop-killed-recover-toast-failed
+    const sid3 = 'c111-recover';
+    const tsPath3 = path.join(proj111, sid3 + '.jsonl');
+    const T1_111 = Date.now() - 2 * 3600 * 1000;
+    let seq3 = 0;
+    const urow3 = (ts, i, o, mdl) => JSON.stringify({ type: 'assistant', id: 'c111r' + (seq3++), timestamp: ts,
+      providerData: { model: mdl || 'probe-model', messageId: 'c111rm' + seq3, usage: { input_tokens: i, output_tokens: o } } });
+    // 同样两模型 → 覆盖恢复路径的分条分支（split 失败也要走到失败分支）
+    const rows3 = [urow3(T1_111 + 1000, 1000, 100), urow3(T1_111 + 2000, 2000, 200),
+      urow3(T1_111 + 2500, 400, 40, 'probe-model-b'), urow3(T1_111 + 3000, 500, 50)];
+    fs.writeFileSync(tsPath3, rows3.join('\n') + '\n');
+    fs.writeFileSync(path.join(skillDir, '.snapshot-' + sid3 + '.json'), JSON.stringify({
+      file: tsPath3, stat: { total: 0, model: 'probe-model' }, lastUserMsgAt: T0_111, lastStopAt: T1_111 - 60000,
+    }));
+    const mk3 = path.join(skillDir, '.stopmark-' + sid3 + '.json');
+    fs.writeFileSync(mk3, JSON.stringify({ at: T1_111 + 60000, tsPath: tsPath3, roundStart: T0_111, aggStart: T1_111 }));
+    const wmPath111 = path.join(skillDir, '.ledger-watermark.json');
+    let wmBak111 = null;
+    try { wmBak111 = fs.existsSync(wmPath111) ? fs.readFileSync(wmPath111, 'utf8') : null; } catch (e) { wmBak111 = null; }
+    let wm3 = {};
+    try { wm3 = JSON.parse(fs.readFileSync(wmPath111, 'utf8')); } catch (e) { wm3 = {}; }
+    wm3[sid3] = { main: 4 };   // 预置「已全部入账」（行数须与 rows3 一致）→ incrementalRecord 返 nothing → 进展示段
+    fs.writeFileSync(wmPath111, JSON.stringify(wm3));
+    const tp3 = path.join(skillDir, '.toasted-' + sid3 + '.json');
+    try { fs.unlinkSync(tp3); } catch (e) { /* 不存在则忽略 */ }
+    const off3 = off111();
+    const offC3 = offC111();
+    const r3 = spawnSync(NODE, [path.join(skillDir, 'token-tracker.js'), '--hook'], {
+      input: JSON.stringify({ session_id: sid3, transcript_path: tsPath3, prompt: 't', cwd: tmp }),
+      env: failEnv, timeout: 90000, windowsHide: true, encoding: 'utf8',
+    });
+    ok('T111-b3 ★端到端：恢复路径（已入账未弹窗）+ toast 失败 → 不写记录、保留 stopmark'
+      + '（下次 --hook 还有机会补弹）、留痕 stop-killed-recover-toast-failed',
+      r3.status === 0 && !fs.existsSync(tp3) && fs.existsSync(mk3)
+      && /"event":"stop-killed-recover-toast-failed"/.test(sliceC111(offC3)),
+      `status=${r3.status} rec在=${fs.existsSync(tp3)} markLeft=${fs.existsSync(mk3)} err=${String(r3.stderr || '').slice(0, 160)}`);
+
+    // 复原沙箱水位线（T110 同款收尾）
+    try {
+      if (wmBak111 === null) fs.unlinkSync(wmPath111);
+      else fs.writeFileSync(wmPath111, wmBak111);
     } catch (e) { /* silent-ok:测试收尾，还原失败不影响断言结论 */ }
   }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.63.2 (2026-10-18)
+// token-usage-tracker v3.63.3 (2026-10-19)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -454,11 +454,23 @@ function recoverKilledStop(o) {
     const model = entry ? baseName + subagentTagOf(entry) : baseName;
     const bal = balanceText();
     const todayTxt = todayUsageTxt();
-    if (!showToastsSplitByModel(agg, {
+    // v3.63.3（AUD-B-01）：showToast / split 现在返回「是否可视为已呈现」——
+    //   弹窗失败（execFileSync 抛异常）时**不许**写「已弹过」记录、不许收口（KI-41 的
+    //   S7 前提：记录只在弹窗成功后写；旧代码这里无条件写，注释与实现第二次分裂）。
+    let recoverShown = showToastsSplitByModel(agg, {
       pricing: o.pricing, tsPath: mk.tsPath, roundStart: mk.roundStart || 0,
       subs: subsMap, firstToday: todayTxt, reason: 'stop-killed-recover',
-    })) {
-      showToast(toastLine1(agg, model, periodNote(agg, o.pricing), bal, todayTxt, noPriceTag1(agg, o.pricing)), toastLine2(agg, o.pricing), 'stop-killed-recover');
+    });
+    if (!recoverShown) {
+      recoverShown = showToast(toastLine1(agg, model, periodNote(agg, o.pricing), bal, todayTxt, noPriceTag1(agg, o.pricing)), toastLine2(agg, o.pricing), 'stop-killed-recover');
+    }
+    if (!recoverShown) {
+      // 弹窗真失败 → 保留 stopmark + 不推进 lastStopAt：轮保持开放，下次 --hook 重入本函数重试。
+      //   绝不写 markToastShown（那会让这条弹窗永久不再出现，正是 KI-41 要修的东西）。
+      try { appendCompactionLog('stop-killed-recover-toast-failed', { sid, aggStart, tries: mk.tries || 0 }); }
+      catch (e2) { /* silent-ok:诊断 — 留痕自身失败无从可写，放弃 */ }
+      stopMarkBump(sid, mk, 'toast-failed');
+      return false;
     }
     // v3.63.2（S7）：补弹成功后同样写「已弹过」记录 —— 与批14 正常 Stop 路径同口径
     //   （记录**只在弹窗成功后**写；写在前面 = "没弹成也算弹过"）。挡住并发双投的第二次。
@@ -2024,6 +2036,12 @@ function showToastsSplitByModel(agg, opts) {
   if (parts.length <= 1) return false;
   const subs = o.subs || subagentModelSet(o.tsPath, o.roundStart || 0);
   const mainKey = normalizeModelName(agg.modelMain || '');
+  // v3.63.3（AUD-B-01）：任一条 toast 失败即整体返 false。旧版无脑 return true，
+  //   失败与「已分条弹完」同形 → 调用方无条件写「已弹过」= KI-42 毒记录。
+  //   ⚠ 首条失败即 break（不再试剩余条）：execFileSync 失败通常是整机性（PATH/powershell 缺失），
+  //     剩余条必然同样失败；且调用方收到 false 会回落单条组合 toast —— 先弹完的几条会被
+  //     组合条重复覆盖一次。**取「多重弹一次」而非「永久丢一条」**（丢弹不可恢复，重复可恢复）。
+  let allOk = true;
   for (let i = 0; i < parts.length; i++) {
     const p = parts[i];
     const mShort = shortModelName(p.stat, pricing);
@@ -2045,15 +2063,16 @@ function showToastsSplitByModel(agg, opts) {
       ? [periodNote(p.stat, pricing), o.periodSuffix].filter(Boolean).join(' ')
       : periodNote(p.stat, pricing);
     if (needTag) {
-      showToast(toastLineTagged(p.stat, pricing, tag), toastLine2(p.stat, pricing), o.reason || 'split-by-model', o.tsPath);
+      allOk = showToast(toastLineTagged(p.stat, pricing, tag), toastLine2(p.stat, pricing), o.reason || 'split-by-model', o.tsPath) && allOk;
     } else {
-      showToast(
+      allOk = showToast(
         toastLine1(p.stat, shortModelName(p.stat, pricing), periodI, balI, todayI, noPriceTag1(p.stat, pricing)),
         toastLine2(p.stat, pricing), o.reason || 'split-by-model', o.tsPath,
-      );
+      ) && allOk;
     }
+    if (!allOk) break; // v3.63.3（AUD-B-01）：见上方注释 —— 首败即停
   }
-  return true;
+  return allOk;
 }
 
 // watcher 用：roundStart 后是否有 timestamp > sinceMs 的新调用（主 transcript）或子代理文件 mtime > sinceMs
@@ -5413,6 +5432,11 @@ function reportSummaryTxt(arg) {
 // 调用后立即清 coalesce / 释放锁 / return 退出；若用 detached+unref 异步 spawn，父进程（watcher）退出时
 // PowerShell 子进程会被一起带走（宿主 job object 管理 hook 进程树，detached 不一定能脱离），toast 还没弹出就丢失。
 // 同步 execFileSync 阻塞几百毫秒保证 toast 弹出后父进程才退出，与本函数调用位置（循环收口后）完全契合，不存在阻塞副作用。
+// 返回 boolean = 本次 toast 是否**可视为已呈现**（v3.63.3 AUD-B-01：调用方凭此决定要不要写「已弹过」记录）。
+//   三种「等价已呈现」返 true：测试静默开关（诊断日志已写，夹具行为不变）/ 同文案去重跳过
+//   （十分钟内刚弹过同一文案）/ 非 win32（该平台无系统通知机制）。
+//   execFileSync 成功返 true；**抛异常返 false** —— 这是调用方唯一可依赖的失败信号
+//   （旧版全出口裸 return，失败与成功同形，调用方只能无条件写记录 = KI-42 毒记录）。
 // 失败不阻断主流程（stderr 记录）。
 function showToast(line1, line2, reason, tsPath) {
   // v2.63.1：把实际文案拼进诊断日志；合并最近 watcher 轮询快照字段（gLastWatchState），
@@ -5431,7 +5455,7 @@ function showToast(line1, line2, reason, tsPath) {
   // v2.90：测试静默开关——TOKEN_TRACKER_NO_TOAST=1 时只写诊断日志、不调系统通知。
   // 【硬规矩（用户 2026-09-05 两次强调，已记 ~/.workbuddy/MEMORY.md）：一切测试/回放必须设此开关，
   // 禁止真弹窗与控制台闪烁骚扰前台】。诊断日志先行（上方 writeToastLog），断言照旧基于 toast 日志。
-  if (process.env.TOKEN_TRACKER_NO_TOAST === '1') return;
+  if (process.env.TOKEN_TRACKER_NO_TOAST === '1') return true;
   // v2.90：撤销 v2.87 的跨进程弹窗抑制（toastSuppressCheck）——实测误杀真弹窗：短轮（纯问答）
   // 每轮只往 transcript 加 2~4 行，"行数差<10=同轮重复"的假设不成立（实测 18:48 吞掉全新轮弹窗，
   // compaction log toast-suppressed 铁证）。它防的"同轮双弹"已被 v2.86 聚合起点根修覆盖，
@@ -5441,11 +5465,11 @@ function showToast(line1, line2, reason, tsPath) {
   const now = Date.now();
   if (gLastToastText !== null && toastState.toastText === gLastToastText && (now - gLastToastTs) < TOAST_DEDUP_MS) {
     process.stderr.write(`[token-tracker] toast 去重跳过: ${reason}\n`);
-    return;
+    return true;
   }
   gLastToastText = toastState.toastText;
   gLastToastTs = now;
-  if (process.platform !== 'win32') return;
+  if (process.platform !== 'win32') return true;
   // v2.34：line1 可能含真实换行符 \n（toastLine1 两行大字布局）。先 escapeXml 转义 &<>"'，
   // 再把 \n 转成 XML 实体 &#10;（若先转再 escapeXml，& 会被转成 &amp; 导致换行失效）
   // v3.19.0（P7 核查结论）：下方 XML 由 **单引号字面量**（'...'）承载 —— 单引号内 $( ) 与反引号都不展开，
@@ -5462,8 +5486,10 @@ function showToast(line1, line2, reason, tsPath) {
   try {
     const enc = Buffer.from(ps, 'utf16le').toString('base64');
     require('child_process').execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', enc], { timeout: 10000, stdio: 'ignore', windowsHide: true });
+    return true;
   } catch (e) {
     process.stderr.write(`[token-tracker] toast 失败: ${e.message}\n`);
+    return false;
   }
 }
 
@@ -6793,7 +6819,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.63.2'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.63.3'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

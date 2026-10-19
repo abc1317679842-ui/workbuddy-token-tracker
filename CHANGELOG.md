@@ -3,6 +3,51 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.63.3（2026-10-19）—— toast 失败不再写「已弹过」毒记录（AUD-B-01）
+
+> 触发：另一会话按《审计规范》v3 全量审出 AUD-B-01（P1）—— `showToast` 全出口裸 return、
+> `showToastsSplitByModel` 无脑 `return true` ⇒ 4 处 `markToastShown` 无条件写：toast 调用
+> 失败时照样记「已弹过」= 毒记录，下次同轮判重直接静默，这条弹窗**永久不再出现**；
+> 且收口三件事（推进 lastStopAt / clearStopMark / 写已完成日志）也无条件执行 ⇒
+> `recoverKilledStop` 闸①被全断。**不动账**（token 硬账不重不漏），修的是「静默丢失」。
+> ⚠ 它架空的是 v3.63.2（KI-41/S7）自身的前提：注释写「记录只在弹窗成功后写」，
+>   但实现里根本没有成功信号可依赖 —— 本项目第二起「注释与代码分裂」。
+
+### 一、AUD-B-01：toast 失败信号传出来，毒记录与恢复路径一起修
+
+- **`showToast` 返回 boolean = 是否可视为已呈现**：三个等价出口（测试静默开关 /
+  同文案去重跳过 / 非 win32）与成功路径返 `true`；**catch 返 `false`** —— 调用方唯一
+  可依赖的失败信号（旧版失败与成功同形）。
+- **`showToastsSplitByModel`**：任一条 toast 失败即整体返 `false`，**首败即停**
+  （execFileSync 失败通常是整机性）；`parts<=1` 早退 false 保留（调用方靠它回落单条）。
+- **4 处 `markToastShown` 全部条件化**：split / 单条 / no-token / recover 四条路径，
+  只有「本次确实弹成功了」才写「已弹过」。
+- **`stop-handler` 收口**：toast 失败时三件事一件不办（不推进 lastStopAt / 不清 stopmark /
+  不写已完成日志），留痕 `stop-sync-toast-show-failed` → 轮保持开放，下次 `--hook`
+  从原轮起点补弹。**不造新机制**：收敛到 v3.61.0 已有的失败路径（此前被吞异常架空）。
+- **`recoverKilledStop`**：弹窗失败 → 保留 stopmark + bump 重试 + 留痕
+  `stop-killed-recover-toast-failed`，绝不写记录（写了 = KI-41 要修的东西复活）。
+- 判据边界（刻意不回滚）：no-token 分支上方（v3.08）已推进 `lastStopAt`，本轮无用量、
+  纯提示条丢了只是少一条提示；回滚会让起点刷新守卫失效、下轮弹窗数值偏大。
+- 失效边界（如实说明）：split 多模型弹到一半失败 → 回落单条组合 toast → 已成功的几条
+  被重复覆盖一次。取「多重弹一次」而非「永久丢一条」。
+
+### 二、审计另两条的处置
+
+- **G-01（P2，本地/远端对象行尾分叉致 15839 行假 diff）**：不发代码修复，立流程纪律 ——
+  发版核 diff 一律带 `--ignore-cr-at-eol`；真相记入《执行纪律》§三·补闸③。
+- **G-03（P3，`.toasted-*` 无清理路径）**：**有意不加**，登记 KI-43 —— 清了就丢 KI-41
+  的判据；60s 窗只约束同轮静默，不授权删除。
+
+### 三、验证
+
+- 守卫 **T111-a1~a5**（源码：showToast 出口形态 / split 汇总返回 / 三处 mark 条件化 /
+  收口三不办 / recover 失败分支在记录之前）+ **T111-b1~b3**（真 spawn：PATH 剥离注入
+  toast 失败 → 不写记录、保留标记、不推进 lastStopAt、留痕；含正常环境对照组证明
+  断言有鉴别力）。
+- T101-b2 桩适配（`tx.showToast` 返 true）；T108-a1 锚点适配（顺序断言继续守护）。
+- 反向 **R80~R84** 逐项染红、BASE 零误伤。
+
 ## v3.63.2（2026-10-18）—— backfill 不再静默抹账本 + 已入账≠已弹窗
 
 > 触发：① 外部全量审计报告 N3「backfill 账本读不懂时按空账本合并」成立（P1）；
