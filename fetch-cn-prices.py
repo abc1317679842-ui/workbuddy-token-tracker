@@ -272,6 +272,28 @@ def parse_adjustment_notices(text, patterns=None):
 # 厂商配置。mode:
 #   tr     —— 页面含 <table>，逐行提取含"元"的行
 #   bundle —— SPA，价格硬编码在前端 JS bundle 里，需三步解析
+# v3.64.0（2026-10-21 页面改版，P1 停更修复）：Kimi 价格从 mintlify .md 源迁到 HTML 页的
+#   RSC 负载 —— chat-k3.md 已 308 跳 chat.md 且导出表格为空（旧路径解析 0 模型、
+#   价格永不更新，且无任何告警）。新形态（2026-10-21 实测）：
+#     HTML 内 DocTable 序列化 `columns:[{title:`模型`,width:`12%`},…],rows:[[`kimi-k3`,
+#     `1M tokens`,`¥20.00`,…]]`，单元格用**反引号**包裹；同一负载在页面里出现两次
+#     （raw + __next_f.push 转义），按 api_name 去重。k3 表 8 列（多出「缓存写入 TTL
+#     5min/1h」两列）、k2 表 6 列 —— 列数不固定，价格列必须按**表头语义**定位。
+KIMI_HTML_URL = 'https://platform.kimi.com/docs/pricing/chat'
+# 兜底路径：页面若回退到 .md 导出（旧格式：双引号 JSON 行），仍走 parse_kimi_row。
+KIMI_PAGES = ['chat-k3']
+# DocTable 块：columns:[...] 与 rows:[[...]] 必须同块匹配（列语义随表而异）。
+#   rows 组必须**配平括号**（深度 ≤3）—— 早期版本用 `rows:\s*\[(?P<rows>[\s\S]*?)\]\]`，
+#   外层 `[` 被模式吃掉、非贪婪又在行尾 `]]` 处收口 → 每组首/末行各缺一个括号，
+#   KIMI_BT_ROW_RE 永远配不齐（k3 表单行、k2 表末行静默漏掉，且无任何告警）。
+KIMI_TABLE_RE = re.compile(
+    r'columns:\s*\[(?P<cols>[^\[\]]*)\]\s*,\s*rows:\s*'
+    r'(?P<rows>\[(?:[^\[\]]|\[(?:[^\[\]]|\[[^\[\]]*\])*\])*\])')
+KIMI_TITLE_RE = re.compile(r'title:\s*`([^`]+)`')
+# 一行 = 反引号单元格数组（如 [`kimi-k3`,`1M tokens`,`¥20.00`,…]）
+KIMI_BT_ROW_RE = re.compile(r'\[\s*((?:`[^`]*`\s*,\s*)+`[^`]*`)\s*\]')
+KIMI_MODEL_RE = re.compile(r'^kimi-[0-9a-z.\-]+$', re.I)
+
 VENDORS = {
     # 阿里云(通义千问)不抓本地库——计费统一走聚合源(llmabacus)人民币价
     'minimax': {
@@ -312,7 +334,9 @@ VENDORS = {
     },
     'kimi': {
         'name': 'Kimi(Moonshot)',
-        'url': 'https://platform.moonshot.cn/docs/pricing/',
+        # v3.64.0（2026-10-21 页面改版）：价格迁到 HTML 页 RSC 负载（.md 导出已空表），
+        #   主路径抓此页；.md 仅作兜底。旧 url(moonshot.cn/docs/pricing/)已 301 失效。
+        'url': KIMI_HTML_URL,
         'mode': 'kimi',
     },
     # 腾讯自家(混元)价格走 parse_tokenhub.py（官方价页 1823/130055），此处不重复抓
@@ -569,16 +593,26 @@ def parse_zhipu_docs(html):
     return out
 
 
+# v3.64.0（2026-10-21 P1 修复）：长度分档门槛（「≤ 512k 输入 tokens」里的 512）。
+#   strip_tags 已把 &gt;/&lt; 解码为 >/<，故直接匹配字符。只匹配「比较符 + 数字 + k」，
+#   价格数字（2.10 这类）不带 k 后缀，不会误剥。
+LEN_TIER_RE = re.compile(r'([≤≥<>]=?)\s*([\d.]+)\s*[kK](?![a-zA-Z])')
+
+
 def parse_minimax(html):
-    """MiniMax 官方定价页（v0.3，2026-09-28）——页面已改版：数据行不含'元'（单位在表头）。
-    实测结构（urllib 直抓 577KB，76 行）：
-      - 语言模型区有「标准 / 优先」两个 service tier 表，优先 = 标准价 ×1.5（页脚注明）；
-        两表行名完全相同 → 同名同档只取首次出现（标准表在前）。
-      - M3 行：模型名后带档位与「永久五折」，6 个数字两两成对 = 刊例/五折：
-          MiniMax-M3 ≤512k 永久五折 4.20 2.10 16.80 8.40 0.84 0.42
-          → 输入 刊例4.20/五折2.10；输出 刊例16.80/五折8.40；缓存读 刊例0.84/五折0.42
-        >512k 档整体 ×2。计费价取「永久五折」价（官方标注永久折扣 = 实际扣费口径），
-        主档取 ≤512k，>512k 与优先 tier 写入 tier_note。
+    """MiniMax 官方定价页（v0.4，2026-10-21）——页面两次改版后的现行结构：
+    实测结构（urllib 直抓 ~684KB）：
+      - 语言模型区有「标准 / 优先」两个 service tier 页签，优先 = 标准价 ×1.5（页脚注明）；
+        两表行名完全相同 → 同名只取首次出现（标准表在前）。
+      - M3 行（2026-10-21 起新版）：模型名后带长度门槛，3 个数字 = 输入/输出/缓存读：
+          MiniMax-M3 ≤ 512k 输入 tokens 2.10 8.40 0.42
+          MiniMax-M3 > 512k 输入 tokens* 4.20 16.80 0.84   （>512k 档整体 ×2）
+        优先页签内同名两行 = 3.15/12.60/0.63 与 6.30/25.20/1.26（×1.5）。
+        主档取标准表 ≤512k 行；>512k 与优先 tier 记入 tier_note。
+      - M3 行（旧版，2026-09-28~10-20）：6 个数字两两成对 = 刊例/永久五折，
+        靠「永久五折」文案分流。该文案 2026-10-21 已从页面消失 → 分支死，
+        M3 落入通用分支后 nums[0] 取到「512k」里的 512 当输入价（高 244 倍，见 v3.64.0 修法）。
+        旧格式保留识别能力（页面若恢复五折文案仍按末 6 位成对解析）。
       - M2.x 行：数字 = 输入, 输出, 缓存读, (缓存写)。
       - H3-Context-IR 行：仍含'元'内联（2 个数字 = 输入/输出）。
     """
@@ -621,7 +655,13 @@ def parse_minimax(html):
             if not mname:
                 continue
             name, rest = mname.group(1), mname.group(2)
-            nums = re.findall(r'(\d+(?:\.\d+)?)', rest)
+            # v3.64.0（2026-10-21 页面改版，P1 错价修复）：M3 行现为
+            #   「MiniMax-M3 ≤ 512k 输入 tokens 2.10 8.40 0.42」——
+            #   长度门槛数字（512）与价格混在同一行，旧代码 nums[0] 直接取到 512 当输入价
+            #   （正确 2.10，高 244 倍，已进线上索引参与计费）。先剥掉「≤/> 512k」类门槛，
+            #   再取价格数字。旧五折格式（6 数字）取末 6 位，不受剥离影响。
+            tier_m = LEN_TIER_RE.search(rest)
+            nums = re.findall(r'(\d+(?:\.\d+)?)', LEN_TIER_RE.sub('', rest))
             if not nums:
                 continue
             api = name.lower()
@@ -647,16 +687,78 @@ def parse_minimax(html):
                      '>512k档×2(刊例8.4/33.6/1.68,五折4.2/16.8/0.84)；'
                      '优先service tier按标准×1.5' % (list_in, list_out, list_ca))
             else:
-                # M2.x 行：[输入, 输出, 缓存读, (缓存写)]
+                # M2.x 行 / 新版 M3 长度分档行：[输入, 输出, 缓存读, (缓存写)]
+                # v3.64.0：长度分档行的主档只取 ≤ 行，> 档显式跳过 —— 不能只靠 seen 去重：
+                #   页面若调换两行顺序（>512k 在前），旧法会把 2 倍价当主档静默入账。
+                if tier_m and tier_m.group(1) in ('>', '>=', '≥'):
+                    continue
                 in_v = float(nums[0])
                 out_v = float(nums[1])
                 ca_v = float(nums[2]) if len(nums) > 2 else None
-                extra = '%s档' % ('highspeed' if 'highspeed' in name else '标准')
-                emit(name, api, in_v, out_v, ca_v, extra)
+                if tier_m:
+                    note = ('官方现行价（主档 ≤512k）；>512k 档为该档×2；'
+                            '优先 service tier 为标准×1.5（页面「优先」页签）')
+                else:
+                    note = '%s档' % ('highspeed' if 'highspeed' in name else '标准')
+                emit(name, api, in_v, out_v, ca_v, note)
     return out
 
 
-KIMI_PAGES = ['chat-k3']
+def kimi_col_map(titles):
+    """DocTable 列标题 → 语义索引（v3.64.0）。与 COL_SYNONYMS 同思路：按词面映射、不按位置。
+    判定顺序要紧：『未命中』含『命中』，必须先判未命中（否则输入价会被缓存列抢走）。
+    返回 {'in': idx|None, 'out': idx|None, 'cache': idx|None}（相对行首的单元格下标）。"""
+    idx = {'in': None, 'out': None, 'cache': None}
+    for i, t in enumerate(titles or []):
+        if '未命中' in t:
+            idx['in'] = i
+        elif '命中' in t:
+            idx['cache'] = i
+        elif '输出' in t:
+            idx['out'] = i
+    return idx
+
+
+def kimi_bt_row_to_record(cells_src, col_map):
+    """RSC 负载一行（反引号单元格串）→ (记录 dict | None, 原因)。纯函数（无 IO）→ 可夹具测试。
+    cells_src = KIMI_BT_ROW_RE 的 group(1)（`` `a`,`b`,… ``）；col_map = kimi_col_map 产物。
+    原因取值：'no-match'（不是模型行）/ 'name'（非 kimi 模型名）/ 'unit'（计价单位非 1M tokens）/
+    'prices'（价格列取不到值）/ None（成功）。"""
+    vals = [v.strip() for v in re.findall(r'`([^`]*)`', cells_src or '')]
+    if len(vals) < 3:
+        return None, 'no-match'
+    name, unit = vals[0], vals[1]
+    if not KIMI_MODEL_RE.match(name):
+        return None, 'name'
+    um = re.match(r'^(?P<qty>[\d.,]+)(?P<mag>[MK])\s*tokens$', unit, re.I)
+    if not um:
+        return None, 'no-match'
+    # v3.59.0（审计 S5）单位断言：量纲错位会 1000× 错价，必须显式校验而非静默按 1M 解释
+    if not (um.group('qty') == '1' and um.group('mag').upper() == 'M'):
+        return None, 'unit'
+
+    def _price(i):
+        if i is None or i >= len(vals):
+            return None
+        pm = re.match(r'^¥([\d.]+)$', vals[i])
+        return pm.group(1) if pm else None
+
+    inp = _price(col_map.get('in'))
+    outp = _price(col_map.get('out'))
+    cache = _price(col_map.get('cache'))
+    if inp is None and outp is None:
+        return None, 'prices'
+    return {
+        'name': name,
+        'brand': 'kimi',
+        'api_name': name,
+        'source_type': 'first_party',
+        'unit': '元/百万 tokens',  # v3.59.0（S5）：单位断言通过后显式回传
+        'in_price': ['%s元' % inp] if inp else [],
+        'out_price': ['%s元' % outp] if outp else [],
+        'cache_hit': ['%s元' % cache] if cache else [],
+        'tier_note': 'Kimi 官方价(¥/1M tokens)',
+    }, None
 
 
 def parse_stepfun_md(md, drop_re=None, keep_over_re=None):
@@ -833,48 +935,74 @@ def parse_kimi_row(line):
     }, None
 
 
-def parse_kimi():
-    """Kimi(Moonshot) 官方价：各模型单独的 mintlify 文档页(.md 源，比 HTML 干净)。
-    v0.3(2026-09-28)：moonshot.cn 文档已 301 迁至 platform.kimi.com（requests 自动跟随，
-    但直接用新域免去一跳）；chat-k25 / chat-v1 实测已是死页（0 行），剔除；
-    3 个有效页返回同一张表（k3/k2.7-code/k2.7-code-highspeed/k2.6），留 1 页即可。
-    表格行形如：
-      ["kimi-k3","1M tokens","¥20.00","¥40.00","¥2.00","¥20.00","¥100.00","1,048,576 tokens"]
-      ["kimi-k2.7-code","1M tokens","¥1.30","¥6.50","¥27.00","262,144 tokens"]
-    价格语义 = [缓存命中, 输入(未命中), 输出]；k3 行多出历史列（共 5 个价）→ 统一取末 3 位，
-    实测 k3 末 3 位 = 2.00/20.00/100.00，与 pricing.json 用户已校对 lock 价完全一致。
-    """
+def parse_kimi_html(html):
+    """HTML 页 RSC DocTable → (记录 list, matched_rows)。纯函数（无 IO）→ 可夹具测试。
+    matched_rows = 正则匹配到表格行的次数（区分「页面没行」与「行全被跳过」，同 .md 路径口径）。"""
     out = []
-    base = 'https://platform.kimi.com/docs/pricing/'
-    matched_rows = 0  # v3.61.0：正则匹配到的行数 —— 用于区分「页面没行」与「行全被跳过」
-    for pg in KIMI_PAGES:
-        try:
-            t = http_get(base + pg + '.md', 20)
-        except Exception as e:
-            print('[WARN] kimi %s: %s' % (pg, repr(e)[:80]))
-            continue
-        for line in t.splitlines():
-            if not line.strip().startswith('['):
-                continue
-            rec, reason = parse_kimi_row(line)
-            if reason == 'no-match':
+    matched_rows = 0
+    for tm in KIMI_TABLE_RE.finditer(html or ''):
+        col_map = kimi_col_map(KIMI_TITLE_RE.findall(tm.group('cols')))
+        if col_map['in'] is None or col_map['out'] is None:
+            continue  # 不是 token 计价表（无输入/输出语义列）
+        for rm in KIMI_BT_ROW_RE.finditer(tm.group('rows')):
+            rec, reason = kimi_bt_row_to_record(rm.group(1), col_map)
+            if reason in ('no-match', 'name'):
                 continue
             matched_rows += 1
-            # v3.59.0（审计 S5）：单位显式断言。原正则把 "1M tokens" 写死成字面量 →
-            #   页面改用「1K tokens」计价时整行不匹配 → 静默 0 模型（连 WARN 都没有）。
-            #   现放宽量纲匹配再显式校验：非 1M tokens 计价 → WARN + 跳过（可见的失败）。
             if reason == 'unit':
-                print('[WARN] kimi %s: 计价单位非 1M tokens（%s tokens）→ 跳过该行'
-                      % (pg, KIMI_ROW_RE.match(line.strip()).group('unit')))
+                print('[WARN] kimi: 计价单位非 1M tokens → 跳过该行（v3.59.0 S5 单位断言）')
                 continue
             if rec is None:
                 continue
-            name = rec['api_name']
-            # v3.52.0（S4）：同其余解析器 —— 只丢真快照，soft 收录 + 待确认留痕
-            if not apply_snap_verdict(name):
-                continue
-            rec['source'] = 'Kimi 官方文档 %s.md' % pg
+            rec['source'] = 'Kimi 官方文档 %s（RSC DocTable）' % KIMI_HTML_URL
             out.append(rec)
+    return out, matched_rows
+
+
+def parse_kimi():
+    """Kimi(Moonshot) 官方价。
+    v0.4（2026-10-21 页面改版）：主路径改抓 HTML 页 RSC 负载（反引号 DocTable，列语义映射，
+    见 kimi_bt_row_to_record）；旧 .md 路径降级为兜底（页面回退时仍能抓到）。
+    v0.3(2026-09-28)：moonshot.cn 文档已 301 迁至 platform.kimi.com；chat-k25 / chat-v1
+    实测已是死页（0 行），剔除；3 个有效页返回同一张表，留 1 页即可。
+    """
+    out = []
+    matched_rows = 0  # v3.61.0：正则匹配到的行数 —— 用于区分「页面没行」与「行全被跳过」
+    # ── 主路径：HTML 页 RSC DocTable（v3.64.0）──
+    try:
+        t = http_get(KIMI_HTML_URL, 20)
+    except Exception as e:
+        print('[WARN] kimi html: %s' % repr(e)[:80])
+        t = ''
+    out, matched_rows = parse_kimi_html(t)
+    # ── 兜底：旧 .md 路径（页面回退到 mintlify .md 导出时；v3.64.0 起仅为 fallback）──
+    if not out:
+        print('[WARN] kimi: HTML 页未解析到价格行，回退旧 .md 路径（%s）' % KIMI_PAGES)
+        base = 'https://platform.kimi.com/docs/pricing/'
+        for pg in KIMI_PAGES:
+            try:
+                t = http_get(base + pg + '.md', 20)
+            except Exception as e:
+                print('[WARN] kimi %s: %s' % (pg, repr(e)[:80]))
+                continue
+            for line in t.splitlines():
+                if not line.strip().startswith('['):
+                    continue
+                rec, reason = parse_kimi_row(line)
+                if reason == 'no-match':
+                    continue
+                matched_rows += 1
+                if reason == 'unit':
+                    print('[WARN] kimi %s: 计价单位非 1M tokens（%s tokens）→ 跳过该行'
+                          % (pg, KIMI_ROW_RE.match(line.strip()).group('unit')))
+                    continue
+                if rec is None:
+                    continue
+                name = rec['api_name']
+                if not apply_snap_verdict(name):
+                    continue
+                rec['source'] = 'Kimi 官方文档 %s.md' % pg
+                out.append(rec)
     seen, uniq = set(), []
     for m in out:
         if m['api_name'] in seen:

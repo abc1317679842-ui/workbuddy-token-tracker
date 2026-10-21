@@ -37,7 +37,11 @@ URL = 'https://cloud.tencent.com/document/product/1823/130055'
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
 
 # 模型名 -> (品牌, 归一化 api 名)
-# 注：Hy-MT2 系是语音/机器翻译模型，不按 LLM token 库保存（用户 2026-08-31 决定），只留 LLM 模型
+# ⚠ v3.64.0（用户 2026-10-21 拍板）：本表**只收腾讯自家通用 LLM**（混元系通用模型）。
+#   腾讯云这个页面同时卖三类东西：① 混元通用模型（收）② 混元非通用模型（不收：
+#   Hy-MT2 机器翻译系 —— 用户明确「只要通用模型，不要翻译模型」，2026-08-31 已决定
+#   不按 LLM token 库保存）③ 转售第三方（DeepSeek/智谱/Kimi/MiniMax/Qwen/MiMo/阶跃，
+#   各自有官方页或聚合源，不收）。把 Hy-MT 系补进本表会被 NON_GENERAL_RE 双重拦下。
 BRAND_MAP = {
     'Hy4 preview': ('hunyuan', 'hy4-preview'),
     'Hy3': ('hunyuan', 'hy3'),
@@ -252,6 +256,13 @@ def parse_lang_table(block):
     return models
 
 
+# v3.64.0（用户 2026-10-21 拍板）：腾讯自家**非通用**模型名（机器翻译系）。
+#   本库只收通用 LLM：翻译/语音/嵌入类一律不收。匹配到的名字不进 kept 也不进 unmapped
+#   （不刷「请补 BRAND_MAP」告警——那不是遗漏，是范围外），仅在 _excluded_non_general 留痕。
+#   新增非通用型号（如下一代翻译模型）落到未识别 → 告警 → 人工确认后补本正则，不会误收。
+NON_GENERAL_RE = re.compile(r'^Hy-MT', re.I)
+
+
 def keep_hunyuan(models):
     """从价表解析结果中挑出腾讯自家(混元)模型。
 
@@ -262,19 +273,47 @@ def keep_hunyuan(models):
       修法遵守「品牌不许猜」红线：**不新增任何启发式**（如按名字前缀推断品牌），
       而是把「丢弃」分三路记账 —— 已知第三方=预期丢弃(不告警) / 未识别=意外(告警 + _unmapped 留痕)。
 
-    返回 (kept, unmapped)：kept = 收录的混元模型；unmapped = 未识别被丢的模型名（调用方负责告警）。
+    v3.64.0（用户 2026-10-21 拍板）：范围收窄为**腾讯自家通用 LLM**。混元系里的非通用模型
+      （Hy-MT2 机器翻译系）原先落在「未识别」里，每次抓取都刷「请补 BRAND_MAP」告警 ——
+      诱导把翻译模型补进价库，与用户「只要通用模型，不要翻译模型」直接冲突。现在
+      NON_GENERAL_RE 命中的名字**两路都不进**（不收录、不告警），由 split_scope 留痕到
+      `_excluded_non_general`；对 brand 已误映射为 hunyuan 的翻译系同样拦下（双保险）。
+
+    返回 (kept, unmapped)：kept = 收录的混元通用模型；unmapped = 未识别被丢的模型名
+    （调用方负责告警）。非通用模型不进任何一个列表（见 split_scope）。
     """
     unmapped = []
     kept = []
     for m in models:
+        nm = m.get('name') or '?'
+        # 范围外：腾讯自家非通用模型（翻译系等）—— 不收录也不告警（split_scope 留痕）
+        if NON_GENERAL_RE.match(nm):
+            continue
         b = m.get('brand')
         if b == 'hunyuan':
             kept.append(m)
         elif b:
             pass  # 已知第三方品牌（deepseek/zhipu/kimi/minimax/qwen 等）：预期丢弃，不告警
-        else:
-            unmapped.append(m.get('name') or '?')
+        elif nm not in unmapped:
+            unmapped.append(nm)  # 去重：页面存在同名多行，告警不刷屏
     return kept, unmapped
+
+
+def split_scope(models):
+    """按收录范围把解析结果分四路（v3.64.0）。
+    返回 (kept, unmapped, excluded)：
+      kept      —— 腾讯自家通用 LLM（入索引）；
+      unmapped  —— 未识别名字（告警：可能是混元新通用模型/改名，需人工补 BRAND_MAP；
+                   也可能是第三方新品——两类都不收，但前者要人看一眼）；
+      excluded  —— 腾讯自家非通用（Hy-MT 翻译系等）：范围外，留痕不告警。
+    后两个列表按原顺序去重（页面存在同名多行，去重后告警不刷屏）。"""
+    kept, unmapped = keep_hunyuan(models)
+    excluded = []
+    for m in models:
+        nm = m.get('name') or '?'
+        if NON_GENERAL_RE.match(nm) and nm not in excluded:
+            excluded.append(nm)
+    return kept, unmapped, excluded
 
 
 def parse_peak_rule(html):
@@ -437,11 +476,17 @@ def main():
         print('解析到模型数: 0 | 区域币种矛盾（%s/%s），已保留上一版 tokenhub_lang.json' % (region_label, currency))
         sys.exit(2)
     models = parse_lang_table(tbl)
-    # 只保留腾讯自家(混元)模型；页面里其余是腾讯转售的第三方(智谱/Kimi/DeepSeek/MiniMax)，一律不要
-    models, unmapped = keep_hunyuan(models)
+    # 只保留腾讯自家通用 LLM；页面里其余是腾讯转售的第三方(智谱/Kimi/DeepSeek/MiniMax)，
+    # 以及混元系里的非通用模型(翻译系 Hy-MT*)——两类都不收（用户 2026-10-21：只要通用模型）
+    models, unmapped, excluded = split_scope(models)
+    if excluded:
+        sys.stderr.write('[parse_tokenhub][SKIP] 以下 %d 个腾讯自家非通用模型按范围排除（不收录、不告警）：%s\n'
+                         '  -> 本库只收通用 LLM；翻译/语音/嵌入类一律不进（用户 2026-10-21 拍板）\n'
+                         % (len(excluded), '、'.join(excluded)))
     if unmapped:
         sys.stderr.write('[parse_tokenhub][WARN] 以下 %d 个模型名未在 BRAND_MAP 中映射，本次未收录：%s\n'
-                         '  -> 若为腾讯混元新模型/改名，请补 BRAND_MAP（本库不猜品牌：宁可不收，也不误收）\n'
+                         '  -> 若为腾讯混元**新通用模型**/改名，请补 BRAND_MAP（本库不猜品牌：宁可不收，也不误收）\n'
+                         '  -> 若为第三方新品（转售），属预期不收，可忽略\n'
                          % (len(unmapped), '、'.join(unmapped)))
     if not models:
         # v3.48.0（审计 F8）：0 模型一律不写、非零退出。5xx/Cloudflare/列序变化都可能切出 0 模型，
@@ -479,8 +524,10 @@ def main():
         'unit': unit,
         'peak_rule': peak_rule,
         'models': models,
-        # v3.55.0（A2）：本次被丢弃的未映射模型名（留痕，供人工补 BRAND_MAP；build_index 不消费）
+        # v3.55.0（A2）：本次被丢弃的未识别模型名（留痕，供人工补 BRAND_MAP；build_index 不消费）
         '_unmapped': unmapped,
+        # v3.64.0：本次按范围排除的腾讯自家非通用模型（翻译系等；留痕，build_index 不消费）
+        '_excluded_non_general': excluded,
     }
     import os
     # v3.51.0（审计批1·C）：输出目录改为 HERE 锚定。原实现 `os.makedirs('prices')` 是

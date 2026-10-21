@@ -39,9 +39,9 @@ type: skill
 
 ## 当前功能总览（版本以 manifest.yaml 为准）
 
-> **v3.63.3 要点（2026-10-19）：toast 失败不再冒充「已弹过」**（**AUD-B-01**：`showToast` 原全出口裸 return、`showToastsSplitByModel` 无脑 `return true` ⇒ 4 处 `markToastShown` **无条件写** —— toast 调用失败时照样记「已弹过」= 毒记录，下次同轮判重直接静默、弹窗**永久不再出现**；且 stop 收口「推进 lastStopAt / clearStopMark / 写完成日志」也无条件执行 ⇒ `recoverKilledStop` 闸①被全断（不止丢一条弹窗）。现 `showToast` 返 boolean（测试静默/同文案去重/非 win32/**成功** = true，**catch = false**）、split 任一条失败整体 false 且首败即停、4 处 mark 全部条件化、收口三件事一件不办、轮保持开放 → 下次 `--hook` 从原轮起点补弹（收敛到 v3.61.0 既有失败路径，不造新机制）。守卫 T111-a1~a5/b1~b3（b 含对照组证鉴别力）；反向 R80~R84）
+> **v3.63.4 要点（2026-10-21）：价格解析器三修（MiniMax-M3 错价 / Kimi 停更 / TokenHub 只收腾讯通用模型）**（**KI-44**：MiniMax 官方页删「永久五折」文案后 M3 行变成「≤ 512k 输入 tokens 2.10 8.40 0.42」三数字，门槛里的 **512 被当成输入价**（高 244 倍）——取价前先剥长度门槛、主档只取 ≤ 行（> 档显式跳过，不靠 seen 去重）；**KI-45**：Kimi 价格从 .md 迁到 HTML 页 RSC 负载（反引号 DocTable，chat-k3.md 已 308 跳空表 → 旧路径 0 模型、**永不更新且无告警**）——改抓 HTML 并按**表头语义**定位价格列（k3 表 8 列 / k2 表 6 列，按位置取必错），.md 降级兜底；**KI-46**：TokenHub 只收腾讯自家**通用** LLM，混元翻译系（Hy-MT2）从「未识别告警」改判「范围外排除」（不告警、不诱导补映射，BRAND_MAP 混进 Hy-MT 会被守卫判红），连带删掉价库目录里的 stale 脚本副本。守卫 T112-a1~a3/b1~b4/c1~c4/d1~d4；反向 R83~R86 全部必红且零误伤；selftest 1229/0/0）
 
-> **v3.63.2 要点（2026-10-18）：backfill 不再静默抹账本 + 已入账≠已弹窗**（**N3**：backfill 锁内合并前 `catch(e){cur={}}` → 账本损坏时按空账本合并、重放值**整本替换**、范围外日期静默抹除且零告警；现三处读取全走 `readLedgerStrict` —— ENOENT 仍合法可写，解析失败/形状非法（`[]`/标量/`null`）→ `--write` **中止告警**，写入前预检 + 锁内复检双闸。**S7**：`recoverKilledStop` 的 `nothing` 分支直接清标记 = Stop 死在「记账后、弹窗前」时弹窗**永久丢失**且再无入口（设计期 R1 风险，批14 只在去重层接了、恢复路径没接）；判据改为 `.toasted-<sid>.json` 弹窗记录（同 roundStart+指纹+60s），没弹过就补弹、**弹成功后才写**；连带修掉「真空轮被当聚合失败 bump 到 giveUp」的注释/代码分裂（`total=0` 实际不可达，新增 `roundHasRowsNoUsage`：轮内有行无用量=无欠账才清标记）。守卫 T109-a1~a5/b1~b4、T110-a1~a3/b1~b3；反向 R69~R72、R73~R78）
+> **v3.63.3 要点（2026-10-19）：toast 失败不再冒充「已弹过」**（**AUD-B-01**：`showToast` 原全出口裸 return、`showToastsSplitByModel` 无脑 `return true` ⇒ 4 处 `markToastShown` **无条件写** —— toast 调用失败时照样记「已弹过」= 毒记录，下次同轮判重直接静默、弹窗**永久不再出现**；且 stop 收口「推进 lastStopAt / clearStopMark / 写完成日志」也无条件执行 ⇒ `recoverKilledStop` 闸①被全断（不止丢一条弹窗）。现 `showToast` 返 boolean（测试静默/同文案去重/非 win32/**成功** = true，**catch = false**）、split 任一条失败整体 false 且首败即停、4 处 mark 全部条件化、收口三件事一件不办、轮保持开放 → 下次 `--hook` 从原轮起点补弹（收敛到 v3.61.0 既有失败路径，不造新机制）。守卫 T111-a1~a5/b1~b3（b 含对照组证鉴别力）；反向 R80~R84）
 
 > **逐版细节、动机、取舍一律查 `CHANGELOG.md`** —— 本文件不再堆版本要点；上面若与旧说法冲突，**以本条为准**。
 

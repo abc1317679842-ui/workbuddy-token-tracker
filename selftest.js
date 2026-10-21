@@ -5734,13 +5734,17 @@ else {
   const rdm65 = fs.readFileSync(path.join(SRC, 'README.md'), 'utf-8');
 
   // ── a. A2：未映射模型可见化 ──
-  ok('T65-a1 ★keep_hunyuan 必须定义且在解析结果处被真正调用（定义了不用 = 白写）',
+  // v3.64.0：main 的收录入口从 keep_hunyuan 改为 split_scope（四路分流：多出「非通用排除」），
+  //   断言随之更新为「split_scope 被调用 + keep_hunyuan 在 split_scope 内被调用」—— 意图不变：
+  //   过滤函数必须定义**且**在解析结果处真正接上（定义了不用 = 白写）。
+  ok('T65-a1 ★keep_hunyuan 必须定义且在解析结果处被真正调用（split_scope→keep_hunyuan，定义了不用 = 白写）',
     pth65.indexOf('def keep_hunyuan(models)') >= 0
-    && pth65.indexOf('models, unmapped = keep_hunyuan(models)') >= 0);
+    && pth65.indexOf('models, unmapped, excluded = split_scope(models)') >= 0
+    && pth65.indexOf('kept, unmapped = keep_hunyuan(models)') >= 0);
   ok('T65-a2 ★三路分流：混元收 / 已知第三方丢 / 未识别进 unmapped；且**不得新增品牌启发式**',
     pth65.indexOf("if b == 'hunyuan':") >= 0
     && pth65.indexOf('elif b:') >= 0
-    && pth65.indexOf("unmapped.append(m.get('name') or '?')") >= 0
+    && pth65.indexOf('unmapped.append(nm)') >= 0
     && !/startswith\(\s*['"]Hy/.test(pth65),
     '红 = 有人用前缀猜品牌（红线：品牌必须显式解析）');
   ok('T65-a3 ★未映射必须落进输出的 _unmapped 字段（只 WARN 不留痕 = 事后无从查证）',
@@ -10695,6 +10699,188 @@ const txInjectionComplete = (ttSrc, shSrc) => (
       if (wmBak111 === null) fs.unlinkSync(wmPath111);
       else fs.writeFileSync(wmPath111, wmBak111);
     } catch (e) { /* silent-ok:测试收尾，还原失败不影响断言结论 */ }
+  }
+}
+
+// ===== T112（v3.64.0 · 批18）：价格解析器三修（MiniMax-M3 错价 / Kimi 停更 / TokenHub 范围）=====
+// 三条主线（均先用真页面复现 → 修 → 配守卫；守卫分源码侧 + 行为侧）：
+//   ① **MiniMax-M3 错价（P1）**：官方页删「永久五折」文案后 M3 行变成 3 数字
+//      「≤ 512k 输入 tokens 2.10 8.40 0.42」→ 旧代码 nums[0] 取到门槛里的 512 当输入价
+//      （正确 2.10，高 244 倍；10-21 实测已污染 latest.json，下一次 build 就会进索引）。
+//      修法：取价前先剥长度门槛（LEN_TIER_RE），主档只取 ≤ 行（> 档显式跳过，不靠 seen 去重）。
+//   ② **Kimi 停更（P1）**：价格从 .md 迁到 HTML 页 RSC 负载（反引号 DocTable），chat-k3.md
+//      已 308 跳 chat.md 且导出空表 → 旧路径 0 模型、价格永不更新且无告警。修法：抓 HTML 按
+//      **列语义**映射（k3 表 8 列 / k2 表 6 列，按位置取价必错），.md 降级为兜底。
+//   ③ **TokenHub 范围（用户 2026-10-21 拍板）**：只收腾讯自家**通用** LLM；混元系翻译模型
+//      （Hy-MT2）与转售第三方都不收。翻译系从「未识别告警」（诱导补 BRAND_MAP）改判
+//      「范围外排除」—— 只留痕不告警；误映射进 BRAND_MAP 的翻译系也要被拦下。
+// 守卫纪律：源码侧锚**使用点**（剥离必须先于取价；> 档必须显式 continue；非通用必须先于
+//   brand 判定）；行为侧 require 真身纯函数喂**真页面形态**夹具（不打网络）。
+{
+  const fc112 = fs.readFileSync(path.join(SRC, 'fetch-cn-prices.py'), 'utf-8').replace(/\r\n/g, '\n');
+  const th112 = fs.readFileSync(path.join(SRC, 'parse_tokenhub.py'), 'utf-8').replace(/\r\n/g, '\n');
+  const stripPy = (s) => s.split('\n').map((line) => {
+    let out = ''; let q = null;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (q) { out += c; if (c === '\\') out += line[++i] || ''; else if (c === q) q = null; continue; }
+      if (c === '"' || c === "'") { q = c; out += c; continue; }
+      if (c === '#') break;
+      out += c;
+    }
+    return out;
+  }).join('\n');
+  const fc112c = stripPy(fc112);
+  const th112c = stripPy(th112);
+  const mmSeg = fc112c.slice(fc112c.indexOf('LEN_TIER_RE'), fc112c.indexOf('def kimi_col_map'));
+  const kimiSeg = fc112c.slice(fc112c.indexOf('def kimi_col_map'), fc112c.indexOf('def parse_stepfun_md'));
+  const kimiMainSeg = fc112c.slice(fc112c.indexOf('def parse_kimi('), fc112c.indexOf('def main('));
+  const thSeg = th112c.slice(th112c.indexOf('def keep_hunyuan'), th112c.indexOf('def parse_peak_rule'));
+  const brandMapSeg = th112c.slice(th112c.indexOf('BRAND_MAP = {'), th112c.indexOf('def ssl_context'));
+
+  // ── a. MiniMax：门槛必须先剥再取价；> 档显式跳过 ──
+  ok('T112-a1 ★MiniMax 取价前必须先剥长度门槛（LEN_TIER_RE.sub 与 nums 取值同行，剥离先于取价）',
+    /LEN_TIER_RE\.sub\('', rest\)/.test(mmSeg)
+    && /nums\s*=\s*re\.findall\(/.test(mmSeg)
+    && mmSeg.indexOf("LEN_TIER_RE.sub('', rest')") < mmSeg.indexOf('nums = re.findall'),
+    mmSeg.slice(mmSeg.indexOf('tier_m = LEN_TIER_RE') - 40, mmSeg.indexOf('nums = re.findall') + 80));
+  ok('T112-a2 ★MiniMax > 档必须显式跳过（不能只靠 seen 去重——页面调换两行顺序会把 2 倍价当主档）',
+    /tier_m\.group\(1\) in \('>', '>=', '≥'\)/.test(mmSeg)
+    && (() => { const i = mmSeg.indexOf("tier_m.group(1) in ('>', '>=', '≥')"); return i >= 0 && /continue/.test(mmSeg.slice(i, i + 120)); })(),
+    mmSeg.slice(mmSeg.indexOf('if tier_m') - 20, mmSeg.indexOf('if tier_m') + 220));
+  ok('T112-a3 ★LEN_TIER_RE 形态 = 比较符+数字+k（只剥门槛，不误剥价格数字）',
+    /LEN_TIER_RE\s*=\s*re\.compile\(r'\(\[≤≥<>\]=/.test(mmSeg)
+    && /\\s\*\[kK\]/.test(mmSeg),
+    mmSeg.slice(mmSeg.indexOf('LEN_TIER_RE'), mmSeg.indexOf('LEN_TIER_RE') + 80));
+
+  // ── b. Kimi：列语义映射 + HTML 主路径 + .md 兜底 ──
+  ok('T112-b1 ★kimi_col_map 判定顺序：『未命中』必须先于『命中』（否则输入价被缓存列抢走）',
+    /def kimi_col_map\(/.test(kimiSeg)
+    && kimiSeg.indexOf("'未命中' in t") >= 0 && kimiSeg.indexOf("'未命中' in t") < kimiSeg.indexOf("'命中' in t"),
+    '未命中@' + kimiSeg.indexOf("'未命中' in t") + ' 命中@' + kimiSeg.indexOf("'命中' in t"));
+  ok('T112-b2 ★Kimi 价格按 col_map 语义列取（不按位置——k3 表 8 列 / k2 表 6 列）',
+    /col_map\.get\('in'\)/.test(kimiSeg) && /col_map\.get\('out'\)/.test(kimiSeg) && /col_map\.get\('cache'\)/.test(kimiSeg));
+  ok('T112-b3 ★parse_kimi 主路径必须抓 HTML 页（KIMI_HTML_URL），且保留 .md 兜底（页面回退不致 0 模型）',
+    /http_get\(KIMI_HTML_URL/.test(kimiMainSeg) && /KIMI_PAGES/.test(kimiMainSeg)
+    && /parse_kimi_row\(line\)/.test(kimiMainSeg) && /KIMI_ROW_RE\.match\(/.test(kimiMainSeg));
+  ok('T112-b4 ★HTML 路径必须是纯函数 parse_kimi_html（夹具测试挂点，T87 纪律延续）',
+    /def parse_kimi_html\(/.test(fc112c) && /parse_kimi_html\(t\)/.test(kimiMainSeg));
+
+  // ── c. TokenHub：只收腾讯自家通用 LLM ──
+  ok('T112-c1 ★keep_hunyuan 必须先拦非通用（NON_GENERAL_RE 判定在 brand 判定之前）',
+    /NON_GENERAL_RE\.match\(nm\)/.test(thSeg)
+    && thSeg.indexOf('NON_GENERAL_RE.match(nm)') < thSeg.indexOf("b = m.get('brand')")
+    && thSeg.indexOf('NON_GENERAL_RE.match(nm)') < thSeg.indexOf("if b == 'hunyuan'"));
+  ok('T112-c2 ★split_scope 三元组分流（kept/unmapped/excluded）且 main 使用它',
+    /return kept, unmapped, excluded/.test(thSeg)
+    && /split_scope\(models\)/.test(th112c) && /_excluded_non_general/.test(th112c));
+  ok('T112-c3 ★BRAND_MAP 不得收录 Hy-MT 系（翻译模型不许补进价库——用户 2026-10-21 拍板）',
+    !/Hy-MT/.test(brandMapSeg), 'BRAND_MAP 内出现 Hy-MT 条目：' + (brandMapSeg.match(/.*Hy-MT.*/) || [''])[0]);
+  ok('T112-c4 ★NON_GENERAL_RE 形态 = ^Hy-MT（混元机器翻译系，大小写不敏感）',
+    /NON_GENERAL_RE\s*=\s*re\.compile\(r'\^Hy-MT', re\.I\)/.test(th112c));
+
+  // ── d. 行为组：真跑 python 喂真页面形态夹具（不打网络）──
+  const pyCands112 = [];
+  if (process.env.CN_PYTHON) pyCands112.push(process.env.CN_PYTHON);
+  try {
+    const pvDir = 'C:/Users/14779/.workbuddy/binaries/python/versions';
+    for (const v of fs.readdirSync(pvDir)) pyCands112.push(path.join(pvDir, v, 'python.exe'));
+  } catch (e) { /* 目录不存在就走 PATH */ }
+  pyCands112.push('python', 'python3');
+  let PY112 = null;
+  for (const c of pyCands112) {
+    const t = spawnSync(c, ['-V'], { encoding: 'utf8', windowsHide: true, timeout: 20000 });
+    if (t.status === 0) { PY112 = c; break; }
+  }
+  if (!SPAWN_OK) {
+    envSkip('T112-d 行为组（MiniMax/Kimi/TokenHub 夹具）', SPAWN_SKIP_REASON);
+  } else if (!PY112) {
+    envSkip('T112-d 行为组（MiniMax/Kimi/TokenHub 夹具）', 'python 不可用');
+  } else {
+    const pySrc112 = [
+      '# -*- coding: utf-8 -*-',
+      'import importlib.util, json, os, sys',
+      'SRC = sys.argv[1]',
+      "spec = importlib.util.spec_from_file_location('fcp112', os.path.join(SRC, 'fetch-cn-prices.py'))",
+      'F = importlib.util.module_from_spec(spec); spec.loader.exec_module(F)',
+      "spec2 = importlib.util.spec_from_file_location('pth112', os.path.join(SRC, 'parse_tokenhub.py'))",
+      'T = importlib.util.module_from_spec(spec2); spec2.loader.exec_module(T)',
+      'fails = []',
+      'def chk(n, c, d=""):',
+      '    if not isinstance(d, str): d = repr(d)',
+      '    print(("  OK   " if c else "  FAIL ") + n + (("  " + d) if d else ""))',
+      '    if not c: fails.append(n)',
+      // ── d1 MiniMax：真页面形态（2026-10-21 抓的 mm.html 同款两表）──
+      "HDR = ('<table><tr><th>模型</th><th>输入价格</th><th>元/百万 tokens</th>'",
+      "       '<th>输出价格</th><th>元/百万 tokens</th><th>缓存读取</th><th>元/百万 tokens</th></tr>')",
+      "T1 = HDR + '<tr><td>MiniMax-M3.1-Flash</td><td>1.00</td><td>4.00</td><td>0.10</td></tr></table>'",
+      "T2 = (HDR + '<tr><td>MiniMax-M3</td><td>≤ 512k 输入 tokens</td><td>2.10</td><td>8.40</td><td>0.42</td></tr>'",
+      "      + '<tr><td>MiniMax-M3</td><td>&gt; 512k 输入 tokens*</td><td>4.20</td><td>16.80</td><td>0.84</td></tr></table>')",
+      "T3 = HDR + '<tr><td>MiniMax-M3</td><td>≤ 512k 永久五折 4.20 2.10 16.80 8.40 0.84 0.42</td></tr></table>'",
+      "recs = F.parse_minimax(T1 + T2)",
+      "names = [r['api_name'] for r in recs]",
+      "m31 = [r for r in recs if r['api_name'] == 'minimax-m3.1-flash']",
+      "chk('M3.1-Flash 不回归（1/4/0.1）', len(m31) == 1 and m31[0]['in_price'] == ['1.0元'] and m31[0]['out_price'] == ['4.0元'] and m31[0]['cache_hit'] == ['0.1元'], m31)",
+      "m3 = [r for r in recs if r['api_name'] == 'minimax-m3']",
+      "chk('M3 只有一条记录（>512k 被显式跳过，不是去重碰巧）', len(m3) == 1, 'n=%d' % len(m3))",
+      "chk('M3 in=2.1（旧病根：nums[0] 吃到 512）', bool(m3) and m3[0]['in_price'] == ['2.1元'], m3 and m3[0]['in_price'])",
+      "chk('M3 out=8.4 / cache=0.42', bool(m3) and m3[0]['out_price'] == ['8.4元'] and m3[0]['cache_hit'] == ['0.42元'])",
+      "chk('M3 tier_note 记主档与倍率口径', bool(m3) and '≤512k' in m3[0]['tier_note'] and '×1.5' in m3[0]['tier_note'], m3 and m3[0]['tier_note'])",
+      "r3 = F.parse_minimax(T3)",
+      "chk('旧五折格式（6 数字）仍按末 6 位解析（页面若恢复文案不回归）', len(r3) == 1 and r3[0]['in_price'] == ['2.1元'] and r3[0]['out_price'] == ['8.4元'] and r3[0]['cache_hit'] == ['0.42元'], r3)",
+      // ── d2 Kimi：真 RSC 形态（2026-10-21 抓的 chat 页同款两表：k3 八列 + k2 六列）──
+      "C3 = ('columns:[{title:`模型`,width:`12%`},{title:`计费单位`,width:`10%`},'",
+      "      '{title:`缓存写入（TTL 5min）`,width:`13%`},{title:`缓存写入（TTL 1h）`,width:`13%`},'",
+      "      '{title:`输入价格（缓存命中）`,width:`13%`},{title:`输入价格（缓存未命中）`,width:`13%`},'",
+      "      '{title:`输出价格`,width:`10%`},{title:`上下文窗口`,width:`16%`}],'",
+      "      'rows:[[`kimi-k3`,`1M tokens`,`¥20.00`,`¥40.00`,`¥2.00`,`¥20.00`,`¥100.00`,`1,048,576 tokens`]]')",
+      "C2 = ('columns:[{title:`模型`,width:`24%`},{title:`计费单位`,width:`12%`},'",
+      "      '{title:`输入价格（缓存命中）`,width:`16%`},{title:`输入价格（缓存未命中）`,width:`16%`},'",
+      "      '{title:`输出价格`,width:`14%`},{title:`上下文窗口`,width:`18%`}],'",
+      "      'rows:[[`kimi-k2.7-code`,`1M tokens`,`¥1.30`,`¥6.50`,`¥27.00`,`262,144 tokens`],'",
+      "      '[`kimi-k2.7-code-highspeed`,`1M tokens`,`¥2.60`,`¥13.00`,`¥54.00`,`262,144 tokens`],'",
+      "      '[`kimi-k2.6`,`1M tokens`,`¥1.10`,`¥6.50`,`¥27.00`,`262,144 tokens`]]')",
+      "krecs, kn = F.parse_kimi_html(C3 + 'x' + C2)",
+      "kmap = {r['api_name']: r for r in krecs}",
+      "chk('Kimi HTML 路径解析出 4 个模型', len(krecs) == 4 and kn == 4, 'n=%d matched=%d' % (len(krecs), kn))",
+      "chk('kimi-k3 = 20/100/2（八列表：缓存写入两列不得混进价）', kmap.get('kimi-k3') and kmap['kimi-k3']['in_price'] == ['20.00元'] and kmap['kimi-k3']['out_price'] == ['100.00元'] and kmap['kimi-k3']['cache_hit'] == ['2.00元'], kmap.get('kimi-k3'))",
+      "chk('kimi-k2.7-code = 6.5/27/1.3（六列表）', kmap.get('kimi-k2.7-code') and kmap['kimi-k2.7-code']['in_price'] == ['6.50元'] and kmap['kimi-k2.7-code']['out_price'] == ['27.00元'] and kmap['kimi-k2.7-code']['cache_hit'] == ['1.30元'])",
+      "chk('kimi-k2.7-code-highspeed = 13/54/2.6', kmap.get('kimi-k2.7-code-highspeed') and kmap['kimi-k2.7-code-highspeed']['in_price'] == ['13.00元'])",
+      "chk('kimi-k2.6 = 6.5/27/1.1', kmap.get('kimi-k2.6') and kmap['kimi-k2.6']['out_price'] == ['27.00元'] and kmap['kimi-k2.6']['cache_hit'] == ['1.10元'])",
+      "cm = F.kimi_col_map(['模型', '计费单位', '输入价格（缓存命中）', '输入价格（缓存未命中）', '输出价格', '上下文窗口'])",
+      "chk('列语义映射：未命中→3 命中→2 输出→4', cm == {'in': 3, 'out': 4, 'cache': 2}, cm)",
+      "_, w_unit = F.kimi_bt_row_to_record('`kimi-k3`,`2K tokens`,`¥1.30`,`¥6.50`,`¥27.00`', cm)",
+      "chk('单位非 1M → reason=unit（S5 单位断言延续）', w_unit == 'unit', w_unit)",
+      "_, w_nm = F.kimi_bt_row_to_record('`not-a-model`,`1M tokens`,`¥1.30`,`¥6.50`,`¥27.00`', cm)",
+      "chk('非 kimi 模型名 → reason=name（不误收页面里别的反引号数组）', w_nm == 'name', w_nm)",
+      "_, w_pr = F.kimi_bt_row_to_record('`kimi-x`,`1M tokens`,`¥1.30`', cm)",
+      "chk('价格列取不到 → reason=prices', w_pr == 'prices', w_pr)",
+      // ── d3 TokenHub：范围四路分流 ──
+      "ms = [{'name': 'Hy3', 'brand': 'hunyuan'}, {'name': 'Hy4 preview', 'brand': 'hunyuan'},",
+      "      {'name': 'Hy-MT2-Pro', 'brand': None}, {'name': 'Hy-MT2-Plus', 'brand': None},",
+      "      {'name': 'Hy-MT2-Pro', 'brand': 'hunyuan'},",
+      "      {'name': 'Kimi K3', 'brand': 'kimi'}, {'name': 'Hy-New', 'brand': None}]",
+      "kept, unmapped, excluded = T.split_scope(ms)",
+      "kn2 = [m['name'] for m in kept]",
+      "chk('混元通用模型收录（Hy3 / Hy4 preview）', kn2 == ['Hy3', 'Hy4 preview'], kn2)",
+      "chk('翻译系进 excluded、不进 unmapped（不刷告警不诱导补映射）', 'Hy-MT2-Pro' in excluded and 'Hy-MT2-Plus' in excluded and 'Hy-MT2-Pro' not in unmapped, 'excluded=%s unmapped=%s' % (excluded, unmapped))",
+      "chk('误映射进 BRAND_MAP 的翻译系（brand=hunyuan）仍被拦下', 'Hy-MT2-Pro' not in kn2)",
+      "chk('已知第三方（Kimi K3）不进 unmapped（不刷假告警）', 'Kimi K3' not in unmapped)",
+      "chk('未识别新名字仍告警（v3.55.0 A2 不回归）', 'Hy-New' in unmapped, unmapped)",
+      "k2, u2 = T.keep_hunyuan(ms)",
+      "chk('keep_hunyuan 两元组签名兼容（T65-e9/e10 既有守卫不回归）', [m['name'] for m in k2] == ['Hy3', 'Hy4 preview'] and u2 == ['Hy-New'], 'u2=%s' % u2)",
+      // ── d4 跨文件一致：Kimi 解析值 == pricing.json 用户已校对 lock 价 ──
+      "P = json.load(open(os.path.join(SRC, 'pricing.json'), encoding='utf-8'))",
+      "lk = P['models'].get('kimi-k3') or {}",
+      "chk('kimi-k3 解析值 == pricing.json lock（20/100/2，解析器与已发布价不分叉）', lk.get('input_price') == 20 and lk.get('output_price') == 100 and lk.get('cached_price') == 2, lk)",
+      "print('FAILS=' + str(len(fails)))",
+    ].join('\n');
+    const r112 = spawnSync(PY112, ['-c', pySrc112, SRC],
+      { timeout: 120000, windowsHide: true, encoding: 'utf-8', env: Object.assign({}, process.env, PY_IO_ENV) });
+    const log112 = String(((r112 && r112.stdout) || '') + ((r112 && r112.stderr) || ''));
+    const nFail112 = (log112.match(/FAILS=(\d+)/) || [])[1];
+    ok('T112-d1~d4 ★行为：MiniMax 门槛剥离 / Kimi 列语义 / TokenHub 范围 / lock 交叉一致（真页面形态夹具）',
+      r112.status === 0 && nFail112 === '0', log112.slice(-1400));
   }
 }
 
