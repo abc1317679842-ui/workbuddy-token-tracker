@@ -9841,8 +9841,13 @@ const txInjectionComplete = (ttSrc, shSrc) => (
       env: Object.assign({}, process.env, PY_IO_ENV, { WB_ROOT: wb104, CN_PRICES_DIR: pr104 }),
       encoding: 'utf8', timeout: 180000, windowsHide: true,
     });
-    const n104 = new Date();
-    const today104 = `${n104.getFullYear()}-${String(n104.getMonth() + 1).padStart(2, '0')}-${String(n104.getDate()).padStart(2, '0')}`;
+    // v3.63.6（KI-51）：快照文件名必须用**北京时间** —— 与 build_index.py 的 `beijing_today()`
+    //   （CN_TZ=UTC+8）**同源**。旧写法取 runner 本地日期：CI 是 UTC，UTC 16:00 之后北京已是次日
+    //   → 这里拼出的日期与 build_index 写出的日期差一天 → 读不到快照 → T104-b1/b2 假红。
+    //   KI-38 同款（**夹具时钟必须与被解释方同源**）；本机 UTC+8 两种写法同值，
+    //   ⇒ 本缺陷**结构上不可能在本机复现**，只在 CI 的 UTC 跨日窗口暴露。
+    const bj104 = new Date(Date.now() + 8 * 3600000); // 北京 = UTC+8（中国无夏令时）
+    const today104 = `${bj104.getUTCFullYear()}-${String(bj104.getUTCMonth() + 1).padStart(2, '0')}-${String(bj104.getUTCDate()).padStart(2, '0')}`;
     let snap104 = null;
     try { snap104 = JSON.parse(fs.readFileSync(path.join(pr104, 'history', 'prices-' + today104 + '.json'), 'utf-8')); } catch (e) { snap104 = null; }
     const M104 = (snap104 && snap104.models) || {};
