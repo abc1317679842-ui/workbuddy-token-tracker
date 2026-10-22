@@ -1088,6 +1088,43 @@ else {
       .map((m) => `${m[1]}.${m[2]}.${m[3]}`);
     return '顶部三条: ' + hdrs.slice(0, 3).join(' / ') + `（hdrs[0] 应为 ${v}，hdrs[1] 应为上一版）`;
   })());
+  // i8（v3.63.5 补，真实缺陷复发防护）：生产代码内不得出现**高于** SKILL_VERSION 的版本标注。
+  //   病象（2026-10-22 外部审计 G-1）：v3.63.4 那一批把修复标注全写成 **v3.64.x**（16 处 ——
+  //   fetch-cn-prices.py 9 / parse_tokenhub.py 5 / selftest.js 2），而发布号是 3.63.4。纯注释级、
+  //   零行为影响，但**事后按版本号检索会整批漏掉**（损害可追溯性），且会让人误以为还有个 v3.64.x。
+  //   i1~i7 只管"四处一致"，抓不到"注释里写了未来的版本号"。
+  //   口径：取 js/py 内 `v\d+\.\d+\.\d+` 的**最大值**，必须 ≤ SKILL_VERSION（相等允许：本版的标注）。
+  //   ⚠ 写法坑（本条守卫自己踩过，留此防复发）：主版本**必须是数字组** `v(\d+)`，
+  //     不能写成 `v3\.(\d+)\.(\d+)\.(\d+)` —— 那等于要求 `v3.x.y.z` **四段**，
+  //     而真实版本号 `v3.63.4` 只有两段数字 → 永远匹配不上（实测 `.test('v3.63.4')===false`，
+  //     守卫恒红且从输出看不出原因：表现是"扫不到任何版本号"）。
+  const RE_VER = new RegExp('\\bv(\\d+)\\.(\\d+)\\.(\\d+)\\b', 'g');
+  const RE_VER_FILE = /\.(js|py)$/;
+  // 三段完整比较（major → minor → patch）：只比 minor/patch 会把 v2.82.3 判成"大于" v3.63.5。
+  const gtVer3635 = (a, b) => (a[0] !== b[0] ? a[0] > b[0] : (a[1] !== b[1] ? a[1] > b[1] : a[2] > b[2]));
+  // 哨兵白名单：`v9.9.9` 是 T12-c「模拟远端有更高版本」的测试夹具，不是真版本标注。
+  const VER_SKIP3635 = new Set(['9.9.9']);
+  const scanVer3635 = () => {
+    let worst = null; let who = '';
+    for (const f of fs.readdirSync(SRC)) {
+      if (!RE_VER_FILE.test(f)) continue;
+      const s = fs.readFileSync(path.join(SRC, f), 'utf-8');
+      for (const m of s.matchAll(RE_VER)) {
+        const t = [Number(m[1]), Number(m[2]), Number(m[3])];
+        if (VER_SKIP3635.has(t.join('.'))) continue;
+        if (!worst || gtVer3635(t, worst)) { worst = t; who = f; }
+      }
+    }
+    return { worst, who };
+  };
+  ok('T12-i8 ★生产代码内不得出现高于 SKILL_VERSION 的版本标注（v3.64.x 误标事故）', (() => {
+    const { worst } = scanVer3635();
+    if (!worst) return false; // 一个版本号都扫不到 = 扫描本身失效，不许假绿
+    return !gtVer3635(worst, v.split('.').map(Number));
+  })(), (() => {
+    const { worst, who } = scanVer3635();
+    return `代码内最大标注 v${worst ? worst.join('.') : '?'}（来自 ${who}）vs SKILL_VERSION ${v}`;
+  })());
   ok('T12-i4 SKILL_VERSION 与主脚本头注释一致',
     new RegExp(`^// token-usage-tracker v${v.replace(/\./g, '\\.')} `, 'm').test(mainSrc));
   // i5：SKILL.md「当前功能总览」标题不得内嵌硬版本号（版本以 manifest 为准——标题里的硬版本号是历史漂移源）
@@ -5734,7 +5771,7 @@ else {
   const rdm65 = fs.readFileSync(path.join(SRC, 'README.md'), 'utf-8');
 
   // ── a. A2：未映射模型可见化 ──
-  // v3.64.0：main 的收录入口从 keep_hunyuan 改为 split_scope（四路分流：多出「非通用排除」），
+  // v3.63.4：main 的收录入口从 keep_hunyuan 改为 split_scope（四路分流：多出「非通用排除」），
   //   断言随之更新为「split_scope 被调用 + keep_hunyuan 在 split_scope 内被调用」—— 意图不变：
   //   过滤函数必须定义**且**在解析结果处真正接上（定义了不用 = 白写）。
   ok('T65-a1 ★keep_hunyuan 必须定义且在解析结果处被真正调用（split_scope→keep_hunyuan，定义了不用 = 白写）',
@@ -10702,7 +10739,7 @@ const txInjectionComplete = (ttSrc, shSrc) => (
   }
 }
 
-// ===== T112（v3.64.0 · 批18）：价格解析器三修（MiniMax-M3 错价 / Kimi 停更 / TokenHub 范围）=====
+// ===== T112（v3.63.4 · 批18）：价格解析器三修（MiniMax-M3 错价 / Kimi 停更 / TokenHub 范围）=====
 // 三条主线（均先用真页面复现 → 修 → 配守卫；守卫分源码侧 + 行为侧）：
 //   ① **MiniMax-M3 错价（P1）**：官方页删「永久五折」文案后 M3 行变成 3 数字
 //      「≤ 512k 输入 tokens 2.10 8.40 0.42」→ 旧代码 nums[0] 取到门槛里的 512 当输入价
@@ -10881,6 +10918,63 @@ const txInjectionComplete = (ttSrc, shSrc) => (
     const nFail112 = (log112.match(/FAILS=(\d+)/) || [])[1];
     ok('T112-d1~d4 ★行为：MiniMax 门槛剥离 / Kimi 列语义 / TokenHub 范围 / lock 交叉一致（真页面形态夹具）',
       r112.status === 0 && nFail112 === '0', log112.slice(-1400));
+  }
+}
+
+// ===== T113（v3.63.5 · 批19）：价库陈旧留痕（外部审计 F-1）=====
+// 审计方主张「回退到随技能走的兜底副本时不触发任何告警」——**该主张不成立**：v2.81 起
+//   `dbStaleTag()` 已在**弹窗**标 `⚠价库M/D`（回退即显示 ⚠价库9/28），实证可复现。真实缺口只有
+//   一条：**日志侧零留痕**（弹窗标签只在弹窗那一轮可见，回退发生在别的轮次就查不到）。
+//   本批：① 补 stderr 留痕通道（口径与弹窗标签一致：built_at 非今天即算陈旧）；
+//        ② 直接删除误导源 —— 技能目录内 built_at=2026-09-28 的副本（git 未跟踪，含活跃库
+//           已淘汰的过期锁价 deepseekv4flash 1.5/4.5/0.05），它正是回退面的源头。
+// 守卫纪律：源码侧锚**使用点**（CN_PRICE_DB 确定之后必须调用 + 必须真写 stderr + 必须导出）；
+//   行为侧 require 真身纯函数喂**五种夹具**（陈旧/今天/无 built_at/坏 JSON/文件缺失）。
+{
+  const tt113 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const seg113 = tt113.slice(tt113.indexOf('function priceIndexStaleDays'), tt113.indexOf('function autoDiscoverCnPriceDir'));
+  ok('T113-a1 ★priceIndexStaleDays 纯函数存在，且读 index.json 的 built_at（按本地日期算天，口径与 dbStaleTag 一致）',
+    /function priceIndexStaleDays\s*\(/.test(seg113)
+    && /JSON\.parse\(raw\)/.test(seg113)
+    && /const b = j && j\.built_at/.test(seg113),
+    seg113.slice(0, 100));
+  ok('T113-a2 ★自动发现确定目录**之后**才调用陈旧检查（顺序：先 CN_PRICE_DB 再算天数）',
+    tt113.indexOf('const CN_PRICE_DB = path.join(CN_PRICE_DIR') >= 0
+    && tt113.indexOf('const CN_PRICE_DB = path.join(CN_PRICE_DIR') < tt113.indexOf('priceIndexStaleDays(CN_PRICE_DB'),
+    `db@${tt113.indexOf('const CN_PRICE_DB = path.join(CN_PRICE_DIR')} call@${tt113.indexOf('priceIndexStaleDays(CN_PRICE_DB')}`);
+  ok('T113-a3 ★陈旧必须真写 stderr（不是只算不用）—— 日志留痕通道是本批要补的东西',
+    /if \(CN_PRICE_STALE_DAYS >= PRICE_DB_STALE_WARN_DAYS\)/.test(tt113)
+    && /process\.stderr\.write\(/.test(tt113.slice(
+      tt113.indexOf('if (CN_PRICE_STALE_DAYS >= PRICE_DB_STALE_WARN_DAYS)'),
+      tt113.indexOf('if (CN_PRICE_STALE_DAYS >= PRICE_DB_STALE_WARN_DAYS)') + 400)));
+  ok('T113-a4 ★exports 必须导出纯函数 + 阈值 + 实测值（selftest 可单测，T87 纪律延续）',
+    /priceIndexStaleDays, PRICE_DB_STALE_WARN_DAYS, CN_PRICE_STALE_DAYS,/.test(tt113));
+
+  // ── b. 行为组：require 真身纯函数喂夹具（不打网络、不依赖真实价库状态）──
+  const mod113 = require(path.join(SRC, 'token-tracker.js'));
+  const dir113 = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-113-'));
+  try {
+    const mk113 = (n, o) => {
+      const p = path.join(dir113, n);
+      fs.writeFileSync(p, typeof o === 'string' ? o : JSON.stringify(o));
+      return p;
+    };
+    const iso = (dt) => `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+    const now = Date.now();
+    const got = [
+      mod113.priceIndexStaleDays(mk113('old.json', { built_at: iso(new Date(now - 30 * 86400000)) }), now),
+      mod113.priceIndexStaleDays(mk113('today.json', { built_at: iso(new Date(now)) }), now),
+      mod113.priceIndexStaleDays(mk113('nobuilt.json', { models: {} }), now),
+      mod113.priceIndexStaleDays(mk113('bad.json', '{ 坏 JSON'), now),
+      mod113.priceIndexStaleDays(path.join(dir113, 'missing.json'), now),
+    ];
+    ok('T113-b1 ★行为：陈旧30天→30 / 今天→0 / 无 built_at→-1 / 坏JSON→-1 / 文件缺失→-1',
+      got[0] === 30 && got[1] === 0 && got[2] === -1 && got[3] === -1 && got[4] === -1,
+      JSON.stringify(got));
+    ok('T113-b2 ★阈值常量与 dbStaleTag 口径一致（built_at 非今天即算陈旧 → 阈值 1 天）',
+      mod113.PRICE_DB_STALE_WARN_DAYS === 1, String(mod113.PRICE_DB_STALE_WARN_DAYS));
+  } finally {
+    try { fs.rmSync(dir113, { recursive: true, force: true }); } catch (e) { /* 清理失败不影响断言 */ }
   }
 }
 

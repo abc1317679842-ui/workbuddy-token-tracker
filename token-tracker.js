@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.63.4 (2026-10-21)
+// token-usage-tracker v3.63.5 (2026-10-22)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -695,6 +695,32 @@ const PRICING = path.join(WB, 'skills', 'token-usage-tracker', 'pricing.json');
 //     ③ 技能自身目录 `prices/`（随技能走的兜底副本，完全不依赖任何工作区）
 //     ④ 旧硬编码路径（向后兼容，最后兜底）
 //   全部未命中 → 返回空串，走既有降级（stderr 告警 + 回退聚合价），绝不崩溃。
+// v3.63.5（外部审计 F-1）：价库陈旧天数（**纯函数**，selftest 直接单测，无需 spawn）。
+//   背景：v2.81 起 `dbStaleTag()` 已在**弹窗**标注 `⚠价库M/D` —— 所以"回退到陈旧副本"并非
+//   零告警（审计方 F-1 的"不触发任何告警"主张**不成立**，已实证）。但弹窗标签只在**弹窗那一轮**
+//   可见：回退发生在别的轮次、或那一轮没弹窗，事后就查不到。补这条 stderr 留痕通道，
+//   让"用了哪份价库、它有多旧"在日志里可查（与弹窗标签配对，两条通道口径一致）。
+//   返回：陈旧天数（>=0）；读不到/坏 JSON/无 built_at → **-1**（保守：不告警，交给下游既有告警）。
+function priceIndexStaleDays(idxPath, nowMs) {
+  try {
+    const raw = fs.readFileSync(idxPath, 'utf8');
+    const j = JSON.parse(raw);
+    const b = j && j.built_at;
+    if (typeof b !== 'string' || !/^\d{4}-\d{2}-\d{2}/.test(b)) return -1;
+    const d0 = b.slice(0, 10);
+    const t0 = Date.parse(d0 + 'T00:00:00');
+    const now = (typeof nowMs === 'number' && isFinite(nowMs)) ? nowMs : Date.now();
+    const d1 = dateStrOfTs(now);
+    const t1 = Date.parse(d1 + 'T00:00:00');
+    if (!isFinite(t0) || !isFinite(t1)) return -1;
+    return Math.round((t1 - t0) / 86400000);
+  } catch (e) {
+    return -1;
+  }
+}
+// 陈旧告警阈值（天）：与 `dbStaleTag` 口径一致 —— built_at 不是今天即算陈旧（价库每日刷新）。
+const PRICE_DB_STALE_WARN_DAYS = 1;
+
 function autoDiscoverCnPriceDir() {
   const cands = [];
   if (process.env.CN_PRICE_DB_DIR) cands.push(String(process.env.CN_PRICE_DB_DIR));
@@ -723,6 +749,15 @@ function autoDiscoverCnPriceDir() {
 }
 const CN_PRICE_DIR = autoDiscoverCnPriceDir();
 const CN_PRICE_DB = path.join(CN_PRICE_DIR, 'index.json');
+// v3.63.5（外部审计 F-1）：实际使用的价库陈旧 → **stderr 留痕**（弹窗侧 `dbStaleTag` 已有
+//   `⚠价库M/D`，但那是"弹窗那一轮才可见"，日志侧此前是零留痕）。此处只留痕、不改变取价路径：
+//   陈旧价可能仍比聚合估算价更准，且弹窗已标注 —— 静默才是要治的病，不是陈旧本身。
+const CN_PRICE_STALE_DAYS = priceIndexStaleDays(CN_PRICE_DB, Date.now());
+if (CN_PRICE_STALE_DAYS >= PRICE_DB_STALE_WARN_DAYS) {
+  process.stderr.write(`[token-tracker] 价库陈旧：${CN_PRICE_DB}`
+    + `（built_at 距今 ${CN_PRICE_STALE_DAYS} 天，阈值 ${PRICE_DB_STALE_WARN_DAYS} 天）`
+    + `—— 弹窗已标 ⚠价库M/D，此处补日志留痕\n`);
+}
 // 抓价流水线目录：同样自适应——优先环境变量，其次价库所在目录（v3.18 删个人路径兜底）。
 const CN_PRICE_PIPELINE_DIR = process.env.CN_PRICE_PIPELINE_DIR
   || (CN_PRICE_DIR ? path.dirname(CN_PRICE_DIR) : '');
@@ -6819,7 +6854,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.63.4'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.63.5'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -7988,6 +8023,8 @@ module.exports = {
   interruptedRowsAfter,
   userCancelKind, // v3.60.0（批A）：用户取消标记的统一判定（按 error.message 形态），selftest 可直接单测
   incrementalRecord, loadLedgerWatermark, saveLedgerWatermark,
+  // v3.63.5（外部审计 F-1）：价库陈旧天数纯函数 + 实测值（selftest 直接单测，见 T113-b）
+  priceIndexStaleDays, PRICE_DB_STALE_WARN_DAYS, CN_PRICE_STALE_DAYS,
   // v3.63.1（批14）：同轮同内容弹窗去重（selftest 直接单测指纹与四条件，不必每次真 spawn 弹窗）
   toastDedupePath, toastFingerprint, toastAlreadyShown, markToastShown,
   // v3.39.0（A2）：「记账成功但水位线没落盘」的回滚（纯文件层、可单测，避免只能靠注释自证）

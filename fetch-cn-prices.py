@@ -272,7 +272,7 @@ def parse_adjustment_notices(text, patterns=None):
 # 厂商配置。mode:
 #   tr     —— 页面含 <table>，逐行提取含"元"的行
 #   bundle —— SPA，价格硬编码在前端 JS bundle 里，需三步解析
-# v3.64.0（2026-10-21 页面改版，P1 停更修复）：Kimi 价格从 mintlify .md 源迁到 HTML 页的
+# v3.63.4（2026-10-21 页面改版，P1 停更修复）：Kimi 价格从 mintlify .md 源迁到 HTML 页的
 #   RSC 负载 —— chat-k3.md 已 308 跳 chat.md 且导出表格为空（旧路径解析 0 模型、
 #   价格永不更新，且无任何告警）。新形态（2026-10-21 实测）：
 #     HTML 内 DocTable 序列化 `columns:[{title:`模型`,width:`12%`},…],rows:[[`kimi-k3`,
@@ -334,7 +334,7 @@ VENDORS = {
     },
     'kimi': {
         'name': 'Kimi(Moonshot)',
-        # v3.64.0（2026-10-21 页面改版）：价格迁到 HTML 页 RSC 负载（.md 导出已空表），
+        # v3.63.4（2026-10-21 页面改版）：价格迁到 HTML 页 RSC 负载（.md 导出已空表），
         #   主路径抓此页；.md 仅作兜底。旧 url(moonshot.cn/docs/pricing/)已 301 失效。
         'url': KIMI_HTML_URL,
         'mode': 'kimi',
@@ -593,7 +593,7 @@ def parse_zhipu_docs(html):
     return out
 
 
-# v3.64.0（2026-10-21 P1 修复）：长度分档门槛（「≤ 512k 输入 tokens」里的 512）。
+# v3.63.4（2026-10-21 P1 修复）：长度分档门槛（「≤ 512k 输入 tokens」里的 512）。
 #   strip_tags 已把 &gt;/&lt; 解码为 >/<，故直接匹配字符。只匹配「比较符 + 数字 + k」，
 #   价格数字（2.10 这类）不带 k 后缀，不会误剥。
 LEN_TIER_RE = re.compile(r'([≤≥<>]=?)\s*([\d.]+)\s*[kK](?![a-zA-Z])')
@@ -611,7 +611,7 @@ def parse_minimax(html):
         主档取标准表 ≤512k 行；>512k 与优先 tier 记入 tier_note。
       - M3 行（旧版，2026-09-28~10-20）：6 个数字两两成对 = 刊例/永久五折，
         靠「永久五折」文案分流。该文案 2026-10-21 已从页面消失 → 分支死，
-        M3 落入通用分支后 nums[0] 取到「512k」里的 512 当输入价（高 244 倍，见 v3.64.0 修法）。
+        M3 落入通用分支后 nums[0] 取到「512k」里的 512 当输入价（高 244 倍，见 v3.63.4 修法）。
         旧格式保留识别能力（页面若恢复五折文案仍按末 6 位成对解析）。
       - M2.x 行：数字 = 输入, 输出, 缓存读, (缓存写)。
       - H3-Context-IR 行：仍含'元'内联（2 个数字 = 输入/输出）。
@@ -655,7 +655,7 @@ def parse_minimax(html):
             if not mname:
                 continue
             name, rest = mname.group(1), mname.group(2)
-            # v3.64.0（2026-10-21 页面改版，P1 错价修复）：M3 行现为
+            # v3.63.4（2026-10-21 页面改版，P1 错价修复）：M3 行现为
             #   「MiniMax-M3 ≤ 512k 输入 tokens 2.10 8.40 0.42」——
             #   长度门槛数字（512）与价格混在同一行，旧代码 nums[0] 直接取到 512 当输入价
             #   （正确 2.10，高 244 倍，已进线上索引参与计费）。先剥掉「≤/> 512k」类门槛，
@@ -688,7 +688,7 @@ def parse_minimax(html):
                      '优先service tier按标准×1.5' % (list_in, list_out, list_ca))
             else:
                 # M2.x 行 / 新版 M3 长度分档行：[输入, 输出, 缓存读, (缓存写)]
-                # v3.64.0：长度分档行的主档只取 ≤ 行，> 档显式跳过 —— 不能只靠 seen 去重：
+                # v3.63.4：长度分档行的主档只取 ≤ 行，> 档显式跳过 —— 不能只靠 seen 去重：
                 #   页面若调换两行顺序（>512k 在前），旧法会把 2 倍价当主档静默入账。
                 if tier_m and tier_m.group(1) in ('>', '>=', '≥'):
                     continue
@@ -705,7 +705,7 @@ def parse_minimax(html):
 
 
 def kimi_col_map(titles):
-    """DocTable 列标题 → 语义索引（v3.64.0）。与 COL_SYNONYMS 同思路：按词面映射、不按位置。
+    """DocTable 列标题 → 语义索引（v3.63.4）。与 COL_SYNONYMS 同思路：按词面映射、不按位置。
     判定顺序要紧：『未命中』含『命中』，必须先判未命中（否则输入价会被缓存列抢走）。
     返回 {'in': idx|None, 'out': idx|None, 'cache': idx|None}（相对行首的单元格下标）。"""
     idx = {'in': None, 'out': None, 'cache': None}
@@ -968,14 +968,14 @@ def parse_kimi():
     """
     out = []
     matched_rows = 0  # v3.61.0：正则匹配到的行数 —— 用于区分「页面没行」与「行全被跳过」
-    # ── 主路径：HTML 页 RSC DocTable（v3.64.0）──
+    # ── 主路径：HTML 页 RSC DocTable（v3.63.4）──
     try:
         t = http_get(KIMI_HTML_URL, 20)
     except Exception as e:
         print('[WARN] kimi html: %s' % repr(e)[:80])
         t = ''
     out, matched_rows = parse_kimi_html(t)
-    # ── 兜底：旧 .md 路径（页面回退到 mintlify .md 导出时；v3.64.0 起仅为 fallback）──
+    # ── 兜底：旧 .md 路径（页面回退到 mintlify .md 导出时；v3.63.4 起仅为 fallback）──
     if not out:
         print('[WARN] kimi: HTML 页未解析到价格行，回退旧 .md 路径（%s）' % KIMI_PAGES)
         base = 'https://platform.kimi.com/docs/pricing/'
