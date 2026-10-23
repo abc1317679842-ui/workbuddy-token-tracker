@@ -3,6 +3,47 @@
 > v3.18 起从 README.md / SKILL.md 拆出集中维护（原两处变更史逐字重复、体积失控且易漂移）。
 > 历史条目按原样迁移，未改写内容。
 
+## v3.63.7（2026-10-23）—— 批21：外部审计两条 P1 修复（AUD-B-01 注入行陈旧 trace / AUD-G-01 rounds 隔离失效）
+
+> 来源：`C://Users//14779//WorkBuddy//2026-10-23-20-18-58//token-tracker-审计报告-2026-10-23.md`（12 条：P0=0/P1=2/P2=2/P3=8）。
+> **本轮不动记账热路径与金额账本**（硬账冻结 §一·补 第 1 条）；两条 P1 都在"外围面"：展示面 + 隔离面。
+
+### AUD-B-01【P1】`--hook` 注入行读的是 9 天前另一个会话的陈旧 trace（已修）
+
+- **现象**：注入行恒为 `hy3 ｜ 输入 24.3万 / 输出 718 tokens（缓存 24.2万）`，**每轮都一样**。
+- **根因**：宿主自 2026-10-14 起把 trace 写成 **`.jsonl`**，而 `latestTraceFile`（:1009）只认 `.json`
+  → 生产 `.json` 最新 mtime 停在 **10-14 09:30**（373 个），`.jsonl` 已有 930 个且持续更新
+  → 恒选中 10-14 那个**别的会话**的 trace；`aggregateRound` 按 sid 过滤后返回 null → 退化为单 trace。
+- **修法（未采纳审计方给的"改过滤器支持 .jsonl"）**：`latestTraceFile` **不按会话归属**，
+  只改过滤器会让 anchor 变成**别的并行会话**的新 trace → 从"稳定错"变成"随机错"，更难识别。
+  改为**门控**：新增 `hookStatUsable()`，非同轮时 stat 必须 ①`trace.sessionId === sid` ②文件 mtime 新鲜
+  （默认 ≤30 分钟，`WB_TRACE_FRESH_MS` 可调），否则**整段不输出**注入行。
+- ⚠ **两个实施陷阱（改前已识别）**：① `lineFor` 首行即 `stat.durMs`，**置 null 会 TypeError** → 必须整段跳过；
+  ② `ensureNewModelPricing` 有副作用（联网自动补录新模型价），门控**置顶**连带跳过它才是对的 ——
+  不可信时 stat 来自别人的陈旧 trace，拿它去补录**别人的模型**价是错上加错。
+
+### AUD-G-01【P1】`WB_ROOT` 隔离契约对 `rounds/` 不成立（已修）
+
+- **现象**：按 §9.10 正确设了 `WB_ROOT=<tmp>` 的隔离运行**仍写入生产明细**（审计期间实测污染 13 行）。
+- **根因**：`:789 ROUNDS_DIR = path.join(__dirname, "rounds")`，而 `:75 TRACE_DIR` 与 `recalc-day.js:44 SKILL_DIR` 都是 WB 相对。
+- **修法**：改为与 `recalc-day.js` 的 `SKILL_DIR` **同源** ——
+  `path.join(process.env.WB_ROOT ? path.join(WB, "skills", "token-usage-tracker") : __dirname, "rounds")`。
+  **不设 `WB_ROOT` 时与旧写法完全等价**（生产零迁移、零回归）；设了则落隔离区。
+  ⚠ 未采纳"直接改成 `path.join(WB,"rounds")`"：那会让生产明细写到 `~/.workbuddy/rounds`，
+  且 `recalc-day.js` 读的是 `SKILL_DIR/rounds` → **读写分裂**（正是本条要治的病，别在修的时候再造一个）。
+
+### 顺带清理（纪律 §一·补 第 7 条：抓到的残留必须当轮清掉）
+
+- `rounds/rounds-2026-10.jsonl` 内 **10 条历史残留已清**：F-04 六条（`sid=""` 且 `roundStart==0`，10-03）
+  + KI-36 已登记却一直没删的四条（`s1-ab-test-0001` / `s1ab2` / `watchtest` / `11111111-2222-…`）。
+  1456 → 1446 行；备份 `2026-10-23-20-18-58\rounds-2026-10.backup-before-residue-cleanup.jsonl`；
+  `recalc-day 2026-10-23` → **「无需修正」**。
+
+### 验证
+
+- selftest 基线：**1243 过 / 0 败 / 0 跳过**（v3.63.6 为 1236；新增 T114 六条）
+- 反向验证：隔离副本 **BASE 1243/0/0**；R90（`ROUNDS_DIR` 改回锚 `__dirname`）→ 仅 `T114-a1`/`T114-b1` 红、\n  R91（`hookStatUsable` 恒返回 true）→ 仅 `T114-b3` 红、R92（删掉门控调用）→ 仅 `T114-a4` 红\n  —— **3/3 必红且零误伤**，全部**串行单跑**（避开连跑压机器导致的 spawn 假红，K19 坑①）。\n  ⚠ BASE 首次跑曾红 `T12-j0/j1/j2`（更新提示 spawn 用例），**单独重跑复判为 1243/0/0** → 确认为假红
+- 零账本实证：两条改动**都不触碰金额账本**（G-01 只改明细目录路径且不设 `WB_ROOT` 时等价于旧写法，\n  由 `T114-b2` 钉住；B-01 只改注入行输出）。已结算日 2026-10-21 token 量**逐位未变**\n  （197937921 / 1017196 / 189708897 / ¥132.92725），10-22、10-23 仅正常记账增长，总天数 70 未变
 ## v3.63.6（2026-10-23）—— 修 CI 跨日假红：T104 夹具时钟改用北京时间（KI-51）
 
 > 触发：v3.63.5 发版后 CI（run 39809872365，attempt 1 与 re-run attempt 2 **均失败**）

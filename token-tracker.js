@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.63.6 (2026-10-23)
+// token-usage-tracker v3.63.7 (2026-10-23)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -786,7 +786,11 @@ const BALANCE_HISTORY_MAX = 20;        // 缓存里保留的余额观测条数�
 // 口径（**硬规矩，不要改**）：in/out/cached/total 是平台落盘的真实用量；
 //   costApiEquiv 是按 pricing.json 的 API 单价折算的**等价金额，不是真实扣费**——
 //   WorkBuddy 内置模型走客户端自带额度，本技能读不到额度扣减，故一律不做"金额↔积分"换算。
-const ROUNDS_DIR = path.join(__dirname, 'rounds');
+// v3.63.7（AUD-G-01）：`rounds/` 必须与 `recalc-day.js:44` 的 `SKILL_DIR`（**WB 相对**）同源 ——
+//   旧写法锚 `__dirname`，按 §9.10 正确设了 `WB_ROOT` 的隔离运行**仍然写入生产明细**
+//   （2026-10-23 审计实测污染 13 行伪造记录）。
+//   不设 WB_ROOT 时**完全等价于旧写法**（生产零迁移、零回归）；设了则落到隔离区，与 recalc 一致。
+const ROUNDS_DIR = path.join(process.env.WB_ROOT ? path.join(WB, 'skills', 'token-usage-tracker') : __dirname, 'rounds');
 const ROUNDS_KEEP_MONTHS = 6;          // 保留最近 N 个月，--report 运行时顺带清理
 const ROUND_LABEL_MAX = 40;            // 轮次标签（本轮首条 user 消息）截断长度
 const EXPORTS_DIR = path.join(__dirname, 'exports'); // v3.20.0：--report --csv 落盘目录（已 gitignore）
@@ -2989,6 +2993,25 @@ function cleanupSnapshots(curSid) {
       process.stderr.write(`[token-tracker] 已清理 ${deleted} 个过期会话快照\n`);
     }
   } catch (e) { /* 清理失败不影响主流程 */ }
+}
+
+// v3.63.7（AUD-B-01）：--hook 注入行的 stat 可信性判定 —— **必须在 main() 外**（T37-b1 硬闸 950 行）。
+//   背景：宿主自 2026-10-14 起把 trace 写成 **.jsonl**，而 `latestTraceFile`(:1009) 只认 `.json`
+//   → 恒选中 9 天前**另一个会话**的陈旧 trace（实证：注入行恒为 24.3万/718/24.2万，逐位吻合那个 10-14 文件）。
+//   判据（仅对**非同轮**生效）：① trace.sessionId === 本会话 sid ② trace 文件 mtime 新鲜（默认 ≤30 分钟）。
+//   ⚠ 不可信时**整段不输出**，绝不置 null 后照常走 lineFor —— lineFor 首行即 `stat.durMs`，传 null 直接 TypeError。
+//   ⚠ 门控**置顶**（在 ensureNewModelPricing 之前）：连带跳过「联网自动补录新模型价」是**正确的** ——
+//     不可信时 stat 来自别人的陈旧 trace，拿它去补录**别人的模型**价本就是错上加错。
+//   ⚠ 不采用「改过滤器支持 .jsonl」的修法：latestTraceFile 不按会话归属，改后 anchor 会变成别的并行会话
+//     → 从「稳定错」变成「随机错」（更难识别）。宁可不显示，也不显示错的。
+function hookStatUsable(t, traceFile, sid, sameRound) {
+  if (sameRound) return true; // 同轮用落定快照值（走 transcript 链路，B 轴已实证 20/20 正确）
+  const traceSid = (t && t.trace && t.trace.sessionId) ? String(t.trace.sessionId) : '';
+  if (traceSid && traceSid !== sid) return false; // 跨会话（别人的 trace）
+  if (!traceFile) return false;
+  const TRACE_FRESH_MS = Number(process.env.WB_TRACE_FRESH_MS) || 1800000; // 默认 30 分钟
+  try { return (Date.now() - fs.statSync(traceFile).mtimeMs) <= TRACE_FRESH_MS; }
+  catch (e) { return false; }
 }
 
 function lineFor(stat, sameRound, modelShort) {
@@ -6854,7 +6877,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.63.6'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.63.7'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -7983,6 +8006,7 @@ function main() {
     saveSnapshot({ file: f, stat }, sid);
   }
 
+  if (!hookStatUsable(t, f, sid, sameRound)) { out({ hookSpecificOutput: {} }); return; }
   const shown = sameRound ? snap.stat : stat;
   const modelShort = shortModelName(shown, pricing);
   const nmNote = ensureNewModelPricing(pricing, shown).note;
@@ -8017,6 +8041,7 @@ module.exports = {
   INJECTION_TAGS_ALL, INJECTION_TAGS_NOT_SUBMIT, injectionTagOf,
   doctorTxt,
   ROUNDS_DIR, EXPORTS_DIR,
+  hookStatUsable, // v3.63.7（AUD-B-01）：导出供 selftest 行为守卫直接喂夹具（陈旧/跨会话/同会话/缺失）
   mainModelState, lastTranscLine, coalescePath, hasActiveSubagentsSince, subagentsDirFromTranscript, subagentPending, subagentsAllStagnant, interruptedByUser, hasSubagentsRecentlyActive,
   subagentsAllSettled, // v3.38.0：子代理「是否已全部落定」判据（终止态 / incomplete 且停写≥20s），selftest 可直接单测
   splitByModelStats, showToastsSplitByModel, // v3.38.0：按模型分条（拆分 / 弹窗），selftest 可直接单测

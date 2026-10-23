@@ -10983,6 +10983,82 @@ const txInjectionComplete = (ttSrc, shSrc) => (
   }
 }
 
+// ===== T114（v3.63.7 · 批21）：两条 P1 修复（外部审计 AUD-B-01 / AUD-G-01）=====
+// AUD-B-01：`--hook` 注入行读的是 9 天前**另一个会话**的陈旧 trace（宿主 10-14 起写 .jsonl，而
+//   latestTraceFile 只认 .json）→ 每轮显示错数字。**不采纳**审计方给的「改过滤器支持 .jsonl」：
+//   latestTraceFile **不按会话归属**，改后 anchor 会变成别的并行会话 → 从「稳定错」变「随机错」。
+//   改法：门控 —— 非同轮时 stat 必须同会话且新鲜，否则**整段不输出**。
+// AUD-G-01：`ROUNDS_DIR` 锚 __dirname → 按 §9.10 设了 WB_ROOT 的隔离运行**仍写生产明细**
+//   （2026-10-23 审计实测污染 13 行）。改法：与 recalc-day.js 的 SKILL_DIR 同源，
+//   不设 WB_ROOT 时完全等价（生产零迁移）。
+{
+  const src114 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const srcR114 = fs.readFileSync(path.join(SRC, 'recalc-day.js'), 'utf-8').replace(/\r\n/g, '\n');
+
+  // ---- AUD-G-01 源码侧 ----
+  ok('T114-a1 ★ROUNDS_DIR 必须与 recalc-day.js 的 SKILL_DIR 同源（隔离生效；不设 WB_ROOT 时等价 __dirname）',
+    /const ROUNDS_DIR = path\.join\(process\.env\.WB_ROOT \? path\.join\(WB, 'skills', 'token-usage-tracker'\) : __dirname, 'rounds'\);/.test(src114),
+    (src114.match(/const ROUNDS_DIR =.*/) || ['未找到'])[0]);
+  ok('T114-a2 ★recalc-day.js 的 SKILL_DIR 必须是 WB 相对（两边口径必须一致，否则读写分裂）',
+    /const SKILL_DIR = path\.join\(WB, 'skills', 'token-usage-tracker'\);/.test(srcR114),
+    (srcR114.match(/const SKILL_DIR =.*/) || ['未找到'])[0]);
+
+  // ---- AUD-G-01 行为侧：用子进程验证模块级路径（避免 require 缓存污染其它 T 段）----
+  const iso114 = path.join(tmp, 'wb114');
+  fs.mkdirSync(iso114, { recursive: true });
+  const ask = (wbv) => spawnSync(process.execPath,
+    ['-e', 'console.log(require(' + JSON.stringify(path.join(skillDir, 'token-tracker.js')) + ').ROUNDS_DIR)'],
+    { env: Object.assign({}, process.env, { WB_ROOT: wbv }), encoding: 'utf-8', windowsHide: true });
+  const isoOut = (ask(iso114).stdout || '').trim().replace(/\\/g, '/');
+  ok('T114-b1 ★行为：设 WB_ROOT 时 ROUNDS_DIR 必须落在隔离区内（旧写法恒指向真实技能目录 → 污染生产明细 13 行）',
+    isoOut.length > 0 && isoOut.startsWith(iso114.replace(/\\/g, '/')),
+    'WB_ROOT=' + iso114 + ' → ' + (isoOut || '(空)'));
+  const noOut = (ask('').stdout || '').trim();
+  ok('T114-b2 ★行为：不设 WB_ROOT 时 ROUNDS_DIR 必须仍等于 __dirname/rounds（生产零迁移、零回归）',
+    noOut === path.join(skillDir, 'rounds'), noOut + ' vs ' + path.join(skillDir, 'rounds'));
+
+  // ---- AUD-B-01 源码侧 ----
+  const mStart114 = src114.indexOf('function main()');
+  ok('T114-a3 ★hookStatUsable 存在且在 main() **外部**（T37-b1 硬闸 950 行；不得内联回涨）',
+    /function hookStatUsable\(/.test(src114) && src114.indexOf('function hookStatUsable') < mStart114,
+    'fn@' + src114.indexOf('function hookStatUsable') + ' main@' + mStart114);
+  ok('T114-a4 ★注入行门控必须置顶且失败时输出空 hookSpecificOutput（绝不置 null 后走 lineFor —— 其首行即 stat.durMs 会 TypeError）',
+    /if \(!hookStatUsable\(t, f, sid, sameRound\)\) \{ out\(\{ hookSpecificOutput: \{\} \}\); return; \}/.test(src114)
+    && src114.indexOf('if (!hookStatUsable(') < src114.indexOf('ensureNewModelPricing(pricing, shown)'),
+    'gate@' + src114.indexOf('if (!hookStatUsable(') + ' nm@' + src114.indexOf('ensureNewModelPricing(pricing, shown)'));
+
+  // ---- AUD-B-01 行为侧：纯函数喂五种夹具 ----
+  const mod114 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  if (!mod114 || typeof mod114.hookStatUsable !== 'function') {
+    ok('T114-b3 ★行为：跨会话→false / 陈旧→false / 同会话且新鲜→true / sameRound→true / 文件缺失→false', false, 'hookStatUsable 未导出');
+  } else {
+    const dir114 = fs.mkdtempSync(path.join(tmp, 'hu114-'));
+    try {
+      const mk114 = (name, ageMin) => {
+        const fp = path.join(dir114, name);
+        fs.writeFileSync(fp, JSON.stringify({ trace: { sessionId: 'sess-A' } }));
+        const t = Date.now() - ageMin * 60000;
+        fs.utimesSync(fp, new Date(t), new Date(t)); // ⚠ t 已是毫秒：再 /1000 会变成 1970 年 → "新鲜"夹具也被判陈旧
+        return fp;
+      };
+      const freshA = mk114('fresh.json', 1);
+      const staleA = mk114('stale.json', 40);
+      const got114 = [
+        mod114.hookStatUsable({ trace: { sessionId: 'other' } }, freshA, 'sess-A', false),
+        mod114.hookStatUsable({ trace: { sessionId: 'sess-A' } }, staleA, 'sess-A', false),
+        mod114.hookStatUsable({ trace: { sessionId: 'sess-A' } }, freshA, 'sess-A', false),
+        mod114.hookStatUsable({ trace: { sessionId: 'other' } }, staleA, 'sess-A', true),
+        mod114.hookStatUsable({ trace: { sessionId: 'sess-A' } }, null, 'sess-A', false),
+      ];
+      ok('T114-b3 ★行为：跨会话→false / 陈旧→false / 同会话且新鲜→true / sameRound→true / 文件缺失→false',
+        got114[0] === false && got114[1] === false && got114[2] === true && got114[3] === true && got114[4] === false,
+        JSON.stringify(got114));
+    } finally {
+      try { fs.rmSync(dir114, { recursive: true, force: true }); } catch (e) { /* 清理失败不影响断言 */ }
+    }
+  }
+}
+
 //   为什么需要：主脚本在被 require 时会跑 loadPricing → maybeRefreshHolidays（每进程一次、四条件命中即
 //   **detach** spawn 一个 refresh-holidays.js 子进程并往 SNAP_DIR 写 `.holidays-refresh.json`）。该子进程
 //   存活到测试结束之后，恰好与这里的 rmSync 抢同一批文件 → Windows 上 rimraf 报

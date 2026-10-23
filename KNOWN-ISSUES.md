@@ -1724,3 +1724,29 @@ Kimi 文档站改版：价格从 mintlify `.md` 源迁到 **HTML 页 RSC 负载*
   **结构上不可能在本机复现**；复现方式 `TZ=UTC node selftest.js`（限北京 00:00~08:00 时段）。
 - **失效边界**：若 CI runner 改到 UTC+8（或显式 `TZ` 设为北京时间），本缺陷不会暴露；
   但只要存在"被测方按北京日期写文件、夹具按机器本地日期读"的错位，换任何时区都会以别的窗口复发。
+
+## KI-52 `--hook` 注入行读的是陈旧 trace（宿主改 .jsonl 后恒选 9 天前另一个会话）【P1，2026-10-23，**已修 v3.63.7**】
+
+- **现象**：注入行（`hy3 ｜ 耗时 … ｜ 输入 24.3万 / 输出 718 tokens…`）**每轮都一样**；实测与 10-14 那个
+  trace 文件的 extract `{in:243404,out:718,cached:241920}` 逐位吻合（跨 3 个会话一致）。
+- **根因**：宿主自 2026-10-14 起把 trace 写成 **`.jsonl`**，而 `latestTraceFile`(:1009) 只认 `.json`；
+  生产 `.json` 最新 mtime 停在 **10-14 09:30**（373 个），`.jsonl` 930 个且持续更新 → 恒选中旧文件；
+  `aggregateRound` 按 sid 过滤返回 null → 退化为单 trace。**账本与 toast 不受影响**（走 transcript 链路，B 轴 20/20 已证）。
+- **已修**：新增 `hookStatUsable()` 门控（非同轮时要求同会话 + mtime ≤30 分钟），不可信**整段不输出**。
+- ★ **未采纳审计方给的「改过滤器支持 .jsonl」**：`latestTraceFile` **不按会话归属**，改后 anchor 会变成
+  **别的并行会话**的新 trace → 从「稳定错」变成「随机错」。宁可不显示，也不显示错的。
+- **两个实施陷阱**：① `lineFor` 首行即 `stat.durMs`，**置 null 会 TypeError** → 必须整段跳过；
+  ② `ensureNewModelPricing` 有副作用（联网自动补录新模型价），门控**置顶**连带跳过它才对
+  （不可信时 stat 是别人的陈旧数据，拿它补录别人的模型价是错上加错）。
+- **失效边界**：会话空闲 >30 分钟后注入行会消失（预期行为）；`WB_TRACE_FRESH_MS` 可调。
+
+## KI-53 `WB_ROOT` 隔离契约对 `rounds/` 不成立 → 隔离运行仍写生产明细【P1，2026-10-23，**已修 v3.63.7**】
+
+- **现象**：按 §9.10 正确设了 `WB_ROOT=<tmp>` 的隔离运行**仍写入生产 `rounds/`**（审计期实测 13 行）。
+- **根因**：`ROUNDS_DIR` 锚 `__dirname`，而 `TRACE_DIR`(:75) 与 `recalc-day.js:44 SKILL_DIR` 都是 WB 相对。
+- **已修**：改为与 `SKILL_DIR` **同源**（`process.env.WB_ROOT ? path.join(WB,"skills","token-usage-tracker") : __dirname`）。
+  **不设 WB_ROOT 时与旧写法完全等价**（生产零迁移）；设了则落隔离区。
+- ★ 未采纳「直接改 `path.join(WB,"rounds")`」：生产明细会写到 `~/.workbuddy/rounds`，且 `recalc-day.js`
+  读的是 `SKILL_DIR/rounds` → **读写分裂**（正是本条要治的病，别在修的时候再造一个）。
+- ★ **为什么自测永远抓不到**：`selftest.js` require 的是 **tmp 副本**，`__dirname` 在副本里 → 天然隔离；
+  污染只发生在 **spawn CLI** 场景（CLI 的 `__dirname` 恒为真实技能目录）。与 KI-51 同类的**带外路径差异**。
