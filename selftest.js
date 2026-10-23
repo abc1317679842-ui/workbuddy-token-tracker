@@ -11059,6 +11059,101 @@ const txInjectionComplete = (ttSrc, shSrc) => (
   }
 }
 
+// ===== T115（v3.63.8 · 批22）：AUD-D-01 已有条目「单边丢失」保护 =====
+// 缺陷：抓取/解析偶发把某个价字段取成 None（页面改版、列错位），而 gate_new_model
+//   **只对上一版没有的新条目生效**（`pe is None`）→ 已有条目漏网；classify_change 对三价
+//   仅判 `o != n` → None 被当成"价格变化"直接采纳 → 一个真实存在的上一版好价被抹掉。
+//   改法：上一版有值、本次 None → 保留上一版值 + 摘掉 price/big_jump + 写 price_lost 流水。
+{
+  const bi115 = fs.readFileSync(path.join(SRC, 'build_index.py'), 'utf-8').replace(/\r\n/g, '\n');
+  const iFn115 = bi115.indexOf('def protect_price_loss(');
+  // ⚠ 锚点必须是**调用形式**：`protect_price_loss(pe, e, key` 会同时匹配到函数定义（:463），
+  //   取到的是定义位置而非调用点 → 位置断言恒假。
+  const iCall115 = bi115.indexOf('kinds, detail = protect_price_loss(pe, e, key');
+  const iCls115 = bi115.indexOf('kinds, detail = classify_change(pe, e)');
+  const iSame115 = bi115.indexOf('_same_price = all(');
+
+  ok('T115-a1 ★build_index 必须定义 protect_price_loss（已有条目上一版有值、本次 None → 保留旧值）',
+    iFn115 >= 0 && iCall115 > 0, 'fn@' + iFn115 + ' call@' + iCall115);
+
+  ok('T115-a2 ★调用点必须在 classify_change 之后、**且在 effective_from 推定之前**' +
+     '（插错位置会把旧价误标成"今天生效" → F-3 按当时价重算算错，本改动最大连锁点）',
+    iCall115 > iCls115 && iCall115 < iSame115,
+    'classify@' + iCls115 + ' < call@' + iCall115 + ' < same_price@' + iSame115);
+
+  ok('T115-a3 ★保留旧值必须写 price_lost 审计流水（静默保留 = 无人能发现 = P0）',
+    /'kind': 'price_lost'/.test(bi115) && /fields/.test(bi115) && /'kept'/.test(bi115),
+    ((bi115.match(/'kind': 'price_lost'/) || ['未找到'])[0]));
+
+  // 取函数体（到下一个顶层 def 为止），确认没有挂 _manual_audit
+  const fnBody115 = iFn115 >= 0
+    ? bi115.slice(iFn115, bi115.indexOf('\ndef ', iFn115 + 10)) : '';
+  ok('T115-a4 ★函数体内不得挂 _manual_audit（Node 侧零引用 = 只写不读的死标记；' +
+     '且会与同条 semantic/region 分支互相覆盖，覆盖顺序即连锁）',
+    // ⚠ 只判**赋值形式**：docstring 里会解释"为什么不挂"，裸词匹配会把注释算成命中 → 恒红。
+    iFn115 >= 0 && fnBody115.indexOf("e['_manual_audit']") < 0,
+    'fnBody 长度 ' + fnBody115.length);
+
+  // ── 行为验证：真跑 python 喂夹具（源码守卫证明不了"最后到底是旧值还是 None"）──
+  const py115 = (() => {
+    if (process.env.CN_PYTHON) return process.env.CN_PYTHON;
+    try {
+      const root = path.join(os.homedir(), '.workbuddy', 'binaries', 'python', 'versions');
+      for (const v of fs.readdirSync(root).sort().reverse()) {
+        const q = path.join(root, v, 'python.exe');
+        if (fs.existsSync(q)) return q;
+      }
+    } catch (e) { /* 探测失败 → 回退裸 python */ }
+    return 'python';
+  })();
+  const probe115 = spawnSync(py115, ['-c', 'print(1)'],
+    { timeout: 20000, windowsHide: true, env: Object.assign({}, process.env, PY_IO_ENV) });
+  if (!SPAWN_OK || probe115.status !== 0) {
+    for (const n of ['T115-b1', 'T115-b2']) {
+      envSkip(n + ' ★protect_price_loss 行为验证（真跑 python 喂夹具）',
+        !SPAWN_OK ? SPAWN_SKIP_REASON : ('未找到可用 python（试探 ' + py115 + ' 失败）'));
+    }
+  } else {
+    const code115 = [
+      'import sys, json',
+      'sys.path.insert(0, ' + JSON.stringify(skillDir) + ')',
+      'import build_index as bi',
+      'pe = {"in_price": 0.003, "out_price": 0.012, "cache_hit": 0.5}',
+      // 场景 1：cache_hit 本次为 None（上一版有值）
+      'e1 = {"in_price": 0.003, "out_price": 0.012, "cache_hit": None}',
+      'k1 = ["price"]; d1 = {"price": {"cache_hit": {"old": 0.5, "new": None}}}; c1 = []',
+      'k1b, d1b = bi.protect_price_loss(pe, e1, "m1", k1, d1, c1, "2026-10-24")',
+      // 场景 2：三价都有值（只是 in_price 变了）→ 必须零干预
+      'e2 = {"in_price": 0.004, "out_price": 0.012, "cache_hit": 0.5}',
+      'k2 = ["price", "big_jump"]; d2 = {"price": {"in_price": {"old": 0.003, "new": 0.004}}, "jump": {}}; c2 = []',
+      'k2b, d2b = bi.protect_price_loss(pe, e2, "m2", k2, d2, c2, "2026-10-24")',
+      'print(json.dumps({',
+      '  "lost_kept": e1["cache_hit"], "lost_kinds": k1b, "lost_detail": d1b,',
+      '  "lost_ch_kind": (c1[0]["kind"] if c1 else None), "lost_ch_fields": (c1[0]["fields"] if c1 else None),',
+      '  "clean_kinds": k2b, "clean_detail_same": (d2b == d2), "clean_ch": len(c2),',
+      '}, ensure_ascii=False))',
+    ].join('\n');
+    const r115 = spawnSync(py115, ['-c', code115],
+      { timeout: 60000, windowsHide: true, env: Object.assign({}, process.env, PY_IO_ENV), encoding: 'utf-8' });
+    let j115 = null;
+    try { j115 = JSON.parse((r115.stdout || '').trim()); } catch (e) { j115 = null; }
+    if (!j115) {
+      ok('T115-b1 ★行为：上一版有值 + 本次 None → 保留旧值、摘掉 price/big_jump、写 price_lost 流水',
+        false, 'python 输出无法解析：' + String(r115.stdout || '').slice(0, 120) + ' | stderr: ' + String(r115.stderr || '').slice(0, 120));
+      ok('T115-b2 ★行为：无字段丢失时**零干预**（kinds/detail 不变、不写流水）',
+        false, '同上（python 输出无法解析）');
+    } else {
+      ok('T115-b1 ★行为：上一版有值 + 本次 None → 保留旧值、摘掉 price/big_jump、写 price_lost 流水',
+        j115.lost_kept === 0.5 && Array.isArray(j115.lost_kinds) && j115.lost_kinds.length === 0
+        && j115.lost_ch_kind === 'price_lost' && String(j115.lost_ch_fields) === 'cache_hit',
+        JSON.stringify(j115).slice(0, 200));
+      ok('T115-b2 ★行为：无字段丢失时**零干预**（kinds/detail 不变、不写流水）',
+        String(j115.clean_kinds) === 'price,big_jump' && j115.clean_detail_same === true && j115.clean_ch === 0,
+        'kinds=' + j115.clean_kinds + ' detail不变=' + j115.clean_detail_same + ' 流水数=' + j115.clean_ch);
+    }
+  }
+}
+
 //   为什么需要：主脚本在被 require 时会跑 loadPricing → maybeRefreshHolidays（每进程一次、四条件命中即
 //   **detach** spawn 一个 refresh-holidays.js 子进程并往 SNAP_DIR 写 `.holidays-refresh.json`）。该子进程
 //   存活到测试结束之后，恰好与这里的 rmSync 抢同一批文件 → Windows 上 rimraf 报

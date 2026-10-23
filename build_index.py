@@ -460,6 +460,45 @@ def classify_change(pe, ne):
         detail['peak'] = {'old': pk_o, 'new': pk_n}
     return sorted(set(kinds)), detail
 
+def protect_price_loss(pe, e, key, kinds, detail, changes, today_iso0):
+    """v3.63.8（AUD-D-01）：已有条目「单边丢失」保护 —— 上一版有值、本次为 None → 保留上一版值。
+
+    缺陷：抓取/解析侧偶发把某个价字段取成 None（页面改版、列错位），而 `gate_new_model`
+      **只对上一版没有的新条目生效**（`pe is None` 分支）→ 已有条目漏网；`classify_change`
+      对三价仅判 `o != n` → None 被当成"价格变化"直接采纳，一个真实存在的上一版好价被抹掉
+      （索引里出现 None → 下游按无价/未收录计）。
+
+    返回 (kinds, detail)：值被恢复后 "价格变化/跳变" 不再成立，须从 kinds/detail 摘掉，
+      否则调用方 `if 'price' in kinds` 会把 effective_from 推到今天（见下方调用点注释）。
+
+    ⚠ **调用点必须位于 effective_from 推定之前**：恢复旧值后 `_same_price` 自动为 True
+      → effective_from 继承上一版。若在其后，会被误推成"今天起生效"，F-3 按当时价重算会错。
+    ⚠ **不挂 `_manual_audit`**：Node 侧对它**零引用**（只写不读的死标记），挂了没人看；
+      且会与同条 semantic/region 分支互相覆盖（覆盖顺序即连锁）。留痕改走 `changes`（活流水）。
+    ⚠ 取舍（fail-closed）：若厂商**真的**停供该价，此处会保留过期价 —— 代价远小于抹掉价格，
+      且每日 `prices/history/prices-<date>.json` 快照可回溯修正。
+    """
+    lost = [f for f in ('in_price', 'out_price', 'cache_hit')
+            if pe.get(f) is not None and e.get(f) is None]
+    if not lost:
+        return kinds, detail
+    for f in lost:
+        e[f] = pe[f]
+    pd = detail.get('price') or {}
+    for f in lost:
+        pd.pop(f, None)
+    if not pd:
+        detail.pop('price', None)
+        detail.pop('jump', None)
+        kinds = [k for k in kinds if k not in ('price', 'big_jump')]
+    changes.append({'ts': datetime.datetime.now().isoformat(timespec='seconds'),
+                    'built_at': today_iso0, 'model': key, 'kind': 'price_lost',
+                    'reason': '本次抓取该字段为 None 而上一版有值 → 已保留上一版值；'
+                              '可能是解析取错列，也可能是厂商真的停供，需人工确认',
+                    'fields': lost,
+                    'kept': {f: pe.get(f) for f in lost}})
+    return kinds, detail
+
 
 # ── v3.62.0（外部审计 F-4②/F-3）：每日价格快照 ──────────────────────────────────
 # 为什么需要：index.json 每日**整份覆盖**，`cn-prices-<date>.json`（第一棒产出）只覆盖
@@ -981,6 +1020,8 @@ def main():
                 e['effective_from'] = today_iso0
             continue
         kinds, detail = classify_change(pe, e)
+        # v3.63.8（AUD-D-01）：**必须在本行之后、effective_from 推定之前**（详见函数 docstring）。
+        kinds, detail = protect_price_loss(pe, e, key, kinds, detail, changes, today_iso0)
         # ── v3.62.0（外部审计 F-4）：价格条目生效时间 ──────────────────────────────
         # 语义：effective_from = 当前这组价**自哪天起有效**——回答"某天用的到底是哪个价"
         #   （F-3 按当时价重算的判据之一；没有它，历史金额不可追溯）。

@@ -1750,3 +1750,17 @@ Kimi 文档站改版：价格从 mintlify `.md` 源迁到 **HTML 页 RSC 负载*
   读的是 `SKILL_DIR/rounds` → **读写分裂**（正是本条要治的病，别在修的时候再造一个）。
 - ★ **为什么自测永远抓不到**：`selftest.js` require 的是 **tmp 副本**，`__dirname` 在副本里 → 天然隔离；
   污染只发生在 **spawn CLI** 场景（CLI 的 `__dirname` 恒为真实技能目录）。与 KI-51 同类的**带外路径差异**。
+
+## KI-54 已有条目价格「单边丢失」被 None 抹掉（AUD-D-01）【P2，2026-10-24，**已修 v3.63.8**】
+
+- **现象**：抓取/解析偶发把某个价字段取成 None（页面改版、列错位），该条目若**上一版已存在**，
+  则 `gate_new_model`（只管新条目）管不到、`classify_change` 又只判 `o != n`
+  → None 被当成"价格变化"采纳 → **一个真实存在的上一版好价被抹掉**。
+- **已修**：`build_index.py` 新增 `protect_price_loss()`，上一版有值 + 本次 None → 保留旧值
+  + 摘掉 `price`/`big_jump` + 写 `price_lost` 流水。
+- ★ **两个实施约束（改错就造新缺陷）**：
+  ① 调用点必须在 `effective_from` 推定**之前**（否则旧价被误标"今天生效"，F-3 回溯算错）；
+  ② **不要挂 `_manual_audit`** —— Node 侧零引用（死标记），且会与 semantic/region 分支互相覆盖。
+- **失效边界**：厂商**真的**停供该价时，此处会保留过期价（fail-closed 的既定代价，
+  小于"抹掉价格"）；可由每日 `prices/history/prices-<date>.json` 快照回溯修正。
+- **当前状态**：索引 51 条目中 9 个 None 全是 `cache_hit`（模型本无缓存价），**本缺陷尚未发生**。
