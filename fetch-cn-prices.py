@@ -290,9 +290,20 @@ KIMI_TABLE_RE = re.compile(
     r'columns:\s*\[(?P<cols>[^\[\]]*)\]\s*,\s*rows:\s*'
     r'(?P<rows>\[(?:[^\[\]]|\[(?:[^\[\]]|\[[^\[\]]*\])*\])*\])')
 KIMI_TITLE_RE = re.compile(r'title:\s*`([^`]+)`')
-# 一行 = 反引号单元格数组（如 [`kimi-k3`,`1M tokens`,`¥20.00`,…]）
-KIMI_BT_ROW_RE = re.compile(r'\[\s*((?:`[^`]*`\s*,\s*)+`[^`]*`)\s*\]')
+# v3.63.9（2026-10-25 页面二次改版）：**不再用「整行 = 纯反引号数组」的正则切行**。
+#   原 KIMI_BT_ROW_RE 要求每格都是裸 `` `值` ``；官方发布 K3.1 Pro 时把模型名格改成
+#   ``_jsx(_components.a,{href:`/guide/…`,children:`kimi-k3.1-pro`})`` → 该正则命中 0 行
+#   → 整厂商 0 模型（与 v3.63.4 修的那次「.md 空表」是不同的改版，见 KI-55）。
+#   现改为「按顶层逗号切格」+「格内取最后一个反引号串」，组件包装/href 属性都不再影响。
 KIMI_MODEL_RE = re.compile(r'^kimi-[0-9a-z.\-]+$', re.I)
+# 独立单位格（旧形态）：`1M tokens`；`1,048,576 tokens` 这类上下文窗口格不匹配（无 M/K 后缀词）
+KIMI_CELL_UNIT_RE = re.compile(r'^([\d.,]+)\s*([MK])\s*tokens?$', re.I)
+# 价格格：旧形态 `¥20.00`；新形态 `¥13.00 / MTok`（单位并进价格格）
+KIMI_CELL_PRICE_RE = re.compile(
+    r'^[¥￥]\s*([\d.,]+)\s*(?:/\s*([A-Za-z]+|百万\s*tokens?|M\s*tokens?))?$')
+# 价格格后缀 → 是否等价于 1M tokens。**未知后缀一律视为不可信**（宁缺勿错）
+KIMI_UNIT_SUFFIX_OK = ('mtok', 'm', 'mtokens', 'milliontokens', '百万tokens', '百万token')
+KIMI_UNIT_SUFFIX_BAD = ('ktok', 'k', 'ktokens', '千tokens', '千token')
 
 VENDORS = {
     # 阿里云(通义千问)不抓本地库——计费统一走聚合源(llmabacus)人民币价
@@ -567,6 +578,11 @@ def parse_zhipu_docs(html):
             if not cells:
                 continue
             name = cells[cmap['name'] or 0].strip()
+            # v3.63.9（2026-10-25 全解析器复核）：先剥尾随括号说明再校验形态 ——
+            #   旧实现要求整格严格匹配 ^GLM[-A-Za-z0-9.]*$，官方给名字加个「（新）」「（限时）」
+            #   注释就整条静默丢弃（0 模型）。只剥**尾随**括号，不动名字主干：
+            #   `GLM-4.7 Flash` 这种真改名仍会被拦下（需要人工看，不能猜）。
+            name = re.sub(r'\s*[（(][^）)]*[）)]\s*$', '', name).strip()
             if not re.match(r'^GLM[-A-Za-z0-9.]*$', name):
                 continue
             inp = _znum(cells[cmap['in']]) if cmap['in'] < len(cells) else None
@@ -647,14 +663,21 @@ def parse_minimax(html):
         cmap = map_price_columns(hdr)
         if cmap['in'] is None or cmap['out'] is None:
             continue
-        if '元/百万' not in strip_tags(rows[0]):
+        if not re.search(r'元\s*[／/]\s*百万', strip_tags(rows[0])):
             continue  # 只处理 token 计价表（跳过 TTS/视频等按秒/万字符计费表）
+        # v3.63.9（2026-10-25 全解析器复核）：原为 `if '元/百万' not in ...` 字面量子串 ——
+        #   官方把表头写成「元 / 百万 tokens」（加了空格）或全角「元／百万」就整页 0 模型。
+        #   现用正则容忍空格/全角/大小写；语义不变（仍要求出现"元每百万"）。
         for row in rows[1:]:
             text = strip_tags(row)
-            mname = re.match(r'^(MiniMax-[A-Za-z0-9.\-]+)\s*(.*)$', text)
+            # v3.63.9：名字写法容错 —— `MiniMax-M3` / `MiniMax M3` 都认，且统一归一成连字符
+            #   形式（否则官方把空格改回连字符时索引里会多出一条重复键：旧键永远走 carry、
+            #   新键从零开始，看起来像"模型换了一代"）。
+            mname = re.match(r'^(MiniMax[\s\-]+[A-Za-z0-9.\-]+)\s*(.*)$', text)
             if not mname:
                 continue
             name, rest = mname.group(1), mname.group(2)
+            name = re.sub(r'^MiniMax\s+', 'MiniMax-', name)
             # v3.63.4（2026-10-21 页面改版，P1 错价修复）：M3 行现为
             #   「MiniMax-M3 ≤ 512k 输入 tokens 2.10 8.40 0.42」——
             #   长度门槛数字（512）与价格混在同一行，旧代码 nums[0] 直接取到 512 当输入价
@@ -707,41 +730,135 @@ def parse_minimax(html):
 def kimi_col_map(titles):
     """DocTable 列标题 → 语义索引（v3.63.4）。与 COL_SYNONYMS 同思路：按词面映射、不按位置。
     判定顺序要紧：『未命中』含『命中』，必须先判未命中（否则输入价会被缓存列抢走）。
-    返回 {'in': idx|None, 'out': idx|None, 'cache': idx|None}（相对行首的单元格下标）。"""
+
+    v3.63.9（2026-10-25 页面二次改版）三处放宽，都是"上游动两个字就整表失效"的病根：
+      ① **显式跳过「缓存写入」列** —— 它是写入价，schema 里没有这一项；旧实现虽靠「不含命中」
+         侥幸没认领，但一旦官方改成「缓存写入（命中后）」就会被 cache 抢走；
+      ② 「输入」「输出」**纯词兜底** —— 官方把表头从「输入价格（缓存未命中）」简化成「输入」
+         之后，旧实现只认「未命中」→ 认不到输入列 → 整表被跳过（本次事故的直接原因）；
+      ③ 补英文同义词（input/output/cache hit），Mintlify 站中英混排时不至于全灭。
+    返回 {'in': idx|None, 'out': idx|None, 'cache': idx|None}（相对行首的单元格下标）。
+    """
     idx = {'in': None, 'out': None, 'cache': None}
     for i, t in enumerate(titles or []):
-        if '未命中' in t:
+        t = str(t or '')
+        low = t.lower()
+        if '缓存写入' in t or 'cache write' in low or 'cachewrite' in low:
+            continue  # ① 写入价不进 schema
+        if ('未命中' in t or 'miss' in low) and idx['in'] is None:
             idx['in'] = i
-        elif '命中' in t:
+        elif ('命中' in t or 'hit' in low) and idx['cache'] is None:
             idx['cache'] = i
-        elif '输出' in t:
+        elif ('输入' in t or 'input' in low) and idx['in'] is None:
+            idx['in'] = i  # ② 纯词兜底
+        elif ('输出' in t or 'output' in low) and idx['out'] is None:
             idx['out'] = i
     return idx
 
 
-def kimi_bt_row_to_record(cells_src, col_map):
-    """RSC 负载一行（反引号单元格串）→ (记录 dict | None, 原因)。纯函数（无 IO）→ 可夹具测试。
-    cells_src = KIMI_BT_ROW_RE 的 group(1)（`` `a`,`b`,… ``）；col_map = kimi_col_map 产物。
-    原因取值：'no-match'（不是模型行）/ 'name'（非 kimi 模型名）/ 'unit'（计价单位非 1M tokens）/
-    'prices'（价格列取不到值）/ None（成功）。"""
-    vals = [v.strip() for v in re.findall(r'`([^`]*)`', cells_src or '')]
-    if len(vals) < 3:
-        return None, 'no-match'
-    name, unit = vals[0], vals[1]
-    if not KIMI_MODEL_RE.match(name):
-        return None, 'name'
-    um = re.match(r'^(?P<qty>[\d.,]+)(?P<mag>[MK])\s*tokens$', unit, re.I)
-    if not um:
-        return None, 'no-match'
-    # v3.59.0（审计 S5）单位断言：量纲错位会 1000× 错价，必须显式校验而非静默按 1M 解释
-    if not (um.group('qty') == '1' and um.group('mag').upper() == 'M'):
-        return None, 'unit'
+def kimi_split_cells(row_src):
+    """一行 RSC 数据 → 单元格原文列表（**按顶层逗号切**，括号/反引号内的逗号不切）。
 
-    def _price(i):
-        if i is None or i >= len(vals):
+    v3.63.9：这是取代旧「整行 = 纯反引号单元格数组」正则（原 KIMI_BT_ROW_RE，已删除）的核心。
+    切成格后，单元格被 `_jsx(...,{href:`…`,children:`模型名`})` 组件包裹、格内带单位后缀、
+    末尾多一列上下文窗口，都不会再让整行"不匹配"。
+    配平口径：`(`/`[`/`{` 进一层，对应的右括号出一层，反引号内整体视为字面量。"""
+    cells, buf, depth, in_tick = [], [], 0, False
+    for ch in str(row_src or ''):
+        if in_tick:
+            buf.append(ch)
+            if ch == '`':
+                in_tick = False
+            continue
+        if ch == '`':
+            in_tick = True
+            buf.append(ch)
+            continue
+        if ch in '([{':
+            depth += 1
+            buf.append(ch)
+            continue
+        if ch in ')]}':
+            if depth > 0:
+                depth -= 1
+            buf.append(ch)
+            continue
+        if ch == ',' and depth == 0:
+            cells.append(''.join(buf).strip())
+            buf = []
+            continue
+        buf.append(ch)
+    tail = ''.join(buf).strip()
+    if tail:
+        cells.append(tail)
+    return [c for c in cells if c]
+
+
+def kimi_cell_value(cell):
+    """单元格 → 文本值：取格内**最后一个**反引号串。
+
+    为什么是最后一个：`_jsx(_components.a,{href:`/guide/x`,children:`kimi-k3.1-pro`})`
+    里 href 在前、children 在后，children 才是真值；裸 `` `kimi-k3` `` 则取它本身。
+    无任何串时退回纯文本（应对官方把某格写成普通文本）。"""
+    vals = re.findall(r'`([^`]*)`', cell or '')
+    if vals:
+        return vals[-1].strip()
+    return strip_tags(cell)
+
+
+def kimi_row_to_record(row_src, col_map, titles=None):
+    """RSC 一行 → (记录 dict | None, 原因)。纯函数（无 IO）→ 可夹具测试。
+
+    v3.63.9 结构无关：先切格（kimi_split_cells），再让**格下标 = 列标题下标**严格对齐
+    （col_map 的下标就是格下标）。因此：
+      - 旧形态（模型/计费单位/缓存写入×2/命中/未命中/输出/上下文窗口，8 列）照旧正确；
+      - 新形态（模型/输入/输出/缓存命中/缓存写入×2，6 列，价格格带 ` / MTok`）同样正确。
+    titles 仅用于诊断（格数 ≠ 列数时打 WARN），不参与取值——取值只靠 col_map 下标。
+
+    原因取值：'no-match'（空格串）/ 'name'（无 kimi 模型名）/ 'unit'（单位非 1M tokens）/
+             'prices'（输入/输出列都取不到价格）/ None（成功）。
+    """
+    cells = kimi_split_cells(row_src)
+    if not cells:
+        return None, 'no-match'
+    vals = [kimi_cell_value(c) for c in cells]
+    name = next((v for v in vals if KIMI_MODEL_RE.match(v)), None)
+    if not name:
+        return None, 'name'
+    if titles and len(cells) != len(titles):
+        # 只诊断、不拒收：缺格/多格时 col_map 下标可能错位，但价格位取不到值会自然 fail-closed
+        print('[WARN] kimi: 行内格数 %d ≠ 表头列数 %d（%s）—— 检查是否有空单元格'
+              % (len(cells), len(titles), name))
+
+    # ── 单位断言（v3.59.0 S5 的延续，两条路任一成立即可，都不成立 → 拒收，绝不默认按 1M 解释）──
+    unit_cells = [v for v in vals if KIMI_CELL_UNIT_RE.match(v)]
+    if unit_cells:
+        # 旧形态：行内有独立「1M tokens」格 → 必须全部是 1M（2K/1K 一律拒收）
+        if not all(KIMI_CELL_UNIT_RE.match(u).group(1) == '1'
+                   and KIMI_CELL_UNIT_RE.match(u).group(2).upper() == 'M' for u in unit_cells):
+            return None, 'unit'
+    else:
+        # 新形态：单位并进价格格（`¥13.00 / MTok`）→ 每格都必须带且只带 1M 等价后缀
+        saw_suffix, ok_suffix = False, True
+        for v in vals:
+            pm = KIMI_CELL_PRICE_RE.match(v)
+            if not pm:
+                continue
+            suf = (pm.group(2) or '').strip().lower().replace(' ', '')
+            if not suf:
+                ok_suffix = False  # 有的价格格带后缀、有的不带 → 口径不明，宁缺勿错
+                continue
+            saw_suffix = True
+            if suf in KIMI_UNIT_SUFFIX_BAD or suf not in KIMI_UNIT_SUFFIX_OK:
+                ok_suffix = False
+        if not (saw_suffix and ok_suffix):
+            return None, 'unit'
+
+    def _price(col_idx):
+        if col_idx is None or col_idx >= len(cells):
             return None
-        pm = re.match(r'^¥([\d.]+)$', vals[i])
-        return pm.group(1) if pm else None
+        pm = KIMI_CELL_PRICE_RE.match(kimi_cell_value(cells[col_idx]))
+        return pm.group(1).replace(',', '') if pm else None
 
     inp = _price(col_map.get('in'))
     outp = _price(col_map.get('out'))
@@ -824,7 +941,15 @@ def parse_stepfun_md(md, drop_re=None, keep_over_re=None):
             if len(cells) <= max(col_in, col_out):
                 continue
             name = cells[0].strip()
+            # v3.63.9（2026-10-25 全解析器复核）：名字不再硬取第一格 —— 表头前面插一列
+            #   （如「计费模式」）就会把该列文字当模型名、整表 0 条。优先用表头语义映射到的
+            #   name 列，兜底在行内找第一个形如 `step-x` 的格。
+            if cmap['name'] is not None and cmap['name'] < len(cells):
+                name = cells[cmap['name']].strip()
             if not re.match(r'^step-[0-9a-z.\-]+$', name, re.I):
+                name = next((c.strip() for c in cells
+                             if re.match(r'^step-[0-9a-z.\-]+$', c.strip(), re.I)), '')
+            if not name:
                 continue
             # v3.52.0（S4）：同 parse_tr —— soft 快照样式不再静默丢弃
             if not apply_snap_verdict(name, keep_over_re):
@@ -832,7 +957,9 @@ def parse_stepfun_md(md, drop_re=None, keep_over_re=None):
             if drop_re and drop_re.search(name):
                 continue
             def _num(s):
-                m = re.match(r'^(\d+(?:\.\d+)?)$', (s or '').strip())
+                # v3.63.9：允许单元格带币种/单位（`¥7.00` / `7.00 元` / `7.00元/百万tokens`），
+                #   取首个数字；`—`/「限时免费」等非数字仍返回 None（不进价库）。
+                m = re.match(r'^[¥￥]?\s*(\d+(?:\.\d+)?)\s*(?:元.*)?$', (s or '').strip())
                 return float(m.group(1)) if m else None
             in_v = _num(cells[col_in])
             cache_v = _num(cells[col_cache]) if col_cache is not None and col_cache < len(cells) else None
@@ -935,17 +1062,60 @@ def parse_kimi_row(line):
     }, None
 
 
+def kimi_split_row_srcs(rows_src):
+    """`rows:[[…],[…]]` → 每行原文列表（按顶层 `],[` 切）。
+
+    v3.63.9：取代按「纯反引号数组」正则切行。行内可能出现 `_jsx(...)`（含逗号与反引号），
+    故只按 `],[` 这个行边界切；单元格内的 `],[` 极罕见（真要出现，那行本身也不是价格行，
+    切歪的结果是解析失败而非错价）。"""
+    body = str(rows_src or '').strip()
+    if body.startswith('['):
+        body = body[1:]
+    if body.endswith(']'):
+        body = body[:-1]
+    # ⚠ 每段还要再剥一层方括号：rows 组可能以 `[[` 开头（首行自带一层），只剥一次的话
+    #   第一段会以 `[` 起头 → kimi_split_cells 的配平深度永远不归零 → 整行被当成 1 格
+    #   → 每张表的第一行静默丢失（2026-10-25 实测踩到，症状是"每块少一条"）。
+    return [s.strip().strip('[]').strip() for s in re.split(r'\]\s*,\s*\[', body) if s.strip()]
+
+
+# 列定义取显示名：Tooltip 包装（`{title:_jsx(Tooltip,{tip:`…`,children:`缓存命中`}),width:`14%`}`）
+# 必须取 children，否则取到的是 width 或 tip 文本。
+KIMI_COL_CHILDREN_RE = re.compile(r'children\s*:\s*`([^`]*)`')
+KIMI_COL_TITLE_RE = re.compile(r'title\s*:\s*`([^`]*)`')
+
+
+def kimi_col_titles(cols_src):
+    """`columns:[{title:…},{title:_jsx(Tooltip,{…,children:`缓存命中`}),…}]` → 列显示名列表。
+
+    v3.63.9：旧实现 `KIMI_TITLE_RE.findall(cols)` 只认 `title:` 后**直接跟**反引号串的列，
+    被 `_jsx(Tooltip,…)` 包住的列（缓存命中 / 缓存写入 5min / 1h）**一个都取不到** ——
+    2026-10-25 官方的 k3 表正是这种写法，结果 titles 只有 3 个（模型/输入/输出），
+    缓存价全空。现按列定义逐项取：优先 children，其次 title。"""
+    titles = []
+    for c in kimi_split_cells(cols_src):
+        m = KIMI_COL_CHILDREN_RE.search(c) or KIMI_COL_TITLE_RE.search(c)
+        titles.append(m.group(1).strip() if m else '')
+    return titles
+
+
 def parse_kimi_html(html):
     """HTML 页 RSC DocTable → (记录 list, matched_rows)。纯函数（无 IO）→ 可夹具测试。
-    matched_rows = 正则匹配到表格行的次数（区分「页面没行」与「行全被跳过」，同 .md 路径口径）。"""
+    matched_rows = 含 kimi 模型名的行数（区分「页面没行」与「行全被跳过」，同 .md 路径口径）。
+
+    v3.63.9：① 行切分改 kimi_split_row_srcs（不再要求纯反引号数组）；
+             ② 表头认不到输入/输出列时**打 WARN**（2026-10-25 事故里这一步是静默 continue，
+                日志一片安静，只能靠下游"0 模型"倒推）。"""
     out = []
     matched_rows = 0
     for tm in KIMI_TABLE_RE.finditer(html or ''):
-        col_map = kimi_col_map(KIMI_TITLE_RE.findall(tm.group('cols')))
+        titles = kimi_col_titles(tm.group('cols'))
+        col_map = kimi_col_map(titles)
         if col_map['in'] is None or col_map['out'] is None:
+            print('[WARN] kimi: 表头认领不到输入/输出列（%r）→ 跳过该表' % (titles,))
             continue  # 不是 token 计价表（无输入/输出语义列）
-        for rm in KIMI_BT_ROW_RE.finditer(tm.group('rows')):
-            rec, reason = kimi_bt_row_to_record(rm.group(1), col_map)
+        for row_src in kimi_split_row_srcs(tm.group('rows')):
+            rec, reason = kimi_row_to_record(row_src, col_map, titles)
             if reason in ('no-match', 'name'):
                 continue
             matched_rows += 1

@@ -10891,11 +10891,11 @@ const txInjectionComplete = (ttSrc, shSrc) => (
       "chk('kimi-k2.6 = 6.5/27/1.1', kmap.get('kimi-k2.6') and kmap['kimi-k2.6']['out_price'] == ['27.00元'] and kmap['kimi-k2.6']['cache_hit'] == ['1.10元'])",
       "cm = F.kimi_col_map(['模型', '计费单位', '输入价格（缓存命中）', '输入价格（缓存未命中）', '输出价格', '上下文窗口'])",
       "chk('列语义映射：未命中→3 命中→2 输出→4', cm == {'in': 3, 'out': 4, 'cache': 2}, cm)",
-      "_, w_unit = F.kimi_bt_row_to_record('`kimi-k3`,`2K tokens`,`¥1.30`,`¥6.50`,`¥27.00`', cm)",
+      "_, w_unit = F.kimi_row_to_record('`kimi-k3`,`2K tokens`,`¥1.30`,`¥6.50`,`¥27.00`', cm)",
       "chk('单位非 1M → reason=unit（S5 单位断言延续）', w_unit == 'unit', w_unit)",
-      "_, w_nm = F.kimi_bt_row_to_record('`not-a-model`,`1M tokens`,`¥1.30`,`¥6.50`,`¥27.00`', cm)",
+      "_, w_nm = F.kimi_row_to_record('`not-a-model`,`1M tokens`,`¥1.30`,`¥6.50`,`¥27.00`', cm)",
       "chk('非 kimi 模型名 → reason=name（不误收页面里别的反引号数组）', w_nm == 'name', w_nm)",
-      "_, w_pr = F.kimi_bt_row_to_record('`kimi-x`,`1M tokens`,`¥1.30`', cm)",
+      "_, w_pr = F.kimi_row_to_record('`kimi-x`,`1M tokens`,`¥1.30`', cm)",
       "chk('价格列取不到 → reason=prices', w_pr == 'prices', w_pr)",
       // ── d3 TokenHub：范围四路分流 ──
       "ms = [{'name': 'Hy3', 'brand': 'hunyuan'}, {'name': 'Hy4 preview', 'brand': 'hunyuan'},",
@@ -11168,6 +11168,158 @@ for (let i = 0; i < 5; i++) {
     try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200); } catch (e2) { /* 退避失败直接重试 */ }
   }
 }
+// ===== T116（v3.63.9 · 2026-10-25 Kimi 页面二次改版）：解析器「字面量/位置硬假设」鲁棒化 =====
+//   事故：10-25 00:26 抓取 kimi 解析出 0 模型 → 索引沿用 10-24 旧价 → 弹窗 `⚠1家价旧`
+//   （v3.62.0 的输入源降级标注按设计响了，所以是"当天可见"而不是"静默坏"）。
+//   根因 = 官方发布 K3.1 Pro 时同时改了三处：
+//     ① 模型名格包进 `_jsx(_components.a,{href:…,children:`kimi-k3.1-pro`})`（不再是裸反引号串）；
+//     ② 单位并进价格格（`¥13.00 / MTok`，不再有独立 `1M tokens` 列）；
+//     ③ 表头「输入价格（缓存未命中）」简化成「输入」，且缓存列被 `_jsx(Tooltip,…)` 包住 →
+//        `KIMI_TITLE_RE.findall` 一个都取不到（缓存价全空）。
+//   旧实现三个硬假设（整行纯反引号数组 / 独立单位格 / 表头含「未命中」）全破 → 0 命中。
+//   本组 = 源码侧钉死"结构无关"的挂点 + 负向断言（不许退回字面量/位置假设）；
+//   行为侧用**新旧两种真实页面形态**喂夹具：新形态必须出 2 条、旧形态必须仍是 4 条且价不变。
+{
+  const f116 = fs.readFileSync(path.join(SRC, 'fetch-cn-prices.py'), 'utf-8').replace(/\r\n/g, '\n');
+  const stripPy116 = (s) => s.split('\n').map((line) => {
+    let out = ''; let q = null;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (q) { out += c; if (c === '\\') out += line[++i] || ''; else if (c === q) q = null; continue; }
+      if (c === '"' || c === "'") { q = c; out += c; continue; }
+      if (c === '#') break;
+      out += c;
+    }
+    return out;
+  }).join('\n');
+  const fc116 = stripPy116(f116);
+  const kimi116 = fc116.slice(fc116.indexOf('def kimi_col_map'), fc116.indexOf('def parse_stepfun_md'));
+  const mini116 = fc116.slice(fc116.indexOf('def parse_minimax'), fc116.indexOf('def kimi_col_map'));
+  const zhipu116 = fc116.slice(fc116.indexOf('def parse_zhipu_docs'), fc116.indexOf('LEN_TIER_RE = re.compile'));
+  const step116 = fc116.slice(fc116.indexOf('def parse_stepfun_md'), fc116.indexOf('KIMI_ROW_RE = re.compile'));
+  const th116 = stripPy116(fs.readFileSync(path.join(SRC, 'parse_tokenhub.py'), 'utf-8').replace(/\r\n/g, '\n'));
+  const ds116 = fs.readFileSync(path.join(SRC, 'deepseek-official.js'), 'utf-8').replace(/\r\n/g, '\n');
+
+  ok('T116-a1 ★Kimi 行切分必须按「顶层逗号切格」，且不得再依赖"整行纯反引号数组"的正则',
+    /def kimi_split_cells\(/.test(kimi116) && /kimi_split_cells\(row_src\)/.test(kimi116)
+    && !/KIMI_BT_ROW_RE\s*=\s*re\.compile/.test(fc116) && !/KIMI_BT_ROW_RE\.finditer/.test(fc116),
+    'KIMI_BT_ROW_RE 仍被定义/调用（组件包装一格就 0 命中）');
+  ok('T116-a2 ★Kimi 表头必须走 kimi_col_titles（认 _jsx(Tooltip,{children:…}) 包装），不得只用 KIMI_TITLE_RE.findall',
+    /def kimi_col_titles\(/.test(fc116) && /kimi_col_titles\(tm\.group\('cols'\)\)/.test(fc116)
+    && /KIMI_COL_CHILDREN_RE/.test(fc116),
+    '缓存列被 Tooltip 包住时 titles 会缺列 → 缓存价全空');
+  ok('T116-a3 ★表头认不到输入/输出列时必须 WARN（不许静默 continue —— 10-25 事故里日志一片安静）',
+    /表头认领不到输入\/输出列/.test(fc116));
+  ok('T116-a4 ★单位断言两条路（独立单位格 / 价格格 MTok 后缀），未知后缀一律拒收',
+    /KIMI_CELL_UNIT_RE/.test(kimi116) && /KIMI_UNIT_SUFFIX_BAD/.test(kimi116)
+    && /saw_suffix/.test(kimi116) && /ok_suffix/.test(kimi116));
+  ok('T116-a5 ★MiniMax 单位声明不得再用字面量「元/百万」子串（改用容忍空格/全角的正则）',
+    /re\.search\(r'元\\s\*\[／\/\]\\s\*百万'/.test(mini116) && !/'元\/百万' not in/.test(mini116),
+    '仍是字面量子串比对：表头写成「元 / 百万 tokens」即整页 0 模型');
+  ok('T116-a6 ★智谱名字必须先剥尾随括号说明再校验 ^GLM（加个「（新）」就整条丢）',
+    /re\.sub\(r'\\s\*\[（\(\]/.test(zhipu116)
+    && zhipu116.indexOf("re.sub(r'\\s*[（(]") < zhipu116.indexOf('^GLM[-A-Za-z0-9.]*$'));
+  ok('T116-a7 ★阶跃名字不得硬取 cells[0]（表头加一列就取到列名文字）',
+    /cmap\['name'\] is not None/.test(step116) && /next\(\(c\.strip\(\) for c in cells/.test(step116));
+  ok('T116-a8 ★TokenHub 单元格必须有"slate 属性全取不到"时的纯文本兜底（属性名是渲染细节）',
+    /any_slate/.test(th116) && /_cell_text\(c\) for c in cells/.test(th116));
+  ok('T116-a9 ★DeepSeek 必须遍历所有 <table> 选含模型表头的（不许只取页面第一个表）',
+    /allTbs/.test(ds116) && /allTbs\.find\(hasModelHeader\)/.test(ds116));
+
+  // ── 行为组：真身纯函数喂"新旧两种真实页面形态"（不打网络）──
+  const pyCands116 = [];
+  if (process.env.CN_PYTHON) pyCands116.push(process.env.CN_PYTHON);
+  try {
+    const pvDir116 = 'C:/Users/14779/.workbuddy/binaries/python/versions';
+    for (const v of fs.readdirSync(pvDir116)) pyCands116.push(path.join(pvDir116, v, 'python.exe'));
+  } catch (e) { /* 目录不存在就走 PATH */ }
+  pyCands116.push('python', 'python3');
+  let PY116 = null;
+  for (const c of pyCands116) {
+    const t = spawnSync(c, ['-V'], { encoding: 'utf8', windowsHide: true, timeout: 20000 });
+    if (t.status === 0) { PY116 = c; break; }
+  }
+  if (!SPAWN_OK) {
+    envSkip('T116-b 行为组（Kimi 新旧两种页面形态）', SPAWN_SKIP_REASON);
+  } else if (!PY116) {
+    envSkip('T116-b 行为组（Kimi 新旧两种页面形态）', 'python 不可用');
+  } else {
+    const pySrc116 = [
+      '# -*- coding: utf-8 -*-',
+      'import importlib.util, os, sys',
+      'SRC = sys.argv[1]',
+      "spec = importlib.util.spec_from_file_location('fcp116', os.path.join(SRC, 'fetch-cn-prices.py'))",
+      'F = importlib.util.module_from_spec(spec); spec.loader.exec_module(F)',
+      'fails = []',
+      'def chk(n, c, d=""):',
+      '    if not isinstance(d, str): d = repr(d)',
+      '    print(("  OK   " if c else "  FAIL ") + n + (("  " + d) if d else ""))',
+      '    if not c: fails.append(n)',
+      // 新形态（2026-10-25 实测：输入/输出纯词 + Tooltip 包装的缓存列 + 价格格带 / MTok）
+      'NEW = ("columns:[{title:`模型`,width:`25%`},{title:`输入`,width:`13%`},{title:`输出`,width:`13%`},"',
+      '       "{title:_jsx(Tooltip,{tip:`命中缓存后按此价`,children:`缓存命中`}),width:`14%`},"',
+      '       "{title:_jsx(Tooltip,{tip:`写入 5min`,children:`缓存写入（5min）`}),width:`18%`},"',
+      '       "{title:_jsx(Tooltip,{tip:`写入 1h`,children:`缓存写入（1h）`}),width:`17%`}],"',
+      '       "rows:[[_jsx(_components.a,{href:`/guide/kimi-k3-1-pro-quickstart`,children:`kimi-k3.1-pro`}),"',
+      '       "`¥13.00 / MTok`,`¥68.00 / MTok`,`¥1.30 / MTok`,`¥13.00 / MTok`,`¥26.00 / MTok`],"',
+      '       "[`kimi-k3`,`¥20.00 / MTok`,`¥100.00 / MTok`,`¥2.00 / MTok`,`¥20.00 / MTok`,`¥40.00 / MTok`]]")',
+      // 旧形态（2026-10-21~24 实测：模型/计费单位/写入×2/命中/未命中/输出/上下文窗口）
+      'C3 = ("columns:[{title:`模型`,width:`12%`},{title:`计费单位`,width:`10%`},"',
+      '      "{title:`缓存写入（TTL 5min）`,width:`13%`},{title:`缓存写入（TTL 1h）`,width:`13%`},"',
+      '      "{title:`输入价格（缓存命中）`,width:`13%`},{title:`输入价格（缓存未命中）`,width:`13%`},"',
+      '      "{title:`输出价格`,width:`10%`},{title:`上下文窗口`,width:`16%`}],"',
+      '      "rows:[[`kimi-k3`,`1M tokens`,`¥20.00`,`¥40.00`,`¥2.00`,`¥20.00`,`¥100.00`,`1,048,576 tokens`]]")',
+      'C2 = ("columns:[{title:`模型`,width:`24%`},{title:`计费单位`,width:`12%`},"',
+      '      "{title:`输入价格（缓存命中）`,width:`16%`},{title:`输入价格（缓存未命中）`,width:`16%`},"',
+      '      "{title:`输出价格`,width:`14%`},{title:`上下文窗口`,width:`18%`}],"',
+      '      "rows:[[`kimi-k2.7-code`,`1M tokens`,`¥1.30`,`¥6.50`,`¥27.00`,`262,144 tokens`],"',
+      '      "[`kimi-k2.7-code-highspeed`,`1M tokens`,`¥2.60`,`¥13.00`,`¥54.00`,`262,144 tokens`],"',
+      '      "[`kimi-k2.6`,`1M tokens`,`¥1.10`,`¥6.50`,`¥27.00`,`262,144 tokens`]]")',
+      'rnew, nnew = F.parse_kimi_html(NEW)',
+      'm = {r["api_name"]: r for r in rnew}',
+      'chk("新形态（组件包装 + /MTok）解析出 2 条", len(rnew) == 2 and nnew == 2, "n=%d matched=%d" % (len(rnew), nnew))',
+      'chk("新形态 kimi-k3.1-pro = 13/68/1.3（缓存命中不得被写入列抢走）",',
+      '    bool(m.get("kimi-k3.1-pro")) and m["kimi-k3.1-pro"]["in_price"] == ["13.00元"]',
+      '    and m["kimi-k3.1-pro"]["out_price"] == ["68.00元"] and m["kimi-k3.1-pro"]["cache_hit"] == ["1.30元"], m.get("kimi-k3.1-pro"))',
+      'chk("新形态 kimi-k3 = 20/100/2", bool(m.get("kimi-k3")) and m["kimi-k3"]["in_price"] == ["20.00元"]',
+      '    and m["kimi-k3"]["out_price"] == ["100.00元"] and m["kimi-k3"]["cache_hit"] == ["2.00元"])',
+      'rold, nold = F.parse_kimi_html(C3 + "x" + C2)',
+      'mo = {r["api_name"]: r for r in rold}',
+      'chk("旧形态仍解析出 4 条（零回归）", len(rold) == 4 and nold == 4, "n=%d matched=%d" % (len(rold), nold))',
+      'chk("旧形态 kimi-k3 = 20/100/2（八列表，写入两列不得混进价）", bool(mo.get("kimi-k3"))',
+      '    and mo["kimi-k3"]["in_price"] == ["20.00元"] and mo["kimi-k3"]["out_price"] == ["100.00元"]',
+      '    and mo["kimi-k3"]["cache_hit"] == ["2.00元"], mo.get("kimi-k3"))',
+      'chk("旧形态 kimi-k2.6 = 6.5/27/1.1", bool(mo.get("kimi-k2.6"))',
+      '    and mo["kimi-k2.6"]["in_price"] == ["6.50元"] and mo["kimi-k2.6"]["cache_hit"] == ["1.10元"])',
+      'titles = F.kimi_col_titles("""{title:`模型`,width:`25%`},{title:`输入`,width:`13%`},""")',
+      'chk("kimi_col_titles 能取纯 title 列", titles == ["模型", "输入"], titles)',
+      'tt = F.kimi_col_titles("{title:_jsx(Tooltip,{tip:`x`,children:`缓存命中`}),width:`14%`}")',
+      'chk("kimi_col_titles 能取 Tooltip 的 children（不是 width / tip）", tt == ["缓存命中"], tt)',
+      '_, wv = F.kimi_row_to_record("`kimi-k3`,`¥20.00 / KTok`,`¥100.00 / KTok`", F.kimi_col_map(["模型", "输入", "输出"]))',
+      'chk("价格格后缀 KTok（元/千 tokens）→ reason=unit（量纲防线不因放宽而失效）", wv == "unit", wv)',
+      '_, wu = F.kimi_row_to_record("`kimi-k3`,`§2K tokens`,`§1.30`".replace("§", chr(165)), F.kimi_col_map(["模型", "计费单位", "输入"]))',
+      'chk("独立单位格 2K tokens → reason=unit", wu == "unit", wu)',
+      'print("RESULT %d %d" % (len(fails), 0))',
+      'sys.exit(1 if fails else 0)',
+    ].join('\n');
+    const fw116 = path.join(tmp, 'b116kimi');
+    fs.mkdirSync(fw116, { recursive: true });
+    const pf116 = path.join(fw116, 't116.py');
+    fs.writeFileSync(pf116, pySrc116, 'utf8');
+    const r116 = spawnSync(PY116, [pf116, SRC], { encoding: 'utf8', timeout: 120000, windowsHide: true, env: Object.assign({}, process.env, PY_IO_ENV) });
+    let matched116 = 0;
+    for (const ln of String(r116.stdout || '').split(/\r?\n/)) {
+      const m116 = /^\s*(OK|FAIL)\s+(.*)$/.exec(ln);
+      if (m116) ok('T116-b' + (++matched116) + ' ' + m116[2], m116[1] === 'OK');
+    }
+    ok('T116-b0 行为组断言行被识别（python 输出格式/编码异常时此处暴露原文）',
+      matched116 > 0,
+      'status=' + r116.status + ' stdout=[' + String(r116.stdout || '').replace(/\n/g, '\\n').slice(0, 600)
+      + '] stderr=[' + String(r116.stderr || '').slice(0, 400) + ']');
+    try { fs.rmSync(fw116, { recursive: true, force: true }); } catch (e) { /* 清理失败不影响断言 */ }
+  }
+}
+
 // v3.24.0（审计⑤）：skip 数显式化 —— 「138 全绿」曾掩盖 26 条端到端用例全部 SKIP 的事实
 // （SPAWN_OK=false 的沙箱环境里绿 ≠ 真跑过）。
 // v3.29.0（A-3）：**退出码语义修正** —— 只有真失败才 exit 1；envSkip 是"环境能力受限"（沙箱禁 spawn、

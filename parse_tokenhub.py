@@ -153,22 +153,43 @@ CLAIM_ORDER = ('name', 'cond', 'peak', 'cache', 'in', 'out')
 
 
 def map_columns(hdr):
-    """表头单元格 -> 各语义列索引（未认领为 None）。v3.52.0 取代原 col(['字面量']) 位置式写法。"""
+    """表头单元格 -> 各语义列索引（未认领为 None）。v3.52.0 取代原 col(['字面量']) 位置式写法。
+
+    v3.63.9（2026-10-25 全解析器复核）：比较改**大小写不敏感**。此前 `w in c` 区分大小写，
+    腾讯把表头改成「Input Price / Input」这种英文写法时整表 0 模型。"""
     res = {k: None for k in COL_SYNONYMS}
     for i, c in enumerate(hdr or []):
+        cl = str(c or '').lower()
         for k in CLAIM_ORDER:
-            if res[k] is None and any(w in c for w in COL_SYNONYMS[k]):
+            if res[k] is None and any(w.lower() in cl for w in COL_SYNONYMS[k]):
                 res[k] = i
                 break
     return res
 
 
+def _cell_text(cell):
+    """单元格 HTML → 纯文本（去标签、压空白）。cells_of_row 的兜底用。"""
+    s = re.sub(r'<[^>]+>', ' ', cell or '')
+    s = s.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&').replace('&nbsp;', ' ')
+    return ' '.join(s.split())
+
+
 def cells_of_row(seg):
-    """一个 <tr> 片段 -> 各 <td>/<th> 的文本（多行合并为一格）"""
-    out = []
-    for cell in re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', seg, re.S):
+    """一个 <tr> 片段 -> 各 <td>/<th> 的文本（多行合并为一格）。
+
+    v3.63.9（2026-10-25 全解析器复核）：腾讯文档页靠 `data-slate-string="true"` 属性取字 ——
+    这是**渲染实现细节**，上游换编辑器或改个属性名就让所有格变空 → 整表 0 模型、退出码 0，
+    与"官网改版"在日志里长得一模一样。现加兜底：整行一个 slate 串都取不到时退回纯文本，
+    宁可多带几个空格也不整厂停更（空格由 _num / 列匹配的宽容逻辑吸收）。"""
+    cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', seg, re.S)
+    out, any_slate = [], False
+    for cell in cells:
         texts = re.findall(r'data-slate-string="true">([^<]*)</span>', cell)
+        if texts:
+            any_slate = True
         out.append(' '.join(t.strip() for t in texts).strip())
+    if cells and not any_slate:
+        out = [_cell_text(c) for c in cells]
     return out
 
 
@@ -182,11 +203,13 @@ def rows_of_block(block):
 
 
 def _num(s):
+    """单元格 -> 数字。v3.63.9：允许带币种/单位（`¥0.8` / `0.8 元` / `0.8元/百万tokens`），
+    取首个数字；`-`/`—`/空 仍返回 None（不进价库）。"""
     s = (s or '').strip()
     if s in ('-', '', '—'):
         return None
-    m = re.match(r'^\d+(\.\d+)?$', s)
-    return float(s) if m else None
+    m = re.match(r'^[¥￥]?\s*(\d+(?:\.\d+)?)\s*(?:元.*)?$', s)
+    return float(m.group(1)) if m else None
 
 
 def parse_lang_table(block):
@@ -242,9 +265,12 @@ def parse_lang_table(block):
         if cur is None:
             continue
         peak_v = '空闲时段' if '空闲' in peak else ('高峰时段' if '高峰' in peak else '')
+        # v3.63.9：条件列判定改大小写不敏感（`128K` / `128k` / `K)` 都能识别成长度档；
+        #   旧实现只认半角小写 k，官方把门槛写成 `128K Tokens` 时会退化成 base 档 → 分档价错位）
+        cond_l = cond.lower()
         if peak_v:
             ttype, tval = 'peak', peak_v
-        elif '输入长度' in cond or 'k)' in cond or 'k]' in cond or 'k+' in cond or 'k）' in cond:
+        elif ('输入长度' in cond or 'k)' in cond_l or 'k]' in cond_l or 'k+' in cond_l or 'k）' in cond):
             ttype, tval = 'length', cond.strip()
         else:
             ttype, tval = 'base', (cond.strip() or '-')

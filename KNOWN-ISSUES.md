@@ -1751,6 +1751,29 @@ Kimi 文档站改版：价格从 mintlify `.md` 源迁到 **HTML 页 RSC 负载*
 - ★ **为什么自测永远抓不到**：`selftest.js` require 的是 **tmp 副本**，`__dirname` 在副本里 → 天然隔离；
   污染只发生在 **spawn CLI** 场景（CLI 的 `__dirname` 恒为真实技能目录）。与 KI-51 同类的**带外路径差异**。
 
+## KI-55 Kimi 官方价页二次改版 → 整厂商 0 模型（RSC DocTable 组件包装/单位并入价格格）【P1，2026-10-25，**已修 v3.63.9**】
+
+- **现象**：10-25 起每条弹窗行 1 末尾带 `⚠1家价旧`（`fetchDegradedTag` 数 `_fetch_degraded.vendors`
+  键数）。`latest.json` 的 `failed = {kimi: "解析出 0 个模型"}`，`models_total` 39 → 35。
+- **根因**：官方发布 **K3.1 Pro** 时同一张 RSC 表改了四处，旧解析器三条硬假设全破：
+  ① 模型名格由裸反引号串变成 `_jsx(_components.a,{href:…,children:`kimi-k3.1-pro`})`
+  → 要求"整行纯反引号数组"的 `KIMI_BT_ROW_RE` 命中 **0 行**；
+  ② 单位由独立列 `1M tokens` 并进价格格 `¥13.00 / MTok`；
+  ③ 表头「输入价格（缓存未命中）」简化成「输入」→ `kimi_col_map` 认不到输入列，整表跳过；
+  ④ 缓存列被 `_jsx(Tooltip,{tip:…,children:`缓存命中`})` 包住 → `KIMI_TITLE_RE.findall` 漏列，缓存价全空。
+  兜底 `.md` 路径同死（Mintlify 导出的 `<table>` 是空标签）。
+- **注意这不是 KI-45 复发**：KI-45 是「价格从 .md 源迁到 HTML RSC」（源迁移）；本次是「同一张 RSC 表的
+  组件序列化方式变了」（渲染层改版）。v3.63.4 的修复有效期为 10-22~10-24（每天 4 条正常）。
+- **已修**：`kimi_split_cells()`（顶层逗号切格）+ `kimi_row_to_record()`（格下标 = 表头下标，
+  模型名用正则搜索）+ `kimi_col_titles()`（优先取 `children:`）+ 单位两条路断言（独立单位格 / `MTok` 后缀，
+  未知后缀拒收）+ 表头认不到列时 WARN。**同名函数 `kimi_bt_row_to_record` 已改名并删除 `KIMI_BT_ROW_RE`**。
+- **同批加固**：MiniMax（`'元/百万'` 字面量 → 正则 + 名字空格/连字符归一）、智谱（剥尾随括号说明）、
+  阶跃（名字走 `cmap['name']` 而非 `cells[0]`；`_num` 容忍币种）、TokenHub（`data-slate-string` 兜底 +
+  大小写不敏感）、DeepSeek（遍历所有 `<table>` 选模型表头 + 价格行复合判定）。
+- **失效边界（如实）**：仍然依赖"表格能被切成格 + 每格有反引号或纯文本"这一结构；若官方改成
+  纯前端 canvas/图片渲染价格表，仍会 0 模型 —— 但那时 `failed` 会照报（可见），不会静默。
+  价格格与表头列数不一致时会打 WARN 并按"取不到值就拒收"fail-closed，不会猜位置。
+
 ## KI-54 已有条目价格「单边丢失」被 None 抹掉（AUD-D-01）【P2，2026-10-24，**已修 v3.63.8**】
 
 - **现象**：抓取/解析偶发把某个价字段取成 None（页面改版、列错位），该条目若**上一版已存在**，

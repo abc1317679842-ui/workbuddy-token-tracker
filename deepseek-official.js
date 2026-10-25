@@ -135,16 +135,25 @@ const hasTerm = (s, arr) => arr.some((w) => String(s).includes(w));
 // prices 每个值是与 models 同序的数组。
 function parseOfficial(html) {
   const out = { models: [], prices: null };
-  const tb = html.match(/<table[\s\S]*?<\/table>/);
-  if (!tb) throw new Error('官方页未找到价格表格');
-  const trs = tb[0].match(/<tr[\s\S]*?<\/tr>/g) || [];
+  // v3.63.9（2026-10-25 全解析器复核）：不再「只取页面第一个 <table>」。
+  //   官方页现有 2 个表（价格表 + 另一张小表）。只要官方在价格表**前面**再插一个表
+  //   （说明/活动/限流），旧实现就取到错表 → 抛「未找到模型表头」→ 不写 pricing.json。
+  //   现遍历所有表，选第一个表头含「模型」的。
+  const allTbs = html.match(/<table[\s\S]*?<\/table>/g) || [];
+  if (!allTbs.length) throw new Error('官方页未找到价格表格');
   const cellText = (t) => t.replace(/<[^>]+>/g, '|').replace(/\|+/g, '|').split('|').map((s) => s.trim()).filter(Boolean);
+  const hasModelHeader = (tb) => /<tr[\s\S]*?<\/tr>/.test(tb)
+    && cellText(tb.match(/<tr[\s\S]*?<\/tr>/)[0]).some((x) => /模型/.test(x));
+  const tb0 = allTbs.find(hasModelHeader) || allTbs[0];
+  const trs = tb0.match(/<tr[\s\S]*?<\/tr>/g) || [];
 
   // 表头（第一个含 模型 的 tr）
   let header = null;
   for (const t of trs) {
     const c = cellText(t);
-    if (c[0] === '模型' || c.includes('模型')) { header = c; break; }
+    // v3.63.9：由 `c[0] === '模型' || c.includes('模型')` 放宽为"任一格含『模型』"——
+    //   `c.includes('模型')` 是数组元素**精确**匹配，官方写成「模型名称」时恒假。
+    if (c.some((x) => /模型/.test(x))) { header = c; break; }
   }
   if (!header) throw new Error('官方页未找到模型表头');
   // v2.93：模型名过滤从 /^deepseek-v4-/ 放宽为 /^deepseek-/。
@@ -198,11 +207,25 @@ function parseOfficial(html) {
     const c = cellText(t);
     const joined = c.join(' ');
     // v3.52.0：判定改走 ROW_TERMS 词表（语义等价，词面集中可维护）
-    if (hasTerm(joined, ROW_TERMS.input) && hasTerm(joined, ROW_TERMS.hit) && hasTerm(joined, ROW_TERMS.off)) prices.cached.off = grab(t, 0);
+    // v3.63.9（2026-10-25 全解析器复核）：词表命中失败时退到**语义复合判定**。
+    //   词表里是「百万tokens输入」这种整段短语，官方改成「输入（百万tokens）」或
+    //   「输入单价（元/百万 tokens）」时整条失效 → 三个字段全空 → 抛"解析不完整" →
+    //   当天不写 pricing.json（价格停更）。复合判定要求「输入/输出」+「百万/tokens」共现，
+    //   且输入行不得含「输出」，不会把输出行误判成输入行。
+    const kindOf = (s) => {
+      const t = String(s || '');
+      if (hasTerm(t, ROW_TERMS.input)) return 'input';
+      if (hasTerm(t, ROW_TERMS.output)) return 'output';
+      if (/输入/.test(t) && /百万|tokens/i.test(t) && !/输出/.test(t)) return 'input';
+      if (/输出/.test(t) && /百万|tokens/i.test(t)) return 'output';
+      return null;
+    };
+    const kind = kindOf(joined);
+    if (kind === 'input' && hasTerm(joined, ROW_TERMS.hit) && hasTerm(joined, ROW_TERMS.off)) prices.cached.off = grab(t, 0);
     if (hasTerm(joined, ROW_TERMS.peak) && hasTerm(cellText(trs[trs.indexOf(t) - 1] || '').join(' '), ROW_TERMS.hit)) prices.cached.peak = grab(t, 0);
-    if (hasTerm(joined, ROW_TERMS.input) && hasTerm(joined, ROW_TERMS.miss) && hasTerm(joined, ROW_TERMS.off)) prices.uncached.off = grab(t, 0);
+    if (kind === 'input' && hasTerm(joined, ROW_TERMS.miss) && hasTerm(joined, ROW_TERMS.off)) prices.uncached.off = grab(t, 0);
     if (hasTerm(joined, ROW_TERMS.peak) && hasTerm(cellText(trs[trs.indexOf(t) - 1] || '').join(' '), ROW_TERMS.miss)) prices.uncached.peak = grab(t, 0);
-    if (hasTerm(joined, ROW_TERMS.output) && hasTerm(joined, ROW_TERMS.off)) prices.output.off = grab(t, 0);
+    if (kind === 'output' && hasTerm(joined, ROW_TERMS.off)) prices.output.off = grab(t, 0);
     if (hasTerm(joined, ROW_TERMS.peak) && hasTerm(cellText(trs[trs.indexOf(t) - 1] || '').join(' '), ROW_TERMS.output)) prices.output.peak = grab(t, 0);
   }
 
