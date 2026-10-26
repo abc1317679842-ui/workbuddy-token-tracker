@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.63.10 (2026-10-26)
+// token-usage-tracker v3.63.11 (2026-10-26)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -6292,7 +6292,9 @@ function pushBalanceHistory(cache, now, total) {
 // v2.10 变化检测：默认不显示（用户："宁愿先几轮不显示"）；每次查询与上次观测对比，
 // 余额变了（账户在真实消耗=自定义 API 模式或别处用同一 key）才显示，积分模式余额恒定 → 永不显示。
 // 缓存 15 秒（BALANCE_TTL_MS，v2.18 从 60s 压短——用户要求实时：余额接口实测 300ms 级，15s 内连发 toast 才复用缓存，正常轮询基本每轮都拿实时数）。
-function balanceText() {
+// KI-56 · C 方案（2026-10-26）：本体改名 balanceTextRaw（**逻辑一字未动**）；对外入口换成下方带 5s
+//   进程内 memo 的幂等 wrapper balanceText()。T42 余额组守卫锚已同步改抓 balanceTextRaw。
+function balanceTextRaw() {
   // v2.30：联网开关——总开关或余额分开关关闭时永不查询余额（默认关闭=零密钥联网）
   if (!(ENABLE_NETWORK && ENABLE_BALANCE_QUERY)) return '';
   const key = deepSeekApiKey();
@@ -6334,6 +6336,24 @@ function balanceText() {
   // ⚠️ 2026-09-28 曾一度改为"每轮都显示"，用户当天明确要求**保留变化检测**并说明理由：
   //   「变化还是留着，因为它无法判断你用的是 API 还是 WorkBuddy 自带的，**只有余额变动了才知道用的是 API**」
   //   → 故本逻辑维持原样：仅余额变化时显示。已回滚"恒定显示"。
+}
+
+// KI-56 · C 方案（2026-10-26）：balanceText 幂等化 —— 同一进程 5 秒内重复调用直接返回首次结果。
+//   为什么：本体是"有副作用的读取"（写 history + 与上次观测比较），同一弹窗生命周期内任何路径
+//   若再调一次，第二次必判"无变化"→ 空串（KI-56 的病根本身）。A 方案（stop-handler 的 balNow
+//   一次算、多处共用）是对症；本 wrapper 把幂等做进函数本身：将来任何新调用点、任何双调路径
+//   都不再可能复现该缺陷（结构性兜底）。
+//   memo 缓存的是**首次返回值（含空串）**：同一时刻的多次询问必须得到同一答案；空串是合法结果，
+//   不能当"无缓存"（判据用 _balanceMemo !== null，不用真值判断）。
+//   5s < BALANCE_TTL_MS(15s)：memo 只覆盖"同一轮弹窗"窗口，不影响正常轮询节奏；过期后照常走本体。
+const BALANCE_MEMO_MS = 5000;
+let _balanceMemo = null; // { at, val } —— val 可为空串，故用 !== null 判"有无缓存"
+function balanceText() {
+  const nowMs = Date.now();
+  if (_balanceMemo !== null && (nowMs - _balanceMemo.at) < BALANCE_MEMO_MS) return _balanceMemo.val;
+  const val = balanceTextRaw();
+  _balanceMemo = { at: nowMs, val };
+  return val;
 }
 
 // ===== 新模型价格自动补录（检测到未收录模型 → 立即联网查 OpenRouter） =====
@@ -6883,7 +6903,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.63.10'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.63.11'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -8063,6 +8083,9 @@ module.exports = {
   estimateInterrupted, estimateInterruptedInc,
   extractUsageFromRow, terminalErrorFromRow, terminalError, freshCompactionMarker, compactionMarkerId,
   showToast, toastLineTagged,
+  // KI-56 · C 方案（2026-10-26）：幂等入口导出，selftest T118 行为夹具直接单测。
+  //   handleStopEnd 的 tx 注入对象另有一份同名成员（stop-handler 走注入），两处都要在，别混。
+  balanceText,
   traceWallDurMs, withFileLock,
   loadPricing, autoRefreshPricing, addModelPrice, savePricing, normalizeModelName, saveDailyUsageRaw,
   getTranscriptStats, sidFromPath, ledgerKey,

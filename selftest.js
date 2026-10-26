@@ -575,6 +575,18 @@ else {
       `ledger=${rec8 && rec8.cost} expect=${cPeak8} off=${cOff8} 桶=${tok8} today桶=${!!led[ttMod.todayStr()]}`);
     fs.rmSync(projDir8, { recursive: true, force: true });
     try { fs.rmSync(path.join(skillDir, '.ledger-watermark.json'), { force: true }); } catch (e) { /* 清理 */ }
+    // ⚠ T9 夹具收尾必须还原真价库（测试基建修复 2026-10-26）：上面覆写的 pricing8b 无 date 字段且仅
+
+    //   1 模型，T9 之后所有**联网态** --hook spawn 都会判"价库极旧"进 autoRefreshPricing 刷新分支 →
+
+    //   spawn refresh-prices.js 全量联网（CN 源慢时实测 52s）> selftest spawn 30s 超时 → T12-j/T17-c
+
+    //   必假红（ETIMEDOUT；stash 干净 HEAD 同红已实证）。恢复为 SRC 真价库（date=今天、每日流水线
+
+    //   刷新），后续组判"新鲜"跳过刷新。T119 守卫钉住本恢复语句（删恢复必红，不依赖网络时序）。
+
+    fs.copyFileSync(path.join(SRC, 'pricing.json'), path.join(skillDir, 'pricing.json'));
+
   }
 }
 
@@ -3521,7 +3533,10 @@ else {
   // ── A12：余额缓存 time 只在真查到新值时刷新（陈旧值会长大/被续命） ──
   //   病根：失败降级用旧值时也写 time: now → API 持续不可达 → 旧余额被反复续命 →
   //   缓存永远读不到过期信号 → 弹窗显示的余额可能已陈旧数天而用户毫无察觉。
-  const balSrc = stripComments(grab42(rawTT42, 'balanceText'));
+  // KI-56 · C 方案（2026-10-26）：本体改名 balanceTextRaw（对外入口换成 5s memo 幂等 wrapper），锚同步改抓原体
+
+  const balSrc = stripComments(grab42(rawTT42, 'balanceTextRaw'));
+
   ok('T42-a17 ★只有真拿到新余额（isFreshQuery）才把 time 刷成 now',
     /isFreshQuery = true;/.test(balSrc)
     && /time: isFreshQuery \? now : \(cache\.time \|\| now\)/.test(balSrc),
@@ -11347,6 +11362,10 @@ for (let i = 0; i < 5; i++) {
     const i1 = sh117.indexOf('clearCoalesce(effSid);', i0);
     return i1 > i0 ? sh117.slice(i0, i1) : null;
   })();
+  // KI-56 · C 方案（2026-10-26）后 balanceText 本身已幂等（见 T118），双调的**运行时后果**已被 memo 兜住；
+
+  //   本条退化为设计意图守卫：「一次算、多处用」仍是 stop-handler 的首选形态，回落分支不许偷偷自算。
+
   ok('T117-a2 ★回落分支必须复用 balNow，绝不二次调用 balanceText()（双调必判"无变化"→ 永远不显示）',
     !!fallback117 && /balNow/.test(fallback117) && !/balanceText\(\)/.test(fallback117),
     fallback117 === null ? '回落分支锚点没找到（结构变了，守卫需同步）' : '回落分支仍在自算余额');
@@ -11378,6 +11397,191 @@ for (let i = 0; i < 5; i++) {
     ok('T117-b2 行为：传入空串时行内不得出现「余额」（证明没把它当"未传"而回退自算）',
       withBal !== '' && emptyBal.indexOf('余额') < 0, JSON.stringify(emptyBal.slice(0, 120)));
   }
+}
+
+// ===== T118（KI-56 · C 方案，2026-10-26）：balanceText 进程内 5s memo 幂等化 =====
+
+//   A 方案（T117）钉死"stop-handler 一次算、多处用"是对症；本组守 C 方案这个**结构性兜底**：
+
+//   balanceText 本身变幂等 —— 同一进程 5s 内重复调用返回首次结果（含空串），把"副作用读取被双调
+
+//   必判无变化"的缺陷类从调用纪律层面挪进函数本身：任何未来调用点再犯双调，运行时也不复现。
+
+//   行为夹具用 **tmp 副本模块**：local-config.json 读 __dirname（不随 WB_ROOT 走）→ 只有复制一份
+
+//   token-tracker.js 到 tmp 下、在副本目录预置 {"enable_balance_query":true}，才能离线驱动完整链路
+
+//   （预置观测让 15s TTL 命中 → 全程不联网，CI 离线遍同样真跑，不产生 envSkip / 不触 C1 门禁）。
+
+{
+
+  const tt118 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+
+  ok('T118-a1 ★本体必须存在为 balanceTextRaw，幂等 wrapper balanceText 在其后（改名不拆、顺序不倒）',
+
+    tt118.indexOf('function balanceTextRaw()') >= 0
+
+    && tt118.indexOf('function balanceText()') >= 0
+
+    && tt118.indexOf('function balanceTextRaw()') < tt118.indexOf('function balanceText()'));
+
+  ok('T118-a2 ★wrapper 必须带 5s memo：命中返首次值、未命中调本体并回填（删 memo = 缺陷类复活）',
+
+    /const BALANCE_MEMO_MS = 5000;/.test(tt118)
+
+    && /if \(_balanceMemo !== null && \(nowMs - _balanceMemo\.at\) < BALANCE_MEMO_MS\) return _balanceMemo\.val;/.test(tt118)
+
+    && /const val = balanceTextRaw\(\);/.test(tt118)
+
+    && /_balanceMemo = \{ at: nowMs, val \};/.test(tt118));
+
+  // 对外契约三处锚：① module.exports 必须真导出 balanceText（T118 行为夹具靠它直接调用幂等入口）；
+
+  //   ② token-tracker.js 的 tx 注入对象、③ stop-handler.js 的解构，仍按 balanceText 这个名字对接
+
+  ok('T118-a3 ★对外契约不变：module.exports 真导出 balanceText，tx 注入与 stop-handler 解构仍用同名',
+
+    /^  balanceText,$/m.test(tt118)
+
+    && /^\s{4}balanceText,$/m.test(tt118)
+
+    && /^\s{4}balanceText,$/m.test(fs.readFileSync(path.join(SRC, 'stop-handler.js'), 'utf-8').replace(/\r\n/g, '\n')));
+
+  if (!SPAWN_OK) {
+
+    envSkip('T118-b 行为组（balanceText memo 幂等，tmp 副本模块真跑）', SPAWN_SKIP_REASON);
+
+  } else {
+
+    const tmp118 = fs.mkdtempSync(path.join(os.tmpdir(), 't118-'));
+
+    // tmp 结构：tmp/skill/（技能目录**顶层全量**副本 + 测试专用 local-config + runner）
+
+    //           + tmp/models.json + tmp/skills/token-usage-tracker/.balance.json
+
+    const skill118 = path.join(tmp118, 'skill');
+
+    fs.mkdirSync(skill118, { recursive: true });
+
+    fs.mkdirSync(path.join(tmp118, 'skills', 'token-usage-tracker'), { recursive: true });
+
+    // ⚠ 必须顶层全量复制：token-tracker.js require('./peak-rules.js') 等兄弟模块，
+
+    //   只拷单文件 = Cannot find module（与反向验证"副本必须完整树"同一教训）。
+
+    //   不用 fs.cpSync(recursive)：该 API 大目录批量拷贝在本环境会触发进程 fastfail 崩溃
+
+    //   （exit 127 / 0xC0000409、stderr 零输出，2026-10-26 实证两起）→ 自写递归替代。
+
+    const cpDeep118 = (s118d, d118d) => {
+
+      fs.mkdirSync(d118d, { recursive: true });
+
+      for (const e118 of fs.readdirSync(s118d, { withFileTypes: true })) {
+
+        if (e118.name === '.git') continue;
+
+        const s118p = path.join(s118d, e118.name), d118p = path.join(d118d, e118.name);
+
+        if (e118.isDirectory()) cpDeep118(s118p, d118p); else fs.copyFileSync(s118p, d118p);
+
+      }
+
+    };
+
+    cpDeep118(SRC, skill118);
+
+    fs.writeFileSync(path.join(skill118, 'local-config.json'), '{"enable_balance_query":true}');
+
+    fs.writeFileSync(path.join(tmp118, 'models.json'),
+
+      JSON.stringify([{ url: 'https://api.deepseek.com/v1', apiKey: 'sk-test-t118' }]));
+
+    // runner：调两次 balanceText，回传两次结果 + .balance.json 的 history 长度（副作用翻倍即缺陷形状）
+
+    const runner118 = path.join(skill118, 'runner.js');
+
+    fs.writeFileSync(runner118, [
+
+      "const fs = require('fs'); const path = require('path');",
+
+      "const balPath = path.join(process.env.WB_ROOT, 'skills', 'token-usage-tracker', '.balance.json');",
+
+      "const tx = require(path.join(__dirname, 'token-tracker.js'));",
+
+      "const a = tx.balanceText(); const b = tx.balanceText();",
+
+      "let histLen = -1; try { histLen = JSON.parse(fs.readFileSync(balPath, 'utf-8')).history.length; } catch (e) { /* 读不到就让父侧以 -1 暴露 */ }",
+
+      "process.stdout.write(JSON.stringify({ a, b, histLen }));",
+
+    ].join('\n'));
+
+    const run118 = (balObj) => {
+
+      fs.writeFileSync(path.join(tmp118, 'skills', 'token-usage-tracker', '.balance.json'), JSON.stringify(balObj));
+
+      const env118 = Object.assign({}, process.env, { WB_ROOT: tmp118 });
+
+      delete env118.WB_NO_NET; delete env118.WB_DISABLE_NET;   // 总开关必须开（balanceText 首行短路会直接返空串）
+
+      const r = spawnSync(NODE, [runner118], { timeout: 30000, windowsHide: true, encoding: 'utf-8', env: env118 });
+
+      try { return JSON.parse(String(r.stdout || '').trim().split('\n').pop()); } catch (e) {
+
+        return { a: null, b: null, histLen: -1, err: String(r.stderr || '').slice(0, 300) };
+
+      }
+
+    };
+
+    // b1/b2 变化场景：预置上次观测 5.00、本次 3.17 → 首调必返「余额¥3.17」，5s 内二调 memo 必须同值；
+
+    //   history 只落 1 条新观测（KI-56 实证缺陷形状 = 弹窗时刻恰落两条同值观测 → 双调必落两条）。
+
+    const r1 = run118({ time: Date.now() - 2000, total: 3.17, currency: 'CNY', history: [{ time: Date.now() - 60000, total: 5 }] });
+
+    ok('T118-b1 行为：同进程两次调用返回同一「余额¥3.17」（memo 命中，第二次不得判"无变化"）',
+
+      r1.a === '余额¥3.17' && r1.b === r1.a, JSON.stringify(r1).slice(0, 240));
+
+    ok('T118-b2 行为：5s 内双调只落 1 条新观测（副作用不翻倍——缺陷现场即两条同值观测）',
+
+      r1.histLen === 2, 'histLen=' + r1.histLen + '（期望 2）');
+
+    // b3 无变化场景：预置观测同值 → 首调空串；memo 必须缓存**空串本身**（被当"无缓存"重跑本体 = 观测翻倍回归）。
+
+    const r2 = run118({ time: Date.now() - 2000, total: 5, currency: 'CNY', history: [{ time: Date.now() - 60000, total: 5 }] });
+
+    ok('T118-b3 行为：memo 缓存空串也幂等（二调仍空串、history 不新增）',
+
+      r2.a === '' && r2.b === '' && r2.histLen === 2, JSON.stringify(r2).slice(0, 240));
+
+    try { fs.rmSync(tmp118, { recursive: true, force: true }); } catch (e) { /* 清理失败不影响断言 */ }
+
+  }
+
+}
+
+// ===== T119（测试基建 · 2026-10-26）：T9 价库还原语句守卫 =====
+
+//   T9-B8 覆写的 pricing8b 无 date 字段且仅 1 模型 → 其后所有联网态 --hook spawn 判"价库极旧"
+
+//   进 autoRefreshPricing 刷新分支 → refresh-prices.js 全量联网（CN 源慢时实测 52s）>
+
+//   selftest spawn 30s 超时 → T12-j/T17-c 必假红（ETIMEDOUT，stash 干净 HEAD 同红已实证）。
+
+//   本守卫钉住 T9 收尾的恢复语句：谁删了恢复，这里必红（静态判据，不依赖网络时序）。
+
+{
+
+  const st119 = fs.readFileSync(path.join(SRC, 'selftest.js'), 'utf-8').replace(/\r\n/g, '\n');
+
+  ok('T119 ★T9 夹具收尾必须恢复 SRC 真价库（删恢复 = 联网态 spawn 撞 52s 刷新 > 30s 超时假红）',
+    // 拼接防自引用：守卫源码里不得含完整锚串，否则锚串恒命中（删被钉注释的变异测不出）
+    new RegExp('T9 夹具收尾必须' + '还原真价库').test(st119)
+    && /fs\.copyFileSync\(path\.join\(SRC, 'pricing\.json'\), path\.join\(skillDir, 'pricing\.json'\)\)/.test(st119));
+
 }
 
 // v3.24.0（审计⑤）：skip 数显式化 —— 「138 全绿」曾掩盖 26 条端到端用例全部 SKIP 的事实
