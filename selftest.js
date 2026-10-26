@@ -11320,6 +11320,66 @@ for (let i = 0; i < 5; i++) {
   }
 }
 
+// ===== T117（v3.63.10 · 2026-10-26 KI-56）：余额「只算一次」=====
+//   事故：普通轮弹窗**从来不显示**「余额¥X」，用户以为功能失效（接口和 key 都正常）。
+//   根因：`balanceText()` 是**有副作用的读取** —— 它把本次余额追加进 .balance.json 的 history，
+//     再与"上一条观测"比较，相同即返回空串（设计如此：只在与上次不同时显示，用来判断"是不是
+//     真在用 API"）。stop-handler 旧写法在分条参数里算一次（**吃掉**了变化），单模型轮分条函数
+//     `parts.length<=1` 直接 return false → 回落分支又算一次 → 15s TTL 命中、与刚写入的观测
+//     同值 → 判"无变化" → 空串 → 弹窗无余额。
+//   实证：每次弹窗时刻 .balance.json 恰好落两条同值观测；toast.log 带「余额」的记录自
+//     v3.38.1（2026-10-09, f8a6003 插入分条调用）之后只剩 stop-killed-recover 这类"只算一次"的路径。
+//   本组 = 源码侧钉死"一次算、多处用"的挂点 + 负向断言（回落分支不许再自算）；
+//     行为侧直接喂 `toastLineTagged(..., balTxt)` 验证：传值必须原样出现、传 '' 必须不显示
+//     （证明它不再偷偷自算）。
+{
+  const sh117 = fs.readFileSync(path.join(SRC, 'stop-handler.js'), 'utf-8').replace(/\r\n/g, '\n');
+  const tt117 = fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n');
+
+  ok('T117-a1 ★stop-handler 必须先算一次 balNow（分条与回落共用），不许各自调 balanceText()',
+    /const balNow = dupShown \? '' : balanceText\(\);/.test(sh117)
+    && /bal: balNow,/.test(sh117));
+
+  // 回落分支（`} else if (!dupShown) {` 到 `clearCoalesce(effSid);`）里**不得**再出现 balanceText()
+  const fallback117 = (() => {
+    const i0 = sh117.indexOf("} else if (!dupShown) {");
+    if (i0 < 0) return null;
+    const i1 = sh117.indexOf('clearCoalesce(effSid);', i0);
+    return i1 > i0 ? sh117.slice(i0, i1) : null;
+  })();
+  ok('T117-a2 ★回落分支必须复用 balNow，绝不二次调用 balanceText()（双调必判"无变化"→ 永远不显示）',
+    !!fallback117 && /balNow/.test(fallback117) && !/balanceText\(\)/.test(fallback117),
+    fallback117 === null ? '回落分支锚点没找到（结构变了，守卫需同步）' : '回落分支仍在自算余额');
+
+  ok('T117-a3 ★toastLineTagged 必须接受第 4 参 balTxt 并优先使用（传了就不许再自算）',
+    /function toastLineTagged\(agg, pricing, tag, balTxt\)/.test(tt117)
+    && /balTxt != null \? balTxt : balanceText\(\)/.test(tt117));
+
+  const taggedCalls117 = (tt117.match(/toastLineTagged\((?:p\.stat|subToastAgg)[^\n]*\)/g) || []);
+  ok('T117-a4 ★三处 toastLineTagged 调用都要把已算好的余额传进去（分条第一张传 balI，子代理两条传 bal）',
+    /toastLineTagged\(p\.stat, pricing, tag, balI\)/.test(tt117)
+    && taggedCalls117.filter((s) => /, bal\)/.test(s)).length === 2
+    && taggedCalls117.every((s) => /, (balI|bal)\)/.test(s)),
+    '仍有调用点没传 bal → 该路径会偷偷自算并吞掉变化：' + JSON.stringify(taggedCalls117.map((s) => s.slice(0, 60))));
+
+  const ttMod117 = (() => { try { return require(path.join(SRC, 'token-tracker.js')); } catch (e) { return null; } })();
+  if (!ttMod117 || typeof ttMod117.toastLineTagged !== 'function') {
+    envSkip('T117-b 行为组（toastLineTagged 余额透传）', '主模块 require/导出缺失');
+  } else {
+    const agg117 = { in: 12000, out: 800, cached: 3000, total: 12800, durMs: 65000, model: 'deepseek-chat' };
+    const pr117 = { models: {} };
+    let withBal = '', emptyBal = '';
+    try {
+      withBal = ttMod117.toastLineTagged(agg117, pr117, '', '余额¥1.23');
+      emptyBal = ttMod117.toastLineTagged(agg117, pr117, '', '');
+    } catch (e) { /* 下面两条断言会以空串失败，stderr 留因 */ process.stderr.write('[T117] ' + e.message + '\n'); }
+    ok('T117-b1 行为：传入「余额¥1.23」时弹窗行必须原样带上它（不再自算覆盖）',
+      withBal.indexOf('余额¥1.23') >= 0, JSON.stringify(withBal.slice(0, 120)));
+    ok('T117-b2 行为：传入空串时行内不得出现「余额」（证明没把它当"未传"而回退自算）',
+      withBal !== '' && emptyBal.indexOf('余额') < 0, JSON.stringify(emptyBal.slice(0, 120)));
+  }
+}
+
 // v3.24.0（审计⑤）：skip 数显式化 —— 「138 全绿」曾掩盖 26 条端到端用例全部 SKIP 的事实
 // （SPAWN_OK=false 的沙箱环境里绿 ≠ 真跑过）。
 // v3.29.0（A-3）：**退出码语义修正** —— 只有真失败才 exit 1；envSkip 是"环境能力受限"（沙箱禁 spawn、

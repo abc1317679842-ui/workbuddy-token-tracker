@@ -1751,6 +1751,21 @@ Kimi 文档站改版：价格从 mintlify `.md` 源迁到 **HTML 页 RSC 负载*
 - ★ **为什么自测永远抓不到**：`selftest.js` require 的是 **tmp 副本**，`__dirname` 在副本里 → 天然隔离；
   污染只发生在 **spawn CLI** 场景（CLI 的 `__dirname` 恒为真实技能目录）。与 KI-51 同类的**带外路径差异**。
 
+## KI-56 普通轮弹窗从来不显示「余额¥X」（balanceText 双调 → 第二次必判无变化）【P2，2026-10-26，**已修 v3.63.10**】
+
+- **现象**：用户用自己 DeepSeek API 连跑多轮，弹窗行 2 始终无 `余额¥X`，怀疑功能失效。
+- **不是**接口/key/开关问题：`.balance.json` 有连续观测且余额真实下降；`enable_balance_query: true` 在位。
+- **根因**：`balanceText()` 有副作用（写 history + 与上一条观测比较、相同返空）。stop-handler 普通轮：
+  分条参数里算一次（吃掉变化）→ 单模型 `parts.length<=1` 返回 false → 回落分支**再算一次**
+  → 15s TTL 命中、与刚写入的观测同值 → 判无变化 → 空串。
+- **实证**：每次弹窗时刻 `.balance.json` 恰好落两条同值观测；`toast.log` 带「余额」的记录自
+  v3.38.1（`f8a6003`，2026-10-09 插入分条调用）之后只剩 `stop-killed-recover`（只算一次的路径）。
+- **已修**：`const balNow = dupShown ? '' : balanceText()` 一次算、分条与回落共用；`toastLineTagged`
+  增加可选第 4 参 `balTxt`（传了就不自算），三处调用点全传。
+- **失效边界**：变化检测不变 —— 余额未变（无消耗 / 变化不足 0.01）时不显示，属设计。
+  将来任何路径若在同一弹窗生命周期内再调一次 `balanceText()`，会重新触发本缺陷 → 由 T117-a2/a4 兜住。
+- **未做**：B 方案（基线改「上次已显示金额」+ 新增 `lastShown` 字段）治本但改动面大，本批不动。
+
 ## KI-55 Kimi 官方价页二次改版 → 整厂商 0 模型（RSC DocTable 组件包装/单位并入价格格）【P1，2026-10-25，**已修 v3.63.9**】
 
 - **现象**：10-25 起每条弹窗行 1 末尾带 `⚠1家价旧`（`fetchDegradedTag` 数 `_fetch_degraded.vendors`

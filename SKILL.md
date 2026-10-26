@@ -39,6 +39,8 @@ type: skill
 
 ## 当前功能总览（版本以 manifest.yaml 为准）
 
+> **v3.63.10 要点（2026-10-26）：余额「只算一次」** —— `balanceText()` 是**有副作用的读取**（写 `.balance.json` 的 history + 与上一条观测比较，相同即返空串）。stop-handler 旧写法在分条参数里算一次、单模型轮分条返回 false 后回落分支**再算一次** → 第二次必判「无变化」→ **普通轮余额从来显示不出来**（自 v3.38.1 / 2026-10-09 回归 17 天；只有 stop-killed-recover 这类"只算一次"的路径能显示）。修法：`const balNow = dupShown ? '' : balanceText()` 一次算、分条与回落共用；`toastLineTagged(agg, pricing, tag, balTxt)` 加第 4 参（传了就不自算），三处调用点全传。守卫 T117 六条（含"回落分支不许出现 balanceText()"的负向断言）。
+
 > **v3.63.9 要点（2026-10-25）：解析器「字面量/位置硬假设」整批拆除** —— Kimi 官方 10-25 发布 K3.1 Pro 时同时改了四处（模型名格包进 `_jsx` 链接组件 / 单位并进价格格 `¥13.00 / MTok` / 表头「输入价格（缓存未命中）」简化成「输入」/ 缓存列被 `_jsx(Tooltip)` 包住）→ 旧解析器三条硬假设全破 → **kimi 整厂商 0 模型**（弹窗 `⚠1家价旧`，v3.62.0 的降级标注按设计报了警）。改法：按**顶层逗号切格**取单元格（`kimi_split_cells`）+ 表头取 `children`（`kimi_col_titles`）+ 单位两条路断言（独立单位格 / `MTok` 后缀）。顺带加固 MiniMax/智谱/阶跃/TokenHub/DeepSeek 的同型脆弱点（字面量、硬取首格、`data-slate-string` 属性、只取第一个 `<table>`）。守卫 T116 共 20 条；旧形态零回归（4 条价逐位不变）
 
 

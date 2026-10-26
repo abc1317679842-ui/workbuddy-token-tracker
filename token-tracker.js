@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.63.9 (2026-10-25)
+// token-usage-tracker v3.63.10 (2026-10-26)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -2102,7 +2102,7 @@ function showToastsSplitByModel(agg, opts) {
       ? [periodNote(p.stat, pricing), o.periodSuffix].filter(Boolean).join(' ')
       : periodNote(p.stat, pricing);
     if (needTag) {
-      allOk = showToast(toastLineTagged(p.stat, pricing, tag), toastLine2(p.stat, pricing), o.reason || 'split-by-model', o.tsPath) && allOk;
+      allOk = showToast(toastLineTagged(p.stat, pricing, tag, balI), toastLine2(p.stat, pricing), o.reason || 'split-by-model', o.tsPath) && allOk;
     } else {
       allOk = showToast(
         toastLine1(p.stat, shortModelName(p.stat, pricing), periodI, balI, todayI, noPriceTag1(p.stat, pricing)),
@@ -6198,10 +6198,16 @@ function toastLine2(stat, pricing) {
 
 // v3.12：在 toast 第一行模型名后插入状态标注（异常轮用"子代理运行中"、补弹用"子代理"），
 //   不改动 toastLine1 本体（保证正常轮/团队轮一字不变）。超宽时放弃标注，绝不超出 TOAST_ROW1_MAX_W。
-function toastLineTagged(agg, pricing, tag) {
-  if (!tag) return toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), balanceText(), todayUsageTxt(), noPriceTag1(agg, pricing));
+// v3.63.10（KI-56）：第 4 参 `balTxt` = 调用方**已经算好**的余额文本（可为 ''、可不传）。
+//   为什么必须能传进来：`balanceText()` 写 history 并做"与上次观测比较"的变化检测，**调两次
+//   第二次必然返空串**。调用方通常已经算过一次用于别处（如分条函数 o.bal），本函数再自算一次
+//   就会把它吃掉 → 带标注的轮永远看不到余额。传了就用传的（含 ''，表示"本轮不显示"），
+//   没传（旧调用点）才自算，保持逐字节兼容。
+function toastLineTagged(agg, pricing, tag, balTxt) {
+  const bal = balTxt != null ? balTxt : balanceText();
+  if (!tag) return toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), bal, todayUsageTxt(), noPriceTag1(agg, pricing));
   const mShort = shortModelName(agg, pricing);
-  const base = toastLine1(agg, mShort, periodNote(agg, pricing), balanceText(), todayUsageTxt(), noPriceTag1(agg, pricing));
+  const base = toastLine1(agg, mShort, periodNote(agg, pricing), bal, todayUsageTxt(), noPriceTag1(agg, pricing));
   const nl = base.indexOf('\n');
   const line1 = nl >= 0 ? base.slice(0, nl) : base;
   const tail = nl >= 0 ? base.slice(nl) : '';
@@ -6877,7 +6883,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.63.9'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.63.10'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -7535,7 +7541,7 @@ function main() {
           if (!showToastsSplitByModel(subAgg, { pricing, tsPath: info.tsPath, roundStart: info.roundStart || 0, subs: subsMap, alwaysTag: true, reason: 'team-sub-only' })) {
             const subToastAgg = Object.assign({}, subAgg, { subModels: undefined });
             const e0 = subsMap.get(normalizeModelName(subAgg.model || ''));
-            showToast(toastLineTagged(subToastAgg, pricing, e0 ? subagentTagOf(e0) : '（子代理使用）'), toastLine2(subToastAgg, pricing), 'team-sub-only', info.tsPath);
+            showToast(toastLineTagged(subToastAgg, pricing, e0 ? subagentTagOf(e0) : '（子代理使用）', bal), toastLine2(subToastAgg, pricing), 'team-sub-only', info.tsPath);
           }
         }
         appendCompactionLog('flush-team-sub-only', { sid: fSid, subTotal: subAgg ? subAgg.total : 0 });
@@ -7829,7 +7835,7 @@ function main() {
           if (!showToastsSplitByModel(subAgg, { pricing, tsPath: pendInfo && pendInfo.tsPath, roundStart: (pendInfo && pendInfo.roundStart) || 0, subs: subsMap, alwaysTag: true, reason: 'team-sub-only' })) {
             const subToastAgg = Object.assign({}, subAgg, { subModels: undefined });
             const e0 = subsMap.get(normalizeModelName(subAgg.model || ''));
-            showToast(toastLineTagged(subToastAgg, pricing, e0 ? subagentTagOf(e0) : '（子代理使用）'), toastLine2(subToastAgg, pricing), 'team-sub-only', pendInfo.tsPath);
+            showToast(toastLineTagged(subToastAgg, pricing, e0 ? subagentTagOf(e0) : '（子代理使用）', bal), toastLine2(subToastAgg, pricing), 'team-sub-only', pendInfo.tsPath);
           }
         }
         appendCompactionLog('hook-team-sub-only', { sid, subTotal: subAgg ? subAgg.total : 0 });

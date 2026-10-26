@@ -448,9 +448,19 @@ function handleStopEndInner(ctx) {
             //   toast 真失败（execFileSync 抛异常）时**不写**「已弹过」记录 —— 旧版无条件写，
             //   失败与成功同形，正是 KI-42 的毒记录（v3.63.2 的 S7 修复在这里被架空）。
             let toastFailed = false;
+            // v3.63.10（KI-56）：**余额只算一次，分条与回落共用这份结果**。
+            //   病根：`balanceText()` 是**有副作用的读取**——它把本次余额追加进 .balance.json 的
+            //   history，再与"上一条观测"比较，相同则返回空串（设计如此：只在与上次不同时显示，
+            //   用来判断"是不是真在用 API"）。旧写法在 split 参数里算一次（这次**吃掉了**变化），
+            //   单模型轮 split 返回 false → 回落分支又算一次 → 15s TTL 命中、与刚写入的观测同值
+            //   → 判"无变化" → 空串 → **普通轮的余额永远不显示**。
+            //   实证：每次弹窗时刻 .balance.json 恰好落两条同值观测；toast.log 带「余额」的记录
+            //   自 v3.38.1（2026-10-09，f8a6003 插入分条调用）之后只剩 stop-killed-recover 这类
+            //   "只算一次"的路径。dupShown 时不算（本轮不弹窗，不该消耗变化也不该发网络请求）。
+            const balNow = dupShown ? '' : balanceText();
             if (!dupShown && showToastsSplitByModel(agg, {
               pricing, tsPath, roundStart: aggStart0,
-              bal: balanceText(), firstToday: todayUsageTxt(),
+              bal: balNow, firstToday: todayUsageTxt(),
               reason: syncReason,
             })) {
               // ⚠ 记录必须在弹窗**成功之后**写：写在前面 = "没弹成也算弹过" → 被砍在弹窗前的轮次
@@ -459,7 +469,7 @@ function handleStopEndInner(ctx) {
               appendCompactionLog(isPlainRound ? 'stop-plain-immediate-split' : 'stop-team-sync-split', { sid: effSid, parts: Object.keys((agg && agg.models) || {}) });
             } else if (!dupShown) {
               if (showToast(
-                toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), balanceText(), todayUsageTxt(), noPriceTag1(agg, pricing)),
+                toastLine1(agg, shortModelName(agg, pricing), periodNote(agg, pricing), balNow, todayUsageTxt(), noPriceTag1(agg, pricing)),
                 toastLine2(agg, pricing),
                 syncReason,
                 tsPath
