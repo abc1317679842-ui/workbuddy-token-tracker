@@ -663,7 +663,27 @@ def parse_minimax(html):
         cmap = map_price_columns(hdr)
         if cmap['in'] is None or cmap['out'] is None:
             continue
-        if not re.search(r'元\s*[／/]\s*百万', strip_tags(rows[0])):
+        # v3.63.12（D-01，2026-10-28 外部审计 P0）：官方表头单位已从「元/百万 tokens」改写成
+        #   「输入价格 每百万 tokens」「输出价格 每百万 tokens」——旧正则只认「元/百万」，
+        #   `每百万` 前面没有「元/」→ 整表 continue。后果不是"少几条"，是**H3-Context-IR 这类
+        #   只有这一张表的模型长期从价库消失，且抓取侧仍报 [OK]（零告警）**。
+        #   现放宽为两支：① 旧写法「元/百万」；② 新写法「每百万 tokens」，但要求页面出现
+        #   ¥/元 佐证币种（币种/单位禁止猜，沿用 v3.52.0 立的原则）。
+        hdr_text = strip_tags(rows[0])
+        unit_ok = bool(re.search(r'元\s*[／/]\s*百万', hdr_text))
+        # 币种佐证必须落在**数据行**上：新写法的表头只有「每百万 tokens」、不带货币符号，
+        #   价格格才是「¥5.80」。⚠ 不要写成 `'元' in html` —— 整页 660KB 必然含「元」字，
+        #   那等于没校验（本轮自查发现并改掉）。
+        if not unit_ok and re.search(r'每\s*百万\s*tokens?', hdr_text, re.I):
+            if any(('¥' in strip_tags(r)) or ('元' in strip_tags(r)) for r in rows[1:]):
+                unit_ok = True
+        if not unit_ok:
+            # 跳过必须留痕，但只对「本该是 token 计价表」告警：表头含 token(s) 才算我们自己认漏了。
+            #   视频/音频表（表头是「输出视频 每秒」这类）本来就该跳，行里同样出现 MiniMax 型号名
+            #   （Hailuo 系列），不加这一层会给每张无关表刷一条 WARN。
+            if 'token' in hdr_text.lower() and any(re.search(r'MiniMax[\s\-]', strip_tags(r)) for r in rows[1:]):
+                print('[WARN] minimax: token 计价表但单位门不认（表头=%r）→ 跳过该表；'
+                      '官方若再次改写单位写法，需同步此处否则该表模型静默消失' % hdr_text[:70])
             continue  # 只处理 token 计价表（跳过 TTS/视频等按秒/万字符计费表）
         # v3.63.9（2026-10-25 全解析器复核）：原为 `if '元/百万' not in ...` 字面量子串 ——
         #   官方把表头写成「元 / 百万 tokens」（加了空格）或全角「元／百万」就整页 0 模型。

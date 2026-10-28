@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.63.11 (2026-10-26)
+// token-usage-tracker v3.63.12 (2026-10-28)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -276,11 +276,16 @@ function writeCoalesce(sid, agg, meta) {
     //   只写 true（false/缺省不写字段 → 与旧格式逐字节一致，零噪音）。
     if (meta.alreadyRecorded === true) payload.alreadyRecorded = true;
   }
-  try { fs.writeFileSync(coalescePath(sid), JSON.stringify(payload)); }
+  let wrote = false;
+  try { fs.writeFileSync(coalescePath(sid), JSON.stringify(payload)); wrote = true; }
   catch (e) { process.stderr.write(`[token-tracker] 合并文件写入失败: ${e.message}\n`); }
   // v3.63.0：合并文件 = "本轮已交给后续补弹路径收口"的凭据 → 在飞标记已完成使命，就地清掉。
   //   放在这里而不是逐个调用点，是为了让 4 处 writeCoalesce 自动覆盖（漏一处就是永久残留标记）。
-  clearStopMark(sid);
+  // v3.63.12（N-01，2026-10-28 外部审计）：清标记必须以「coalesce 真的落盘」为前提。
+  //   旧写法无条件清 → 写失败（磁盘满 / EPERM / 杀软锁文件）时 coalesce 不存在、stopmark 被删，
+  //   补账与补弹两条凭据同时消失，该轮永久丢账且无任何入口可救。频次 0/3252 但后果不可恢复，
+  //   按本项目「凭据销毁不看频率」的定级规则算 P1，不是 P3。
+  if (wrote) clearStopMark(sid);
 }
 function clearCoalesce(sid) {
   try { fs.unlinkSync(coalescePath(sid)); } catch (e) { /* 不存在则忽略 */ }
@@ -793,6 +798,18 @@ const BALANCE_HISTORY_MAX = 20;        // 缓存里保留的余额观测条数�
 const ROUNDS_DIR = path.join(process.env.WB_ROOT ? path.join(WB, 'skills', 'token-usage-tracker') : __dirname, 'rounds');
 const ROUNDS_KEEP_MONTHS = 6;          // 保留最近 N 个月，--report 运行时顺带清理
 const ROUND_LABEL_MAX = 40;            // 轮次标签（本轮首条 user 消息）截断长度
+// v3.64.x（KI-57）：roundLabel 的扫描窗口。改前实测 1825 条轮次明细里 label 空 1475 条（80.8%）。
+//   SCAN_BACK —— 往前回溯多久找「本轮起点那条 user 行」。实测 roundStart（hook 里的 Date.now()）
+//     比该 user 行**晚 P50 1.6s / P90 6.2s / P95 26s**（hook 自身要跑聚合，还可能重试），
+//     所以不能靠小容差卡边界，直接给 5 分钟窗口。
+//   **精确性不靠这个窗口**，而是靠 roundLabel 里的「其后是否已有 assistant」判据 ——
+//     本轮用户行发出时 hook 正在阻塞，模型还没开始回，其到 roundStart 之间必然没有 assistant；
+//     上一轮的用户行后面一定有模型回复。窗口开大只影响性能，不影响正确性。
+//   SCAN_BYTES —— 倒序扫描字节上限。**实测必须够大**：本机 transcript 178MB，长会话一轮就能写几十 MB，
+//     4MB 窗口连轮首都够不到（实测 12:38~12:58 八个轮次全扫不到用户行、只扫到 system-reminder）。
+//     配合回调里的「先看有没有 "role" 再 JSON.parse」预筛，32MB 只解析少量行，Stop 侧可接受。
+const ROUND_LABEL_SCAN_BACK_MS = Number(process.env.WB_ROUND_LABEL_SCAN_BACK_MS) || 300000;
+const ROUND_LABEL_SCAN_BYTES = 32 * 1024 * 1024;
 const EXPORTS_DIR = path.join(__dirname, 'exports'); // v3.20.0：--report --csv 落盘目录（已 gitignore）
 // v3.34.0（A2·第五轮审计 P1）：exports/ 此前**零清理**——每次 `--report --csv` 都按秒级时间戳新建
 //   一个 CSV，目录只增不减（rounds/ 至少有保留期，exports/ 连保留期都没有）。
@@ -4110,6 +4127,59 @@ function injectionTagOf(txt, tags) {
   const m = /^<([a-zA-Z0-9_-]+)/.exec(String(txt || '').trim());
   return m && tags.indexOf(m[1]) >= 0 ? m[1] : '';
 }
+// v3.64.x（KI-57 / KI-58）：压缩后客户端自动插入的「继续」指令 —— **不是用户说的话**。
+//   形态固定且**纯文本、无尖括号**，所以 injectionTagOf（只认行首尖括号标签）认不出它：
+//   `Please continue with the conversation based on the summarized context above. Maintain the same ...`
+//   本机 14 天 41 条，全部带 providerData.isCompactInternal=true（证据：工作区《宿主钩子能力总表》§5.19）。
+//   两个消费者都必须跳过它：
+//     · roundLabel               —— 它会变成轮次标签（10-17 那轮 1116 万 token 的 label 就是这句）
+//     · inferRoundStartFromText  —— 它会变成轮起点，把压缩前那段调用挤出聚合窗口（漏账）
+//   ⚠ 用 startsWith 而不是正则字面量：本文件踩过「正则字面量落盘被 JSON 解码成控制字符」的事故。
+const INTERNAL_CONTINUE_PREFIX = 'Please continue with the conversation based on the summarized context above';
+function isInternalContinueText(txt) {
+  return String(txt || '').trim().startsWith(INTERNAL_CONTINUE_PREFIX);
+}
+// v3.64.x（KI-57 真正的根因）：真实用户消息**不是一个纯文本行** —— 宿主把注入块和用户的话塞进
+//   同一条 `role=user` 里。实测（32MB 窗口，179 条 user 行）：
+//     reminder + `<user_query>` 混排 **111 条(62%)**／压缩摘要 28／task-notification 37／
+//     压缩续跑指令 2／**纯文本无前缀 0 条**。
+//   原判据只看行首标签 → 命中 system-reminder 就把整条当注入丢弃 → 真用户输入一次都取不到：
+//     · roundLabel            → 标签 100% 失效（1825 条明细里 80.8% 空、其余全是 `[注入]`）
+//     · inferRoundStartFromText → **恒返回 0** → `roundStart0 > 0` 不成立 → 整轮记账被跳过
+//       （正是该函数头注释里 S1 的病根 ⇒ v3.33.0 那次兜底修复其实从未真正生效过）
+//   修法：先把用户自己的话剥出来，再判它是不是注入 / 续跑指令。
+//   tags 由调用方给各自的表（刻意不统一）：
+//     · roundLabel 用宽表 ALL —— 含 teammate-message，团队消息整条剥空 → 落到 `[注入]` 兜底；
+//     · inferRoundStartFromText 用窄表 NOT_SUBMIT —— 剥不空 → 仍当起点，宁可起点偏晚也不返回 0。
+function userTextOf(txt, tags) {
+  const s = String(txt || '');
+  const list = Array.isArray(tags) ? tags : INJECTION_TAGS_ALL;
+  // ⚠ ①②的顺序**就是判据本身**（v3.64.x 二轮审计修正，别对调）：
+  //   必须**先剥前导注入块、再找 <user_query> 容器**。反序（先全局搜容器）会踩一个账务级坑——
+  //   压缩摘要 `<cb_summary>` / `<conversation_history_summary>` 的正文会**原样抄进历史对话**，
+  //   其中含成组的 `<user_query>…</user_query>`（本机实测 23/218 条摘要行含 8~19 组）→
+  //   先搜容器就会命中摘要内部那一段，于是：
+  //     · roundLabel                → 标签写成几天前的旧话（不是用户这一轮说的话）
+  //     · inferRoundStartFromText   → **压缩摘要行被当成本轮起点**，起点被推到压缩之后
+  //       → 压缩前那段调用全被挤出聚合窗口 → **静默漏账**（KI-58 想修的病换个入口又回来了）
+  //   先剥块则相反：整条摘要被整块剥空 → 返回 '' → 两个消费者都正确跳过。
+  // ① 逐层剥掉前导注入块
+  let rest = s;
+  for (let i = 0; i < 8; i++) {
+    const mm = /^\s*<([a-zA-Z0-9_-]+)[^>]*>/.exec(rest);
+    if (!mm || list.indexOf(mm[1]) < 0) break;
+    const close = '</' + mm[1] + '>';
+    const at = rest.indexOf(close);
+    if (at < 0) return ''; // 未闭合 = 整条都是注入块
+    rest = rest.slice(at + close.length);
+  }
+  // ② 剥完为空 = 整条都是注入（摘要 / task-notification / 队友消息）
+  if (!rest.trim()) return '';
+  // ③ 剩下的若还套着宿主给的用户容器，取容器内容（宿主把它放在注入块之后）
+  const m = /<user_query>([\s\S]*?)<\/user_query>/.exec(rest);
+  if (m) return m[1].trim();
+  return rest.trim();
+}
 // 从原始 transcript 行里取纯文本（content 可能是字符串，也可能是 [{type:'text',text}] 数组）
 function transcTextOfRow(obj) {
   try {
@@ -4125,25 +4195,65 @@ function transcTextOfRow(obj) {
 function roundLabel(tsPath, roundStartMs) {
   try {
     if (!tsPath || !(roundStartMs > 0)) return '';
-    for (const ln of readTailRawLines(tsPath, 400)) {
+    // ── v3.64.x（KI-57）：三处修复。改前实测 rounds-2026-10.jsonl 1825 条明细：
+    //   label 空 1475 条（80.8%）／`[注入] xxx` 32 条／真文本 317 条；当天 47 条**零条**用户真话。
+    //   ① 原 `if (inj) return '[注入] ' + inj;` 是**提前返回**——每轮首条 user 行必是 system-reminder /
+    //      task-notification，于是恒定短路，真文本一次都取不到。原注释称「纯展示层改写，无副作用」，
+    //      实际副作用就是 100% 失效。→ 改为记为兜底、继续往前找；找不到才用它。
+    //   ② 原 `ts < roundStartMs 就丢` 把本轮真用户行也排除了（原因见 ROUND_LABEL_TOL_MS 注释）。
+    //   ③ 原 `readTailRawLines(400)` 只取尾部 400 行，长轮次（数千行工具调用）扫不到轮首那条 user 行。
+    //      → 改为倒序扫描 + 越过起点即早停。
+    //   另：压缩续跑指令不是用户的话，跳过（见 isInternalContinueText）。
+    //   ⚠ 判据核心不是时间窗，是「其后有没有 assistant」（见下方 seenAssist 注释）。
+    const lower = roundStartMs - ROUND_LABEL_SCAN_BACK_MS;
+    const seq = []; // 倒序（新→旧）收集窗口内的 user/assistant 行：{ ts, assistant, txt, inj }
+    eachTailLineReverse(tsPath, ROUND_LABEL_SCAN_BYTES, (ln) => {
+      // 预筛（解析前）：32MB 窗口里绝大多数是 tool 结果，没有 role 字段 → 直接跳过，不 JSON.parse。
+      //   这是把窗口从 4MB 放大到 32MB 的前提，否则 Stop 侧会被解析拖慢。
+      if (ln.indexOf('"role"') < 0) return false;
       let r;
-      try { r = JSON.parse(ln); } catch (e) { continue; }
-      if (!r || r.type !== 'message' || r.role !== 'user') continue;
+      try { r = JSON.parse(ln); } catch (e) { return false; }
+      if (!r || r.type !== 'message') return false;
       const ts = Number(r.timestamp) || 0;
-      if (ts && ts < roundStartMs) continue; // 上一轮的 user 行
-      const txt = transcTextOfRow(r).trim();
-      if (!txt) continue;
-      // 注入型 user 行（客户端 / 钩子 / 队友消息塞进来的）不是「用户说了什么」，不能当标签。
-      // v3.33.0：改用统一白名单 INJECTION_TAGS_ALL 并补上 teammate-message（实测本机 32/219 条中招）。
-      const inj = injectionTagOf(txt, INJECTION_TAGS_ALL);
-      if (inj) return '[注入] ' + inj;
+      if (ts && ts < lower) return true; // 越过窗口 → 停（再往前都太旧）
+      if (r.role === 'assistant') { seq.push({ ts, assistant: true }); return false; }
+      if (r.role !== 'user') return false;
+      const rawTxt = transcTextOfRow(r).trim();
+      if (!rawTxt) return false;
+      // 真实用户行是「注入块 + <user_query>用户的话</user_query>」混排 → 必须先剥出用户原话。
+      //   剥完为空 = 整条都是注入块（摘要 / task-notification / 队友消息）→ 只留 tag 作兜底标签。
+      const txt = userTextOf(rawTxt, INJECTION_TAGS_ALL);
+      seq.push({ ts, assistant: false, txt, inj: txt ? '' : injectionTagOf(rawTxt, INJECTION_TAGS_ALL) });
+      return false;
+    });
+    // 兜底标签只认**本轮**（ts <= roundStart）的注入行，且倒序遍历一路覆写 → 留下的是本轮**最早**那条
+    //   （= 本轮开头的注入形态）。原写法取倒序第一个 = 窗口内最新的一条，可能落在后续轮次上。
+    let inj0 = '';
+    for (const u of seq) {
+      if (u.assistant || !u.inj) continue;
+      if (u.ts && u.ts > roundStartMs) continue;
+      inj0 = u.inj;
+    }
+    // 本轮起点行：从新往旧，第一条 ts <= roundStart 且**其后没有 assistant** 的用户真话。
+    //   判据刻意不用时间：真用户行总比 roundStart 早 1.6~26 秒（hook 延迟，实测 P50 1.6s/P95 26s），
+    //   用时间卡边界要么卡掉本轮、要么吃进上一轮。改用「它到 roundStart 之间有没有模型回复」：
+    //   用户发出消息时 hook 正在阻塞、模型还没开始回；有 assistant = 已被回复过 = 上一轮（T31-b1）。
+    let cand = '';
+    let seenAssist = false;
+    for (const u of seq) {
+      if (u.ts && u.ts > roundStartMs) continue;  // roundStart 之后（含后续轮次）不参与
+      if (u.assistant) { seenAssist = true; continue; }
+      if (!u.txt) continue;                       // 纯注入行
+      if (isInternalContinueText(u.txt)) continue; // 压缩续跑指令，不是用户说的话
+      if (seenAssist) break;                      // 已被回复过 = 上一轮 → 本轮没有起点行
       // v3.33.0（B 系列·隐私声明）：这里是**本技能唯一一处会把用户自己敲的话落盘的地方**——
       //   用户消息的前 ROUND_LABEL_MAX(40) 字符，明文、只写本地、随 rounds-*.jsonl 保留 6 个月后清理。
       //   保留它的理由（权衡过）：没有标签的轮次明细就只是一堆数字，回答不了"这一轮到底在干什么"。
       //   已在 README「隐私与数据安全」逐条声明；**不要**因为"看起来像日志"就顺手删掉或加大截断长度。
-      return txt.slice(0, ROUND_LABEL_MAX).replace(/\s+/g, ' ');
+      cand = u.txt.slice(0, ROUND_LABEL_MAX).replace(/\s+/g, ' ');
+      break;
     }
-    return '';
+    return cand || (inj0 ? '[注入] ' + inj0 : '');
   } catch (e) { return ''; }
 }
 // v3.33.0（第四轮审计 S1 修复）：从 transcript **反推本轮起点**（= UserPromptSubmit hook 记录的
@@ -4166,13 +4276,17 @@ function inferRoundStartFromText(tsPath) {
     if (!r || r.type !== 'message' || r.role !== 'user') return false;
     const ts = Number(r.timestamp) || 0;
     if (!ts) return false;
-    const txt = transcTextOfRow(r).trim();
-    if (!txt) return false;
+    const rawTxt = transcTextOfRow(r).trim();
+    if (!rawTxt) return false;
     // 注入型 user 行（客户端 / 钩子塞进来的）不是"用户提交"，不当轮起点。
     // v3.33.0：改用统一白名单，但**刻意只用窄表 INJECTION_TAGS_NOT_SUBMIT**——
     //   见 INJECTION_TAGS_ALL 处注释：这里返回 0 会让整轮记账被跳过（静默丢账），
     //   而 teammate-message 在团队模式下可能是**唯一**的 user 行（排除它 → 起点归 0 → 丢账）。
-    if (injectionTagOf(txt, INJECTION_TAGS_NOT_SUBMIT)) return false;
+    // v3.64.x（KI-58）：先用 userTextOf 把用户原话从注入块里剥出来 —— 真实用户行 62% 是
+    //   「system-reminder + <user_query>」混排，原来整条被当注入 → 本函数恒返回 0 → 整轮丢账。
+    const txt = userTextOf(rawTxt, INJECTION_TAGS_NOT_SUBMIT);
+    if (!txt) return false;                       // 剥完为空 = 整条都是注入块
+    if (isInternalContinueText(txt)) return false;
     best = ts;
     return true; // 倒序扫描：第一条命中的就是"最后一条 user 行"
   });
@@ -6903,7 +7017,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.63.11'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.63.12'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天

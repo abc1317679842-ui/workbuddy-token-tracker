@@ -19,7 +19,7 @@ const { spawn: spawnAsync } = require('child_process');
 
 const SRC = __dirname;
 const NODE = process.execPath;
-let pass = 0, fail = 0, envSkipCount = 0;
+let pass = 0, fail = 0, envSkipCount = 0, premiseSkipCount = 0;
 
 function ok(name, cond, extra) {
   if (cond) { pass++; console.log(`  ✓ ${name}`); }
@@ -27,8 +27,14 @@ function ok(name, cond, extra) {
 }
 // envSkip：**环境受限**类跳过（非代码问题）——只统计，不影响退出码。reason 必须说明真实原因，
 // 不再像旧 skip() 那样所有跳过都硬编码「本环境禁止 node 子进程」（require 失败也这么说 → 误导）。
-function envSkip(name, reason) {
+// v3.63.12（S-02，2026-10-28 外部审计）：第三参 opts 标记「环境前提缺口」类跳过。
+//   区别在哪：普通 envSkip（沙箱禁 spawn）在 CI 上**不该出现**，出现就等于用例没真跑 = 假绿；
+//   而 T3-R4 的三种跳过（WB_NO_NET 离线 / 联网重建超 90s spawn 上限 / 重建未完成）是**环境不具备
+//   该前提**，不代表代码有问题。之前 gate 只按「WB_NO_NET 是否为 1」推、上限 0/1 两档，识别不了
+//   v3.63.12 新加的 ETIMEDOUT 分支 → CI 联网遍偶发超时会被判红（假红，且把环境问题伪装成回归）。
+function envSkip(name, reason, opts) {
   envSkipCount++;
+  if (opts && opts.premise === true) premiseSkipCount++;
   console.log(`  – ${name}（跳过：${reason}）`);
 }
 const SPAWN_SKIP_REASON = '本环境禁止 node 子进程（SPAWN_OK=false，属环境能力限制、非代码问题；CI 上应真跑）';
@@ -66,9 +72,20 @@ function makeT72bChildEnv(base) {
 //   为什么抽成纯函数：守卫要对**真函数**做表驱动行为断言（本项目硬教训：行为守卫必须与源码守卫**配对**，
 //   只断言源码文本会在回退后匹配到注释同文本 → 假绿）。
 function ciSkipGate(o) {
-  const expectedPremise = ((o && o.wbNoNet) === '1') ? 1 : 0;   // 离线那一遍的 T3-R4 前提缺口
-  const unexpected = Math.max(0, ((o && o.envSkipCount) || 0) - expectedPremise);
-  return { expectedPremise, unexpected, shouldFail: !!((o && o.inCI) && unexpected > 0) };
+  const opt = o || {};
+  // v3.63.12（S-02，2026-10-28 外部审计）：从「按 WB_NO_NET 猜」改成「按来源计数」。
+  //   旧实现只问 `wbNoNet === '1'`，上限 0/1 两档 —— 但 v3.63.12 给 T3-R4 新加了「联网重建超 90s」
+  //   的 envSkip（CI **联网**遍也会命中），那时 expectedPremise 仍算 0，一条环境受限跳过被当成
+  //   "假绿"判红：既是假红，又把环境问题伪装成代码回归（正是本门禁想避免的误判方向）。
+  //   现由 envSkip 第三参 { premise:true } 显式声明来源，gate 只认这个声明；
+  //   ★ 上限硬编码 1 是防滥用：T3-R4 只有一处、三种原因互斥，至多 1 条；
+  //     否则"给任意跳过标 premise"就能把真跳过洗白，门禁等于失守。
+  //   WB_NO_NET 仍计入（等价于一条 premise），保持旧语义与旧断言的兼容。
+  const declared = Number(opt.premiseSkipCount) > 0 ? 1 : 0;
+  const offline = (opt.wbNoNet === '1') ? 1 : 0;
+  const expectedPremise = Math.min(1, declared + offline);
+  const unexpected = Math.max(0, (Number(opt.envSkipCount) || 0) - expectedPremise);
+  return { expectedPremise, unexpected, shouldFail: !!(opt.inCI && unexpected > 0) };
 }
 
 // 统一注释剥离（T10/T14/T17 源码守卫与「导出一致性」检查共用这一份，不再各自维护一份实现）：
@@ -148,6 +165,26 @@ for (const f of ['backfill.js']) {
 const pricesDir = path.join(tmp, 'prices');
 fs.mkdirSync(pricesDir, { recursive: true });
 fs.writeFileSync(path.join(pricesDir, 'index.json'), JSON.stringify({ models: {} }));
+// v3.63.12（测试基建）：**价格库的"新鲜度"必须在夹具层钉死**，否则联网态 --hook spawn 会自己跑流水线。
+//   判据在 token-tracker.js:3739 —— `if (pricing.date === todayStr()) return pricing;`，
+//   即 pricing.json 缺 date 或 date≠今天 ⇒ autoRefreshPricing 真去 spawn refresh-prices.js
+//   全量抓取（CN 源慢时实测 30~54s > selftest spawn 30s 超时）→ 与机器负载/网络时序强相关的
+//   假红（T12-j/T17-c，ETIMEDOUT）。历史两次只修单点（10-26 修 T9 收尾、本轮先修 CN 索引）都
+//   治不干净，因为**任何一个夹具**把 pricing.json 覆写成假库都会重新打开这个分支。
+//   结构性处置：① CN 索引给 built_at（priceIndexStaleDays 读的是 built_at，不是 date）；
+//   ② 存一份 **pristine 模板**（真价表 + date=今天），夹具覆写完一律 restorePricing() 还原。
+const PRICING_PRISTINE = path.join(tmp, 'pricing.pristine.json');
+function restorePricing() { fs.copyFileSync(PRICING_PRISTINE, path.join(skillDir, 'pricing.json')); }
+try {
+  const idxPath = path.join(pricesDir, 'index.json');
+  const _pj = JSON.parse(fs.readFileSync(idxPath, 'utf-8'));
+  _pj.built_at = new Date().toISOString();
+  fs.writeFileSync(idxPath, JSON.stringify(_pj));
+  const _pp = JSON.parse(fs.readFileSync(path.join(skillDir, 'pricing.json'), 'utf-8').replace(/^\uFEFF/, ''));
+  const _d = new Date();
+  _pp.date = `${_d.getFullYear()}-${String(_d.getMonth() + 1).padStart(2, '0')}-${String(_d.getDate()).padStart(2, '0')}`;
+  fs.writeFileSync(PRICING_PRISTINE, JSON.stringify(_pp, null, 2));
+} catch (e0) { /* 夹具自愈失败不阻断：后面 restorePricing 会当场炸出来 */ }
 // v3.62.0（批4·续）：**孤儿轮对账的测试基线 = 仓库默认档（off）**。
 //   为什么必须显式钉住：该档位新增了"未设 env 时回落本机 local-config.json 的 orphan_scan"（本机已设 on），
 //   而下一行的 `env` 继承 process.env、`require` 主模块的组又与本进程共享 process.env —— 不钉住的话
@@ -222,9 +259,16 @@ else {
     })());
   }
   const rebuilt = (() => { try { return JSON.parse(fs.readFileSync(path.join(skillDir, 'pricing.json'), 'utf8')); } catch (e) { return null; } })();
-  if (process.env.WB_NO_NET === '1') envSkip('T3 R4 告警断言', 'WB_NO_NET=1（CI 断网：损坏重建走失败分支、前提不成立；已知覆盖缺口见 CHANGELOG「T3 R4」条目，本机不设此变量时真实验证）');
+  if (process.env.WB_NO_NET === '1') envSkip('T3 R4 告警断言', 'WB_NO_NET=1（CI 断网：损坏重建走失败分支、前提不成立；已知覆盖缺口见 CHANGELOG「T3 R4」条目，本机不设此变量时真实验证）', { premise: true });
+  // v3.63.12（测试基建）：**先区分「环境没跑完」与「护栏没告警」**。本用例是本文件里唯一依赖
+  //   **真实联网重建**的断言：spawn 上限 90s，重建链路（refresh-prices → 各源抓取）在网络抖动/
+  //   机器负载高时可能超时被杀 → stderr 只剩「损坏，已备份…尝试重建」半行，而重建子进程往往
+  //   已经把 pricing.json 写好 → `rebuilt` 非空 → 直接判「护栏没告警」= **假红且无法复盘**
+  //   （实测 2026-10-27 连跑两遍：一遍红、一遍 1303/0/0，红的那次就是这么来的）。
+  //   故超时必须显式标成环境受限，并带出耗时供复盘。
+  else if (r.error && r.error.code === 'ETIMEDOUT') envSkip('T3 R4 告警断言', `联网重建超过 90s spawn 上限（环境受限，非代码问题）：${String(r.stderr || '').slice(0, 80)}`, { premise: true });
   else if (rebuilt) ok('T3 R4 护栏告警进 stderr（⚠价库）', String(r.stderr || '').indexOf('⚠价库') >= 0, String(r.stderr || '').slice(0, 140));
-  else envSkip('T3 R4 告警断言', '重建未完成（离线/受限），前提不成立');
+  else envSkip('T3 R4 告警断言', '重建未完成（离线/受限），前提不成立', { premise: true });
 }
 
 // ── T4：deepseek-official M7 守卫 —— 损坏 pricing 原地存在时拒绝覆盖 ────────
@@ -576,16 +620,11 @@ else {
     fs.rmSync(projDir8, { recursive: true, force: true });
     try { fs.rmSync(path.join(skillDir, '.ledger-watermark.json'), { force: true }); } catch (e) { /* 清理 */ }
     // ⚠ T9 夹具收尾必须还原真价库（测试基建修复 2026-10-26）：上面覆写的 pricing8b 无 date 字段且仅
-
     //   1 模型，T9 之后所有**联网态** --hook spawn 都会判"价库极旧"进 autoRefreshPricing 刷新分支 →
-
     //   spawn refresh-prices.js 全量联网（CN 源慢时实测 52s）> selftest spawn 30s 超时 → T12-j/T17-c
-
-    //   必假红（ETIMEDOUT；stash 干净 HEAD 同红已实证）。恢复为 SRC 真价库（date=今天、每日流水线
-
-    //   刷新），后续组判"新鲜"跳过刷新。T119 守卫钉住本恢复语句（删恢复必红，不依赖网络时序）。
-
-    fs.copyFileSync(path.join(SRC, 'pricing.json'), path.join(skillDir, 'pricing.json'));
+    //   必假红（ETIMEDOUT；stash 干净 HEAD 同红已实证）。v3.63.12 起统一走 restorePricing()（pristine
+    //   模板 = 真价表 + date=今天，见文件头夹具区），T119 守卫钉住**定义 + 每一处调用**。
+    restorePricing();
 
   }
 }
@@ -837,15 +876,53 @@ else {
   const tsL = path.join(tmp, 'label-t11.jsonl');
   const labRow = (c) => JSON.stringify({ type: 'message', role: 'user', timestamp: 1700000000000, content: c });
   fs.writeFileSync(tsL, [labRow('帮我看看这个方案'), JSON.stringify({ type: 'assistant', timestamp: 1700000001000 })].join('\n') + '\n');
-  ok('T11-i1 提取本轮首条 user 消息（≤40 字）', ttMod.roundLabel(tsL, 1699999999000) === '帮我看看这个方案',
-    JSON.stringify(ttMod.roundLabel(tsL, 1699999999000)));
+  ok('T11-i1 提取本轮首条 user 消息（≤40 字）', ttMod.roundLabel(tsL, 1700000000500) === '帮我看看这个方案',
+    JSON.stringify(ttMod.roundLabel(tsL, 1700000000500)));
   fs.writeFileSync(tsL, labRow('<task-notification>x') + '\n');
   ok('T11-i2 注入型 user 行标为 [注入]（不拿注入文本当标签）',
-    ttMod.roundLabel(tsL, 1699999999000) === '[注入] task-notification', JSON.stringify(ttMod.roundLabel(tsL, 1699999999000)));
-  fs.writeFileSync(tsL, labRow('上一条消息') + '\n');
-  ok('T11-i3 早于 roundStart 的 user 行不算本轮（返回空串）',
+    ttMod.roundLabel(tsL, 1700000000500) === '[注入] task-notification', JSON.stringify(ttMod.roundLabel(tsL, 1700000000500)));
+  // v3.64.x（KI-57）：夹具语义修正 —— 原夹具是「user 行早 roundStart 1 秒、其后无模型回复」，
+  //   在新判据下那**就是本轮起点行**（实测 roundStart 比真用户行晚 P50 1.6s / P90 6.2s，用户行本就
+  //   早于 roundStart），继续断言空串等于把错误行为钉死。真正该排除的是「已被模型回复过的上一条」。
+  fs.writeFileSync(tsL, labRow('上一条消息') + '\n'
+    + JSON.stringify({ type: 'message', role: 'assistant', timestamp: 1700000000500, content: 'ok' }) + '\n');
+  ok('T11-i3 ★上一条已被回复过的 user 行不算本轮（返回空串）',
     ttMod.roundLabel(tsL, 1700000001000) === '', JSON.stringify(ttMod.roundLabel(tsL, 1700000001000)));
   ok('T11-i4 文件不存在不抛错', ttMod.roundLabel(path.join(tmp, 'no-such-file.jsonl'), 1) === '');
+  // v3.64.x（KI-57 核心）：注入行不再「命中即提前返回」，而是跳过继续找真文本。
+  //   这就是 1825 条明细里 80.8% 标签为空、其余全是 `[注入] xxx` 的主因。
+  fs.writeFileSync(tsL, labRow('<system-reminder>x') + '\n'
+    + JSON.stringify({ type: 'message', role: 'user', timestamp: 1700000000400, content: '真正要说的话' }) + '\n');
+  ok('T11-i5 ★注入行之后有真文本时必须取真文本（老行为：命中注入即返回 → 真文本永远取不到）',
+    ttMod.roundLabel(tsL, 1700000001000) === '真正要说的话', JSON.stringify(ttMod.roundLabel(tsL, 1700000001000)));
+  // 压缩后客户端自动插入的续跑指令：纯文本无尖括号，injectionTagOf 认不出 → 必须单独排除
+  fs.writeFileSync(tsL, labRow('真提问') + '\n'
+    + JSON.stringify({ type: 'message', role: 'user', timestamp: 1700000000400,
+      content: 'Please continue with the conversation based on the summarized context above. Maintain the same level of detail.' }) + '\n');
+  ok('T11-i6 ★压缩续跑指令不得当轮次标签（跳过它，取更早的真用户行）',
+    ttMod.roundLabel(tsL, 1700000001000) === '真提问', JSON.stringify(ttMod.roundLabel(tsL, 1700000001000)));
+  ok('T11-i9 ★兜底起点 inferRoundStartFromText 跳过续跑指令（否则起点被推到压缩之后 → 压缩前整段漏聚合）',
+    ttMod.inferRoundStartFromText(tsL) === 1700000000000, String(ttMod.inferRoundStartFromText(tsL)));
+  // ★v3.64.x 二轮审计回归守卫（本轮改动**自己引入**的坑，实测已复现）：
+  //   压缩摘要正文会原样抄进历史对话，其中含成组的 <user_query>…</user_query>（本机 23/218 条摘要行
+  //   含 8~19 组）。userTextOf 若「先全局搜容器、后剥注入块」，就会命中摘要内部那一段 →
+  //   roundLabel 把几天前的旧话当本轮标签、inferRoundStartFromText 把**摘要行当成本轮起点**
+  //   → 起点推到压缩之后 → 压缩前整段漏账。判据顺序必须「先剥块、后找容器」。
+  const sumInner = '旧对话回放：\n<user_query>很早以前的旧话</user_query>\n中间摘要正文\n<user_query>另一段旧话</user_query>';
+  fs.writeFileSync(tsL,
+    labRow([{ type: 'text', text: '<system-reminder data-role="user-context">\nctx\n</system-reminder>\n<user_query>真话在容器里</user_query>' }]) + '\n'
+    + JSON.stringify({ type: 'message', role: 'user', timestamp: 1700000000300, content: [{ type: 'text', text: '<cb_summary>\nSummary of the conversation so far:\n' + sumInner + '\n</cb_summary>' }] }) + '\n');
+  ok('T11-i10 ★压缩摘要行不得被当成用户的真话（正文内含 <user_query> 组；老顺序会取到"很早以前的旧话"）',
+    ttMod.roundLabel(tsL, 1700000001000) === '真话在容器里', JSON.stringify(ttMod.roundLabel(tsL, 1700000001000)));
+  ok('T11-i11 ★兜底起点不得取压缩摘要行（否则起点被推到压缩之后 → 压缩前整段漏账）',
+    ttMod.inferRoundStartFromText(tsL) === 1700000000000, String(ttMod.inferRoundStartFromText(tsL)));
+  // 源码守卫：剥注释后扫真源，锚「提前 return 注入」这个老病根，并钉住新判据的存在。
+  //   锚串用拼接构造，避免守卫自身源码命中（T119 教训）。
+  const srcI57 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  const fnI57 = (() => { const i = srcI57.indexOf('function roundLabel('); return i < 0 ? '' : srcI57.slice(i, i + 6000); })();
+  ok('T11-i8 ★源码守卫：roundLabel 不得"命中注入就提前 return"，且必须保留「其后有无 assistant」判据',
+    fnI57.length > 0 && !new RegExp('if \\(inj\\)' + ' return').test(fnI57) && /seenAssist/.test(fnI57),
+    `len=${fnI57.length}`);
 
   // j：过期 rounds 清理
   //   v3.40.0（A4）：本用例要验的是「保留**当下**当月」——它必须用一个**真当月**的文件名，
@@ -875,6 +952,11 @@ else {
   })());
   ok('T11-k4 recordUsage 的 meta 为可选参数（不传 = 旧行为，8 个调用点零改动）',
     /function recordUsage\(stat, pricing, byModel, tsMs, meta\)/.test(mainSrc));
+
+  // ⚠ 夹具收尾必须还原真价库（v3.63.12）：h 组把 pricing.json 覆写成「仅 m-x、无 date」的假库，
+  //   不还原的话后续每个联网态 --hook spawn 都会走 autoRefreshPricing 全量抓取（30~54s）→
+  //   T12-j/T17-c 撞 30s spawn 超时假红。T119 守卫钉住本调用（与 T9 收尾同一处置）。
+  restorePricing();
 }
 
 // ── T12（v3.21.0 建立 / v3.22.0 扩充）：版本更新提示 ──────────────────────────────
@@ -2431,10 +2513,13 @@ else {
 //   6 个月），已加源码声明 + README/CHANGELOG 声明（b4 锁声明不得被静默删除）。
 {
   const src31 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  // v3.64.x（KI-57）：injectionTagOf 的调用点从 3 降到 2 —— roundLabel 改为先用 userTextOf
+  //   剥出用户原话，injectionTagOf 只剩「剥完为空时取兜底 tag」一处 + 定义本身。
   ok('T31-a1 ★注入白名单收敛为单一定义：源码里只剩一处标签字面量清单（旧的两份内联正则已删）',
     (src31.match(/task-notification\|conversation_history_summary/g) || []).length === 0
     && /const INJECTION_TAGS_ALL = \[/.test(src31)
-    && (src31.match(/injectionTagOf\(/g) || []).length >= 3);
+    && (src31.match(/injectionTagOf\(/g) || []).length >= 2
+    && /function userTextOf\(/.test(src31));
   ok('T31-a2 ★宽表含 teammate-message、窄表**不含**（轮起点推断返回 0 = 丢账，宁可取偏晚起点）',
     /const INJECTION_TAGS_ALL = \[[^\]]*'teammate-message'[^\]]*\]/.test(src31)
     && /const INJECTION_TAGS_NOT_SUBMIT = \[[^\]]*\]/.test(src31)
@@ -2464,13 +2549,13 @@ else {
         + line('assistant', 2000, 'ok')
         + line('user', 3000, '<teammate-message teammate_id="system" summary="s">hi</teammate-message>'), 'utf-8');
       ok('T31-b1 ★teammate-message 不再被当成用户的话当标签（旧行为：label = `<teammate-message teammate_id="s`）',
-        mod31.roundLabel(transc31, 2500) === '[注入] teammate-message',
-        JSON.stringify(mod31.roundLabel(transc31, 2500)));
+        mod31.roundLabel(transc31, 3500) === '[注入] teammate-message',
+        JSON.stringify(mod31.roundLabel(transc31, 3500)));
       // 真实提问（本轮内）仍要被当标签，且截到 ROUND_LABEL_MAX(40)
       const long31 = 'P'.repeat(60);
       fs.writeFileSync(transc31,
         line('assistant', 2000, 'ok') + line('user', 3000, long31), 'utf-8');
-      const lb31 = mod31.roundLabel(transc31, 2500);
+      const lb31 = mod31.roundLabel(transc31, 3500);
       ok('T31-b2 真实用户提问仍取前 40 字符作标签（该功能与截断长度都不得被顺手改掉）',
         lb31 === 'P'.repeat(40) && lb31.length === 40, `len=${lb31.length}`);
       // 轮起点推断：**只有**队友消息时也必须给非 0（否则 6041 整轮记账被跳过 = 丢账）
@@ -6213,6 +6298,11 @@ else {
     } catch (e) {
       ok('T67 行为夹具异常', false, (e && e.message) || String(e));
     }
+    // ⚠ 夹具收尾必须还原真价库（v3.63.12）：PRICING67 **无 date** → backfill 之后的每一次联网态
+    //   `--hook` spawn（T102/T103/T106/T107/T110/T111 共 6 处，全部用同一个 skillDir）都会走
+    //   autoRefreshPricing 全量抓取 → 单次 7~36s，既拖长整轮又给 30s spawn 超时递刀。
+    //   这些组只关心水位线/弹窗，不需要 PRICING67 的坐标价，还原零影响。T119 守卫钉住本调用。
+    restorePricing();
   }
 }
 
@@ -7747,7 +7837,7 @@ const txInjectionComplete = (ttSrc, shSrc) => (
 //      天然写着"不推进 lastStopAt / 不写 coalesce"，不剥注释会假绿（项目既有教训：源码守卫剥注释再扫）。
 {
   const shRaw83 = fs.readFileSync(path.join(SRC, 'stop-handler.js'), 'utf-8');
-  const strip83 = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+  const strip83 = (s) => s.replace(/\r/g, '').replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
   const i83 = shRaw83.indexOf('if (teamSyncToast && !teamDataReady) {');
   const j83 = shRaw83.indexOf('if (isPlainRound || teamDataReady || teamSyncToast) {', i83);
   const body83 = (i83 >= 0 && j83 > i83) ? strip83(shRaw83.slice(i83, j83)) : '';
@@ -7880,6 +7970,21 @@ const txInjectionComplete = (ttSrc, shSrc) => (
     g84({ inCI: false, envSkipCount: 9, wbNoNet: undefined }).shouldFail === false);
   ok('T84-b5 ★C1 门禁行为：CI + 联网跑 + 0 跳过 → 不判失败（正常路径）',
     g84({ inCI: true, envSkipCount: 0, wbNoNet: undefined }).shouldFail === false);
+  // ── v3.63.12（S-02，2026-10-28 外部审计）：来源分档 ──
+  ok('T84-b6 ★S-02：CI 联网遍 + 1 条【已声明】前提缺口（T3-R4 重建超 90s）→ 不判失败',
+    g84({ inCI: true, envSkipCount: 1, premiseSkipCount: 1, wbNoNet: undefined }).shouldFail === false);
+  ok('T84-b7 ★S-02：CI 联网遍 + 1 条【未声明】跳过 → 判失败（环境缺口不得掩盖真跳过）',
+    g84({ inCI: true, envSkipCount: 1, premiseSkipCount: 0, wbNoNet: undefined }).shouldFail === true);
+  ok('T84-b8 ★S-02：前提缺口抵扣上限恒为 1（声明 2 条也只抵 1 条 → 另一条仍判失败，防"标 premise 洗白"）',
+    g84({ inCI: true, envSkipCount: 2, premiseSkipCount: 2, wbNoNet: undefined }).shouldFail === true);
+  // 源码侧：声明通道本身必须存在，且 T3-R4 三处都真的带上了（漏一处 = 该分支在 CI 上仍假红）。
+  //   两处锚串都拼接构造，避免守卫源码自带完整锚串而恒命中（自引用）。
+  ok('T84-a5 ★S-02：envSkip 必须支持第三参 premise 声明（gate 的来源分档靠它拿输入）',
+    /opts\s*&&\s*opts\.premise\s*===\s*true/.test(self84));
+  const premTag84 = '{ prem' + 'ise: true }';
+  const premCnt84 = self84.split(premTag84).length - 1;
+  ok('T84-a6 ★S-02：T3-R4 三处前提缺口（离线/超时/未完成）必须都带 premise 声明',
+    premCnt84 === 3, `premise 标记数=${premCnt84}（期望 3）`);
 }
 
 // ===== T85（v3.60.0 · CI 编码）：钉死「CI 连红 3 天」的两个根因（编码 18 红 + T72-b 4 红）=====
@@ -9954,6 +10059,13 @@ const txInjectionComplete = (ttSrc, shSrc) => (
   ok('T106-a6 ★正常同步弹窗收口时必须清掉在飞标记（否则每个会话留一个含绝对路径的残留文件）',
     codeH106.indexOf('clearStopMark(sid);') > codeH106.indexOf("stopStep('recorded'"),
     `clear@${codeH106.indexOf('clearStopMark(sid);')} recorded@${codeH106.indexOf("stopStep('recorded'")}`);
+  // v3.63.12（N-01，2026-10-28 外部审计）：清标记必须以「coalesce 真的落盘」为前提。
+  //   写失败（磁盘满 / EPERM / 杀软锁文件）时若无条件清 → coalesce 不存在 + stopmark 被删，
+  //   补账与补弹两条凭据同时消失，该轮永久丢账且没有任何入口可救。
+  //   频次 0/3252 但不可恢复，按「凭据销毁不看频率」定级 P1（原报告压成 P3，已上调）。
+  ok('T106-a7 ★N-01：coalesce 写失败时不得清在飞标记（否则两条凭据同时消失 = 永久丢账）',
+    /if \(wrote\) clearStopMark\(sid\);/.test(code106),
+    '未找到"写成功才清"的条件守卫 → 写盘失败会连带销毁补账凭据');
 
   if (!SPAWN_OK) envSkip('T106-b1~b3 被砍轮补账补弹端到端', SPAWN_SKIP_REASON);
   else {
@@ -11231,6 +11343,15 @@ for (let i = 0; i < 5; i++) {
   ok('T116-a5 ★MiniMax 单位声明不得再用字面量「元/百万」子串（改用容忍空格/全角的正则）',
     /re\.search\(r'元\\s\*\[／\/\]\\s\*百万'/.test(mini116) && !/'元\/百万' not in/.test(mini116),
     '仍是字面量子串比对：表头写成「元 / 百万 tokens」即整页 0 模型');
+  // v3.63.12（D-01，2026-10-28 外部审计）：官方表头出现第二种写法「输入价格 每百万 tokens」——
+  //   没有「元/」前缀，a5 那条正则照样不命中 → 整表 continue。这两条钉住「认得两种写法」+「跳过要留痕」。
+  const unitLine116 = mini116.split('\n').find((l) => l.indexOf('每') >= 0 && l.indexOf('tokens?') >= 0) || '';
+  ok('T116-a11 ★MiniMax 单位门必须同时认「每百万 tokens」写法（同一行内出现，不许只留「元/百万」一支）',
+    unitLine116.length > 0,
+    '只认「元/百万」：官方把表头改成「输入价格 每百万 tokens」时，该表全部模型静默消失');
+  ok('T116-a12 ★MiniMax 的 token 计价表被单位门跳过时必须 WARN（静默 continue = 丢条不留痕）',
+    /\[WARN\] minimax/.test(mini116),
+    '跳过路径无告警：抓取仍报 [OK]，价库少条但无人知晓（D-01 的真正危险处）');
   ok('T116-a6 ★智谱名字必须先剥尾随括号说明再校验 ^GLM（加个「（新）」就整条丢）',
     /re\.sub\(r'\\s\*\[（\(\]/.test(zhipu116)
     && zhipu116.indexOf("re.sub(r'\\s*[（(]") < zhipu116.indexOf('^GLM[-A-Za-z0-9.]*$'));
@@ -11563,25 +11684,44 @@ for (let i = 0; i < 5; i++) {
 
 }
 
-// ===== T119（测试基建 · 2026-10-26）：T9 价库还原语句守卫 =====
-
-//   T9-B8 覆写的 pricing8b 无 date 字段且仅 1 模型 → 其后所有联网态 --hook spawn 判"价库极旧"
-
-//   进 autoRefreshPricing 刷新分支 → refresh-prices.js 全量联网（CN 源慢时实测 52s）>
-
-//   selftest spawn 30s 超时 → T12-j/T17-c 必假红（ETIMEDOUT，stash 干净 HEAD 同红已实证）。
-
-//   本守卫钉住 T9 收尾的恢复语句：谁删了恢复，这里必红（静态判据，不依赖网络时序）。
-
+// ===== T119（测试基建）：隔离价库"新鲜度"守卫 =====
+//   病因（两次踩、第二次才看清全貌）：token-tracker.js 的 autoRefreshPricing 早退条件是
+//   `pricing.date === todayStr()`。这个隔离环境里 **任何一个夹具** 把 pricing.json 覆写成
+//   「假库 / 无 date」，其后所有**联网态** --hook spawn 都会当场 spawn refresh-prices.js 全量抓取
+//   （CN 源慢时实测 30~54s）> selftest spawn 30s 超时 → T12-j/T17-c 假红（ETIMEDOUT）。
+//   10-26 只补了 T9 一处 → 本轮 T11-h 又踩（pricing.json 被写成 140B、仅 m-x、无 date）。
+//   故改为**单点实现**：夹具区存 pristine 模板（真价表 + date=今天），覆写完一律 restorePricing()。
+//   本守卫钉住①模板创建②函数定义③**每一处调用**——少一处就必红，且不依赖网络时序。
 {
-
-  const st119 = fs.readFileSync(path.join(SRC, 'selftest.js'), 'utf-8').replace(/\r\n/g, '\n');
-
-  ok('T119 ★T9 夹具收尾必须恢复 SRC 真价库（删恢复 = 联网态 spawn 撞 52s 刷新 > 30s 超时假红）',
-    // 拼接防自引用：守卫源码里不得含完整锚串，否则锚串恒命中（删被钉注释的变异测不出）
-    new RegExp('T9 夹具收尾必须' + '还原真价库').test(st119)
-    && /fs\.copyFileSync\(path\.join\(SRC, 'pricing\.json'\), path\.join\(skillDir, 'pricing\.json'\)\)/.test(st119));
-
+  // v3.63.12（S-01，2026-10-28 外部审计）：口径修正 —— 旧实现扫**未剥注释**的原文，
+  //   `// restorePricing();` 与 `/* restorePricing(); */` 同样被计入 → 把任一处真调用注释掉后
+  //   T119-b 仍然全绿（"守卫本身缺牙"，与 D-01 同族：没人守检测机制）。实测当前 3 处全为真调用，
+  //   所以尚未假绿，但必须补上。同文件 T84/T85 的口径本来就是先剥注释，这里对齐。
+  const st119Raw = fs.readFileSync(path.join(SRC, 'selftest.js'), 'utf-8');
+  const st119 = stripComments(st119Raw);
+  // 拼接防自引用：守卫源码里不得含完整锚串，否则锚串恒命中（删了被钉内容也测不出）
+  const fnDef = new RegExp('function ' + 'restorePricing' + '\\(\\) \\{');
+  const tmpl = new RegExp('const ' + 'PRICING_PRISTINE' + ' = path\\.join\\(tmp, .pricing\\.pristine\\.json.\\);');
+  const calls = (st119.match(/^[^\n]*\brestorePricing\(\);/gm) || []).length;
+  ok('T119 ★隔离价库单点实现存在（pristine 模板 + restorePricing 定义）',
+    fnDef.test(st119) && tmpl.test(st119), `def=${fnDef.test(st119)} tmpl=${tmpl.test(st119)}`);
+  // T9 收尾 + T11 收尾 + T67 收尾 = 3 处（新增夹具覆写必须同时补调用，否则这里必红）
+  ok('T119-b ★每一处夹具覆写后都调用了 restorePricing（当前应为 3 处：T9/T11/T67）',
+    calls === 3, `调用点数=${calls}`);
+  // v3.63.12（S-01 配套行为断言）：口径自检 —— "一真 + 两注释"的样本必须只数出 1。
+  //   样本用拼接构造，避免本段源码里出现完整调用串（否则它自己会被算成第 4 处调用）。
+  const callee119 = 'restore' + 'Pricing();';
+  const probe119 = [callee119, '// ' + callee119, '/* ' + callee119 + ' */'].join('\n');
+  const probeCalls = stripComments(probe119).split('\n')
+    .filter((l) => l.indexOf(callee119) >= 0).length;
+  ok('T119-c ★调用点计数必须排除注释（否则把真调用注释掉仍全绿 = 守卫缺牙）',
+    probeCalls === 1, `probe=${probeCalls}（期望 1：一真调用 + 两条注释）`);
+  // v3.63.12（S-01 收口）：上面 c 只证明"剥注释后口径正确"，没证明 st119 真的剥了 ——
+  //   把 st119 改回扫原文时 c 仍绿（实测反向验证抓出）。这条把「实现确实调用剥注释」钉死。
+  const anchor119 = 'const st119 = ' + 'strip' + 'Comments(';
+  ok('T119-d ★T119 的计数必须基于「剥注释后」文本（扫原文 = 注释掉的调用也计入，b 条恒绿）',
+    st119Raw.split(anchor119).length - 1 === 1,
+    `剥注释调用点=${st119Raw.split(anchor119).length - 1}（期望 1）`);
 }
 
 // v3.24.0（审计⑤）：skip 数显式化 —— 「138 全绿」曾掩盖 26 条端到端用例全部 SKIP 的事实
@@ -11593,7 +11733,7 @@ for (let i = 0; i < 5; i++) {
 // v3.60.0（C1 门禁）：**保留**上面本地语义不动，另在 **CI** 上把"跳过"变成硬失败（见 ciSkipGate 顶部）。
 //   出口复用同一条 `fail ? 1 : 0`（**不再引入 exit 2**，避免重蹈 A-3 覆辙）。
 const _inCI = !!(process.env.CI || process.env.GITHUB_ACTIONS);   // GitHub Actions 两者都设；只看其一遇 runner 差异会静默失效
-const _gate = ciSkipGate({ inCI: _inCI, envSkipCount, wbNoNet: process.env.WB_NO_NET });
+const _gate = ciSkipGate({ inCI: _inCI, envSkipCount, premiseSkipCount, wbNoNet: process.env.WB_NO_NET });
 if (_gate.shouldFail) fail++;   // 计入 fail：与"真断言失败"走同一出口 → 退出码 1
 console.log(`\n结果：${pass} 过 / ${fail} 败 / ${envSkipCount} 环境受限跳过`
   + (envSkipCount > 0 ? '（需要 node 子进程或 WB_NO_NET 前提缺口；属环境能力限制；本地不计入退出码、CI 上按 C1 门禁计入）' : ''));
