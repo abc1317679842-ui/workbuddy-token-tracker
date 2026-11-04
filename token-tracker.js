@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// token-usage-tracker v3.63.12 (2026-10-28)
+// token-usage-tracker v3.64.0 (2026-11-04)
 //
 // ── 版本要点（v2.61 … v3.32.1）已迁出本文件 ──────────────────────────────
 //   为什么要迁：这段逐版要点是 CHANGELOG.md 的镜像，且**永不参与运行**，却常驻文件头部——
@@ -836,9 +836,44 @@ function normalizeModelName(n) {
 // 按"一个字符不同就是不同模型"的要求，这类等价替换一律取消。
 
 // 显式别名表：仅限人工逐一核实过的等价名称（如厂商改名、历史遗留 key）。
-// 当前为空表——需要时手动添加，格式：'实际使用的名字': 'pricing.json 里的 key'。
+// 格式：'实际使用的名字': 'pricing.json / 本地价库里的 key'。
 // 注意：这里每加一条就等价于放行一次"不同名同价"，务必人工核实二者确实是同一模型且同价后再加。
-const MODEL_ALIASES = {};
+const MODEL_ALIASES = {
+  // 2026-11-04（F 批）：**清空**。原 4 条 `hy4-free/hy4free/hy4std/hy4-std → hy4` 实测是死代码：
+  //   把本表整个改成 {} 后，这 4 个名字仍全部命中 hy4（靠下一级的 channelStemOf 后缀剥离，
+  //   命中级别 suffix>exact）→ 保留它们只会让人误以为"混元四是手工映射的"。
+  //   ⚠ 宿主侧事实（保留备查）：`ModelRateLimitCap` 里 `Hy4: {freeId:"hy4free", paidId:"hy4std"}`，
+  //     两条的 name 都是 "Hy4"、credits 分别 x0.00 / x0.29 —— credits 是**客户端积分倍率**，
+  //     与本技能的刊例价口径无关（金额一律按 API 单价折算，SKILL.md「金额就是我真花的钱」条）。
+  //   本表仍然保留，供**人工逐一核实过**的厂商改名/历史遗留 key 使用（不要拿它当后缀规则的替代品）。
+};
+
+// 2026-11-04（步1）：**计费档 / 渠道后缀**白名单。这些后缀描述的是"同一模型的哪个计费档/哪个渠道"，
+//   不是模型能力差异，所以剥掉之后仍指向同一个价：
+//     -free / -std / -standard / -promo / -trial / -paid
+//   ⚠ 刻意**不含** -preview / -exp / -beta / -latest / -pro / -flash / -highspeed：
+//     那些是**版本档/能力档**，价格与计费口径可能不同（deepseek preview 与正式版就不同价），
+//     剥掉等于把两个不同模型当同一个 → 静默错价。这一类只能靠人工别名或厂商页面自己声明。
+const CHANNEL_SUFFIXES = ['-free', '-std', '-standard', '-promo', '-trial', '-paid'];
+
+// 从归一化后的模型名里剥掉渠道后缀，得到"疑似同一模型的规范名"；剥不出返回 ''。
+//   两条形态都要认：
+//     ① 带分隔符：hy4-free / glm-5.3-std
+//     ② 无分隔符：hy4std / hy4free（宿主模型目录里的产品 id 就是这种写法，而 transcript 上报的
+//        是带连字符的 hy4-free —— 两种形态都会出现，只认一种就会漏）
+//   ⚠ 本函数只负责"提出候选"，**是否采用由调用方决定**：findModel 里要求候选能在价库精确命中，
+//     否则一律返回 null（宁可未收录，也不猜一个价）。
+function channelStemOf(normName) {
+  const n = String(normName || '');
+  if (!n) return '';
+  for (const s of CHANNEL_SUFFIXES) {
+    if (n.length > s.length + 2 && n.endsWith(s)) return n.slice(0, -s.length);
+  }
+  // 无分隔符形态：只认「以数字收尾的主干 + 后缀」，且主干至少 3 字符（hy4std → hy4）
+  const m = n.match(/^(.*\d)(free|std|standard|promo|trial|paid)$/);
+  if (m && m[1].length >= 3) return m[1];
+  return '';
+}
 
 // v3.27.0：**「查到了但厂商未公布按 token 价」**的哨兵值（匿名模型 / 订阅制模型，OpenRouter 标 $0）。
 //   与 `null`（查不到这个模型）、`undefined`（网络/解析失败）三者严格区分——三种情况处理方式不同：
@@ -3151,6 +3186,10 @@ function mergeLocalPriceDb(pricing) {
       if (mult && Math.abs(mult - 2) < 0.05) rec.peak_multiplier = 2;
       else if (mult) { rec.peak_multiplier = mult; rec.tier_note = '峰谷非整数倍(' + mult + '×)，需人工核验'; }
     }
+    // 2026-11-04（C 批 / KI-61）：厂商官网声明的真实调用参数名，供 findModel 第 2.3 级兜底。
+    //   只在源确实给了才写（没有就不写，别用 api_name 顶上——那就等于假装"声明过且一致"，
+    //   而第 2.3 级存在的意义正是"声明与 key 不一致"这一情形）。
+    if (typeof v.api_decl === 'string' && v.api_decl) rec.api_decl = v.api_decl;
     if (v.tier_note) rec.tier_note = (rec.tier_note ? rec.tier_note + '；' : '') + String(v.tier_note).slice(0, 80);
     if (existingKey) Object.assign(pricing.models[existingKey], rec); // 覆盖非 lock 旧条目（聚合旧价→今日官方价），保留原 key 名
     else { pricing.models[k] = rec; byAlnum[ak] = k; }
@@ -3176,7 +3215,11 @@ function mergeLocalPriceDb(pricing) {
         // v3.62.0（F-2/S-3）：价锁自身的问题（invalid_lock / stale_lock）也要能挂上去 ——
         //   漏这一路时「只有价锁坏、厂商抓取全正常」的降级会被下面的 delete 抹掉，
         //   ⚠价锁 标签与 authoritativeIssuesNotice 明细双双失效（审计要防的正是这种静默）。
-        || (Array.isArray(_deg.authoritative_issues) && _deg.authoritative_issues.length > 0));
+        || (Array.isArray(_deg.authoritative_issues) && _deg.authoritative_issues.length > 0)
+        // 2026-11-04（A 批）：**漏收**同样是一路独立信号 —— 它的典型形态就是"厂商抓取全正常、
+        //   源也不陈旧，纯粹是 BRAND_MAP 没认出新模型"。漏这一路 → 整个 _fetch_degraded 被 delete →
+        //   ⚠漏收 标签与 unrecognizedModelsNotice 明细双双失效，而这恰好是它唯一会出现的场景。
+        || (Array.isArray(_deg.unrecognized_models) && _deg.unrecognized_models.length > 0));
   if (_degOn) pricing._fetch_degraded = _deg;
   else delete pricing._fetch_degraded;
   return pricing;
@@ -3501,23 +3544,80 @@ function maybeRefreshHolidays() {
 
 // v3.18.1（N6）：模型"已查未收录"列表——本地 sidecar 文件（.lookedup-models.json，.gitignore 排除），
 // 不再写进 pricing.json（旧实现把本机自定义模型名随公开仓库分发）。上限 200 条防无界增长。
+// 2026-11-04（批27 · A1）：**已查列表必须有保质期**，原来它是一张"永久黑名单"。
+//   病根：纯字符串数组、无时间戳 → 一次失败永久拉黑，两种完全不同的情况被压成同一状态：
+//     ① 公开源确实没有这个模型（该拉黑）；
+//     ② 我们查的名字在公开世界不存在（如拿宿主免费档 id `hy4-free` 去查，而 OpenRouter 是
+//        `tencent/hy4`）、或上游临时故障（超时/限流）——这些**过几天就可能查到**，却永不重试。
+//   实测：`hy4-free` 就是这样被锁死的（后靠"查询键剥后缀"修好，但列表里的历史条目仍锁着）。
+//   修法：条目改为 `{n:名字, t:首次判定时间}`，超过 LOOKEDUP_TTL_MS 视为过期 → 允许重查。
+//   为什么是 7 天：官方上新/补价属低频事件，一周重试一次的联网量可忽略（每条最多 2 次子进程 fetch）；
+//     且过期条目会被重新判定并刷新时间戳，不会每轮都查（见 rememberLookedup）。
+//   迁移：旧格式（纯字符串）读到时**按"本次读到时刻"补时间戳并立即回写**——
+//     不用文件 mtime：否则升级后第一次运行会把积压条目一次性判过期，瞬间几十条并发联网。
 const LOOKEDUP_FILE = path.join(path.dirname(PRICING), '.lookedup-models.json');
+const LOOKEDUP_TTL_MS = 7 * 24 * 3600 * 1000;
+const LOOKEDUP_MAX = 200;
 let _lookedupCache = null;
+
+// 纯函数（可测）：把磁盘上的任意历史格式规整成 [{n,t}]，并告诉你"是否发生过旧格式迁移"。
+function parseLookedupPayload(arr, now) {
+  const out = [];
+  let legacy = false;
+  for (const x of Array.isArray(arr) ? arr : []) {
+    if (typeof x === 'string') { if (x) { out.push({ n: x, t: now }); legacy = true; } }
+    else if (x && typeof x.n === 'string' && x.n) out.push({ n: x.n, t: Number(x.t) || 0 });
+  }
+  return { out, legacy };
+}
+
+// 纯函数（可测）：条目是否仍在保质期内。t<=0（缺时间戳的脏数据）一律视为过期 —— 宁可多查一次。
+function lookedupEntryAlive(entry, now) {
+  const t = entry && Number(entry.t);
+  if (!(t > 0)) return false;
+  return (now - t) < LOOKEDUP_TTL_MS;
+}
+
 function loadLookedup() {
   if (_lookedupCache) return _lookedupCache;
   try {
     const a = JSON.parse(fs.readFileSync(LOOKEDUP_FILE, 'utf-8'));
-    _lookedupCache = Array.isArray(a) ? a.filter((x) => typeof x === 'string').slice(-200) : [];
+    const r = parseLookedupPayload(a, Date.now());
+    _lookedupCache = r.out.slice(-LOOKEDUP_MAX);
+    if (r.legacy) saveLookedup(); // 旧格式立刻落成新格式，避免每个进程都重新"补 now"
   } catch (e) { _lookedupCache = []; }
   return _lookedupCache;
 }
+
+function saveLookedup() {
+  const now = Date.now();
+  const a = loadLookedup().filter((e) => lookedupEntryAlive(e, now)); // 顺手清掉过期条目，文件不涨
+  try { fs.writeFileSync(LOOKEDUP_FILE, JSON.stringify(a)); } catch (e) { /* 写失败仅影响下次去重，不致命 */ }
+}
+
+// 查询：只有"仍在保质期内"才算查过。过期 = 允许重新联网（这就是 A1 的全部意义）。
+function lookedupHas(name) {
+  const a = loadLookedup();
+  for (let i = a.length - 1; i >= 0; i--) {
+    if (a[i].n === name) return lookedupEntryAlive(a[i], Date.now());
+  }
+  return false;
+}
+
 function rememberLookedup(name) {
   const a = loadLookedup();
-  if (a.indexOf(name) < 0) {
-    a.push(name);
-    if (a.length > 200) a.splice(0, a.length - 200);
-    try { fs.writeFileSync(LOOKEDUP_FILE, JSON.stringify(a)); } catch (e) { /* 写失败仅影响下次去重，不致命 */ }
+  let idx = -1;
+  for (let i = a.length - 1; i >= 0; i--) { if (a[i].n === name) { idx = i; break; } }
+  if (idx >= 0) {
+    // 已在表里：保质期内 → 什么都不用做（不重复写盘）；已过期 → 刷新时间戳，
+    // 否则下一轮立刻又是"过期"，变成每轮都联网查一次。
+    if (lookedupEntryAlive(a[idx], Date.now())) return;
+    a[idx].t = Date.now();
+  } else {
+    a.push({ n: name, t: Date.now() });
+    if (a.length > LOOKEDUP_MAX) a.splice(0, a.length - LOOKEDUP_MAX);
   }
+  saveLookedup();
 }
 
 // v2.39（2026-08-15）：日界改用「本地时间」——旧版用 UTC（toISOString），用户在 UTC+8，
@@ -3657,11 +3757,146 @@ function autoRefreshPricing(pricing) {
 //   让 hy3-x 按 hy3 计价、deepseek-ai/DeepSeek-V4-Flash 按 deepseek-v4-flash 计价。
 // - 其它（默认/精确）：跳过步骤 3，只保留步骤 1（归一化完全相等）+1.5（去标点）+2（别名表），
 //   失败即返回 null（当前无调用点，保留为 API 语义与防御）。
+// ===== 宿主模型目录（2026-11-04 D 批）：把「宿主 id」映射到「宿主官方显示名」 =====
+//   为什么需要：取价时手上只有宿主上报的 id（`hy4free` / `hy4-preview-ctrl`），而价库 key 是
+//   厂商 api 名（`hy4` / `hy4-preview`）。靠后缀规则去猜只能覆盖白名单里的 6 个后缀，且名单外
+//   的后缀会被边界匹配「吞」成主型号。宿主目录里的 `name` 字段是**宿主自己声明**的型号名，
+//   用它查价库不需要猜任何后缀 —— 后缀怎么变都无所谓。
+//
+//   降级（硬要求）：目录不存在 / 解析失败 / 结构变了 / 名字是纯中文（归一后为空）→ 返回 null，
+//   调用方原样回落到既有 6 级查找。**最差情况 = 现状，绝不比现在差。**
+//
+//   性能：实测全树扫描 900ms（不可接受）→ 只扫两个已知目录（`cache/` 与
+//   `cache/conversation-product-spill/`，142 份候选全在这两处）**3~5ms**，且进程内缓存 10 分钟。
+const HOST_CATALOG_TTL_MS = 10 * 60 * 1000;
+const _hostCatalog = { at: 0, map: null, done: false };
+
+function loadHostCatalog() {
+  if (_hostCatalog.done && (Date.now() - _hostCatalog.at) < HOST_CATALOG_TTL_MS) return _hostCatalog.map;
+  _hostCatalog.done = true;
+  _hostCatalog.at = Date.now();
+  _hostCatalog.map = null;
+  try {
+    const root = require('./wb-root.js').detectWorkBuddyRoot();
+    // 只扫这两个目录：全树 walk 实测 900ms（会拖慢弹窗），定向扫 3~5ms。
+    const dirs = [path.join(root, 'cache'), path.join(root, 'cache', 'conversation-product-spill')];
+    let best = null;
+    for (const d of dirs) {
+      let list = [];
+      try { list = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { continue; }
+      for (const ent of list) {
+        if (!ent.isFile()) continue;
+        const n = ent.name;
+        if (!(n === 'wb-product-config.json' || n.indexOf('acc-product-config') === 0)) continue;
+        const q = path.join(d, n);
+        let st; try { st = fs.statSync(q); } catch (e2) { continue; }
+        if (!best || st.mtimeMs > best.t) best = { t: st.mtimeMs, p: q };
+      }
+    }
+    if (!best) return null;
+    const j = JSON.parse(fs.readFileSync(best.p, 'utf-8'));
+    const ms = ((j['product-config-snapshot'] || {}).data || {}).models || j.models || [];
+    if (!Array.isArray(ms) || !ms.length) return null;
+    const map = buildHostIdNameMap(ms);
+    if (Object.keys(map).length) _hostCatalog.map = map;
+  } catch (e) {
+    _hostCatalog.map = null; // 任何异常都静默降级（这条链路是增强，不是必需）
+  }
+  return _hostCatalog.map;
+}
+
+// 纯函数：宿主 models 数组 → { 归一化 id: 显示名 }。抽出来是为了能单测（不依赖本机宿主目录）。
+//   · 归一后为空（纯中文名 / 纯符号）→ 跳过，否则所有中文名模型会撞成同一个 key
+//   · 同 key 先到先得（宿主并集里同一 id 的多份快照可能名字不同，取最新那份在前）
+function buildHostIdNameMap(models) {
+  const map = {};
+  for (const m of models || []) {
+    const id = String((m && m.id) || '');
+    const nm = String((m && m.name) || '');
+    if (!id || !nm) continue;
+    // 2026-11-04（批27 · 审计抓出）：**用户自建的模型条目没有"厂商身份"可言**。
+    //   实测证据（E 批留痕文件 .price-match-conflicts.json 第 1 条）：宿主 id `custom-local:deepseek-flash`
+    //   的 name 是「DeepSeek-V4.1-Flash」—— 那是**用户自己填的显示文字**，不是厂商声明的型号。
+    //   拿它当取价依据，等于按用户随手写的名字猜价（用户把自建模型命名成「GLM-5.3」就会按 GLM 计价）。
+    //   方向性判断：这类条目 id 里的模型名（`deepseek-flash`）来自实际配置，比显示名可信；
+    //   且漏用宿主名最多是"回到旧行为"，误用宿主名则可能整笔错价 → 跳过。
+    if (id.toLowerCase().indexOf('custom-local:') === 0) continue;
+    const a = alnumKey(id);
+    if (!a) continue;
+    // ★ 名字归一后为空（纯中文/纯符号）同样跳过 —— 否则 hostDisplayNameOf 会返回一个永远查不到价库的
+    //   名字，进而触发下一级"宿主认识但价库无 → 拒绝回落"的硬闸，把本来能由边界匹配命中的模型
+    //   变成未收录。**没能力判断的名字，就当没这个名字**（宁可退化回现状，也不要误拦）。
+    if (!alnumKey(nm)) continue;
+    if (!map[a]) map[a] = nm;
+  }
+  return map;
+}
+
+// 宿主目录里这个 id（归一后）对应的官方显示名；无 → ''
+function hostDisplayNameOf(modelName, hostMap) {
+  const cat = hostMap || loadHostCatalog();
+  if (!cat) return '';
+  const a = alnumKey(modelName);
+  if (!a) return '';
+  return cat[a] || '';
+}
+
+// ===== 价格映射分歧留痕（2026-11-04 E 批） =====
+//   场景：宿主名查到 A，而按 id 规则（后缀剥离/边界匹配）会查到 B —— 两条信息源不一致。
+//   现在代码是**静默取宿主名**，用户永远不知道曾经有过分歧。本函数把分歧落到本机 sidecar
+//   （`.price-match-conflicts.json`，与 .lookedup-models.json 同级，不入库），供 --report 展示。
+//   ⚠ 只留痕，不改变任何取价结果：取谁的价仍由 findModel 决定。
+const CONFLICT_FILE = path.join(path.dirname(PRICING), '.price-match-conflicts.json');
+let _conflictCache = null;
+let _conflictLogged = {};
+
+function loadConflicts() {
+  if (_conflictCache) return _conflictCache;
+  try {
+    const a = JSON.parse(fs.readFileSync(CONFLICT_FILE, 'utf-8'));
+    _conflictCache = Array.isArray(a) ? a.filter((x) => x && typeof x === 'object' && x.model) : [];
+  } catch (e) { _conflictCache = []; }
+  return _conflictCache;
+}
+
+function recordPriceMatchConflict(model, byId, byHost) {
+  try {
+    const sig = model + '|' + byId + '|' + byHost;
+    if (_conflictLogged[sig]) return;
+    _conflictLogged[sig] = 1;
+    const a = loadConflicts();
+    if (a.some((x) => x.model === model && x.by_id === byId && x.by_host === byHost)) return;
+    a.push({ model, by_id: byId, by_host: byHost, at: new Date().toISOString().slice(0, 19) });
+    if (a.length > 200) a.splice(0, a.length - 200);
+    try { fs.writeFileSync(CONFLICT_FILE, JSON.stringify(a)); } catch (e) { /* 写失败仅影响下次展示 */ }
+    process.stderr.write('[token-tracker] ⚠ 价格映射出现分歧：' + model
+      + ' —— 按 id 规则算出「' + byId + '」，宿主官方名指向「' + byHost + '」→ 已用宿主名，已留痕供核对\n');
+  } catch (e) { /* 留痕失败绝不能影响取价 */ }
+}
+
+// 报表口径：把分歧全量列出来（纯函数，便于单测）
+function formatPriceMatchConflicts(list) {
+  const arr = Array.isArray(list) ? list.filter((x) => x && x.model) : [];
+  if (!arr.length) return '';
+  const out = ['', '⚠ 价格映射分歧 ' + arr.length + ' 条（宿主官方名 与 id 规则算出的不是同一个价库 key）:'];
+  for (const x of arr.slice(0, 20)) {
+    out.push('  · ' + x.model + '：按 id 规则 → ' + x.by_id + '；宿主名指向 → ' + x.by_host
+      + '（已采用宿主名' + (x.at ? '，' + x.at : '') + '）');
+  }
+  if (arr.length > 20) out.push('  … 另有 ' + (arr.length - 20) + ' 条，见 ' + path.basename(CONFLICT_FILE));
+  out.push('  → 分歧本身不代表错。但若"宿主名指向"那侧有误，此处就是唯一能看见它的地方。');
+  return out.join('\n');
+}
+
+function priceMatchConflictNotice() {
+  try { return formatPriceMatchConflicts(loadConflicts()); } catch (e) { return ''; }
+}
+
 // 依据（v2.67 源数据核查仍有效）：日期后缀模型的价格并不可靠相同——deepseek-r1 vs r1-0528、
 // deepseek-chat-v3-0324 vs chat-v3.1、deepseek-v4-pro vs v4-pro-0813 价格均不同；
 // 因此【精确路径】不做后缀归并（宁可不计价也不算错价）；【计费路径】仅做边界子串匹配
 // 近似取价（精确优先，宽松兜底），且统计与计费解耦——桶名永不受影响。
-function findModel(pricing, modelName, mode) {
+function findModel(pricing, modelName, mode, opts) {
   if (!pricing || !pricing.models || !modelName) return null;
   const norm = normalizeModelName(modelName);
   if (!norm) return null;
@@ -3687,7 +3922,8 @@ function findModel(pricing, modelName, mode) {
     }
   }
 
-  // 2) 显式别名表：人工维护，当前为空表 → 不生效（见 MODEL_ALIASES 定义处说明）
+  // 2) 显式别名表：**当前为空表**（见 MODEL_ALIASES 定义处的清空说明）。只供人工核实过的
+  //    "厂商改名/同价等价名"使用；计费档后缀（free/std/promo…）一律交给下一级剥离，不进这张表。
   const alias = MODEL_ALIASES[norm];
   if (alias) {
     const ak = normalizeModelName(alias);
@@ -3695,6 +3931,94 @@ function findModel(pricing, modelName, mode) {
     for (const key of keys) {
       if (normalizeModelName(key) === ak) return { key, m: models[key] };
     }
+  }
+
+  // 2.2) 2026-11-04（D 批）：**宿主官方显示名**。宿主模型目录里每个 id 都带 name（`hy4free` →
+  //   "Hy4"、`hy4-preview-ctrl` → "Hy4 preview"、`kimi-k2.7` → "Kimi-K2.7-Code"），这是宿主
+  //   自己声明的型号身份，用它查价库**不需要猜任何后缀**。
+  //   为什么放在别名表之后、后缀剥离之前：
+  //     · 精确/去标点/别名（1/1.5/2）是确定性命中，必须优先，且这样**对既有结果零改动**；
+  //     · 后缀剥离和边界匹配都是启发式，宿主声明比它们可信 → 必须先于它们；
+  //     · 这一级只在"原本要靠猜"的情况下才会被走到，所以零回归。
+  //   降级：目录不可用/名字归一为空 → hostDisplayNameOf 返回 ''，直接落到原 2.5/3 级（= 现状）。
+  //   opts.skipHost=true 用于 E 批分歧检测（算一次"不走宿主名"的结果做对比），外部调用不传。
+  if (!(opts && opts.skipHost)) {
+    // opts.hostMap 仅供 selftest 注入假目录；生产调用一律不传（走进程内缓存的真实目录）。
+    const hnRaw = hostDisplayNameOf(modelName, opts && opts.hostMap);
+    if (hnRaw) {
+      const hnN = normalizeModelName(hnRaw);
+      let hitH = null;
+      if (models[hnN]) hitH = { key: hnN, m: models[hnN] };
+      if (!hitH) {
+        const hnA = alnumKey(hnRaw);
+        if (hnA) {
+          for (const key of keys) {
+            if (alnumKey(key) === hnA) { hitH = { key, m: models[key] }; break; }
+          }
+        }
+      }
+      if (hitH) {
+        // E 批：分歧检测 —— 只看"两边都命中但指向不同 key"，一方未命中不算分歧（那叫救回来）。
+        const byIdOnly = findModel(pricing, modelName, mode, { skipHost: true });
+        if (byIdOnly && byIdOnly.key !== hitH.key) {
+          recordPriceMatchConflict(modelName, byIdOnly.key, hitH.key);
+        }
+        return hitH;
+      }
+      // ★ 宿主认识这个 id，但**宿主声明的型号名在价库里查不到** → 这是「我们还没收录该型号」
+      //   （典型：官方刚上新、价库还没抓到；或官方压根没给 token 价）。
+      //   此处**必须拒绝回落到后缀/边界去猜主型号** —— 那会把一个新型号按老型号的价记账，
+      //   是最难发现的一类错账（数值合理、无告警）。这与本项目既有红线一致：
+      //   「本库不猜品牌：宁可不收，也不误收」（parse_tokenhub.py keep_hunyuan 注释）。
+      //   实测影响面：当前 62 个宿主 id 中 0 个会因此变化（全部宿主名都能在价库对上），
+      //   只在"未来新型号尚未收录"的窗口内生效。
+      const byIdOnly2 = findModel(pricing, modelName, mode, { skipHost: true });
+      if (byIdOnly2 && byIdOnly2.key) {
+        // 只有"本来会被猜成某个 key"时才留痕 —— 否则两边都是未收录，没有信息量。
+        recordPriceMatchConflict(modelName, byIdOnly2.key, '(价库无此型号 → 已拒绝回落)');
+      }
+      return null;
+    }
+  }
+
+  // 2.3) 2026-11-04（C 批 / KI-61）：**厂商官网声明的调用参数名**（索引条目的 `api_decl`）。
+  //   TokenHub 价表有一列「model（调用参数）」，是腾讯自己声明的真实 API 调用名，可能与我们在
+  //   BRAND_MAP 里手写的 key 不同（实测 6 个腾讯模型里 1 个：`Hy-Role-Latest` 我们写
+  //   `hy-role-latest`、官网声明 `hunyuan-role-latest`）。宿主认的是 API 名 → 只按 key 匹配
+  //   会判「未收录」，而价其实就在库里。
+  //   三个"为什么"：
+  //     · 为什么不改 key —— key = 账本桶名（daily-usage.json 的 models 键），改名会让历史计量分裂；
+  //     · 为什么不加别名表 —— F 批刚清空（手写规则会随厂商改名腐烂）；这一级用的是**抓来的
+  //       真实元数据**，随每次抓取自动更新，不需要人维护；
+  //     · 为什么排在宿主名（2.2）之后 —— 宿主名是宿主自己的声明、覆盖面更广；两者都不中才轮到
+  //       后缀剥离（2.5）这种启发式。
+  //   ⚠ 唯一命中才用：两个条目声明同一 api 名时无从判断该给谁 → 放弃（与"本库不猜"一致）。
+  //   ⚠ 实际触发窗口极窄：凡是 key / api_name 能匹配的查询在 1 / 1.5 级就返回了，走到这里必然
+  //     "库里所有 key 都对不上" → 对既有结果零改动（零账本实证逐条相等）。
+  if (normAlnum) {
+    let _decl = null;
+    for (const key of keys) {
+      const _m = models[key];
+      if (!_m || typeof _m.api_decl !== 'string' || !_m.api_decl) continue;
+      if (alnumKey(_m.api_decl) !== normAlnum) continue;
+      if (_decl && _decl.key !== key) { _decl = null; break; } // 两个条目同名声明 → 这一级放弃
+      _decl = { key, m: _m };
+    }
+    if (_decl) return _decl;
+  }
+
+  // 2.5) 2026-11-04（步1）：**渠道/计费档后缀剥离**。宿主上报的 id 常带促销或计费档后缀
+  //   （hy4-free / hy4std），而价库 key 是厂商 api 名（hy4）→ 步骤1/1.5/3 全落空，
+  //   直接判「未收录」。这里剥掉后缀再走一遍完整查找（核心要求：候选必须**精确命中**价库）。
+  //   为什么放在别名表之后：人工核过的别名永远优先于启发式；放在边界匹配之前：剥完是精确命中，
+  //   比"子串近似"更可信。
+  //   ⚠ 终止性：剥出来的 stem 不再以渠道后缀结尾 → 递归深度 ≤2，不会自激。
+  const _stem = channelStemOf(norm);
+  if (_stem && _stem !== norm) {
+    // E 批：opts 必须透传 —— 否则 skipHost 的对比分支里，后缀这一层又会偷偷走宿主名，
+    //   导致"by_id"其实掺了宿主名结果，分歧检测变得没有意义。
+    const _hs = findModel(pricing, _stem, mode, opts);
+    if (_hs) return _hs;
   }
 
   // 3) 计费模式（v2.82.1 收紧）：仅「边界分隔」匹配，且**单向**——只允许具体模型名命中
@@ -5057,6 +5381,12 @@ function reportRangeTxt(from, to) {
   // v3.62.0（外部审计 F-2/S-3）：价锁不可信明细（同纪律：只读 index.json、无问题返回 '' → 输出不变）
   const _authNotice = authoritativeIssuesNotice();
   if (_authNotice) lines.push(_authNotice);
+  // 2026-11-04（A 批）：漏收明细（同纪律：只读 index.json、无漏收返回 '' → 输出不变）
+  const _unrecNotice = unrecognizedModelsNotice();
+  if (_unrecNotice) lines.push(_unrecNotice);
+  // 2026-11-04（E 批）：价格映射分歧（宿主名 与 id 规则指向不同价库 key）—— 全量列出供核对
+  const _conflictNotice = priceMatchConflictNotice();
+  if (_conflictNotice) lines.push(_conflictNotice);
   lines.push(`===== ${from} ~ ${to}（${agg.days} 天有记录）=====`);
   lines.push('| 模型 | 输入 | 输出 | 缓存 | 缓存命中 | 总 token | 金额 |');
   lines.push('| --- | --- | --- | --- | --- | --- | --- |');
@@ -5500,6 +5830,12 @@ function reportTxt(arg) {
   // v3.62.0（外部审计 F-2/S-3）：价锁不可信明细（同纪律：只读 index.json、无问题返回 '' → 输出不变）
   const _authNotice = authoritativeIssuesNotice();
   if (_authNotice) lines.push(_authNotice);
+  // 2026-11-04（A 批）：漏收明细（同纪律：只读 index.json、无漏收返回 '' → 输出不变）
+  const _unrecNotice = unrecognizedModelsNotice();
+  if (_unrecNotice) lines.push(_unrecNotice);
+  // 2026-11-04（E 批）：价格映射分歧（宿主名 与 id 规则指向不同价库 key）—— 全量列出供核对
+  const _conflictNotice = priceMatchConflictNotice();
+  if (_conflictNotice) lines.push(_conflictNotice);
   for (const date of targets) {
     const day = d[date];
     if (!day) { lines.push(`===== ${date} =====\n  （无记录）`); continue; }
@@ -5564,6 +5900,12 @@ function reportSummaryTxt(arg) {
   // v3.62.0（外部审计 F-2/S-3）：价锁不可信明细（同纪律：只读 index.json、无问题返回 '' → 输出不变）
   const _authNotice = authoritativeIssuesNotice();
   if (_authNotice) lines.push(_authNotice);
+  // 2026-11-04（A 批）：漏收明细（同纪律：只读 index.json、无漏收返回 '' → 输出不变）
+  const _unrecNotice = unrecognizedModelsNotice();
+  if (_unrecNotice) lines.push(_unrecNotice);
+  // 2026-11-04（E 批）：价格映射分歧（宿主名 与 id 规则指向不同价库 key）—— 全量列出供核对
+  const _conflictNotice = priceMatchConflictNotice();
+  if (_conflictNotice) lines.push(_conflictNotice);
   for (const date of targets) {
     const day = d[date];
     if (!day) { lines.push(`${date}  （无记录）`); continue; }
@@ -5677,6 +6019,9 @@ function shortModelName(stat, pricing) {
   } else {
     // v2.75：显示名使用应用原始模型名（如 hy3、deepseek-v4-flash），不取 pricing 的 name 字段。
     // 价格匹配仍由 findModel('price') 在计费路径（calcCost/periodNote/ensureNewModelPricing）完成，与此处显示解耦。
+    // 2026-11-04（用户拍板）：**显示不做别名归一** —— 曾试过把 `hy4-free` 显示成 `Hy4`，结果弹窗说 Hy4、
+    //   报表/账本仍写 `hy4-free`，同一份数据两个出口两个名字。宁可难看也要一致：显示 = 账本桶名 = 宿主上报 id。
+    //   别名只用于「取价」（MODEL_ALIASES），不参与显示。
     const hit = findModel(pricing, raw, 'price');
     name = raw || (hit && hit.m && hit.m.name) || '';
   }
@@ -5810,6 +6155,52 @@ function authoritativeErrTag(pricing) {
   return '⚠价锁';
 }
 
+// 2026-11-04（A 批·漏收可见）：**抓取器看见了、但没认出来**的腾讯自家模型 → 弹窗短标签 `⚠漏收`。
+//   与上面两条的语义分工：
+//     ⚠N家价旧 / ⚠价旧 —— 源**坏了/旧了**（抓取失败、文件陈旧）→ 价可能过期；
+//     ⚠价锁           —— 权威层**自己有问题**（lock 坏值 / 对照停更）；
+//     ⚠漏收           —— 源**好好的、页面有这一行**，是我们的白名单（BRAND_MAP）没收录它
+//                        → 价库里根本没有这个模型，用到它时会显示「未收录｜⚠未计价」。
+//   为什么必须单独标：Hy4 正式版漏收那次，弹窗只写「未收录」，用户无从判断是
+//     "这模型官方没公布价" 还是 "我们瞎了" —— 而真相是官网明码 6/18/0.3、抓取器把整行丢了。
+//   噪音纪律（与 priceAuditTag 同口径）：**只在本轮弹窗涉及的模型与之相关时才挂**。
+//     否则每个用户天天看到「⚠漏收」，却跟自己用的模型毫无关系 = 永久噪音（v3.30.0 A-8 那个坑）。
+//   自愈：补进 BRAND_MAP 后 build_index 重写该字段为空 → 标签自动撤下。
+let _unrecLogged = false; // 同轮多条路径构建行2，stderr 明细只打一次
+
+// 页面显示名（`Hy4`）↔ 宿主上报 id（`hy4-free`）的宽松匹配：
+//   归一成纯字母数字后，完全相同或互为子串即算相关（覆盖免费档/付费档后缀差异）。
+//   两侧都要求 ≥3 字符，避免 `hy` / `glm` 这类过短主干把无关模型全捞进来。
+function unrecMentionsModel(pageName, models) {
+  const a = alnumKey(pageName);
+  if (!a || a.length < 3) return false;
+  return (models || []).some((n) => {
+    const b = alnumKey(n);
+    if (!b || b.length < 3) return false;
+    return a === b || a.indexOf(b) >= 0 || b.indexOf(a) >= 0;
+  });
+}
+
+function unrecognizedModelsTag(stat, pricing) {
+  if (!pricing || typeof pricing !== 'object') return '';
+  const deg = pricing._fetch_degraded;
+  if (!deg || typeof deg !== 'object') return '';
+  const arr = Array.isArray(deg.unrecognized_models)
+    ? deg.unrecognized_models.filter((x) => x && typeof x === 'object' && x.name) : [];
+  if (!arr.length) return '';
+  const names = roundModelNames(stat);
+  if (!names.length) return '';
+  const hit = arr.filter((u) => unrecMentionsModel(u.name, names));
+  if (!_unrecLogged && hit.length) {
+    _unrecLogged = true;
+    // 与 priceAuditTag 同纪律：命中的点名，未命中的也走 stderr（诊断不减、弹窗不吵）
+    process.stderr.write(`[token-tracker] 价库漏收的腾讯自家模型 ${arr.length} 个`
+      + `（其中 ${hit.length} 个与本轮模型相关 → 弹窗已标注「⚠漏收」）：`
+      + `${arr.map((u) => `${u.name}${u.since ? `（自 ${u.since} 起）` : ''}`).join('、')}\n`);
+  }
+  return hit.length ? '⚠漏收' : '';
+}
+
 // v3.29.0（A-8）：价格诊断告警链修复 —— refresh-prices.js 会往 pricing.json 落四类诊断字段，
 //   但此前 token-tracker.js **只消费 last_refresh_error**，其余（_price_audit / last_refresh_note /
 //   _ambig_warnings）全部只写不读，用户在弹窗里完全看不到。这里补上：toast 只挂一个**极短**标签
@@ -5924,6 +6315,31 @@ function authoritativeIssuesNotice() {
   return out.join('\n');
 }
 
+// 2026-11-04（A 批·漏收可见）：**报表**侧的漏收提示（--report 三个出口共用）。
+//   与 fetchDegradedNotice / authoritativeIssuesNotice 同纪律：**只读** index.json，
+//   不触发 loadPricing 的刷新副作用；无漏收时返回 '' → 既有出口输出逐字节不变。
+//   为什么报表要全量、弹窗只标相关：报表是"我要检查一下"的主动动作，全量才有诊断价值；
+//   弹窗是每条回答都弹，只能标与本轮模型相关的（否则 = 永久噪音）。
+function formatUnrecognizedNotice(deg) {
+  const arr = (deg && typeof deg === 'object' && Array.isArray(deg.unrecognized_models))
+    ? deg.unrecognized_models.filter((x) => x && typeof x === 'object' && x.name) : [];
+  if (!arr.length) return '';
+  const out = [`⚠ 价库漏收 ${arr.length} 个腾讯自家模型：官网价表有这一行，但抓取器（parse_tokenhub.py 的 BRAND_MAP）没认出来`];
+  for (const it of arr) {
+    out.push(`  · ${it.name}${it.since ? `（自 ${it.since} 起）` : ''}`);
+  }
+  out.push('  后果：这些模型在价库里不存在 → 用到时按「未收录」计 0 元（不是它没公开价，是我们漏了）');
+  out.push('  修复：把该名字补进 skills/token-usage-tracker/parse_tokenhub.py 的 BRAND_MAP'
+    + '（页面显示名 → (品牌, api 名)），重跑流水线即收录');
+  return out.join('\n');
+}
+
+function unrecognizedModelsNotice() {
+  let db = null;
+  try { db = JSON.parse(fs.readFileSync(CN_PRICE_DB, 'utf-8')); } catch (e) { return ''; }
+  return formatUnrecognizedNotice(db && db._fetch_degraded);
+}
+
 // v3.62.0（外部审计 S-6）：法定假日数据降级的 toast 标注（行2 末尾，同 dbStaleTag 机制）。
 //   现状：holidays.json 的 `years[2027] = null` + `stale_years: [2027]` → **2027-01-01 起**，
 //   该年峰谷判定按「非假日」降级。原本唯一的告警是 isPeakHour 里那条 stderr（每年每进程 1 条），
@@ -5971,7 +6387,8 @@ function holidayDegradedNotice() {
 
 function periodNote(stat, pricing) {
   const base = periodPeakNote(stat, pricing);
-  const tag = [dbStaleTag(pricing), peakRuleTag(pricing), fetchDegradedTag(pricing), holidayDegradedTag(stat, pricing), authoritativeErrTag(pricing)].filter(Boolean).join(' ');
+  // 2026-11-04（A 批）：`⚠漏收` 放在最后 —— 它解释的是「为什么显示未收录」，比其它价格状态更贴本轮
+  const tag = [dbStaleTag(pricing), peakRuleTag(pricing), fetchDegradedTag(pricing), holidayDegradedTag(stat, pricing), authoritativeErrTag(pricing), unrecognizedModelsTag(stat, pricing)].filter(Boolean).join(' ');
   if (!base) return tag;
   if (!tag) return base;
   return `${base} ${tag}`;
@@ -6127,9 +6544,14 @@ function toastLine1(stat, modelShort, period, balTxt, todayTxt, extraTag) {
   //   顶超宽」时会掉进 fallback 把标注**整段丢掉**（实测：高峰标注 + ⚠无公开价 + 长模型名 =
   //   49.5u，本可缩名到 30.5u 放下，却输出成裸模型名）。现按「标注预算」统一缩名，不再误丢。
   if (dispWidthTitle(line1Out) > TOAST_ROW1_MAX_W) {
-    const keep = periodTxt + tagTxt;
-    const keepW = dispWidthTitle(keep);
-    if (keep && TOAST_ROW1_MAX_W - keepW >= 8) {
+    // 2026-11-04（批27 · B）：**分层退让**。原来只有"全保"和"全丢"两档 —— period+tag 的预算一旦
+    //   低于 8u 就整段丢掉，连通告**来源标注**「（补弹 …）」一起丢。加了「⚠未收录」后这一档被触发得
+    //   更容易，T102-b2 当场抓到：补弹弹窗变成一条裸模型名，用户看不出这条是哪来的。
+    //   优先级：来源标注（哪条弹窗）> 价格标注（⚠未收录/⚠无公开价，行2 还有「未计价/未收录」兜底）。
+    //   故改为三档：① period+tag 都保（缩名让位）⇒ ② 只保 period ⇒ ③ 只剩名字。
+    for (const keep of [periodTxt + tagTxt, periodTxt]) {
+      const keepW = dispWidthTitle(keep);
+      if (!keep || TOAST_ROW1_MAX_W - keepW < 8) continue;
       const budget = TOAST_ROW1_MAX_W - keepW;
       const headKeep = dispWidthTitle(head) > budget ? shrinkTitle(head, budget) : head;
       return `${headKeep}${keep}\n${line2}`;
@@ -6170,12 +6592,38 @@ function anyCachePriceUnknown(stat, pricing) {
   }
   return isUnk(stat.model);
 }
+// 2026-11-04（批27 · B）：本轮是否存在「价库压根没有这个模型」的**云端**参与方（= 未收录）。
+//   为什么要单独一个函数：弹窗行1 原来只标「⚠无公开价」，而"未收录"只在行2 金额位显示「未收录」——
+//   **混合轮**里金额位显示的是有价部分的和，缺的那块只剩一个「⚠未计价」，读者看不出成因是
+//   "厂商没公布价"还是"我们库里没这个模型"，而这两件事的处理动作完全不同（等 vs 补库）。
+//   与 anyNoPublicPrice 的边界（两条互斥，不许重叠标注）：
+//     · unpublished（有条目、厂商没公布单价）→ 归「⚠无公开价」，本函数跳过；
+//     · 本地模型（localhost/127.0.0.1）→ cost 恒 null 是**既定正确行为**，跳过（否则纯本地轮误标）。
+//   判据用 findModel 而不是 calcCost：calcCost 会因入参缺字段/缓存价 null 等返回各种结果，
+//   而"未收录"的定义就是**价库里查不到这个模型**，findModel 正好是这件事本身（且不走网络）。
+function anyUnpricedModel(stat, pricing) {
+  if (!stat || !pricing || !pricing.models) return false;
+  const miss = (n) => {
+    if (!n) return false;
+    if (isLocalModel(n)) return false;
+    const m = pricing.models[n];
+    if (m && m.pricing_status === 'unpublished') return false;
+    return !findModel(pricing, n, 'price');
+  };
+  if (stat.models && typeof stat.models === 'object') {
+    for (const n of Object.keys(stat.models)) if (miss(n)) return true;
+  }
+  return miss(stat.model);
+}
 // v3.27.0：行1 用的标注文本（用户 2026-10-02 指定放行1 模型名右侧，那里有空位）。
 //   有 token 消耗才标（空轮不标）；行1 放不下时由 toastLine1 的超宽守卫丢弃，绝不挤掉数据。
 // v3.31.0：缓存价未知 → 降级挂「⚠缓存价未知」；两种缺陷同时存在时只显示更严重的「无公开价」
 //   （那时金额整段算不出来，标注必须优先给最严重的一条）。
 function noPriceTag1(stat, pricing) {
   if (anyNoPublicPrice(stat, pricing)) return ((stat && stat.in) || (stat && stat.out)) ? '｜⚠无公开价' : '';
+  // 2026-11-04（B）：未收录（价库没这个模型）比"缺缓存价"严重——前者整笔算不出来，后者只是偏低。
+  //   放在缓存价未知之前，保证混合轮标注指向更严重的那条。
+  if (anyUnpricedModel(stat, pricing)) return ((stat && stat.in) || (stat && stat.out)) ? '｜⚠未收录' : '';
   // 只有**真有缓存命中**时才会因缺缓存价而低估 —— 无缓存命中的轮标了纯属噪音
   if (anyCachePriceUnknown(stat, pricing)) return Number(stat && stat.cached) > 0 ? '｜⚠缓存价未知' : '';
   // v3.44.0（用户 2026-10-10 要求）：**价格类标签从行2 整体移到行1** —— 行2 已满（加标签就会挤掉
@@ -6675,6 +7123,44 @@ function addModelPrice(pricing, modelName, ref, region) {
   return res.ok;
 }
 
+// 2026-11-04（批27 · A2）：兜底查询的"候选名"构造。顺序 = 命中概率从高到低，去重保序。
+//   ① 剥后缀名：计费档/渠道后缀（free/std/promo…）是宿主自己的写法，公开源不会用（`hy4-free` → `hy4`）。
+//   ② 原 id：多数模型本来就不带后缀，剥完等于原名（会自动去重）。
+//   ③ 宿主官方显示名：宿主目录里 name 字段是宿主声明的型号身份（「Hy4 preview」/「Kimi-K2.7-Code」）。
+//   为什么把"原 id"排在"剥后缀名"之后：宿主 id 是本地私有命名空间，公开源命中率低于规范名；
+//   而剥后缀只有在真剥掉了东西时才与原名不同，顺序对"本来就没有后缀"的模型零影响。
+function buildLookupCandidates(name) {
+  const out = [];
+  const add = (v) => {
+    const x = String(v == null ? '' : v).trim();
+    if (x && out.indexOf(x) < 0) out.push(x);
+  };
+  try { add(channelStemOf(normalizeModelName(name))); } catch (e) { /* 纯字符串处理，不会抛，但别让兜底链断在这 */ }
+  add(name);
+  try { add(hostDisplayNameOf(name)); } catch (e) { /* 宿主目录读不到 → 少一个候选，不影响前两个 */ }
+  return out;
+}
+
+// 2026-11-04（A2）：按候选名逐个查，返回 { hit, noPublic, unreachable, usedName }。
+//   三种结果必须分清，混了就会做错决策：
+//     · hit：拿到价 → 立刻用，不再试后续名字（省联网）；
+//     · null（明确"源里没这个模型"）→ 换下一个名字；
+//     · undefined（源不可达/超时）→ **立刻停**，换名字不解决网络问题，继续试只会把延迟放大 N 倍。
+//   NO_PUBLIC_PRICE（源有这条但厂商没公布单价）**不立刻返回**：换下一个名字也许能拿到真价，
+//   全部候选都只给"无公开价"时才按无公开价处理（比原来更准，且不会把有价模型记成 0 元）。
+function lookupFirstHit(cands, lookupFn) {
+  let noPublic = false;
+  for (const c of cands) {
+    let r;
+    try { r = lookupFn(c); } catch (e) { r = undefined; }
+    if (r === undefined) return { hit: null, noPublic, unreachable: true, usedName: '' };
+    if (r === null) continue;
+    if (r === NO_PUBLIC_PRICE) { noPublic = true; continue; }
+    if (r) return { hit: r, noPublic, unreachable: false, usedName: c };
+  }
+  return { hit: null, noPublic, unreachable: false, usedName: '' };
+}
+
 // 检测未收录模型 → 立即联网补录。返回 { status, note }：
 //   none（已收录/无模型名）| added（自动补录成功）| not-found（国内外源均无此模型，记入已查列表）
 //   | error（联网失败，不记已查，下次重试）| skipped（已查过未收录，不再重复联网）
@@ -6706,14 +7192,25 @@ function ensureNewModelPricing(pricing, stat) {
     process.stderr.write(`[token-tracker] ${stat.model} 为「无公开价」条目且已过重查窗口 → 本轮重新联网确认官方是否已公布单价\n`);
   }
   const name = lookupKeyOf(stat.model); // v3.18：路径型模型名（本地 .gguf 等）取末段做键，避免把本机绝对路径写进价格库
-  const looked = loadLookedup().indexOf(name) >= 0;
+  // 2026-11-04（A2）：**兜底查询按候选名逐个试**，不再拿一个名字赌一次。
+  //   病根（同日实测）：宿主 id / 宿主显示名 / 厂商 api 名是三套体系 —— `hy4-free` / `Hy4` / `hy4`。
+  //   原来只拿"剥后缀名"去查，一旦公开源用的是别的写法就判 NOT_FOUND，再被已查列表锁死 →
+  //   弹窗永远「未收录」，其实源里有价。现在按「剥后缀 → 原 id → 宿主显示名」顺序试，
+  //   命中即停；只有源**明确说没有**(null) 才换下一个；源不可达(undefined) 立刻停
+  //   （换名字解决不了网络问题，别把一次超时放大成三次）。
+  //   ⚠ 只改查询键：写库键仍是 `stat.model`（账本桶名 / 追溯口径不变）。
+  const cands = buildLookupCandidates(name);
+  // 2026-11-04（A1）：改成带保质期的查询 —— 过期条目允许重新联网（旧实现 indexOf 判存在 = 永久黑名单）
+  const looked = lookedupHas(name);
   if (looked) {
     return { status: 'skipped', note: `⚠️ 新模型 ${stat.model} 价格已查过未收录，可搜官方定价页人工补录` };
   }
 
   // v2.31：先查国内源 llmabacus（人民币价，自动判断国内外），再回退 OpenRouter
-  const cnRef = lookupCnPrice(stat.model);
-  if (cnRef === NO_PUBLIC_PRICE) return rememberNoPublicPrice(pricing, stat.model);
+  const cnRes = lookupFirstHit(cands, lookupCnPrice);
+  const cnRef = cnRes.hit;
+  if (cnRef && cnRes.usedName) process.stderr.write(`[token-tracker] ${stat.model} 国内源按查询名「${cnRes.usedName}」命中\n`);
+  if (!cnRef && cnRes.noPublic) return rememberNoPublicPrice(pricing, stat.model);
   if (cnRef && typeof cnRef.id === 'string') {
     if (cnRef.priceCurrency === 'CNY') {
       // 国内模型：直接人民币价补录
@@ -6738,13 +7235,15 @@ function ensureNewModelPricing(pricing, stat) {
     rememberLookedup(name);
     return { status: 'skipped', note: `⚠️ 新模型 ${stat.model} 币种未知，已跳过自动补录（避免错价 7 倍），请人工核对` };
   }
-  if (cnRef === undefined) {
+  if (cnRes.unreachable) {
     process.stderr.write(`[token-tracker] 国内源 llmabacus 不可达，回退 OpenRouter 补录\n`);
   }
 
-  const ref = lookupOrPrice(stat.model);
-  if (ref === NO_PUBLIC_PRICE) return rememberNoPublicPrice(pricing, stat.model);
-  if (ref === null) {
+  const orRes = lookupFirstHit(cands, lookupOrPrice);
+  const ref = orRes.hit;
+  if (ref && orRes.usedName) process.stderr.write(`[token-tracker] ${stat.model} OpenRouter 按查询名「${orRes.usedName}」命中\n`);
+  if (!ref && orRes.noPublic) return rememberNoPublicPrice(pricing, stat.model);
+  if (!ref && !orRes.unreachable) {
     // 国内外源均确认没有 → 记入已查列表，避免每次运行都联网
     // v3.18.1（N6）：已查列表改存本地 sidecar 文件（.lookedup-models.json，不入库）——
     // 旧实现写进 pricing.json，本机自定义模型名（fast-model 等）会随公开仓库分发
@@ -6760,7 +7259,7 @@ function ensureNewModelPricing(pricing, stat) {
     if (lr.skipped) process.stderr.write(`[token-tracker] 已查列表写入跳过（被其他进程持锁）\n`);
     return { status: 'not-found', note: `⚠️ 新模型 ${stat.model} 国内外价格源均未收录，请搜索厂商官方定价页人工补录` };
   }
-  if (ref === undefined) {
+  if (!ref) {
     return { status: 'error', note: `⚠️ 新模型 ${stat.model} 联网查价失败（国内外源均不可达），稍后自动重试` };
   }
   const ok = addModelPrice(pricing, stat.model, ref, 'US');
@@ -7017,7 +7516,7 @@ function roundWatchMain(sid, tsPath, roundStart, logFile) {
 //
 // 不做全自动更新：安装方式是「拷目录」，自动覆盖会动用户文件，可能抹掉 `local-config.json` /
 //   本机改动 → 只提示，升级动作交给用户（步骤见 SKILL.md）。
-const SKILL_VERSION = '3.63.12'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
+const SKILL_VERSION = '3.64.0'; // 单一真源：本常量（selftest 会断言它与 manifest.yaml / README 徽章 / CHANGELOG 一致）
 const UPDATE_CHECK_FILE = path.join(__dirname, '.update-check.json');
 const UPDATE_REPO = 'abc1317679842-ui/workbuddy-token-tracker';
 const UPDATE_INTERVAL_MS = 7 * 24 * 3600 * 1000;            // 检查周期：7 天
@@ -8166,6 +8665,24 @@ module.exports = {
   //   而本项目已因"复制实现靠注释同步"记了 A3 / KI-29 两条。
   numOr0,
   calcCost, triPrice, triPriceRounded, costFromPeakSplit, peakMultOf, classifyWatchLock, findModel, isLocalModel, fmtCost, cleanModelName,
+  // 2026-11-04：显示名解析导出（selftest T120 直接断言「促销 id 显示为规范名」，
+  //   否则只能靠 spawn 弹窗，受限环境验不了）
+  shortModelName,
+  // 2026-11-04（A 批）：漏收可见的两个出口导出 —— selftest 直接断言「点名本轮模型才挂⚠漏收」
+  //   「报表全量列出」，否则只能靠 spawn 弹窗 + 改生产 index.json，受限环境验不了。
+  unrecognizedModelsTag, formatUnrecognizedNotice, unrecMentionsModel,
+  // 2026-11-04（D/E 批）：宿主目录映射 + 价格映射分歧留痕 —— 导出供 selftest 直接断言
+  //   「宿主名优先」「分歧留痕」「降级为现状」，否则只能靠读生产宿主目录验。
+  loadHostCatalog, hostDisplayNameOf, buildHostIdNameMap, formatPriceMatchConflicts, priceMatchConflictNotice,
+  // 2026-11-04（批27·A1）：已查列表"保质期"的两个纯函数导出 —— selftest 直接断言迁移与过期语义，
+  //   否则只能靠改本机 .lookedup-models.json + 真跑联网，受限环境验不了。
+  parseLookedupPayload, lookedupEntryAlive, lookedupHas, LOOKEDUP_TTL_MS,
+  // 2026-11-04（批27·A2）：兜底候选名构造 + 逐名查询（含"不可达即停"语义）—— selftest 用假 lookupFn 直接验
+  buildLookupCandidates, lookupFirstHit,
+  // 2026-11-04（B）：弹窗行1 的「未收录」判定导出 —— selftest 直接断言三种成因互斥不重叠
+  anyUnpricedModel,
+  // 2026-11-04（A2）：哨兵本身也要导出 —— T126 要断言「全候选都是无公开价」与「真价优先于哨兵」
+  NO_PUBLIC_PRICE,
   readTranscLines, parseTranscChunk, readTranscLinesFrom, extractUsage, perModelFromRows, aggregatePerModel,
   aggregateMainOnly, aggregateSubsOnly, aggregateTranscript,
   todayDisplay, reportTxt, reportSummaryTxt, normalizeDailyUsage,

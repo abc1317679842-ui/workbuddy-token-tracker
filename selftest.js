@@ -1685,7 +1685,24 @@ else {
     ok('T18-c1 ★两个查价源都把「输入输出同为 0」判为未公布单价（NO_PUBLIC_PRICE），不再当合法价',
       (main18.match(/NO_PUBLIC_PRICE/g) || []).length >= 4, 'occurrences=' + (main18.match(/NO_PUBLIC_PRICE/g) || []).length);
     ok('T18-c2 ★哨兵值与 null/undefined 三态严格区分（查不到 vs 查失败 vs 无公开价）',
-      /const NO_PUBLIC_PRICE = Symbol/.test(main18) && /if \(ref === NO_PUBLIC_PRICE\)/.test(main18) && /if \(cnRef === NO_PUBLIC_PRICE\)/.test(main18));
+      // 2026-11-04（批27·A2）：三态的判定点从"调用点 if"搬进了 lookupFirstHit（多候选名逐试），
+      //   断言随之钉在新位置 —— 意图不变：查不到(null) / 查失败(undefined) / 无公开价(Symbol) **必须分开**。
+      //   若哪天有人把 undefined 也当 null（`if (!r) continue`）→ 源不可达就会被读成"这模型不存在"，
+      //   进而记进已查列表锁 7 天，正是 A1 要治的病。这里逐条钉住三个分支。
+      /const NO_PUBLIC_PRICE = Symbol/.test(main18)
+      && /if \(r === undefined\) return \{ hit: null, noPublic, unreachable: true/.test(main18)
+      && /if \(r === null\) continue;/.test(main18)
+      && /if \(r === NO_PUBLIC_PRICE\) \{ noPublic = true; continue; \}/.test(main18)
+      && /if \(!cnRef && cnRes\.noPublic\)/.test(main18)
+      && /if \(!ref && orRes\.noPublic\)/.test(main18),
+      '三态判定缺失：' + JSON.stringify({
+        sym: /const NO_PUBLIC_PRICE = Symbol/.test(main18),
+        und: /if \(r === undefined\) return \{ hit: null, noPublic, unreachable: true/.test(main18),
+        nul: /if \(r === null\) continue;/.test(main18),
+        np: /if \(r === NO_PUBLIC_PRICE\) \{ noPublic = true; continue; \}/.test(main18),
+        cn: /if \(!cnRef && cnRes\.noPublic\)/.test(main18),
+        or: /if \(!ref && orRes\.noPublic\)/.test(main18),
+      }));
     ok('T18-c3 ★backfill 重建账本时同样留痕 no_price（漏则 --write 会把标记洗掉）',
       /isNoPublicPrice\(name\)/.test(back18) && /m\.no_price = true/.test(back18));
     ok('T18-c4 ★recalc 回算后清除 no_price 标记（金额已真实，不能仍显示"无公开价"）',
@@ -5347,9 +5364,18 @@ else {
     bi61.indexOf("th_region = th.get('region')") >= 0 && bi61.indexOf("'腾讯云TokenHub文档(广州,'") < 0);
   // v3.62.0（外部审计 F-4）：元组新增 effective_from / superseded_at 后跨两行 —— 守卫改为
   //   锚定首行 + 单独断言两个新字段在元组里（既容忍折行，又钉住 F-4 的透达不被回退）。
+  // 2026-11-04（C 批 / KI-61）：元组再添 api_decl（官网声明的调用参数名，供 findModel 2.3 级），
+  //   且中间夹了注释行 → 不能再按「字面相邻」断言（旧写法 `'effective_from', 'superseded_at')`
+  //   要求右括号紧跟，加字段即假红）。改为**切出 for 元组本体**再逐个断言字段，
+  //   既容忍折行/插注释，也钉住「这三个字段必须在同一个元组里」这个原始意图。
+  const _f61head = "for f in ('currency', 'unit', 'region', 'source_url', 'fetched_at',";
+  const _f61at = bi61.indexOf(_f61head);
+  const _f61tuple = _f61at >= 0 ? bi61.slice(_f61at, bi61.indexOf('):', _f61at) + 1) : '';
   ok('T61-b5 ★索引条目必须透出契约字段（下游 mergeLocalPriceDb 按白名单读、未知字段忽略 → 计费侧零影响）',
-    bi61.indexOf("for f in ('currency', 'unit', 'region', 'source_url', 'fetched_at',") >= 0
-    && bi61.indexOf("'effective_from', 'superseded_at')") >= 0);
+    _f61tuple !== ''
+    && _f61tuple.indexOf("'effective_from'") >= 0
+    && _f61tuple.indexOf("'superseded_at'") >= 0
+    && _f61tuple.indexOf("'api_decl'") >= 0);
 
   // ── c. fetch-cn-prices：契约字段 + 阶跃 .md 语义解析（2026-10-12 页面改版活样例）──
   // v3.59.0（批12·S5）：unit 兜底从 setdefault 改为「WARN 留痕 + 仍兜底」——
@@ -8521,8 +8547,11 @@ const txInjectionComplete = (ttSrc, shSrc) => (
     && /conservative = !opts \|\| opts\.holidayUnknownNoPeak !== false/.test(pr));
   // v3.62.0（F-2/S-3）：tag 数组新增 authoritativeErrTag（⚠价锁）—— 相邻序列随之改写，
   //   断言意图不变（holidayDegradedTag 必须在数组里、且新标签不得插在它前面打乱既有顺序）。
+  // 2026-11-04（A 批）：末尾追加了 unrecognizedModelsTag（⚠漏收）→ **不再锚行尾 `]`**，
+  //   改锚「三连相邻序列」。锚行尾会让"以后再加一个标签"必然打红本项目自己的守卫，
+  //   而本条真正要防的是「顺序被打乱 / holidayDegradedTag 被摘掉」，与行尾无关。
   ok('T94-a4 ★toast 必须接入 holidayDegradedTag，且只在本轮有峰谷模型时才标（避免纯噪音）',
-    /fetchDegradedTag\(pricing\), holidayDegradedTag\(stat, pricing\), authoritativeErrTag\(pricing\)\]/.test(ttCode) && /peakMultOf\(hit\.m, n\) > 1/.test(ttCode));
+    /fetchDegradedTag\(pricing\), holidayDegradedTag\(stat, pricing\), authoritativeErrTag\(pricing\)/.test(ttCode) && /peakMultOf\(hit\.m, n\) > 1/.test(ttCode));
   ok('T94-a5 ★报表必须接入 holidayDegradedNotice，且只读 holidays.json（不触发刷新）',
     (ttCode.match(/holidayDegradedNotice\(\)/g) || []).length >= 4 && /readFileSync\(HOLIDAYS_FILE/.test(ttCode));
 
@@ -8874,8 +8903,10 @@ const txInjectionComplete = (ttSrc, shSrc) => (
     /'kind': 'stale_lock'/.test(bi) && /SOURCE_TTL_HOURS/.test(bi));
   ok('T98-a6 ★mergeLocalPriceDb 必须把 authoritative_issues 也算进挂载条件（漏这路 → ⚠价锁 永不显示）',
     /Array\.isArray\(_deg\.authoritative_issues\) && _deg\.authoritative_issues\.length > 0/.test(tt));
+  // 2026-11-04（A 批）：tag 数组末尾追加了 unrecognizedModelsTag（⚠漏收）→ 不再锚行尾 `]`，
+  //   改锚「相邻序列」（同 T94-a4；锚行尾会让此后每次加标签都误伤本条）。
   ok('T98-a7 ★periodNote 必须接入 authoritativeErrTag（行2 末尾，同 ⚠价库 机制）',
-    /holidayDegradedTag\(stat, pricing\), authoritativeErrTag\(pricing\)\]/.test(tt)
+    /holidayDegradedTag\(stat, pricing\), authoritativeErrTag\(pricing\)/.test(tt)
     && /return '⚠价锁';/.test(tt));
   ok('T98-a8 ★三个报表出口都必须接入 authoritativeIssuesNotice（--report 是用户对界第二通道）',
     (tt.match(/authoritativeIssuesNotice\(\)/g) || []).length >= 4,
@@ -11722,6 +11753,682 @@ for (let i = 0; i < 5; i++) {
   ok('T119-d ★T119 的计数必须基于「剥注释后」文本（扫原文 = 注释掉的调用也计入，b 条恒绿）',
     st119Raw.split(anchor119).length - 1 === 1,
     `剥注释调用点=${st119Raw.split(anchor119).length - 1}（期望 1）`);
+}
+
+// ===== T120（2026-11-04）：Hy4 正式版漏收 + 宿主促销 id 归一 =====
+//   事故链（实测证据）：
+//     ① 腾讯云 TokenHub 2026-11-04 12:13 给价表加了 `Hy4 | hy4 | 6/18/0.3`；
+//     ② 我们 15:08 的抓取**抓到了**，但 parse_tokenhub.py 的 BRAND_MAP 是**逐条全名白名单**，
+//        没有 'Hy4' 键 → 该行被判「未识别」丢弃，只留 `_unmapped` + stderr WARN（hook 子进程看不到）；
+//     ③ 宿主在免费额度期把模型 id 报成 `hy4-free` → 价库无此 key → 弹窗「未收录｜⚠未计价」。
+//   教训：白名单的漏洞必然落在**最新模型**上（新模型天生不在旧表里），所以白名单必须配守卫。
+{
+  // a) 源码级：BRAND_MAP 必须含 Hy4（腾讯自家新通用模型不得再被静默丢弃）
+  const pthRaw = fs.readFileSync(path.join(SRC, 'parse_tokenhub.py'), 'utf-8');
+  const pthCode = stripComments(pthRaw);
+  const key = "'" + 'Hy4' + "':";
+  const nMap = pthCode.split(key).length - 1;
+  ok('T120-a ★parse_tokenhub 的 BRAND_MAP 必须收录 Hy4（正式版漏收事故）',
+    nMap >= 1, `Hy4 映射条目=${nMap}（期望 ≥1）`);
+
+  // b/c) 行为级：促销 id 必须取到正式版价、且显示为规范名（用内存假价库，不依赖生产 index.json）
+  const tt120 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  if (!tt120) ok('T120-b 行为验证（findModel/shortModelName）', false, 'token-tracker.js require 失败 —— CI 正常环境下这必是代码回归，不允许静默跳过');
+  else {
+    const fakePricing = { models: { hy4: {
+      name: 'Hy4', input_price: 6, output_price: 18, cached_price: 0.3, region: 'CN', lock: true,
+    } } };
+    const hit = tt120.findModel(fakePricing, 'hy4-free', 'price');
+    ok('T120-b ★宿主上报 id hy4-free 必须取到 Hy4 的价（否则弹窗「未收录｜⚠未计价」）',
+      !!hit && hit.key === 'hy4' && hit.m.input_price === 6 && hit.m.output_price === 18 && hit.m.cached_price === 0.3,
+      `hit=${hit ? hit.key + ' ' + JSON.stringify({ i: hit.m.input_price, o: hit.m.output_price, c: hit.m.cached_price }) : 'null'}`);
+    // ⚠ 口径说明（反向验证实测）：`hy4-free` 这一条**不依赖别名表**——findModel 第 3 级边界子串
+    //   （'hy4' 是 'hy4-free' 的边界子串，间隔符 '-' 属 BOUND）本来就能命中。所以 b 条守的是
+    //   「价库里有 hy4」这个结果，不是「别名表生效」。**无分隔符**的宿主目录 id（paidId=`hy4std`）
+    //   边界规则对它无效，单列一条钉住 —— 但注意它现在也不靠别名表（见下方的口径修正）。
+    // ⚠ 口径修正（D/F 批后反向验证实测）：hy4std 现在有**两条**独立通路 —— ①后缀剥离
+    //   （`std` 在 CHANNEL_SUFFIXES 里）；②宿主官方显示名（宿主目录 name=「Hy4」）。别名表已清空，
+    //   所以本条的标题不再写"只能靠别名"，改为"必须能命中"：它守的是结果，不是某一条实现。
+    //   变异实测：只关后缀剥离 → 绿（宿主名兜住）；只关宿主名 → 绿（剥离兜住）；两条都关 → 红。
+    const hit2 = tt120.findModel(fakePricing, 'hy4std', 'price');
+    ok('T120-b2 ★无分隔符的宿主目录 id hy4std 必须仍命中 hy4（边界规则对它无效：\'s\' 不是边界符）',
+      !!hit2 && hit2.key === 'hy4',
+      `hit=${hit2 ? hit2.key : 'null'}（边界规则对 hy4std 无效：'s' 不是边界符）`);
+    ok('T120-c ★hy4-free 在弹窗里仍显示原始 id（与账本/报表同名，不做显示归一）',
+      tt120.shortModelName({ model: 'hy4-free', modelMain: 'hy4-free' }, fakePricing) === 'hy4-free',
+      JSON.stringify(tt120.shortModelName({ model: 'hy4-free', modelMain: 'hy4-free' }, fakePricing)));
+    // 反证：未登记别名的模型必须仍显示原始 id（防止"顺手把所有名字都规范化"）
+    ok('T120-d ★未登记别名的模型仍显示原始 id（显示归一不得扩散）',
+      tt120.shortModelName({ model: 'glm-5.3-flash', modelMain: 'glm-5.3-flash' }, fakePricing) === 'glm-5.3-flash',
+      JSON.stringify(tt120.shortModelName({ model: 'glm-5.3-flash', modelMain: 'glm-5.3-flash' }, fakePricing)));
+  }
+
+  // e) 源码级：recalc 补价回算后必须清掉 unpriced / unpriced_note（否则账本出现 cost 与「未收录」并存）
+  const rc120 = stripComments(fs.readFileSync(path.join(SRC, 'recalc-day.js'), 'utf-8'));
+  const delUnpriced = 'delete stat.' + 'unpriced;';
+  const delUnpricedNote = 'delete stat.' + 'unpriced_note;';
+  ok('T120-e ★recalc 补价回算后清除 unpriced / unpriced_note（no_price 那半早有，这半曾漏）',
+    rc120.split(delUnpriced).length - 1 >= 1 && rc120.split(delUnpricedNote).length - 1 >= 1,
+    `delete unpriced=${rc120.split(delUnpriced).length - 1} / note=${rc120.split(delUnpricedNote).length - 1}`);
+}
+
+// ===== T121（2026-11-04 步1）：渠道/计费档后缀剥离 =====
+//   事故：宿主上报 `hy4-free`，价库 key 是厂商 api 名 `hy4` —— 精确/去标点/别名/边界四级全落空，
+//   且联网补价拿 `hy4-free` 去查（OpenRouter 明明有 `tencent/hy4`）→ NOT_FOUND → 记入已查列表永不重试。
+//   设计：只剥**计费档/渠道**后缀（free/std/standard/promo/trial/paid），剥完必须精确命中价库；
+//   版本档后缀（preview/exp/beta）**严禁**剥——那是不同模型/不同价。
+{
+  const tt121 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  if (!tt121) ok('T121 行为验证（渠道后缀剥离）', false, 'token-tracker.js require 失败 —— CI 正常环境下这必是代码回归，不允许静默跳过');
+  else {
+    // 假价库刻意**只放规范名**，且这些促销名都不在 MODEL_ALIASES 里 → 命中只可能来自后缀剥离
+    const fp = { models: {
+      hy4: { name: 'Hy4', input_price: 6, output_price: 18, cached_price: 0.3, region: 'CN' },
+      'hy4-preview': { name: 'hy4-preview', input_price: 6, output_price: 18, cached_price: 0.3, region: 'CN' },
+      'kimi-k3': { name: 'kimi-k3', input_price: 20, output_price: 100, region: 'CN' },
+    } };
+    const kOf = (n) => { const h = tt121.findModel(fp, n, 'price'); return h ? h.key : null; };
+    // ⚠ 选例铁律（反向验证实测抓出）：**不能用 `hy4-promo` 这类带分隔符的名字当守卫** ——
+    //   findModel 第 3 级「边界子串」本来就能让 'hy4' 命中 'hy4-promo'（'-' 是边界符），
+    //   把 suffix 剥离整个删掉这条断言照样绿 = 缺牙守卫。只有**无分隔符**形态
+    //   （hy4paid / hy4promo，宿主目录 id 风格）才只能靠剥离命中。T120-b 踩过同一个坑。
+    ok('T121-a ★无分隔符渠道后缀 hy4paid 只能靠剥离命中规范名（证明是通用规则，且该名不在别名表）',
+      kOf('hy4paid') === 'hy4', `hy4paid → ${kOf('hy4paid')}`);
+    ok('T121-b ★无分隔符形态 hy4promo 同样剥离（宿主目录 id 风格，非别名覆盖）',
+      kOf('hy4promo') === 'hy4', `hy4promo → ${kOf('hy4promo')}`);
+    ok('T121-c ★带分隔符形态 hy4-trial 结果不变（边界规则与剥离都收敛到 hy4）',
+      kOf('hy4-trial') === 'hy4', `hy4-trial → ${kOf('hy4-trial')}`);
+    ok('T121-d ★版本档后缀 -preview 严禁剥离（hy4-preview 必须留在 preview 条目）',
+      kOf('hy4-preview') === 'hy4-preview', `hy4-preview → ${kOf('hy4-preview')}`);
+    ok('T121-e ★能力档后缀 -pro 严禁剥离（kimi-k3.1-pro 不得塌缩到 kimi-k3，二者不同价）',
+      kOf('kimi-k3.1-pro') === null, `kimi-k3.1-pro → ${kOf('kimi-k3.1-pro')}（期望 null）`);
+
+    // f) 源码级 + 行为级：联网补价必须**按候选名逐个试**（剥后缀名优先），且不许直接把宿主原样 id
+    //    丢给查价源。2026-11-04（批27·A2）：原断言钉的是单个 `queryName`，A2 把"只试一个名字"
+    //    换成"按 buildLookupCandidates 顺序试"，所以断言随之升级 —— 守的意图不变：
+    //    **别拿宿主私有命名空间的 id 去公开源赌一次**（hy4-free 就是这么被锁成"未收录"的）。
+    const m121 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8'));
+    const c121 = (typeof tt121.buildLookupCandidates === 'function') ? tt121.buildLookupCandidates('hy4-free') : [];
+    ok('T121-f ★联网补价必须按候选名逐个试（剥后缀名优先），不许只拿宿主原样 id 赌一次',
+      c121[0] === 'hy4' && c121.indexOf('hy4-free') > 0
+      && m121.indexOf('buildLookupCandidates(name)') > 0
+      && m121.indexOf('lookupFirstHit(cands, lookupCnPrice)') > 0
+      && m121.indexOf('lookupFirstHit(cands, lookupOrPrice)') > 0
+      && m121.indexOf('lookupCnPrice(stat.model)') < 0 && m121.indexOf('lookupOrPrice(stat.model)') < 0,
+      `候选=${JSON.stringify(c121)} 直传原样 id=${m121.indexOf('lookupOrPrice(stat.model)') >= 0}`);
+  }
+}
+
+// ===== T122（2026-11-04 A 批）：漏收可见（unmapped → 弹窗 ⚠漏收 / 报表明细） =====
+//   事故：Hy4 正式版上线，官网价表当天 12:13 就加了 `Hy4 | hy4 | 6/18/0.3` 这一行，
+//     但 parse_tokenhub.py 的 BRAND_MAP 是**逐条全名白名单**，新模型天生不在旧表里 →
+//     整行进 `_unmapped` 被丢，只打一条 stderr WARN。而调用方是 hook 子进程，用户看不到。
+//     最终态：官网明码价，本地按「未收录」计 0 元，弹窗只显示「未收录｜⚠未计价」，
+//     用户无法区分「这模型官方没公布价」和「我们瞎了」—— 而真相是后者。
+//   本条守的是**出口**：漏收必须能走到用户面前（弹窗标签 + 报表明细），
+//     且必须**只报真漏收**（第三方转售名天天报 = 噪音 = 等于没报）。
+//   分层：
+//     a/b  python 行为 —— split_scope 分路正确、`_unmapped_in_scope` 被 build_index 汇进
+//          `unrecognized_models`、无该字段时字段为空（老数据兼容）；
+//     c/d/e node 行为 —— 弹窗只标相关、报表全量、干净数据不输出；
+//     f/g  源码级 —— 函数真接进出口（防"写了函数但没人调用"）。
+{
+  const tt122 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  const pyCands122 = [];
+  try {
+    const pvDir = path.join(os.homedir(), '.workbuddy', 'binaries', 'python', 'versions');
+    for (const v of fs.readdirSync(pvDir)) pyCands122.push(path.join(pvDir, v, 'python.exe'));
+  } catch (e) { /* 目录不存在就走 PATH */ }
+  pyCands122.push('python', 'python3');
+  let PY122 = null;
+  for (const c of pyCands122) {
+    const t = spawnSync(c, ['-V'], { encoding: 'utf8', windowsHide: true, timeout: 20000 });
+    if (t.status === 0) { PY122 = c; break; }
+  }
+
+  if (!SPAWN_OK) envSkip('T122-a/b 行为组（spawn python）', SPAWN_SKIP_REASON);
+  else if (!PY122) envSkip('T122-a/b 行为组（spawn python）', 'python 不可用');
+  else {
+    const tmp122 = fs.mkdtempSync(path.join(os.tmpdir(), 'tt122-'));
+    // 内联脚本：不跑 main()，直接调纯函数 —— 秒级，且验的是**真代码**（不是复刻逻辑）。
+    //   r.split  —— split_scope 三路分类
+    //   r.unrec  —— _degraded_state 把 _unmapped_in_scope 转成 unrecognized_models
+    //   r.empty  —— tokenhub_lang.json 是老版本（没这次的新字段）时不得报任何漏收
+    const py122 = [
+      'import sys, os, json, io',
+      'src, tmp = sys.argv[1], sys.argv[2]',
+      "os.environ['CN_PRICES_DIR'] = tmp",
+      'sys.path.insert(0, src)',
+      'import build_index as B, parse_tokenhub as P',
+      'r = {}',
+      "models = [{'name': 'Hy4', 'brand': None}, {'name': 'Kimi K3.1 Pro', 'brand': None},",
+      "          {'name': 'Hy-MT2-Pro', 'brand': None}, {'name': 'DeepSeek-V4.1-Flash', 'brand': None}]",
+      'kept, unmapped, excluded = P.split_scope(models)',
+      'r["unmapped"] = unmapped',
+      'r["excluded"] = excluded',
+      'r["in_scope"] = [n for n in unmapped if P.IN_SCOPE_RE.match(n)]',
+      'now = B.beijing_now().isoformat(timespec="seconds")',
+      "th = {'fetched_at': now, 'models': [], '_unmapped_in_scope': ['Hy4', '混元5']}",
+      "io.open(os.path.join(tmp, 'tokenhub_lang.json'), 'w', encoding='utf-8').write(json.dumps(th, ensure_ascii=False))",
+      'deg = B._degraded_state({}, [], {})',
+      'r["unrec"] = [u.get("name") for u in (deg.get("unrecognized_models") or [])]',
+      'r["since"] = deg.get("since")',
+      "th2 = {'fetched_at': now, 'models': []}",
+      "io.open(os.path.join(tmp, 'tokenhub_lang.json'), 'w', encoding='utf-8').write(json.dumps(th2, ensure_ascii=False))",
+      'deg2 = B._degraded_state({}, [], {})',
+      'r["empty"] = [u.get("name") for u in (deg2.get("unrecognized_models") or [])]',
+      'print("@@RES@@" + json.dumps(r, ensure_ascii=False) + "@@END@@")',
+    ].join('\n');
+    const r122 = spawnSync(PY122, ['-c', py122, SRC, tmp122], {
+      env: Object.assign({}, process.env, PY_IO_ENV), encoding: 'utf-8', windowsHide: true, timeout: 60000,
+    });
+    const mo122 = /@@RES@@([\s\S]*?)@@END@@/.exec(String(r122.stdout || ''));
+    let d122 = null;
+    try { d122 = mo122 ? JSON.parse(mo122[1]) : null; } catch (e) { d122 = null; }
+    if (!d122) {
+      ok('T122-a/b python 行为组可执行', false,
+        `python 未返回可解析结果 status=${r122.status} err=${String(r122.stderr || '').slice(0, 400)}`);
+    } else {
+      // a) 三路分类：Hy-MT（翻译系）必须被范围外排除、不进 unmapped；第三方与混元新品都进 unmapped；
+      //    再按 IN_SCOPE_RE 筛，只留腾讯自家命名。
+      //    ⚠ 这一步是"只报真漏收"的**唯一闸门**：若 IN_SCOPE_RE 失效（恒真），
+      //      第三方转售新品会天天进漏收告警 → 立刻变成噪音 → 用户又会忽略它。
+      ok('T122-a ★split_scope + IN_SCOPE_RE 只把「腾讯自家未识别名」判为漏收（第三方转售不得混入）',
+        JSON.stringify(d122.unmapped) === JSON.stringify(['Hy4', 'Kimi K3.1 Pro', 'DeepSeek-V4.1-Flash'])
+        && JSON.stringify(d122.excluded) === JSON.stringify(['Hy-MT2-Pro'])
+        && JSON.stringify(d122.in_scope) === JSON.stringify(['Hy4']),
+        `unmapped=${JSON.stringify(d122.unmapped)} excluded=${JSON.stringify(d122.excluded)} in_scope=${JSON.stringify(d122.in_scope)}`);
+      // b) 数据流：parse_tokenhub 写的 _unmapped_in_scope 必须真的出现在 index.json 的
+      //    _fetch_degraded.unrecognized_models 里（否则 Node 侧拿不到、弹窗永远不响）
+      ok('T122-b ★_unmapped_in_scope 必须被 build_index 汇进 _fetch_degraded.unrecognized_models（否则无人可见）',
+        JSON.stringify(d122.unrec) === JSON.stringify(['Hy4', '混元5'])
+        && d122.since && d122.since['unrec:Hy4'],
+        `unrec=${JSON.stringify(d122.unrec)} since=${JSON.stringify(d122.since)}`);
+      // b2) 老 tokenhub_lang.json（本次改动前产出的）没有该字段 → 必须安静，不得凭空报漏收
+      ok('T122-b2 ★tokenhub_lang.json 无 _unmapped_in_scope 时不得凭空报漏收（老数据兼容 / 自愈基线）',
+        Array.isArray(d122.empty) && d122.empty.length === 0, JSON.stringify(d122.empty));
+    }
+    try { fs.rmSync(tmp122, { recursive: true, force: true }); } catch (e) { /* 清理失败不影响断言 */ }
+  }
+
+  if (!tt122) ok('T122-c/d/e 行为验证（漏收标签与报表）', false, 'token-tracker.js require 失败 —— CI 正常环境下这必是代码回归，不允许静默跳过');
+  else {
+    // 假降级态：只放一个漏收名 Hy4（页面显示名），本轮宿主上报的是 hy4-free
+    const dp = { _fetch_degraded: { unrecognized_models: [{ name: 'Hy4', since: '2026-11-04' }] } };
+    // c) 本轮用到的正是那个漏收模型 → 必须挂标签
+    //    匹配走 unrecMentionsModel（归一成纯字母数字后互为子串）：`hy4` ⊂ `hy4free`
+    ok('T122-c ★本轮模型就是漏收那个时必须挂「⚠漏收」（Hy4 ↔ hy4-free 跨命名匹配）',
+      tt122.unrecognizedModelsTag({ model: 'hy4-free', modelMain: 'hy4-free' }, dp) === '⚠漏收',
+      JSON.stringify(tt122.unrecognizedModelsTag({ model: 'hy4-free', modelMain: 'hy4-free' }, dp)));
+    // d) 噪音纪律（对齐 v3.30.0 A-8）：本轮模型与之无关 → **不许**挂，否则每条弹窗都带 = 永久噪音
+    ok('T122-d ★本轮模型与漏收项无关时不得挂标签（防「永久噪音」，A-8 同款坑）',
+      tt122.unrecognizedModelsTag({ model: 'glm-5.3-flash', models: { 'glm-5.3-flash': {} } }, dp) === '',
+      JSON.stringify(tt122.unrecognizedModelsTag({ model: 'glm-5.3-flash', models: { 'glm-5.3-flash': {} } }, dp)));
+    // e) 报表出口：全量列出（报表是主动检查动作，全量才有诊断价值），干净数据返回 ''（输出逐字节不变）
+    const n122 = tt122.formatUnrecognizedNotice(dp._fetch_degraded);
+    ok('T122-e ★--report 报表必须全量列出漏收项（含「自何日起」与修复指引）',
+      n122.indexOf('Hy4') >= 0 && n122.indexOf('2026-11-04') >= 0 && n122.indexOf('BRAND_MAP') >= 0,
+      JSON.stringify(n122.slice(0, 160)));
+    ok('T122-e2 ★无漏收 / 字段缺失时报表提示必须为空串（既有出口输出不得变化）',
+      tt122.formatUnrecognizedNotice({ unrecognized_models: [] }) === ''
+      && tt122.formatUnrecognizedNotice(null) === ''
+      && tt122.formatUnrecognizedNotice({}) === '',
+      JSON.stringify([tt122.formatUnrecognizedNotice({ unrecognized_models: [] }), tt122.formatUnrecognizedNotice(null)]));
+  }
+
+  // f) 源码级：标签必须真接进 periodNote 的拼接行（防"函数写了但没调用"——
+  //    本项目已有 KI-41/KI-42/KI-60 三条"代码在、通路断"的先例）
+  const n122 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8'));
+  const tagLine122 = /const tag = \[[^\]]*\]/.exec(n122);
+  ok('T122-f ★unrecognizedModelsTag 必须接进 periodNote 的标签拼接行（否则弹窗永远不显示⚠漏收）',
+    !!tagLine122 && tagLine122[0].indexOf('unrecognizedModelsTag(stat, pricing)') >= 0,
+    tagLine122 ? tagLine122[0].slice(0, 240) : '未找到 const tag = [...] 行');
+  // g) 源码级：三个 --report 出口都要接（区间表 / 单日表 / summary），少一个就有一种报表看不见漏收
+  const calls122 = n122.split('const _unrecNotice = unrecognizedModelsNotice()').length - 1;
+  ok('T122-g ★--report 三个出口都必须接 unrecognizedModelsNotice()（区间/单日/summary）',
+    calls122 === 3, `实际接入 ${calls122} 处（期望 3）`);
+  // h) 源码级：`_fetch_degraded` 的**挂载闸门**必须含 unrecognized_models 一路。
+  //    这是全链最容易漏的接点，且漏了之后症状极具迷惑性：漏收的典型形态恰恰是
+  //    「厂商抓取全正常 + 源不陈旧 + 价锁没问题」→ 只有这一路非空；
+  //    闸门若不认它 → 整个 _fetch_degraded 被 delete → ⚠漏收 标签与报表明细**双双失效**，
+  //    而数据源里明明写着漏了。与 T98-a6（价锁那一路）是同一个坑的第二例。
+  ok('T122-h ★_fetch_degraded 挂载闸门必须认 unrecognized_models（漏它 → 该标签永不显示）',
+    /if \(_degOn\) pricing\._fetch_degraded = _deg;/.test(n122)
+    && /Array\.isArray\(_deg\.unrecognized_models\) && _deg\.unrecognized_models\.length > 0/.test(n122),
+    '挂载闸门（mergeLocalPriceDb 的 _degOn）缺 unrecognized_models 分支');
+}
+
+// ===== T123（2026-11-04 F 批）：别名表清空 + 后缀剥离独立生效 =====
+{
+  const tk = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  // a) 别名表必须为空 —— 原 4 条 hy4-* 实测是死代码（清空后仍靠后缀剥离命中），
+  //    留着会让人误以为"混元四是手工映射的"。以后要加别名必须是人工核实过的厂商改名类。
+  const mAlias = tk.match(/const MODEL_ALIASES = \{([\s\S]*?)\n\};/);
+  const body = mAlias ? mAlias[1] : null;
+  const entryCount = body ? (body.match(/^\s*'[^']+'\s*:/gm) || []).length : -1;
+  ok('T123-a ★MODEL_ALIASES 必须为空（4 条 hy4-* 已证死代码；留着会误导"混元四是手工映射"）',
+    !!mAlias && entryCount === 0,
+    'MODEL_ALIASES 仍有 ' + entryCount + ' 条条目；若确需别名，必须是人工核实过的厂商改名，不能是计费档后缀');
+
+  // b) **行为断言**：别名表清空后，hy4 的四种写法必须仍靠后缀剥离命中 hy4。
+  //    这是在真 findModel 上跑（不是扫源码），别名表一旦被清空得过头/后缀链路断了都会红。
+  const pr123 = { models: { hy4: { input_price: 6, output_price: 18, cached_price: 0.3 } } };
+  const tt123 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  const bad123 = ['hy4-free', 'hy4free', 'hy4std', 'hy4-std'].filter((n) => {
+    if (!tt123 || typeof tt123.findModel !== 'function') return true;
+    const h = tt123.findModel(pr123, n, 'price');
+    return !(h && h.key === 'hy4');
+  });
+  ok('T123-b ★hy4-free/hy4free/hy4std/hy4-std 必须仍命中 hy4（别名表清空后靠 channelStemOf，不许回归成未收录）',
+    bad123.length === 0,
+    '以下名字在别名表清空后无法命中 hy4：' + bad123.join(', '));
+}
+
+// ===== T124（2026-11-04 D/E 批）：宿主官方显示名前置 + 拒绝误吞 + 分歧留痕 =====
+//   病根：取价时手上只有宿主上报的 id（`hy4-free` / `hy4previewexp1` / `hy4-pro`），价库 key 是厂商
+//     api 名（`hy4` / `hy4-preview`）。靠后缀白名单只能覆盖 6 个后缀，名单外的会被**边界匹配吞成主型号**
+//     —— 一个不同价的新型号被按老型号记账，数值合理、无告警、事后查不出。宿主目录的 name 字段是
+//     宿主自己声明的型号身份，用它查价库不需要猜任何后缀。
+{
+  const tk124 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  const tm124 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  const ok124 = !!tm124;
+
+  // a) findModel 必须支持 opts.skipHost / opts.hostMap（否则分歧检测无法算"不走宿主名"的对照，测试也注入不了）
+  ok('T124-a ★findModel 必须支持 opts.skipHost 与 opts.hostMap（分歧检测要算对照；测试要能注入假目录）',
+    /function findModel\(pricing, modelName, mode, opts\)/.test(tk124)
+    && /if \(!\(opts && opts\.skipHost\)\) \{/.test(tk124)
+    && /hostDisplayNameOf\(modelName, opts && opts\.hostMap\)/.test(tk124),
+    'findModel 缺少 opts 参数 / skipHost 分支 / hostMap 注入');
+
+  // b) 顺序硬约束：宿主名这一级必须在「后缀剥离」**之前**，但必须在「精确/去标点/别名」**之后**。
+  //    放在后缀之后 = 后缀名单外的名字先被剥没，宿主名永远没机会；放在精确之前 = 会把精确命中改判。
+  {
+    const iHost = tk124.indexOf('hostDisplayNameOf(modelName, opts && opts.hostMap)');
+    const iStem = tk124.indexOf('const _stem = channelStemOf(norm);');
+    const iAlias = tk124.indexOf('const alias = MODEL_ALIASES[norm];');
+    ok('T124-b ★宿主名级必须夹在「别名表之后」与「后缀剥离之前」之间（顺序错 → 精确被改判 / 宿主名永远轮不到）',
+      iAlias >= 0 && iHost > iAlias && iStem > iHost,
+      '顺序不对：iAlias=' + iAlias + ' iHost=' + iHost + ' iStem=' + iStem);
+  }
+
+  // c) ★行为断言：宿主认识这个 id、但宿主名在价库里查不到 → **必须拒绝回落到边界猜主型号**。
+  //    hy4pro 宿主叫「Hy4 Pro」，价库只有 hy4 → 正确结果是 null（未收录），不是 hy4。
+  //    这条就是"不同价新型号被吞成老型号"的唯一防线。
+  {
+    const p124 = { models: { hy4: { input_price: 6, output_price: 18, cached_price: 0.3 } } };
+    const hm124 = { hy4pro: 'Hy4 Pro', hy4previewexp1: 'Hy4 preview', kimik31: 'Kimi-K3', hy4std: 'Hy4' };
+    const r = ok124 ? tm124.findModel(p124, 'hy4-pro', 'price', { hostMap: hm124 }) : undefined;
+    const noHost = ok124 ? tm124.findModel(p124, 'hy4-pro', 'price', { hostMap: hm124, skipHost: true }) : undefined;
+    ok('T124-c ★宿主名查不到价库时必须拒绝回落（hy4pro→未收录，不得被吞成 hy4）',
+      ok124 && r === null && noHost && noHost.key === 'hy4',
+      '宿主名版应返回 null（拒绝回落），id 规则版应为 hy4（证明回落确实存在、是这道闸挡住的）');
+  }
+
+  // d) ★行为断言：宿主名能把"后缀剥离救不回来"的 id 救回（hy4previewexp1 → hy4-preview）
+  {
+    const p124d = { models: { hy4: { input_price: 6, output_price: 18, cached_price: 0.3 }, 'hy4-preview': { input_price: 6, output_price: 18, cached_price: 0.3 } } };
+    const hm124d = { hy4previewexp1: 'Hy4 preview' };
+    const r = ok124 ? tm124.findModel(p124d, 'hy4previewexp1', 'price', { hostMap: hm124d }) : undefined;
+    ok('T124-d ★宿主名必须救回后缀规则救不掉的 id（hy4previewexp1 → hy4-preview）',
+      ok124 && r && r.key === 'hy4-preview',
+      '宿主名版未能命中 hy4-preview');
+  }
+
+  // e) ★行为断言（零回归）：精确命中永远优先，不许被宿主名"降级"成同系列短名。
+  //    kimi-k3-1 精确在价库里；宿主名却是「Kimi-K3」→ 必须仍是 kimi-k3-1。
+  {
+    const p124e = { models: { 'kimi-k3-1': { input_price: 20, output_price: 100, cached_price: 2 }, 'kimi-k3': { input_price: 20, output_price: 100, cached_price: 2 } } };
+    const hm124e = { kimik31: 'Kimi-K3' };
+    const r = ok124 ? tm124.findModel(p124e, 'kimi-k3-1', 'price', { hostMap: hm124e }) : undefined;
+    ok('T124-e ★精确命中必须优先于宿主名（kimi-k3-1 不得被宿主名降级成 kimi-k3）',
+      ok124 && r && r.key === 'kimi-k3-1',
+      '宿主名把精确命中改判了 —— 这是最危险的回归');
+  }
+
+  // f) buildHostIdNameMap 纯函数：中文名跳过（否则所有中文名撞成同一 key）/ 空值跳过 / 先到先得
+  {
+    const m = ok124 ? tm124.buildHostIdNameMap([
+      { id: 'hy4free', name: 'Hy4' },
+      { id: 'fast-model', name: '快速' },      // 归一后为空 → 必须跳过
+      { id: '', name: 'X' },                  // 空 id → 跳过
+      { id: 'x1', name: '' },                 // 空名 → 跳过
+      { id: 'hy4std', name: 'Hy4' },
+      { id: 'HY4STD', name: 'Hy4-Second' },   // 同 key 先到先得 → 保留 'Hy4'
+    ]) : null;
+    ok('T124-f ★buildHostIdNameMap 必须跳过中文/空值，且同 key 先到先得（否则中文名模型会撞成同一个 key）',
+      ok124 && m && m.hy4free === 'Hy4' && m.fastmodel === undefined && m.x1 === undefined
+      && Object.keys(m).length === 2 && m.hy4std === 'Hy4',
+      '归一结果不对：' + JSON.stringify(m));
+  }
+
+  // g) 分歧留痕：空列表必须返回 ''（既有出口输出不变）；非空必须含 model / 两侧 key / 指引
+  {
+    const empty = ok124 ? tm124.formatPriceMatchConflicts([]) : undefined;
+    const nonEmpty = ok124 ? tm124.formatPriceMatchConflicts([
+      { model: 'custom-local:deepseek-flash', by_id: 'deepseek-flash', by_host: 'deepseek-v4.1-flash', at: '2026-11-04T17:00:00' },
+    ]) : undefined;
+    ok('T124-g ★分歧提示：无分歧必须空串（既有输出不变）；有分歧必须点出两侧 key（否则等于没说）',
+      ok124 && empty === '' && typeof nonEmpty === 'string'
+      && nonEmpty.indexOf('custom-local:deepseek-flash') >= 0
+      && nonEmpty.indexOf('deepseek-flash') >= 0
+      && nonEmpty.indexOf('deepseek-v4.1-flash') >= 0,
+      '空/非空分支或字段缺失');
+  }
+
+  // h) --report 三个出口都必须接分歧提示（漏一个 → 那条出口永远看不到分歧）
+  {
+    const n124 = (tk124.match(/const _conflictNotice = priceMatchConflictNotice\(\);/g) || []).length;
+    ok('T124-h ★--report 三个出口（区间/单日/summary）都必须接 priceMatchConflictNotice()',
+      n124 === 3,
+      '实际接了 ' + n124 + ' 处，应为 3 处');
+  }
+
+  // i) 性能硬约束：只准扫已知两个目录 + 必须带 TTL 缓存。
+  //    全树 walk 实测 900ms（会拖慢弹窗），退回去就是性能事故。
+  // j) ★用户自建模型（`custom-local:*`）**不得**用宿主显示名取价 —— 那是用户自己填的文字，不是厂商身份。
+  //    实测证据：E 批留痕文件第一条就是 `custom-local:deepseek-flash` 的 name = 「DeepSeek-V4.1-Flash」，
+  //    旧 D 批逻辑会按宿主名改判到 `deepseek-v4.1-flash`（本机这两条同价，纯属侥幸）。
+  {
+    const mm = (ok124 && tm124.buildHostIdNameMap) ? tm124.buildHostIdNameMap([
+      { id: 'custom-local:deepseek-flash', name: 'DeepSeek-V4.1-Flash' },
+      { id: 'hy4free', name: 'Hy4' },
+    ]) : null;
+    const p124j = { models: { 'deepseek-flash': { input_price: 1, output_price: 4, cached_price: 0.02 },
+      'deepseek-v4.1-flash': { input_price: 1, output_price: 4, cached_price: 0.02 } } };
+    const rj = ok124 ? tm124.findModel(p124j, 'custom-local:deepseek-flash', 'price', { hostMap: mm }) : undefined;
+    ok('T124-j ★custom-local:* 必须跳过宿主名（用户自填的文字不能当厂商型号身份），仍走 id 规则',
+      ok124 && !!mm && mm['customlocaldeepseekflash'] === undefined && mm.hy4free === 'Hy4'
+      && rj && rj.key === 'deepseek-flash',
+      JSON.stringify({ map: mm, hit: rj && rj.key }));
+  }
+
+  ok('T124-i ★loadHostCatalog 只准扫 cache/ 两个已知目录且必须带 TTL（全树 walk 实测 900ms）',
+    /const dirs = \[path\.join\(root, 'cache'\), path\.join\(root, 'cache', 'conversation-product-spill'\)\]/.test(tk124)
+    && /HOST_CATALOG_TTL_MS/.test(tk124)
+    && /_hostCatalog\.done && \(Date\.now\(\) - _hostCatalog\.at\) < HOST_CATALOG_TTL_MS/.test(tk124),
+    '目录范围或 TTL 缓存缺失');
+}
+
+// ===== T125（2026-11-04 批27 · A1）：已查列表的"保质期" =====
+//   病根：`.lookedup-models.json` 是纯字符串数组、无时间戳 → **一次失败永久拉黑**，且把两种完全不同的
+//   情况压成同一状态：① 公开源真的没有这个模型（该拉黑）；② 我们查的名字在公开世界不存在 / 上游临时
+//   故障（过几天就可能查到）。实测 `hy4-free` 就是这样被锁死的。修法：条目带时间戳，7 天后过期可重查。
+{
+  const tm125 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  const tk125 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  const DAY = 24 * 3600 * 1000;
+  const NOW = 1800000000000;
+
+  // a) 旧格式（纯字符串）必须能迁移，且迁移时间戳 = 读到的时刻（不是 0、也不是文件 mtime）——
+  //    用 mtime 会让升级后第一次运行把积压条目一次性判过期，几十条并发联网。
+  const mig = tm125 ? tm125.parseLookedupPayload(['wb-lite', { n: 'x', t: 500 }, '', null, 42], NOW) : null;
+  ok('T125-a ★旧格式（纯字符串数组）必须迁移成 {n,t}，t=读到时刻（否则升级后积压条目一次性判过期→并发联网）',
+    !!mig && mig.legacy === true && mig.out.length === 2
+    && mig.out[0].n === 'wb-lite' && mig.out[0].t === NOW
+    && mig.out[1].n === 'x' && mig.out[1].t === 500,
+    JSON.stringify(mig));
+
+  // b) 过期语义：6 天算"查过"，8 天算"没查过"；t 缺失/为 0 一律按过期（宁可多查一次，也别永久锁死）
+  const al = (t) => (tm125 ? tm125.lookedupEntryAlive({ n: 'x', t }, NOW) : null);
+  ok('T125-b ★保质期边界：6 天内仍算查过、8 天后必须放行重查、缺时间戳一律按过期',
+    al(NOW - 6 * DAY) === true && al(NOW - 8 * DAY) === false && al(0) === false && al(undefined) === false,
+    '6d=' + al(NOW - 6 * DAY) + ' 8d=' + al(NOW - 8 * DAY) + ' t0=' + al(0) + ' tUndef=' + al(undefined));
+
+  // c) 源码：调用点必须走 lookedupHas，不许再用 indexOf 直接判存在（那等于永久黑名单）
+  ok('T125-c ★调用点必须用 lookedupHas(name)，不许残留 loadLookedup().indexOf(name)（后者 = 永久黑名单）',
+    /const looked = lookedupHas\(name\);/.test(tk125) && tk125.indexOf('loadLookedup().indexOf(') < 0);
+
+  // d) 源码：保质期内重复记录必须早退（不重复写盘）；过期后必须刷新时间戳（否则下一轮立刻又过期）
+  ok('T125-d ★rememberLookedup 保质期内不重复写盘、过期后刷新时间戳（否则每轮都重新联网）',
+    /if \(lookedupEntryAlive\(a\[idx\], Date\.now\(\)\)\) return;/.test(tk125)
+    && /a\[idx\]\.t = Date\.now\(\);/.test(tk125));
+}
+
+// ===== T126（2026-11-04 批27 · A2）：兜底查询按候选名逐个试 =====
+//   病根：宿主 id / 宿主显示名 / 厂商 api 名是三套体系（hy4-free / Hy4 / hy4）。原来只拿剥后缀名
+//   赌一次，源里换个写法就判 NOT_FOUND，再被已查列表锁死 → 弹窗永远「未收录」，其实源里有价。
+{
+  const tm126 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  const tk126 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  const o126 = !!tm126;
+
+  const c1 = (o126 && tm126.buildLookupCandidates) ? tm126.buildLookupCandidates('hy4-free') : [];
+  ok('T126-a ★候选名顺序 = 剥后缀名 → 原 id → 宿主显示名，且必须去重',
+    !!o126 && c1[0] === 'hy4' && c1.indexOf('hy4-free') > 0 && c1.length === new Set(c1).size,
+    JSON.stringify(c1));
+
+  const c2 = (o126 && tm126.buildLookupCandidates) ? tm126.buildLookupCandidates('deepseek-v4.1-flash') : [];
+  ok('T126-b ★不带可剥后缀的模型候选首位仍是原名（既有模型的查询名零变化）',
+    !!o126 && c2[0] === 'deepseek-v4.1-flash',
+    JSON.stringify(c2));
+
+  let calls = [];
+  const r1 = o126 ? tm126.lookupFirstHit(['a', 'b', 'c'], (x) => { calls.push(x); return x === 'b' ? { id: 'b' } : null; }) : null;
+  ok('T126-c ★命中即停（第 2 个命中后不得再查第 3 个，避免无谓联网）',
+    !!r1 && !!r1.hit && r1.hit.id === 'b' && r1.usedName === 'b' && calls.join(',') === 'a,b',
+    calls.join(','));
+
+  calls = [];
+  const r2 = o126 ? tm126.lookupFirstHit(['a', 'b', 'c'], (x) => { calls.push(x); return undefined; }) : null;
+  ok('T126-d ★源不可达必须立刻停（不得把一次超时放大成三次）',
+    !!r2 && r2.unreachable === true && r2.hit === null && calls.length === 1,
+    'calls=' + calls.length);
+
+  calls = [];
+  const r3 = o126 ? tm126.lookupFirstHit(['a', 'b'], (x) => { calls.push(x); return x === 'a' ? tm126.NO_PUBLIC_PRICE : { id: 'b' }; }) : null;
+  ok('T126-e ★前面候选是「无公开价」时必须继续试后面的（有价模型不能被记成 0 元）',
+    !!r3 && !!r3.hit && r3.hit.id === 'b' && r3.noPublic === true,
+    JSON.stringify({ hit: !!(r3 && r3.hit), noPublic: !!(r3 && r3.noPublic) }));
+
+  const r4 = o126 ? tm126.lookupFirstHit(['a', 'b'], () => tm126.NO_PUBLIC_PRICE) : null;
+  ok('T126-f ★全部候选都是无公开价 → noPublic=true 且 hit=null（调用方据此写 unpublished 条目，而不是"未收录"）',
+    !!r4 && r4.noPublic === true && r4.hit === null && r4.unreachable === false,
+    JSON.stringify(r4));
+
+  ok('T126-g ★两个查价源都必须走 lookupFirstHit(cands,…)，且禁止直传宿主原样 id',
+    /lookupFirstHit\(cands, lookupCnPrice\)/.test(tk126) && /lookupFirstHit\(cands, lookupOrPrice\)/.test(tk126)
+    && tk126.indexOf('lookupCnPrice(stat.model)') < 0 && tk126.indexOf('lookupOrPrice(stat.model)') < 0);
+
+  ok('T126-h ★命中时把实际用的查询名写进 stderr（否则事后无法解释"这次为什么查到了"）',
+    /按查询名「\$\{cnRes\.usedName\}」命中/.test(tk126) && /按查询名「\$\{orRes\.usedName\}」命中/.test(tk126));
+}
+
+// ===== T127（2026-11-04 批27 · B）：弹窗把「未收录」与「无公开价」分开标 =====
+//   病根：行1 原来只标「⚠无公开价」；"未收录"只在行2 金额位显示，而**混合轮**里金额位给的是
+//   有价部分的和，缺的那块只剩「⚠未计价」→ 用户看不出成因是"厂商没公布价（等）"还是
+//   "我们库里没这个模型（该补库）"。两种动作完全不同，必须分开标。
+{
+  const tm127 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+  const tk127 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+  const o127 = !!tm127;
+  const pr127 = { models: {
+    'known-m': { input_price: 1, output_price: 2, cached_price: 0.1, region: 'CN' },
+    'unpub-m': { input_price: 0, output_price: 0, pricing_status: 'unpublished' },
+  } };
+  const un = (st) => (o127 ? tm127.anyUnpricedModel(st, pr127) : null);
+  // a) 三态互斥：已收录=false、无公开价=false（归另一条标注）、真未收录=true
+  ok('T127-a ★「未收录」判定必须与「无公开价」互斥（重叠标注 = 同一轮挂两个原因，用户更糊涂）',
+    un({ model: 'known-m' }) === false && un({ model: 'unpub-m' }) === false && un({ model: 'miss-m' }) === true,
+    JSON.stringify({ known: un({ model: 'known-m' }), unpub: un({ model: 'unpub-m' }), miss: un({ model: 'miss-m' }) }));
+
+  // b) 本地模型必须排除（cost 恒 null 是既定正确行为，否则纯本地轮误标"未收录"）
+  const body127 = (tk127.match(/function anyUnpricedModel[\s\S]*?\n\}/) || [''])[0];
+  ok('T127-b ★本地模型必须排除在「未收录」之外（本地不计费 ≠ 价库漏收）',
+    body127.indexOf('isLocalModel(n)') > 0);
+
+  // c) 行1 标注优先级：无公开价 > 未收录；空轮不标；混合轮照样标
+  const t127 = (st) => (o127 ? tm127.noPriceTag1(st, pr127) : null);
+  ok('T127-c ★行1 标注：无公开价优先、未收录次之、无 token 不标、混合轮也要标',
+    t127({ model: 'unpub-m', in: 100, out: 10 }) === '｜⚠无公开价'
+    && t127({ model: 'miss-m', in: 100, out: 10 }) === '｜⚠未收录'
+    && t127({ model: 'miss-m', in: 0, out: 0 }) === ''
+    && t127({ model: 'known-m', in: 5, out: 1, models: { 'known-m': { in: 5, out: 1 }, 'miss-m': { in: 1, out: 1 } } }) === '｜⚠未收录',
+    JSON.stringify([t127({ model: 'unpub-m', in: 100, out: 10 }), t127({ model: 'miss-m', in: 100, out: 10 }), t127({ model: 'miss-m', in: 0, out: 0 })]));
+
+  // d) ★宽度分层退让：行1 挤爆时**不许把来源标注（补弹）连坐丢掉**
+  //    实测事故（本条加标后 T102-b2 当场红）：加「｜⚠未收录」使 period+tag 预算 <8u →
+  //    旧的两档逻辑一路退到"只剩裸模型名"，补弹弹窗变成 `orph-model`，用户看不出这条哪来的。
+  //    现三档：period+tag → period → 名字。来源标注（哪条弹窗）比价格标注重要（行2 还有兜底）。
+  const l1a = o127 ? String(tm127.toastLine1({ in: 100, out: 10, durMs: 1000 }, 'orph-model', '（补弹 时长 2.0s 今日 ¥0.03）', '', '', '｜⚠未收录')).split('\n')[0] : '';
+  const l1b = o127 ? String(tm127.toastLine1({ in: 100, out: 10, durMs: 1000 }, 'm1', '（补弹 80%）', '', '', '｜⚠未收录')).split('\n')[0] : '';
+  ok('T127-d ★行1 超宽时先丢价格标注、必须保住来源标注「（补弹 …）」；放得下时两者都要',
+    l1a.indexOf('补弹') >= 0 && l1b.indexOf('补弹') >= 0 && l1b.indexOf('⚠未收录') >= 0,
+    JSON.stringify({ wide: l1a, narrow: l1b }));
+}
+
+// ===== T128（2026-11-04 批27 · C）：TokenHub 读 `model（调用参数）` 列 + 双轨收录 =====
+//   病根：页面第 2 列 `model（调用参数）` 是腾讯自己声明的真实 api 名（实测 Hy4→hy4、
+//   Hy-Role-Latest→hunyuan-role-latest），此前**完全没被读**（COL_SYNONYMS['name'] 里的 'model'
+//   同义词被「模型名称」先占位，这一列被静默丢弃）。它是"宿主上报的 id 长什么样"的权威来源。
+//   ③ 实测抓到的真不一致：Hy-Role-Latest 表内 hy-role-latest / 官网 hunyuan-role-latest。
+{
+  const tk128 = stripComments(fs.readFileSync(path.join(SRC, 'parse_tokenhub.py'), 'utf-8').replace(/\r\n/g, '\n'));
+  // a) 源码：api 列必须由**第二遍**认领，并跳过已被 name 占用的那一列（否则英文表 Model 被抢走）
+  ok('T128-a ★api 列必须单独第二遍认领且跳过 name 列（同义词表里 model/api 会与 name 抢同一列）',
+    /'api': \(\)/.test(tk128)
+    && /res\['api'\] = None/.test(tk128)
+    && /if i == res\['name'\]/.test(tk128)
+    && /if '调用参数' in cl or 'api' in cl or re\.search\(r'model', cl\)/.test(tk128));
+
+  // b) 源码：解析要落到 api_decl、双轨收录要留痕 api_source='page'、main 要跑交叉校验
+  ok('T128-b ★解析必须落 api_decl；双轨收录必须留痕 api_source="page"；main 必须调 verify_api_names',
+    /'api_decl': pick_api_decl\(get\(r, i_api\)\)/.test(tk128)
+    && /m\['api_source'\] = 'page'/.test(tk128)
+    && /mismatch = verify_api_names\(models\)/.test(tk128));
+
+  // c) 行为（真跑 python）：pick_api_decl / map_columns / 双轨判定 / 交叉校验
+  const py128 = (() => {
+    if (process.env.CN_PYTHON) return process.env.CN_PYTHON;
+    try {
+      const root = path.join(os.homedir(), '.workbuddy', 'binaries', 'python', 'versions');
+      for (const v of fs.readdirSync(root).sort().reverse()) {
+        const p0 = path.join(root, v, 'python.exe');
+        if (fs.existsSync(p0)) return p0;
+      }
+    } catch (e) { /* 探测失败 → 回退裸 python */ }
+    return 'python';
+  })();
+  const probe128 = spawnSync(py128, ['-c', 'print(1)'], { timeout: 20000, windowsHide: true, env: Object.assign({}, process.env, PY_IO_ENV) });
+  if (!SPAWN_OK || probe128.status !== 0) {
+    envSkip('T128-c ★python 行为验证（pick_api_decl / map_columns / 双轨 / 交叉校验）',
+      !SPAWN_OK ? SPAWN_SKIP_REASON : ('未找到可用 python（试探 ' + py128 + ' 失败）'));
+  } else {
+    const scr128 = path.join(tmp, 't128.py');
+    fs.writeFileSync(scr128, [
+      'import sys, json, os',
+      'sys.path.insert(0, ' + JSON.stringify(SRC.replace(/\\/g, '/')) + ')',
+      'import parse_tokenhub as P',
+      'out = {}',
+      "# pick_api_decl：多值取第一个非斜杠 token；纯斜杠/中文 → ''",
+      "out['decl_multi'] = P.pick_api_decl('deepseek-v4-flash-202605 deepseek/deepseek-v4-flash-0731')",
+      "out['decl_slash'] = P.pick_api_decl('deepseek/deepseek-flash')",
+      "out['decl_cn'] = P.pick_api_decl('模型名称')",
+      "out['decl_plain'] = P.pick_api_decl('hunyuan-role-latest')",
+      '# map_columns：中文表头 + 英文表头都不许把 name 抢走',
+      "out['map_cn'] = P.map_columns(['模型名称', 'model（调用参数）', '条件 （token）', '峰谷计费', '推理输入 （元/百万 tokens）', '推理输出 （元/百万 tokens）'])",
+      "out['map_en'] = P.map_columns(['Model', 'Input Price', 'Output Price'])",
+      '# 双轨判定',
+      "out['ten_hy4'] = P._page_api_is_tencent({'api_decl': 'hy4'})",
+      "out['ten_mt'] = P._page_api_is_tencent({'api_decl': 'hy-mt2-pro'})",
+      "out['ten_ds'] = P._page_api_is_tencent({'api_decl': 'deepseek-v4-flash'})",
+      '# 交叉校验：腾讯自家不一致要抓到；第三方不一致不报',
+      "ms = [{'name': 'Hy-Role-Latest', 'brand': 'hunyuan', 'api_name': 'hy-role-latest', 'api_decl': 'hunyuan-role-latest'},",
+      "      {'name': 'Hy4', 'brand': 'hunyuan', 'api_name': 'hy4', 'api_decl': 'hy4'},",
+      "      {'name': 'DeepSeek-X', 'brand': 'deepseek', 'api_name': 'deepseek-x', 'api_decl': 'deepseek-x-202605'}]",
+      'out[\'mis\'] = P.verify_api_names(ms)',
+      "out['mis_field'] = ms[0].get('api_mismatch', {})",
+      'print(json.dumps(out, ensure_ascii=False))',
+    ].join('\n'));
+    const r128 = spawnSync(py128, [scr128], { timeout: 60000, windowsHide: true, env: Object.assign({}, process.env, PY_IO_ENV), encoding: 'utf-8' });
+    let o128 = null;
+    try { o128 = JSON.parse(String(r128.stdout || '').trim().split('\n').pop()); } catch (e) { o128 = null; }
+    ok('T128-c ★pick_api_decl：多值取首个非斜杠 token、纯斜杠/中文 → 空串（宁可没有，也不拿半截名字当 key）',
+      !!o128 && o128.decl_multi === 'deepseek-v4-flash-202605' && o128.decl_slash === ''
+      && o128.decl_cn === '' && o128.decl_plain === 'hunyuan-role-latest',
+      JSON.stringify(o128) + ' stderr=' + String(r128.stderr || '').slice(0, 300));
+    ok('T128-d ★map_columns 两种表头都不许抢走 name 列（中文表 api=1；英文表 api 不得顶替 name）',
+      !!o128 && o128.map_cn.name === 0 && o128.map_cn.api === 1
+      && o128.map_en.name === 0 && o128.map_en.api === null,
+      JSON.stringify(o128 && { cn: o128.map_cn, en: o128.map_en }));
+    ok('T128-e ★双轨判据：hy4 → 腾讯；hy-mt2-pro（翻译系）→ 否；deepseek-* → 否',
+      !!o128 && o128.ten_hy4 === true && o128.ten_mt === false && o128.ten_ds === false,
+      JSON.stringify(o128 && { a: o128.ten_hy4, b: o128.ten_mt, c: o128.ten_ds }));
+    ok('T128-f ★交叉校验只报腾讯自家不一致，且必须落 api_mismatch 字段（第三方多值形态不入噪音）',
+      !!o128 && Array.isArray(o128.mis) && o128.mis.length === 1 && o128.mis[0] === 'Hy-Role-Latest'
+      && o128.mis_field.mapped === 'hy-role-latest' && o128.mis_field.declared === 'hunyuan-role-latest',
+      JSON.stringify(o128 && { mis: o128.mis, f: o128.mis_field }));
+  }
+}
+
+// ===== T129（2026-11-04 批28 · C / KI-61）：findModel 第 2.3 级「官网声明的调用参数名」 =====
+//   病根：`Hy-Role-Latest` 表内写 `hy-role-latest`，腾讯官网「model（调用参数）」列声明的是
+//   `hunyuan-role-latest`。宿主认的是 API 名 → 只按 key 匹配会判「未收录」，而价就在库里
+//   （实测 2.4 / 9.6 元每百万 tokens，索引 key = `hyrolelatest`）。
+//   为什么不改 key：key = 账本桶名（daily-usage.json 的 models 键），改名会把历史计量分裂成两个桶。
+//   为什么不加别名表：F 批刚清空（手写规则随厂商改名腐烂）；这一级吃的是**抓来的真实元数据**，
+//   每次抓取自动更新，不需要人维护。
+{
+  const tk129 = stripComments(fs.readFileSync(path.join(SRC, 'token-tracker.js'), 'utf-8').replace(/\r\n/g, '\n'));
+
+  // a) 源码：这一级必须存在，且撞名必须放弃（两个条目声明同一 api 名 → 无从判断该给谁）
+  ok('T129-a ★findModel 必须有「官网声明名 api_decl」级；撞名时必须放弃（不猜该给谁）',
+    /alnumKey\(_m\.api_decl\) !== normAlnum/.test(tk129)
+    && /_decl && _decl\.key !== key/.test(tk129),
+    '缺少 api_decl 级 或 缺少撞名放弃分支');
+
+  // b) 顺序硬约束：必须在「宿主名之后」「后缀剥离之前」。
+  //    放后缀之后 = 后缀名单外的名字先被剥没，这一级永远轮不到；
+  //    放精确/去标点之前 = 会把已经命中的查询改判成另一条。
+  {
+    const iHost = tk129.indexOf('hostDisplayNameOf(modelName, opts && opts.hostMap)');
+    const iDecl = tk129.indexOf('alnumKey(_m.api_decl)');
+    const iStem = tk129.indexOf('const _stem = channelStemOf(norm);');
+    ok('T129-b ★api_decl 级必须夹在「宿主名之后」与「后缀剥离之前」之间',
+      iHost > 0 && iDecl > iHost && iStem > iDecl,
+      JSON.stringify({ host: iHost, decl: iDecl, stem: iStem }));
+  }
+
+  // c) 数据链路：tokenhub_lang → index → pricing.models 全链路透传。
+  //    ★ mergeLocalPriceDb 不许拿 api_name 顶替 api_decl —— 那等于假装"声明过且一致"，
+  //      而这一级存在的意义正是"声明与 key 不一致"这一情形。
+  {
+    const bi129 = fs.readFileSync(path.join(SRC, 'build_index.py'), 'utf-8');
+    const m129 = (tk129.match(/function mergeLocalPriceDb[\s\S]*?\n\}/) || [''])[0];
+    ok('T129-c ★api_decl 必须从 tokenhub_lang 一路透传到 pricing.models，且不许用 api_name 顶替',
+      bi129.indexOf("'api_decl': m.get('api_decl')") >= 0
+      && m129.indexOf('rec.api_decl = v.api_decl') >= 0
+      && !/rec\.api_decl = v\.api_name/.test(m129),
+      JSON.stringify({ bi: bi129.indexOf("'api_decl': m.get('api_decl')"), rec: m129.indexOf('rec.api_decl') }));
+  }
+
+  // d) 行为（真跑 findModel）：声明名能命中、原 key 写法不受影响、带尾巴的变体不许误收
+  {
+    const tm129 = (() => { try { return require(path.join(skillDir, 'token-tracker.js')); } catch (e) { return null; } })();
+    const mk129 = (decl) => ({ models: {
+      hyrolelatest: { name: 'Hy-Role-Latest', input_price: 2.4, output_price: 9.6, api_decl: decl },
+    } });
+    const hit129 = (p, n) => { try { const r = tm129.findModel(p, n, 'price'); return r && r.key ? r.key : null; } catch (e) { return 'ERR'; } };
+    ok('T129-d ★行为：官网声明名 hunyuan-role-latest 必须命中 hyrolelatest；带尾巴的变体不许误收',
+      !!tm129 && hit129(mk129('hunyuan-role-latest'), 'hunyuan-role-latest') === 'hyrolelatest'
+      && hit129(mk129('hunyuan-role-latest'), 'hy-role-latest') === 'hyrolelatest'
+      && hit129(mk129('hunyuan-role-latest'), 'hunyuan-role-latest-x') === null,
+      JSON.stringify(tm129 ? [hit129(mk129('hunyuan-role-latest'), 'hunyuan-role-latest'),
+        hit129(mk129('hunyuan-role-latest'), 'hy-role-latest'),
+        hit129(mk129('hunyuan-role-latest'), 'hunyuan-role-latest-x')] : null));
+    ok('T129-e ★撞名放弃 + 无声明条目不参与（不声明就只按 key 匹配，与加这一级之前完全一致）',
+      !!tm129 && hit129({ models: {
+        a: { name: 'A', input_price: 1, output_price: 1, api_decl: 'hunyuan-role-latest' },
+        b: { name: 'B', input_price: 2, output_price: 2, api_decl: 'hunyuan-role-latest' },
+      } }, 'hunyuan-role-latest') === null
+      && hit129({ models: { c: { name: 'C', input_price: 1, output_price: 1 } } }, 'hunyuan-role-latest') === null
+      && hit129({ models: { d: { name: 'D', input_price: 1, output_price: 1, api_decl: '' } } }, 'hunyuan-role-latest') === null,
+      JSON.stringify(tm129 ? [
+        hit129({ models: { a: { name: 'A', input_price: 1, output_price: 1, api_decl: 'hunyuan-role-latest' }, b: { name: 'B', input_price: 2, output_price: 2, api_decl: 'hunyuan-role-latest' } } }, 'hunyuan-role-latest'),
+        hit129({ models: { c: { name: 'C', input_price: 1, output_price: 1 } } }, 'hunyuan-role-latest'),
+        hit129({ models: { d: { name: 'D', input_price: 1, output_price: 1, api_decl: '' } } }, 'hunyuan-role-latest'),
+      ] : null));
+  }
 }
 
 // v3.24.0（审计⑤）：skip 数显式化 —— 「138 全绿」曾掩盖 26 条端到端用例全部 SKIP 的事实

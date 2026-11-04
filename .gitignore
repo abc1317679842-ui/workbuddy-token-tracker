@@ -57,6 +57,10 @@ docs/*
 !docs/version-diary.md
 # 模型已查列表（本地运行时，不入库）
 .lookedup-models.json
+# 2026-11-04（E 批）：价格映射分歧留痕（本地运行时，不入库）——
+#   里面含**本机实际用过的模型名**（与 .lookedup-models.json 同一隐私等级），
+#   漏了这条 = 用户的本机模型清单可能随仓库/PR 被推出去。
+.price-match-conflicts.json
 
 # v3.20.0：--report --csv 导出目录 / 轮次明细留档（本地运行时数据，会持续增长，不入库）
 exports/

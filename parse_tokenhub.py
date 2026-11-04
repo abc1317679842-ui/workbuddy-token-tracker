@@ -43,6 +43,11 @@ UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
 #   不按 LLM token 库保存）③ 转售第三方（DeepSeek/智谱/Kimi/MiniMax/Qwen/MiMo/阶跃，
 #   各自有官方页或聚合源，不收）。把 Hy-MT 系补进本表会被 NON_GENERAL_RE 双重拦下。
 BRAND_MAP = {
+    # 2026-11-04：Hy4 正式版上线（TokenHub 同日 12:13 加行 `Hy4 | hy4 | 6/18/0.3`），
+    #   本表没跟上 → 该行落到「未识别」被丢弃，只打一条 stderr WARN（hook 子进程里看不到）。
+    #   实测证据：当天 15:08 抓取的 tokenhub_lang.json 里 `_unmapped` 首位就是 "Hy4"。
+    #   → 这是本表**结构性问题**：白名单的漏洞必然落在「最新模型」上，因为新模型天生不在旧表里。
+    'Hy4': ('hunyuan', 'hy4'),
     'Hy4 preview': ('hunyuan', 'hy4-preview'),
     'Hy3': ('hunyuan', 'hy3'),
     'Hy3 preview': ('hunyuan', 'hy3-preview'),
@@ -147,6 +152,9 @@ COL_SYNONYMS = {
     'cache': ('缓存命中', '缓存价格', '缓存'),
     'in': ('推理输入', '输入价格', '输入单价', '输入'),
     'out': ('推理输出', '输出价格', '输出单价', '输出'),
+    # 2026-11-04（批27 · C）：空元组 = 本表不参与同义词认领，由 map_columns 第二遍专门处理
+    #   （见该函数注释：'model' 与 name 的同义词冲突，谁先拿到取决于表头顺序）。
+    'api': (),
 }
 # 认领顺序：先特殊列，再 in/out（含裸「输入/输出」的同义词最宽，必须最后认领）
 CLAIM_ORDER = ('name', 'cond', 'peak', 'cache', 'in', 'out')
@@ -156,7 +164,15 @@ def map_columns(hdr):
     """表头单元格 -> 各语义列索引（未认领为 None）。v3.52.0 取代原 col(['字面量']) 位置式写法。
 
     v3.63.9（2026-10-25 全解析器复核）：比较改**大小写不敏感**。此前 `w in c` 区分大小写，
-    腾讯把表头改成「Input Price / Input」这种英文写法时整表 0 模型。"""
+    腾讯把表头改成「Input Price / Input」这种英文写法时整表 0 模型。
+
+    2026-11-04（批27 · C）：新增 `api` 列认领（页面第 2 列 `model（调用参数）`）。
+      这一列是**腾讯自己声明的真实调用参数**（实测：Hy4→`hy4`、Hy4 preview→`hy4-preview`、
+      Hy-Role-Latest→`hunyuan-role-latest`），也就是"宿主上报的 id 长什么样"的权威来源。
+      此前它完全没被读 —— COL_SYNONYMS['name'] 里有 'model' 同义词，但「模型名称」先占位，
+      于是这一列被静默丢弃。**不能用同义词表认领**：'model' 同时是 name 的同义词，
+      谁先拿到取决于表头顺序（不可控），必须单独第二遍、并显式跳过已被 name 认领的那一列。
+    """
     res = {k: None for k in COL_SYNONYMS}
     for i, c in enumerate(hdr or []):
         cl = str(c or '').lower()
@@ -164,7 +180,34 @@ def map_columns(hdr):
             if res[k] is None and any(w.lower() in cl for w in COL_SYNONYMS[k]):
                 res[k] = i
                 break
+    # 第二遍：api 列（调用参数）。① 含「调用参数」直接认领；② 否则按 model/api 词面认领，
+    #   但**跳过 name 已占的那一列**（否则英文表 `Model` 会被 api 抢走，name 反而没了）。
+    res['api'] = None
+    for i, c in enumerate(hdr or []):
+        if i == res['name']:
+            continue
+        cl = str(c or '').lower()
+        if '调用参数' in cl or 'api' in cl or re.search(r'model', cl):
+            res['api'] = i
+            break
     return res
+
+
+# 2026-11-04（批27 · C）：从 `model（调用参数）` 单元格挑出"真正的 api 名"。
+#   实测该列可能塞**多个**调用参数（空格分隔，如
+#   `deepseek-v4-flash-202605 deepseek/deepseek-v4-flash-0731 deepseek/deepseek-v4-flash`），
+#   混元自家则都是单值（hy4 / hy4-preview / hunyuan-role-latest）。
+#   规则：按空格切，取第一个**不含 '/'、不含中文**的 token —— 带斜杠的是聚合平台写法（vendor/model），
+#   不是本库价库 key 的形态；取不到就返回 ''（宁可没有，也不要拿半截名字当 key）。
+def pick_api_decl(cell):
+    for tok in str(cell or '').replace('\u3000', ' ').split():
+        t = tok.strip().strip(',，、')
+        if not t or '/' in t:
+            continue
+        if re.search(r'[\u4e00-\u9fa5]', t):
+            continue
+        return t
+    return ''
 
 
 def _cell_text(cell):
@@ -230,6 +273,7 @@ def parse_lang_table(block):
     cm = map_columns(rows[hidx])
     i_name, i_cond, i_peak = cm['name'], cm['cond'], cm['peak']
     i_in, i_out, i_cache = cm['in'], cm['out'], cm['cache']
+    i_api = cm['api']  # 2026-11-04（C）：`model（调用参数）` 列，腾讯声明的真实 api 名
     if None in (i_name, i_in, i_out):
         return []
 
@@ -257,6 +301,12 @@ def parse_lang_table(block):
                 'name': base,
                 'brand': brand,
                 'api_name': api,
+                # 2026-11-04（C）：页面自己声明的 api 名（`model（调用参数）` 列）。
+                #   与 BRAND_MAP 手写的 api_name 是**两个独立来源**：一个来自官网表格，一个来自人工表。
+                #   两者不一致时以官网为准做**告警**（不自动改 key —— 改 key 会让历史账本桶名分裂），
+                #   见 verify_api_names + keep_hunyuan 的双轨收录。
+                'api_decl': pick_api_decl(get(r, i_api)),
+                'api_source': 'brand_map' if api else None,
                 'sku': '原厂直供' if is_first else ('腾讯标准版' if brand != 'hunyuan' else '官方'),
                 'first_party': is_first or (brand == 'hunyuan'),
                 'tiers': [],
@@ -287,6 +337,49 @@ def parse_lang_table(block):
 #   （不刷「请补 BRAND_MAP」告警——那不是遗漏，是范围外），仅在 _excluded_non_general 留痕。
 #   新增非通用型号（如下一代翻译模型）落到未识别 → 告警 → 人工确认后补本正则，不会误收。
 NON_GENERAL_RE = re.compile(r'^Hy-MT', re.I)
+
+# ── 2026-11-04（A 批·漏收可见）：本库「应负责」的名字范围 ───────────────────────────
+# 背景：`_unmapped` 是个大杂烩 —— 里面既有「腾讯混元新品没进 BRAND_MAP」（**我们的漏收**，
+#   必须有人看见），也有「TokenHub 页面转售的第三方新品」（**预期不收**，天天照单报警就是噪音）。
+#   Hy4 正式版漏收那次，`_unmapped` 的首位就是 "Hy4"，但它只写进了 stderr 一行 WARN ——
+#   而调用方是 hook 子进程，用户根本看不到。最终态：官网有明码价、本地按「未收录」计 0 元，
+#   用户从弹窗只能看到「未收录」，无法区分"抓取器瞎了"还是"这模型真没公开价"。
+# 这里只做**范围界定**（不猜品牌、不猜价）：名字以 Hy / 混元 / Hunyuan 开头即视为本库应负责。
+#   判定结果只用于「要不要告警」，**不参与收录逻辑本身** —— 收录仍严格走 BRAND_MAP（宁可不收）。
+# ⚠ 顺序：NON_GENERAL_RE（翻译系 Hy-MT*）先被判范围外，不会进 unmapped，故此处无需再排除。
+IN_SCOPE_RE = re.compile(r'^(?:Hy|混元|Hunyuan)', re.I)
+
+# 2026-11-04（批27 · C）：**双轨收录**用 —— 腾讯自家 api 命名空间。
+#   依据不是"名字像"，而是 TokenHub 页面 `model（调用参数）` 列**腾讯自己写的调用参数**（实测：
+#   hy4 / hy4-preview / hy3 / hunyuan-role-latest / hy-mt2-pro 全部落在这个命名空间）。
+#   这一轨解决的是 BRAND_MAP 的**结构性缺陷**：白名单的漏洞必然落在"最新模型"上（Hy4 漏收那次就是），
+#   而 api 名是官网逐行随表更新的，不需要我们维护。范围仍受 NON_GENERAL_RE 约束（翻译系不进）。
+TEN_API_RE = re.compile(r'^(?:hy|hunyuan)', re.I)
+
+
+def verify_api_names(models):
+    """交叉校验：BRAND_MAP 手写的 api_name 与页面声明的 api_decl 是否一致（只管腾讯自家）。
+
+    2026-11-04（C）实测抓到 1 条真不一致：
+      `Hy-Role-Latest` —— 我们表里写 `hy-role-latest`，官网声明 `hunyuan-role-latest`。
+    后果：宿主若上报官网那个名字，findModel 精确匹配 miss，弹窗「未收录」，而价库里明明有这条。
+    **不自动改 key**：价库 key 是账本桶名，改它会让历史计量分裂成两个桶（且旧 key 的记录再也
+    匹配不上）。只告警 + 落 `api_mismatch` 字段，由人工决定是否同步（改 key 需配一次账本合并）。
+    第三方转售模型的 api 列是多值/带 vendor 前缀（`deepseek/deepseek-flash`），形态本就不一致，
+    不参与校验（否则每次抓取刷 5 条噪音，把真问题埋掉）。
+    """
+    out = []
+    for m in models:
+        if (m.get('brand') or '') != 'hunyuan':
+            continue
+        mapped = (m.get('api_name') or '').strip()
+        decl = (m.get('api_decl') or '').strip()
+        if not mapped or not decl or mapped == decl:
+            continue
+        m['api_mismatch'] = {'mapped': mapped, 'declared': decl}
+        if m['name'] not in out:
+            out.append(m['name'])
+    return out
 
 
 def keep_hunyuan(models):
@@ -320,9 +413,28 @@ def keep_hunyuan(models):
             kept.append(m)
         elif b:
             pass  # 已知第三方品牌（deepseek/zhipu/kimi/minimax/qwen 等）：预期丢弃，不告警
+        elif _page_api_is_tencent(m):
+            # 2026-11-04（C）：**第二轨收录** —— 显示名没进 BRAND_MAP，但官网 `model（调用参数）`
+            #   列把它写成了腾讯自家命名空间（hy*/hunyuan*）。这是官网逐行声明的真实数据，不是猜品牌；
+            #   且本表本身就是「在线推理-语言模型」价表 → 收录符合「只收腾讯自家通用 LLM」的既定范围。
+            #   留痕：api_source='page'（main 会单独打一条 [API] 日志，便于事后核对/回滚）。
+            m['brand'] = 'hunyuan'
+            m['api_name'] = m['api_decl']
+            m['api_source'] = 'page'
+            kept.append(m)
         elif nm not in unmapped:
             unmapped.append(nm)  # 去重：页面存在同名多行，告警不刷屏
     return kept, unmapped
+
+
+def _page_api_is_tencent(m):
+    """页面声明的 api 名是否属腾讯自家命名空间（双轨收录的判据，单列出来便于测试与复用）。"""
+    decl = (m.get('api_decl') or '').strip()
+    if not decl or not TEN_API_RE.match(decl):
+        return False
+    if NON_GENERAL_RE.match(decl):  # 翻译系 api 名（hy-mt2-*）同样排除，双保险
+        return False
+    return True
 
 
 def split_scope(models):
@@ -505,6 +617,24 @@ def main():
     # 只保留腾讯自家通用 LLM；页面里其余是腾讯转售的第三方(智谱/Kimi/DeepSeek/MiniMax)，
     # 以及混元系里的非通用模型(翻译系 Hy-MT*)——两类都不收（用户 2026-10-21：只要通用模型）
     models, unmapped, excluded = split_scope(models)
+    # 2026-11-04（C）：双轨收录留痕 + api 名交叉校验（两条都只写 stderr，不影响本期写入内容）
+    page_added = [m.get('name') for m in models if m.get('api_source') == 'page']
+    if page_added:
+        sys.stderr.write('[parse_tokenhub][API] 双轨收录 %d 个模型（显示名未进 BRAND_MAP，'
+                         '但官网 `model（调用参数）` 列声明为腾讯自家命名空间）：%s\n'
+                         '  -> 这些条目的价库 key 直接取自官网调用参数，**不是**人工表里的值；'
+                         '若需固定，建议把名字补进 BRAND_MAP（品牌 + api 名）以便留档\n'
+                         % (len(page_added), '、'.join(page_added)))
+    mismatch = verify_api_names(models)
+    if mismatch:
+        detail = '；'.join('%s：表内 %s / 官网 %s' % (m['name'], m['api_mismatch']['mapped'], m['api_mismatch']['declared'])
+                          for m in models if m.get('api_mismatch'))
+        sys.stderr.write('[parse_tokenhub][API] ★ 以下 %d 个腾讯模型的 api 名与官网 `model（调用参数）` 列不一致：%s\n'
+                         '  -> 若宿主上报的是**官网那个名字**，价库精确匹配会 miss → 弹窗「未收录」，'
+                         '而价库里其实有这条\n'
+                         '  -> 不自动改 key（价库 key = 账本桶名，改它会分裂历史计量）；'
+                         '请人工确认后同步 BRAND_MAP 并安排一次账本合并\n'
+                         % (len(mismatch), detail))
     if excluded:
         sys.stderr.write('[parse_tokenhub][SKIP] 以下 %d 个腾讯自家非通用模型按范围排除（不收录、不告警）：%s\n'
                          '  -> 本库只收通用 LLM；翻译/语音/嵌入类一律不进（用户 2026-10-21 拍板）\n'
@@ -514,6 +644,17 @@ def main():
                          '  -> 若为腾讯混元**新通用模型**/改名，请补 BRAND_MAP（本库不猜品牌：宁可不收，也不误收）\n'
                          '  -> 若为第三方新品（转售），属预期不收，可忽略\n'
                          % (len(unmapped), '、'.join(unmapped)))
+    # 2026-11-04（A 批）：从 unmapped 里挑出**本库应负责**的那些（腾讯自家命名），单独留痕 + 醒目告警。
+    #   旧实现把这两类混在一行 WARN 里，等于告诉用户"里面有要看的也有不用看的"，结果是都不看。
+    #   这份清单会被 build_index 汇进 index.json 的 `_fetch_degraded.unrecognized_models`，
+    #   进而出现在弹窗（⚠漏收，仅当本轮模型相关时才挂）与 --report 顶部（全量）。
+    in_scope = [n for n in unmapped if IN_SCOPE_RE.match(n)]
+    if in_scope:
+        sys.stderr.write('[parse_tokenhub][MISS] ★ 以下 %d 个**腾讯自家**模型名本次未收录（官网有行、本库没认出来）：%s\n'
+                         '  -> 这是真漏收（不是第三方转售）：价库缺它 → 用到该模型时无法计价，'
+                         '弹窗将显示「未收录」并挂「⚠漏收」标签\n'
+                         '  -> 修法：把该名字补进本文件 BRAND_MAP（品牌 + api 名），重跑流水线即收录\n'
+                         % (len(in_scope), '、'.join(in_scope)))
     if not models:
         # v3.48.0（审计 F8）：0 模型一律不写、非零退出。5xx/Cloudflare/列序变化都可能切出 0 模型，
         #   而 0 模型文件会让 build_index 的"逐模型沿用 ≤7 天"失效 → Hunyuan 从索引消失 →
@@ -550,8 +691,12 @@ def main():
         'unit': unit,
         'peak_rule': peak_rule,
         'models': models,
-        # v3.55.0（A2）：本次被丢弃的未识别模型名（留痕，供人工补 BRAND_MAP；build_index 不消费）
+        # v3.55.0（A2）：本次被丢弃的未识别模型名（留痕，供人工补 BRAND_MAP）
         '_unmapped': unmapped,
+        # 2026-11-04（A 批）：其中**属于本库范围**的那些（腾讯自家命名）—— 这是"真漏收"，
+        #   由 build_index 汇进 _fetch_degraded.unrecognized_models → 弹窗/报表可见。
+        #   与 _unmapped 分开存：第三方转售名不该触发漏收告警（否则天天报，等于没报）。
+        '_unmapped_in_scope': in_scope,
         # v3.63.4：本次按范围排除的腾讯自家非通用模型（翻译系等；留痕，build_index 不消费）
         '_excluded_non_general': excluded,
     }

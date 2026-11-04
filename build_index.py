@@ -185,17 +185,23 @@ def _degraded_state(d, skipped, prev, auth_issues=None):
         stale.append({'source': 'latest.json', 'fetched_at': d.get('fetched_at'),
                       'age_hours': round(age, 1)})
     # ②-b tokenhub 单独判断：它由 parse_tokenhub.py 独立产出，停更时 build_index 完全无感
+    #   2026-11-04（A 批）：改为**读一次、供 ②-b 与 ⑤ 共用** —— 原来 ⑤ 会二次读同一文件，
+    #   既多一次 IO，也可能两次读到不同版本（抓取脚本正在原子替换时）。
+    th = None
     if os.path.exists(TOKENHUB):
         try:
             th = json.load(open(TOKENHUB, encoding='utf-8'))
-            th_age = _age_hours(th.get('fetched_at'))
-            if th_age is not None and th_age > SOURCE_TTL_HOURS:
-                stale.append({'source': 'tokenhub_lang.json', 'fetched_at': th.get('fetched_at'),
-                              'age_hours': round(th_age, 1)})
-                vendors.setdefault('tencent_tokenhub', '腾讯云 TokenHub 文档陈旧（已 %.1f 小时，'
-                                                      '混元价格可能非最新）' % th_age)
         except Exception:
-            vendors.setdefault('tencent_tokenhub', '腾讯云 TokenHub 文档读取失败（混元价格可能非最新）')
+            th = None
+    if isinstance(th, dict):
+        th_age = _age_hours(th.get('fetched_at'))
+        if th_age is not None and th_age > SOURCE_TTL_HOURS:
+            stale.append({'source': 'tokenhub_lang.json', 'fetched_at': th.get('fetched_at'),
+                          'age_hours': round(th_age, 1)})
+            vendors.setdefault('tencent_tokenhub', '腾讯云 TokenHub 文档陈旧（已 %.1f 小时，'
+                                                  '混元价格可能非最新）' % th_age)
+    elif os.path.exists(TOKENHUB):
+        vendors.setdefault('tencent_tokenhub', '腾讯云 TokenHub 文档读取失败（混元价格可能非最新）')
     else:
         # 文件缺失：首日部署同样缺失，故只在"上一版索引里有混元条目"时才报
         # （否则全新安装会被一条无意义告警骚扰）。
@@ -242,13 +248,39 @@ def _degraded_state(d, skipped, prev, auth_issues=None):
             'since': s_since,
         })
     auth_since = {'auth:' + r['model']: r['since'] for r in auth}
+    # ⑤ 2026-11-04（A 批·漏收可见）：**本库应负责、但抓取器没认出来**的模型名。
+    #   语义与上面四路都不同：不是"源坏了"，而是"源好好地看到了这一行，我们却没收录它"。
+    #   这是白名单式发现（BRAND_MAP）的固有缺口，且必然落在**最新上线的模型**上
+    #   （新模型天生不在旧表里）—— Hy4 正式版就是这么漏的：官网 12:13 加了行，
+    #   我们的解析器把它丢进 `_unmapped`，只打一条 hook 子进程里的 stderr，用户零感知。
+    #   数据源是 parse_tokenhub.py 写的 `_unmapped_in_scope`（已按"腾讯自家命名"筛过），
+    #   第三方转售名不在其中 → 不会变成每日噪音。自愈：补了 BRAND_MAP 后该名消失，字段自动清空。
+    prev_deg = (prev or {}).get('_fetch_degraded') or {}
+    prev_unrec = {str(i.get('name')) for i in (prev_deg.get('unrecognized_models') or [])
+                  if isinstance(i, dict) and i.get('name')}
+    prev_unrec_since = prev_deg.get('since') if isinstance(prev_deg.get('since'), dict) else {}
+    unrec = []
+    seen_unrec = set()
+    _unrec_src = (th.get('_unmapped_in_scope') or []) if isinstance(th, dict) else []
+    for nm in _unrec_src:
+        nm = str(nm or '').strip()
+        if not nm or nm in seen_unrec:
+            continue
+        seen_unrec.add(nm)
+        # 同一模型上一版已漏收 → 继承旧起始日（"已经漏了 N 天"，不是今天才漏）
+        u_since = (prev_unrec_since.get('unrec:' + nm) or (prev_deg.get('generated_at') or '')[:10]
+                   or beijing_today()) if nm in prev_unrec else beijing_today()
+        unrec.append({'name': nm, 'since': u_since, 'source': 'tokenhub_lang.json'})
+    unrec_since = {'unrec:' + r['name']: r['since'] for r in unrec}
     return {
         'generated_at': beijing_now().isoformat(timespec='seconds'),
         'vendors': vendors,       # 厂商级降级（键=厂商键）；非空即有厂商价格可能为旧值
-        'since': dict(since, **auth_since),  # 每个键自哪天起降级（继承上一版）
+        'since': dict(since, **auth_since, **unrec_since),  # 每个键自哪天起降级（继承上一版）
         'stale_sources': stale,   # 源级陈旧明细（含年龄；latest.json 整体 + tokenhub 单独）
         # v3.62.0（S-3/F-2）：lock 权威条目自身问题（模型级）——坏手工价被拒收 / 官方对照停更
         'authoritative_issues': auth,
+        # 2026-11-04（A 批）：官网有行、本库没认出来的腾讯自家模型（真漏收）—— 与"第三方转售不收"区分开
+        'unrecognized_models': unrec,
         'ttl_hours': SOURCE_TTL_HOURS,
     }
 
@@ -770,6 +802,11 @@ def main():
                 'vendor': 'tencent_tokenhub',
                 'name': m.get('name'),
                 'api_name': m.get('api_name'),
+                # 2026-11-04（C 批 / KI-61）：页面「model（调用参数）」列 = 腾讯自己声明的真实
+                #   调用参数名。可能与 BRAND_MAP 手写的 api_name 不同（实测 6 个腾讯模型里
+                #   1 个：`Hy-Role-Latest` 我们写 hy-role-latest、官网声明 hunyuan-role-latest）。
+                #   透传目的：JS 侧 findModel 多一级按它匹配（不改 key，key = 账本桶名）。
+                'api_decl': m.get('api_decl'),
                 'source_type': st,
                 'in': inp, 'out': outp, 'cache': cache,
                 'tier_note': ('峰谷计费' if (idle or peak) else '') +
@@ -816,7 +853,11 @@ def main():
         #   （token-tracker.js:2544-2571）按固定字段白名单读取，未知字段直接忽略 →
         #   对计费侧零影响；这些字段供契约海关校验与人工审计消费。
         for f in ('currency', 'unit', 'region', 'source_url', 'fetched_at',
-                  'effective_from', 'superseded_at'):
+                  'effective_from', 'superseded_at',
+                  # 2026-11-04（C 批 / KI-61）：官网声明的调用参数名随主候选落进索引顶层，
+                  #   供 token-tracker.js findModel 第 2.3 级匹配。**不进 all_sources 之外任何
+                  #   计价字段**，mergeLocalPriceDb 只挑白名单字段读 → 对计费侧零影响。
+                  'api_decl'):
             if primary.get(f):
                 entry[f] = primary[f]
         # 携带峰谷价格：优先主候选；主候选无 peak 时从同组 first_party 候选里补
@@ -1266,6 +1307,14 @@ def main():
         _parts += ['lock条目 %s: %s' % (a['model'], a['reason']) for a in _deg.get('authoritative_issues', [])[:5]]
         sys.stderr.write('[build_index][WARN] 输入源降级（价格可能为旧值；已写入 index.json 的 '
                          '_fetch_degraded，弹窗/报表会显示）：%s\n' % '; '.join(_parts))
+    # 2026-11-04（A 批）：漏收单独打一条 —— 它跟"源坏了"是两回事（源好好的，是我们没认出来），
+    #   混在上面的"降级"里会让人以为是抓取失败，反而去查网络。
+    _unrec = _deg.get('unrecognized_models') or []
+    if _unrec:
+        sys.stderr.write('[build_index][MISS] ★ 本库漏收 %d 个腾讯自家模型（官网有行、BRAND_MAP 没认出来）：%s\n'
+                         '  -> 已写入 index.json 的 _fetch_degraded.unrecognized_models，'
+                         '弹窗（⚠漏收）/ --report 顶部会显示\n'
+                         % (len(_unrec), '、'.join('%s（自 %s 起）' % (u['name'], u['since']) for u in _unrec[:10])))
     else:
         sys.stderr.write('[build_index] 输入源全部正常（无降级）\n')
     # v3.52.0（审计批2·G7）：写盘前**滚动备份上一版**。原实现只有 tmp + os.replace 的原子写

@@ -501,6 +501,15 @@ function main() {
         delete stat.no_price; delete stat.no_price_note;
         report.push({ model, note: '已补公开价并回算，清除 no_price 标记' });
       }
+      // 2026-11-04：**同一类缺陷的另一半** —— v3.31.0 给「价库查不到 → calcCost 返回 null」的条目
+      //   打了 unpriced / unpriced_note（token-tracker 收口处）。价库补上单价后重算，金额已是真实值，
+      //   但没人清这两个字段 → 账本里出现「cost=16.04 且 unpriced=true」的自相矛盾条目，
+      //   任何读 unpriced 的下游（报表成因列 / 后续审计）都会被误导成「这模型还没价」。
+      //   走到这里说明 findModel 已命中且带数值单价 → 标记必为陈旧，无条件清。
+      if (stat.unpriced) {
+        delete stat.unpriced; delete stat.unpriced_note;
+        report.push({ model, note: '已补单价并回算，清除 unpriced 标记' });
+      }
       // v3.58.0（批8-①）：同上 —— 累加侧再兜一次（未回写的原值仍是脏值时也不能污染合计）。
       dayTotal += safeCost(stat.cost);
     }
