@@ -1,3 +1,9 @@
+> ## ⚠️ 已归档，停止维护（2026-11）
+>
+> 本仓库转为只读归档，作者不再更新。原因：弹窗提醒层依赖宿主的非公开内部信号（子代理状态、任务边界等均无事件通知），判定只能启发式推测，边界路径组合复杂，维护成本持续上升且部分问题无稳定解，作者后续无足够时间精力投入。
+>
+> 相比之下，**账本记账层（token 统计与金额）自始至终准确可靠**，可继续正常使用；不需要弹窗提醒可设环境变量 `TOKEN_TRACKER_NO_TOAST=1` 静音。
+
 # WorkBuddy Token Tracker（token-usage-tracker）
 
 ![License](https://img.shields.io/github/license/abc1317679842-ui/workbuddy-token-tracker)
